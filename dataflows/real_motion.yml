@@ -1,0 +1,69 @@
+# MoveIt-lite motion graph: meshcat teleop (sliders -> plan -> preview) feeds a
+# trajectory executor that streams motor commands through the command-mode DM
+# bridge. Self-collision-aware planning runs in the teleop node (MuJoCo
+# collision world + OMPL).
+#
+# SAFETY — the graph comes up DISARMED. The operator_arm gate feeds the bridge
+# `arm` input directly (press Enter in the launch terminal, or
+# `touch /tmp/arm_operator_arm`). Arming enables the motors into the executor's
+# measured-pose hold; motion happens only on the meshcat Execute button. The
+# 0.1s deadman + fault reflex are live the whole time.
+#
+#   ARM_CONTROL_CONFIG=configs/real/assembler.yaml dora run dataflows/real_motion.yml
+#   (or: python scripts/view.py real motion)
+nodes:
+  - id: operator_arm
+    path: ../nodes/operator_arm.py
+    outputs:
+      - arm
+
+  - id: motion_teleop
+    path: ../nodes/motion_teleop.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+    outputs:
+      - trajectory
+      - gripper
+
+  - id: trajectory_executor
+    path: ../nodes/trajectory_executor.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      trajectory:  motion_teleop/trajectory
+      gripper:     motion_teleop/gripper
+    outputs:
+      - motor_command
+
+  - id: plant_interface
+    path: ../nodes/hardware_interface.py
+    # Command mode: safety layer built, disarmed until operator_arm fires.
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
+    inputs:
+      motor_command: trajectory_executor/motor_command
+      arm:           operator_arm/arm
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - motor_health
+      - can_bus_status
+      - model_revision
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state:    plant_interface/motor_state_viz
+      can_bus_status: plant_interface/can_bus_status
+
+  # Tracking log for gain tuning: measured pos/vel/torque + commanded q_des
+  # per motor_state tick -> CSV (motor_log_path, default
+  # /tmp/arm_control_motor_state.csv). Steady-state error = qdes - pos.
+  - id: motor_state_logger
+    path: ../nodes/motor_state_logger.py
+    inputs:
+      motor_state:   plant_interface/motor_state
+      motor_command: trajectory_executor/motor_command

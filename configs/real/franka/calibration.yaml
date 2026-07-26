@@ -1,0 +1,53 @@
+# Franka Research 3 — MEASURED VALUES.
+#
+# Lifetime: rewritten by a calibration run. Same rungs as the assembler arm, but
+# note what the FR3 makes CHEAPER: its kinematics are factory-calibrated to
+# ~0.1 mm repeatability, so the arm-mount solve is the only geometric unknown
+# and there is no gain ramp (rung 4) and no grip-force fit (rung 11) — libfranka
+# takes stiffness and grasp force in physical units directly.
+#
+# Writers:
+#   scripts/calibrate_hand_eye.py wrist   -> arm.world_*, perception.wrist.*
+#   scripts/calibrate_hand_eye.py static  -> perception.static.world_T_cam
+#     (workcell-wide: shared with the assembler arm, calibrate once)
+
+# --- Arm mount (rung 6 / rung 9) -------------------------------------------
+# FR3 base pose in the world(=ChArUco board) frame. PLACEHOLDER identity;
+# `calibrate_hand_eye.py wrist` prints this exact block.
+# With two arms on one table this is THE number that keeps them in the same
+# world — get it wrong and the FR3 picks where the assembler thinks the module
+# is, not where it actually is.
+arm:
+  world_origin: [0.0, 0.0, 0.0]
+  world_rpy:    [0.0, 0.0, 0.0]
+
+  # --- Gain table (SIM-facing since the position path was removed) -----------
+  # No process on this host closes a loop over the real FR3 (torque control
+  # lives on the RT machine). These values exist for the executor's shape
+  # checks and for the MuJoCo twin, whose explicit PD uses kp as stiffness
+  # (N·m/rad-scaled — NOT the DM arm's MIT kp).
+  kp: [1200, 1200, 1200, 1200, 800, 600, 400]
+  # kd 0 rings forever in sim; configs/sim/franka.yaml overrides it with the
+  # measured plateau values — that override and this line are a pair.
+  kd: [0, 0, 0, 0, 0, 0, 0]
+
+# --- Camera extrinsics (rung 9) --------------------------------------------
+perception:
+  static:
+    # world_T_cam: shared workcell value — paste the SAME matrix both arms use.
+    {}
+  wrist:
+    # ee_T_cam / base_T_board for a wrist camera on THIS arm (empty if the 305
+    # stays on the assembler). Re-run after any tool change.
+    {}
+  # Pick-zone crop, WORLD frame. Shared with the assembler arm — it describes
+  # the table, not the robot.
+  crop_min: [0.05, -0.60, -0.02]
+  crop_max: [0.90,  0.60,  0.40]
+
+# --- Workcell geometry (rung 9) ---------------------------------------------
+# Static obstacles in the FR3's OWN base frame (the planner's world).
+environment:
+  - name: table
+    size: [1.2, 0.8, 0.05]
+    pose: [0.45, 0.0, -0.025, 0.0, 0.0, 0.0]   # top face at z=0 PLACEHOLDER

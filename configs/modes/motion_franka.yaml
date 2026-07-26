@@ -1,0 +1,65 @@
+# MoveIt-lite motion mode for the FRANKA RESEARCH 3.
+#
+# Peer of motion.yaml. It is a separate file rather than a shared one because
+# every number in the controller block is an arm hardware fact, and the two arms
+# do not share units: the DM table is MIT-wire-format kp (ceiling 500) closed by
+# the motor firmware, the FR3 wants joint stiffness in N·m/rad closed by
+# libfranka's internal impedance controller. One table cannot serve both, and a
+# mode config keyed by the wrong joint names expands to ZERO gains.
+#
+# planner.joints is deliberately absent — it defaults to `arm.joints` from the
+# arm config, which is the canonical answer for whichever arm is loaded.
+plant:
+  mode: command
+  listen_mode: false
+
+controller:
+  command_rate_hz: 100
+  state_timeout_sec: 0.25
+  start_pos_tol_rad: 0.1   # refuse a trajectory starting farther than this from measured
+  abort_pos_err_rad: 0.35  # runaway guard: abort tracking when q_des leaves the arm behind
+  hold_relatch_rad: 0.3    # idle hold re-anchors if the arm is moved externally past this
+  # Raise the DM wire-format ceilings: these are stiffnesses, not MIT kp.
+  kp_max: 3000.0           # Franka's own default tops out at 3000 N·m/rad
+  kd_max: 200.0            # sim needs real damping (no real-arm loop on this host)
+  torque_limit_max: 90.0   # FR3 joint torque limits are 87 / 12 N·m
+  # Joint stiffness (N·m/rad). Matches arm.kp in the FR3 calibration.yaml —
+  # consumed by the SIM plant's PD (the real position path was removed;
+  # torque control lives on the RT machine).
+  kp:
+    fr3_joint1: 1200.0
+    fr3_joint2: 1200.0
+    fr3_joint3: 1200.0
+    fr3_joint4: 1200.0
+    fr3_joint5: 800.0
+    fr3_joint6: 600.0
+    fr3_joint7: 400.0
+  # kd is deliberately ABSENT: it falls back to arm.kd in the ARM config. The
+  # base calibration carries kd = 0 (no host loop over the real arm), and in
+  # SIM the MuJoCo plant closes an explicit PD law where kd = 0 means NO
+  # damping — kp = 1200 rings forever (measured: ~10 Hz constant-amplitude
+  # oscillation on joints 1-3). configs/sim/franka.yaml overrides arm.kd.
+  # Bounds the executor's tau_ff (sim-only on this arm). Kept truthful to
+  # the datasheet so the numbers still mean something.
+  torque_limits:
+    fr3_joint1: 87.0
+    fr3_joint2: 87.0
+    fr3_joint3: 87.0
+    fr3_joint4: 87.0
+    fr3_joint5: 12.0
+    fr3_joint6: 12.0
+    fr3_joint7: 12.0
+
+# OMPL RRT-Connect over joint space + MuJoCo self-collision oracle.
+planner:
+  vel_limits: 0.5          # rad/s — keep <= franka.max_joint_velocities
+  acc_limits: 1.0          # rad/s^2
+  soft_speed_frac: 0.5
+  soft_acc_floor: 0.15
+  self_collision_padding_m: -0.002
+  solve_time_sec: 2.0
+  simplify_time_sec: 0.5
+  resolution_frac: 0.005
+
+teleop:
+  http_port: 7501   # 7500 is the assembler arm's panel — both can run at once

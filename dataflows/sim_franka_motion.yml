@@ -1,0 +1,53 @@
+# Sim twin of real_franka_motion.yml — the FR3 through the MuJoCo plant.
+#
+# Identical to sim_motion.yml except for the pinned mode config: every node's
+# `env:` block names configs/modes/motion_franka.yaml so a bare `dora run` gets
+# the FR3's gains. That pin is why this file has to exist at all — a per-node
+# `env:` entry OVERRIDES the launcher's environment, so pointing view.py at a
+# different mode config is not enough on its own. Getting this wrong is silent:
+# the DM gain table is keyed by Joint1..Joint6 and expands to ZERO gains for
+# fr3_* joints (the executor now refuses that outright).
+#
+#   python scripts/setup_fr3_assets.py --check   # meshes must be staged
+#   ARM_CONTROL_CONFIG=configs/sim/franka.yaml dora run dataflows/sim_franka_motion.yml
+#   (or: python scripts/view.py sim franka motion)
+nodes:
+  - id: motion_teleop
+    path: ../nodes/motion_teleop.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+    outputs:
+      - trajectory
+      - gripper
+
+  - id: trajectory_executor
+    path: ../nodes/trajectory_executor.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      trajectory:  motion_teleop/trajectory
+    outputs:
+      - motor_command
+
+  - id: plant_interface
+    path: ../nodes/mujoco_interface.py
+    inputs:
+      motor_command: trajectory_executor/motor_command
+      # Teleop gripper slider drives the scene's finger servos directly (the
+      # 6-motor sim config has no gripper motor slot). No-op if the scene has
+      # no gripper.
+      motor_command_gripper: motion_teleop/gripper
+    outputs:
+      - motor_state
+      - sim_qpos       # live twin qpos (unconsumed here)
+      - gripper_state  # finger positions/efforts (unconsumed here)
+      - topology_state # sent once with model_revision (unconsumed here)
+      - model_revision
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state

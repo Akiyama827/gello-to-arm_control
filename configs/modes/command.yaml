@@ -1,0 +1,10 @@
+# Command mode for the DM hardware bridge: disables listen so the bridge builds
+# the SafetyController + GraspController layer (disarmed by default; motors are
+# NOT enabled on open). Used by command graphs that drive real setpoints — e.g.
+# the M1 grasp+lift graph (dataflows/real_assembler_grasp.yml, `view.py real grasp`).
+# Minimal on purpose: the bridge reads plant.mode (listen_mode kept for the
+# port-contract test / back-compat derive). Controller/behavior knobs (unlike
+# float.yaml) do not belong here — the orchestrator owns gains.
+plant:
+  mode: command
+  listen_mode: false

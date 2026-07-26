@@ -1,0 +1,29 @@
+nodes:
+  - id: plant_interface
+    path: ../nodes/hardware_interface.py
+    inputs:
+      motor_command: impedance_controller/motor_command
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - model_revision
+      - can_bus_status
+
+  - id: controller_tuner
+    path: ../nodes/controller_tuner.py
+    outputs:
+      - controller_settings
+
+  - id: impedance_controller
+    path: ../nodes/impedance_controller.py
+    inputs:
+      motor_state: plant_interface/motor_state
+      controller_settings: controller_tuner/controller_settings
+    outputs:
+      - motor_command
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      can_bus_status: plant_interface/can_bus_status

@@ -1,0 +1,31 @@
+# Derived from Control/.gitignore. Only the rules that still have a producer in
+# THIS repo are kept; assembler/*.sdf, modules/*.sdf, isaac_assets/ and rl/*
+# went with the project.
+
+# Staged FR3 description (scripts/setup_fr3_assets.py). Not vendored: it comes
+# from franka_description (Apache-2.0) or a local Isaac install, and the meshes
+# are large. Run the script to (re)create it.
+# LEADING SLASH IS LOAD-BEARING: unanchored `franka/` also matches
+# configs/real/franka/ and configs/sim/franka.yaml's sibling dir, which are
+# tracked config.
+/franka/
+
+# Planning cache (arm_control/assembly/build.py -> $ARM_CONTROL_ROOT/.cache/planning).
+.cache/
+
+# MuJoCo model cache + native log.
+.mj_cache/
+MUJOCO_LOG.TXT
+
+# Local runtime output.
+dataflows/out/
+Log/
+
+# Vendor DM CAN shared objects (dlopen'd by hardware/dm_backend.py). Untracked
+# AND unignored in Control today, which is how it went missing; name it here.
+dlls/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/

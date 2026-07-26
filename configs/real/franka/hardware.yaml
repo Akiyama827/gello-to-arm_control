@@ -1,0 +1,120 @@
+# Franka Research 3 — HARDWARE IDENTITY.
+#
+# Lifetime: changes when the robot or its network/tooling changes. Nothing here
+# is a bench knob and nothing here is written by a calibration script.
+#
+# Prerequisites the config cannot check for you:
+#   - the FR3 is powered, UNLOCKED in Desk, and FCI mode is active
+#   - this PC is on the robot's LAN (there is a `franka` NetworkManager profile)
+#   - pylibfranka is importable from conda BASE and matches /usr/lib/libfranka.so
+#   - franka.enforce_realtime: true needs a PREEMPT_RT kernel (see below)
+#
+# Stage the description first (URDF + link meshes):
+#   python scripts/setup_fr3_assets.py --source <franka_description checkout>
+
+real_backend: pylibfranka
+listen_mode: false
+
+arm:
+  # 7 DoF. These names must match franka/urdf/fr3.urdf.
+  joints: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+  # This arm's REAL finger joints. Whether the bridge COMMANDS them as a motor
+  # slot is signalled independently by the presence of `joint_mimics` (absent
+  # here — the Franka Hand is its own device, driven by grasp requests). These
+  # are what the sim plant servos and what the Rerun ghost renders.
+  gripper_joints: [fr3_finger_joint1, fr3_finger_joint2]
+  # Tool centre point between the fingers — the frame every waypoint targets.
+  # Use fr3_link8 instead if you fit a custom flange tool.
+  ee_frame: fr3_hand_tcp
+  urdf: franka/urdf/fr3.urdf
+  # world_origin / world_rpy live in calibration.yaml — they are MEASURED.
+
+# 7 arm joints; the Hand is NOT a motor slot (contrast the DM arm's 7 = 6 + gripper).
+num_motors: 7
+motor_ids: [1, 2, 3, 4, 5, 6, 7]
+motor_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+render_joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+
+# No `joint_mimics` block, deliberately. Its absence is the signal that this
+# arm's gripper is not a motor on the same bus: the orchestrator then packs
+# arm-only commands and the Franka Hand is driven by grasp requests instead.
+
+# Franka Hand finger travel, PER FINGER (total opening is 2x this). From the
+# URDF's fr3_finger_joint limits and confirmed on the robot: GripperState
+# reports max_width 0.0799 m. Needed explicitly because the teleop slider's
+# usual source is joint_mimics, which this arm has none of — without it the
+# slider silently inherited the DM arm's 0.0439 m.
+gripper_range_m: [0.0, 0.04]
+
+# --- libfranka / FCI --------------------------------------------------------
+franka:
+  # Desk/FCI address of the control box. MEASURED on this bench 2026-07-26: the
+  # `franka` NetworkManager profile puts this PC at 172.16.0.1/24 on enp6s0 and
+  # the control box answers on .3 (not the .2 in Franka's docs). Confirm with
+  # `ip neigh show dev enp6s0` if the arm ever stops answering.
+  ip: 172.16.0.3
+  # kEnforce refuses to run without RT scheduling. This host only READS state
+  # and drives the gripper (the position path was removed 2026-07-26 — torque
+  # control lives on the RT machine), so a stock kernel is fine here.
+  enforce_realtime: false
+  # Contact reflex thresholds. Deliberately low for bring-up: the arm stops on
+  # light contact and automatic_error_recovery clears it on the next arm.
+  lower_torque_thresholds: [20, 20, 18, 18, 16, 14, 12]
+  upper_torque_thresholds: [40, 40, 36, 36, 32, 28, 24]
+  lower_force_thresholds: [20, 20, 20, 25, 25, 25]
+  upper_force_thresholds: [40, 40, 40, 50, 50, 50]
+  gripper:
+    enabled: true
+    # Row module is 57 mm across (row_motor.stl bbox); the Hand's stroke is
+    # 0-80 mm. Target inside the module so the fingers load up on it.
+    grasp_width_m: 0.045
+    speed_mps: 0.05
+    force_n: 40.0              # RUNG 11 equivalent — the Hand states force directly
+    epsilon_inner_m: 0.02      # accepted width band around grasp_width_m
+    epsilon_outer_m: 0.02
+    open_width_m: 0.075
+
+# No host-side deadman: this process cannot move the arm (motion lives on the
+# RT machine, which runs its own watchdog), so there is nothing for a host
+# timer to stop. The FR3 enforces its own limits for everything else.
+
+urdf_path: franka/urdf/fr3.urdf
+update_rate_hz: 100
+hardware_update_rate_hz: 100
+viz_publish_rate_hz: 60
+rerun_fk_rate_hz: 30
+rerun_plot_window_s: 10.0
+viz_log_rates: false
+rerun_app_id: arm_control_real_fr3
+
+motor_log_path: /tmp/fr3_motor_log.csv
+
+# --- Camera rig -------------------------------------------------------------
+# Same physical rig as the assembler arm: perception publishes in the WORLD
+# (board) frame, so both arms consume the identical module_poses stream and each
+# converts with its own arm.world_* mount. Only the wrist extrinsic is per-arm.
+perception:
+  static:
+    serial: ""
+    rate_hz: 2.0
+  wrist:
+    serial: ""
+    rate_hz: 5.0
+  # module_meshes + tags live in scenario.yaml — task data, not rig identity.
+  voxel_m: 0.004
+  plane_dist_m: 0.008
+  cluster_eps_m: 0.02
+  cluster_min_points: 80
+  icp_dist_m: 0.01
+  min_fitness: 0.6
+  upright_axis_tol_deg: 30
+  upright_local_axis: [0.0, 1.0, 0.0]
+  upright_world_axis: [0.0, 0.0, -1.0]
+  stale_s: 2.0
+  board:
+    squares_x: 5
+    squares_y: 7
+    square_m: 0.03
+    marker_m: 0.022
+    dict: DICT_5X5_100

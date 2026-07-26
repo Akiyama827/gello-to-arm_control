@@ -1,0 +1,66 @@
+# MoveIt-lite motion mode: meshcat teleop -> self-collision-aware planner ->
+# trajectory executor -> command-mode bridge. Hardware identity stays in
+# configs/real. The bridge comes up DISARMED (operator arm gate + deadman +
+# fault reflex live); the executor streams a measured-pose hold until a
+# trajectory arrives, so arming never jumps.
+plant:
+  mode: command
+  listen_mode: false
+
+# Tracking servo (NOT float): kp/kd drive the arm along the trajectory and
+# reject friction/payload/model error; RNEA feedforward (gravity + Coriolis +
+# inertia) carries the modeled dynamics. kp/kd start at the bench-ramp anchor
+# (kp=20/kd=0.5) — climb on the bench.
+controller:
+  command_rate_hz: 100
+  state_timeout_sec: 0.25
+  start_pos_tol_rad: 0.1   # refuse a trajectory starting farther than this from measured
+  abort_pos_err_rad: 0.35  # runaway guard: abort tracking when q_des leaves the arm behind
+  hold_relatch_rad: 0.3    # idle hold re-anchors if the arm is moved externally past this
+  kp:
+    Joint1: 20.0
+    Joint2: 20.0
+    Joint3: 20.0
+    Joint4: 20.0
+    Joint5: 20.0
+    Joint6: 20.0
+    Gripper: 5.0           # hold-in-place only; the planner never moves the gripper
+  kd:
+    Joint1: 0.5
+    Joint2: 0.5
+    Joint3: 0.5
+    Joint4: 0.5
+    Joint5: 0.5
+    Joint6: 0.5
+    Gripper: 0.2
+  torque_limits:
+    Joint1: 8.0
+    Joint2: 8.0
+    Joint3: 8.0
+    Joint4: 3.0
+    Joint5: 2.0
+    Joint6: 1.5
+    Gripper: 0.2
+
+# OMPL RRT-Connect over joint space + MuJoCo self-collision oracle.
+planner:
+  # `joints` omitted on purpose: it defaults to `arm.joints` from the arm config,
+  # so this mode file carries no arm identity. (It used to hardcode the DM arm's
+  # Joint1..Joint6, which made the file unusable for any other arm.)
+  vel_limits: 0.5          # rad/s, scalar or per-joint dict — bench-conservative
+  acc_limits: 1.0          # rad/s^2
+  # Soft launch/landing: allowed acc tapers with speed below
+  # soft_speed_frac * local vel cap, floored at soft_acc_floor * acc_limits.
+  # Kills the end-of-motion jerk impulse (ringing at kp=40/kd=2.5).
+  # Floor 1.0 = old hard trapezoid; lower floor = softer + slower ends.
+  soft_speed_frac: 0.5
+  soft_acc_floor: 0.15
+  # Absorbs shallow convex-hull overlap at the rest pose (MuJoCo hulls the
+  # concave STLs for collision); hulls stay conservative elsewhere.
+  self_collision_padding_m: -0.002
+  solve_time_sec: 2.0
+  simplify_time_sec: 0.5
+  resolution_frac: 0.005   # validity-check resolution, fraction of joint-space extent
+
+teleop:
+  http_port: 7500   # stdlib control panel (sliders/buttons); visuals in Rerun

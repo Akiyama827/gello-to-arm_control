@@ -1,0 +1,14 @@
+nodes:
+  - id: plant_interface
+    path: ../nodes/hardware_interface.py
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - model_revision
+      - can_bus_status
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      can_bus_status: plant_interface/can_bus_status

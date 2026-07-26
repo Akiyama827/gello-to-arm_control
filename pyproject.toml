@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arm_control"
+version = "0.1.0"
+description = "Control interfaces, planning and simulation for the modular arm (Dora nodes + library)"
+requires-python = ">=3.10"
+
+# HARD deps = imported at module top level by code any consumer hits.
+#   numpy    — every module
+#   pyarrow  — messages.py (top-level; includes the grasp + module_poses codecs)
+#   pyyaml   — config.py, node_utils.py (top-level)
+#   dora-rs  — nodes/*.py import `from dora import Node` at top level; this
+#              repo ships the node set, so dora is not optional here.
+#              (In `perceptions` it IS optional: those two nodes import dora
+#              inside main().)
+dependencies = [
+    "numpy",
+    "pyarrow",
+    "pyyaml",
+    "dora-rs",
+]
+
+[project.optional-dependencies]
+# --- pip-installable extras -------------------------------------------------
+# simulation/ + planning/mujoco_collision.py import mujoco at MODULE top level,
+# so `pip install arm_control[sim]` is required before importing those.
+sim = ["mujoco"]
+# nodes/visualizer.py, planning/preview_rerun.py, simulation/rerun_scene.py.
+# visualizer is in every dataflow, so in practice this is not optional at
+# RUNTIME — it is an extra only because the library imports it lazily.
+viz = ["rerun-sdk"]
+# simulation/convex_decomp.py (coacd + trimesh, both lazy) and
+# scripts/setup_fr3_assets.py (trimesh, lazy).
+mesh = ["trimesh", "coacd"]
+
+# --- NOT pip-installable. Listed for documentation only; do not add these to
+# --- `dependencies` and do not expect `pip install .[...]` to satisfy them.
+#
+#   pinocchio / hpp-fcl  conda-forge only:
+#                            conda install -c conda-forge pinocchio
+#                        The PyPI `pin` wheel is an unofficial mirror and has
+#                        bitten this project before (open3d/numpy-2 ABI class
+#                        of failure). All pinocchio imports in this repo are
+#                        LAZY (inside a function or try/except), so the package
+#                        imports fine without it — dynamics, IK, FK and the
+#                        preview then raise at call time.
+#   ompl                 conda-forge (`conda install -c conda-forge ompl`) or
+#                        built from source with Python bindings. No usable PyPI
+#                        wheel. planning/ompl_planner.py imports it lazily.
+#   pylibfranka          built alongside libfranka; not on PyPI.
+#                        hardware/franka_backend.py imports it lazily, so
+#                        `python -m arm_control.hardware.franka_backend`
+#                        (config parsing self-check) runs without it.
+#   dmcan                vendor SDK for the DM USB2FDCAN dongle; not on PyPI.
+#                        hardware/dm_backend.py imports it lazily and also
+#                        dlopen()s $ARM_CONTROL_ROOT/dlls/libdm_device.so,
+#                        which is neither tracked nor gitignored today.
+#
+# Deliberately absent: open3d, opencv (except [calib]) — those left with
+# `perceptions`. Nothing under arm_control/ imports open3d after the split.
+
+[project.scripts]
+# ponytail: NOT wired yet. Adding one entry per node here would make the
+# dataflow YAMLs location-independent (`path: arm-control-visualizer` instead
+# of a relative path) and is the upgrade if the submodule mount point ever
+# moves again. Every node already has a main() + __main__ guard, so it is one
+# line each. Skipped for now: relative paths are a smaller diff.
+
+[tool.setuptools.packages.find]
+# Only arm_control/ is an installed package. nodes/, scripts/, configs/ and
+# dataflows/ stay plain repo files: dora launches nodes BY PATH from the
+# dataflow YAML, and nodes/ has no __init__.py (it works today purely as an
+# implicit namespace package under the sys.path bootstrap).
+include = ["arm_control*"]
+
+# ruff needs no config: repo follows ruff defaults, whose line-length is
+# already 88. `ruff check .` from the repo root is the whole lint story.

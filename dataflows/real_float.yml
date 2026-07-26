@@ -1,0 +1,30 @@
+nodes:
+  - id: plant_interface
+    path: ../nodes/hardware_interface.py
+    inputs:
+      motor_command: impedance_controller/motor_command
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - model_revision
+      - can_bus_status
+
+  - id: impedance_controller
+    path: ../nodes/impedance_controller.py
+    inputs:
+      motor_state: plant_interface/motor_state
+    outputs:
+      - motor_command
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      can_bus_status: plant_interface/can_bus_status
+
+  # CSV joint-state log (cfg motor_log_path) — scripts/calibrate_hand_eye.py
+  # reads the freshest row per pose while the arm floats (rung 9).
+  - id: motor_state_logger
+    path: ../nodes/motor_state_logger.py
+    inputs:
+      motor_state: plant_interface/motor_state
