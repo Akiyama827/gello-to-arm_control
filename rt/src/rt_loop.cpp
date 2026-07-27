@@ -40,6 +40,17 @@ void elevate(const ServerConfig& cfg) {
   sp.sched_priority = cfg.rt_priority;
   if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
     std::perror("[rt] SCHED_FIFO (continuing at normal priority)");
+  if (cfg.rt_cpu >= 0) {
+    // Only THIS thread moves to the isolated core; the comms threads keep the
+    // default mask (the housekeeping cores, once isolcpus removes this one).
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cfg.rt_cpu, &set);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
+      std::perror("[rt] rt-cpu pin (continuing unpinned)");
+    else
+      std::printf("[rt] servo thread pinned to cpu %d\n", cfg.rt_cpu);
+  }
 }
 
 } // namespace

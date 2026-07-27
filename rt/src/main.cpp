@@ -28,7 +28,7 @@ void usage(const char* argv0) {
       "usage: %s [--backend fake|franka|dm] [--n N] [--udp-port P] [--tcp-port P]\n"
       "          [--state-hz HZ] [--hold-ms MS] [--fault-ms MS] [--slew NM]\n"
       "          [--hold-kp V] [--hold-kd V] [--franka-ip IP] [--can-if IF]\n"
-      "          [--rt-priority N]\n",
+      "          [--rt-priority N] [--rt-cpu CPU]\n",
       argv0);
 }
 
@@ -58,6 +58,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--franka-ip")) cfg.franka_ip = next("--franka-ip");
     else if (!std::strcmp(argv[i], "--can-if")) cfg.can_if = next("--can-if");
     else if (!std::strcmp(argv[i], "--rt-priority")) cfg.rt_priority = std::atoi(next("--rt-priority"));
+    else if (!std::strcmp(argv[i], "--rt-cpu")) cfg.rt_cpu = std::atoi(next("--rt-cpu"));
     else {
       usage(argv[0]);
       return 2;

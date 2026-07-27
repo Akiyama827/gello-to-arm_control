@@ -44,6 +44,8 @@ struct ServerConfig {
   double hold_kp = 50.0;    // hold gains when no command was ever received
   double hold_kd = 5.0;
   int rt_priority = 80;     // SCHED_FIFO; failure to set is a warning, not fatal
+  int rt_cpu = -1;          // pin the SERVO thread here (an isolcpus core);
+                            // comms threads float on the housekeeping cores
 };
 
 struct ServerCtx {
