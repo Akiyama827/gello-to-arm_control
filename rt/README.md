@@ -80,7 +80,28 @@ separate soft-start path.
 
 The ARM ack rule for clients: `FAULTED` in the STATUS flags is the refusal —
 `ARMED` alone is not consent, because a fault-holding server keeps its ARMED
-flag on purpose.
+flag on purpose. Symmetrically, a DISARM ack is not proof authority dropped
+(the RT loop applies it at its next sample, seconds away inside a blocking
+plant call) — `safe_stop()` confirms against the state stream and returns
+the verdict.
+
+Hardening from the post-rung-2 adversarial review (all bench-triggered or
+review-caught, all in the stale-authority class):
+
+- **Gains are snapshotted at command acceptance** — the hold branch never
+  dereferences the live command buffer, so a stray zero-gain datagram (every
+  tool's address-teach prime) cannot un-spring a parked arm.
+- **ARM is a generation counter, not a level** — a DISARM→ARM pair faster
+  than one servo tick still triggers every per-epoch reset (gains, hold
+  pose, plant retry, backend stop).
+- **While armed, UDP commands are accepted only from the control client's
+  IP** — nothing else can steal the state stream or inject authority.
+- **The control session has a real deadman** — the server PINGs at 4 Hz and
+  treats ~1.2 s of silence as session loss (a half-open socket from a dead
+  PC otherwise takes the kernel's 2-hour keepalive to notice).
+- NaN/Inf commands are dropped at the UDP boundary; misconfigured safety
+  flags (`hold-ms >= fault-ms`, `slew <= 0`) refuse to start; the seqlock
+  read is bounded (a preempted writer can't spin the FIFO reader).
 
 ## Bring-up ladder
 

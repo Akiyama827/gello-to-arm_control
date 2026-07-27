@@ -54,6 +54,7 @@ class FrankaBackend final : public Backend {
 public:
   explicit FrankaBackend(const std::string& ip)
       : robot_(ip, franka::RealtimeConfig::kEnforce) {
+    fault_.reserve(256);  // latch path must not allocate on the RT thread
     // Bring-up-friendly collision thresholds: firm hand contact is fine,
     // a hard shove trips the reflex — which is the safe outcome; the
     // operator clears it with a DISARM->ARM cycle.
@@ -99,8 +100,10 @@ public:
           need_recovery_ = false;
         }
         control_ = robot_.startTorqueControl();
+        active_ = true;        // ownership and flag must never disagree: if
+                               // the readOnce below throws, fail() must see
+                               // active_ and release the live session
         control_->readOnce();  // ActiveControl: a write must follow a read
-        active_ = true;
       }
       franka::Torques torques{{0, 0, 0, 0, 0, 0, 0}};
       for (int j = 0; j < n && j < FR3_N; ++j) torques.tau_J[j] = tau[j];
@@ -132,12 +135,15 @@ public:
 
 private:
   void fail(const franka::Exception& exc) {
+    // Unconditional: an error with NO session open (reflex entered while
+    // idle, startTorqueControl refused) must ALSO set need_recovery_, or the
+    // documented DISARM->ARM reflex recovery is unreachable — every re-arm
+    // repeats the refused start forever. A spurious automaticErrorRecovery()
+    // after a mere network blip is a harmless no-op.
     fault_ = exc.what();
-    if (active_) {  // dead session: back to idle reads so state keeps flowing
-      control_.reset();
-      active_ = false;
-      need_recovery_ = true;
-    }
+    control_.reset();  // back to idle reads so state keeps flowing
+    active_ = false;
+    need_recovery_ = true;
   }
 
   franka::Robot robot_;

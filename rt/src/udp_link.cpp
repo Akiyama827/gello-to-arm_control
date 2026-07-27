@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -38,12 +39,39 @@ void udp_rx_thread(ServerCtx& ctx) {
   CommandPacket pkt;
   sockaddr_in src = {};
   socklen_t srclen = sizeof(src);
+  uint32_t dropped_ip = 0;
   while (!ctx.shutdown.load()) {
     const ssize_t got = recvfrom(fd, &pkt, sizeof(pkt), 0,
                                  reinterpret_cast<sockaddr*>(&src), &srclen);
     if (got != ssize_t(sizeof(pkt))) continue;  // timeout, runt, or junk
     if (pkt.magic != MAGIC_CMD || pkt.version != VERSION) continue;
     if (pkt.n == 0 || pkt.n > MAX_JOINTS) continue;
+    // While ARMED, only the control client's address has authority — a valid
+    // packet from anywhere else (stray tool, second graph) must not steal
+    // the state stream or reach the seqlock. Disarmed keeps the open
+    // teach-me behavior the bench tools rely on.
+    if (ctx.armed.load(std::memory_order_acquire)) {
+      const uint32_t owner = ctx.ctl_peer_ip.load(std::memory_order_acquire);
+      if (owner != 0 && src.sin_addr.s_addr != owner) {
+        if (dropped_ip != src.sin_addr.s_addr) {
+          dropped_ip = src.sin_addr.s_addr;
+          char buf[INET_ADDRSTRLEN] = {};
+          inet_ntop(AF_INET, &src.sin_addr, buf, sizeof(buf));
+          std::fprintf(stderr, "[rt] dropping commands from %s (armed; owner"
+                               " is the control client)\n", buf);
+        }
+        continue;
+      }
+    }
+    // NaN passes every clamp comparison — stop it here, on the non-RT thread.
+    const auto all_finite = [](const double* a) {
+      for (int j = 0; j < MAX_JOINTS; ++j)
+        if (!std::isfinite(a[j])) return false;
+      return true;
+    };
+    if (!(all_finite(pkt.q_des) && all_finite(pkt.qd_des) &&
+          all_finite(pkt.tau_ff) && all_finite(pkt.kp) && all_finite(pkt.kd)))
+      continue;
     {
       std::lock_guard<std::mutex> lock(ctx.peer_mu);
       ctx.peer = src;
@@ -60,12 +88,21 @@ void state_tx_thread(ServerCtx& ctx) {
   const long period_ns = long(1e9 / hz);
   StatePacket pkt;
   uint64_t sent_version = 0;
+  int unchanged = 0;
   while (!ctx.shutdown.load()) {
     timespec ts{0, period_ns};
     nanosleep(&ts, nullptr);
     if (ctx.udp_fd < 0) continue;
     const uint64_t v = ctx.state_out.read(pkt);
-    if (v == 0 || v == sent_version) continue;  // nothing new
+    if (v == 0) continue;
+    if (v == sent_version) {
+      // Nothing new — the RT thread may be inside a legitimately blocking
+      // plant call (franka session open takes seconds). Re-send the last
+      // packet at ~10 Hz so the CLIENT can tell "link alive, servo busy"
+      // (its stamp goes stale, arrival stays fresh) from "link dead".
+      if (++unchanged < int(hz / 10.0) + 1) continue;
+    }
+    unchanged = 0;
     sent_version = v;
     sockaddr_in peer;
     {

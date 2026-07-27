@@ -68,6 +68,19 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--n must be 1..%d\n", arm_rt::MAX_JOINTS);
     return 2;
   }
+  // A misconfigured safety flag must refuse to start, not silently disable a
+  // reflex (hold-ms >= fault-ms makes the command deadman unreachable;
+  // slew <= 0 pins torque to tau_ref = an armed arm with zero authority).
+  if (cfg.hold_ms <= 0 || cfg.fault_ms <= cfg.hold_ms) {
+    std::fprintf(stderr, "need 0 < --hold-ms < --fault-ms (got %.0f/%.0f)\n",
+                 cfg.hold_ms, cfg.fault_ms);
+    return 2;
+  }
+  if (cfg.slew <= 0 || cfg.hold_kp < 0 || cfg.hold_kd < 0 ||
+      cfg.state_hz < 1 || cfg.state_hz > 1000) {
+    std::fprintf(stderr, "need --slew > 0, hold gains >= 0, --state-hz 1..1000\n");
+    return 2;
+  }
 
   g_ctx = &ctx;
   std::signal(SIGINT, on_signal);

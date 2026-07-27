@@ -99,13 +99,17 @@ def main() -> None:
             last_step = now
             step_count += 1
 
-            state = backend.motor_state()
-            node.send_output("motor_state", _pack(state))
-            if now - last_viz >= viz_period:
-                last_viz = now
-                node.send_output("motor_state_viz", _pack(state))
-
             health = backend.motor_health()
+            # Publish state ONLY while the RT stream is fresh. Republishing a
+            # frozen snapshot at graph rate would defeat the executor's own
+            # staleness deadman (it keys on Dora arrival time) and let it
+            # keep commanding against a dead picture of the arm.
+            if health["state_fresh"]:
+                state = backend.motor_state()
+                node.send_output("motor_state", _pack(state))
+                if now - last_viz >= viz_period:
+                    last_viz = now
+                    node.send_output("motor_state_viz", _pack(state))
             edge = (health["armed"], health["latched_fault"], health["any_fault"])
             if edge != health_prev or step_count % max(1, int(rate_hz / 2.0)) == 0:
                 node.send_output("motor_health", pack_json_message("motor_health", health))

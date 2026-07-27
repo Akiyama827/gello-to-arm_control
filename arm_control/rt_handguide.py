@@ -108,8 +108,13 @@ def main() -> None:
             stop.set()
             logger.join(timeout=1.0)
     finally:
-        backend.close()  # safe_stop (disarm) + sockets
-        print(f"[guide] disarmed; log: {args.log}")
+        disarmed = backend.safe_stop()  # verified: ack + state stream
+        backend.close()
+        if disarmed:
+            print(f"[guide] disarmed (confirmed); log: {args.log}")
+        else:
+            print("[guide] DISARM NOT CONFIRMED — check the server console "
+                  f"before approaching the arm; log: {args.log}")
 
 
 if __name__ == "__main__":

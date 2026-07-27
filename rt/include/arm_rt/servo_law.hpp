@@ -37,10 +37,13 @@ inline void servo_torque(int n,
                          double slew_per_tick,
                          double* tau_out) {
   for (int j = 0; j < n; ++j) {
+    // (clamp runs before the slew; the final re-clamp below closes the case
+    // where tau_ref itself sits outside the limit — impossible for franka's
+    // tau_J_d and the fake's self-echo, cheap insurance for the DM bus)
     double t = kp[j] * (q_des[j] - q[j]) + kd[j] * (qd_des[j] - dq[j]) + tau_ff[j];
     t = clamp(t, -tau_limit[j], tau_limit[j]);
     t = clamp(t, tau_ref[j] - slew_per_tick, tau_ref[j] + slew_per_tick);
-    tau_out[j] = t;
+    tau_out[j] = clamp(t, -tau_limit[j], tau_limit[j]);
   }
 }
 

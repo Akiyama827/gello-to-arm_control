@@ -11,7 +11,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Adjust the path and backend for the box (franka on the bench RT machine).
-ExecStart=/opt/arm_rt/arm_rt_server --backend franka --franka-ip 172.16.0.3
+# --rt-cpu pins ONLY the servo thread to an isolcpus core; do NOT add a
+# CPUAffinity= line — pinning the whole process would put the SCHED_OTHER
+# comms threads on the servo core, where a preempted seqlock writer competes
+# with the FIFO reader for the same cycles.
+ExecStart=/opt/arm_rt/arm_rt_server --backend franka --franka-ip 172.16.0.3 --rt-cpu 3
 Restart=on-failure
 RestartSec=2
 # RT scheduling + locked memory; pair with a PREEMPT_RT kernel and the
@@ -21,7 +25,6 @@ LimitMEMLOCK=infinity
 # and refuses to start below it — confirmed live (95 ok, 99 EPERM = the
 # "unable to set realtime scheduling" error).
 LimitRTPRIO=99
-CPUAffinity=2 3
 Nice=-20
 
 [Install]

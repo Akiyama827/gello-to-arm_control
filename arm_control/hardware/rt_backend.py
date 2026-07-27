@@ -132,22 +132,42 @@ class RtBackend:
 
     def enable_all(self) -> None:
         """Arm. The server holds the current pose until commands flow."""
+        # Clear BEFORE consenting: a CTL_FAULT that lands after the ack is
+        # new evidence and must not be erased by this cycle's bookkeeping.
+        self._latched_fault = ""
         status = self._control_roundtrip(rtp.CTL_ARM)
         # FAULTED in the ack is the refusal — ARMED alone is not consent: the
         # server keeps its ARMED flag while fault-HOLDING a latched arm.
         if status.arg & rtp.FLAG_FAULTED or not status.arg & rtp.FLAG_ARMED:
             raise RtLinkError(f"arm refused: {status.text or 'latched fault'}")
-        self._latched_fault = ""
 
-    def safe_stop(self) -> None:
+    def safe_stop(self) -> bool:
         """Disarm (also clears a server-side fault latch, matching the bench
-        bridges' explicit DISARM->ARM recovery cycle)."""
+        bridges' explicit DISARM->ARM recovery cycle).
+
+        Returns True only when the drop of authority is CONFIRMED: the ack
+        must show ARMED cleared, and the state stream must reflect it — the
+        TCP ack alone is not proof, since the RT loop applies the flag at its
+        next sample (which can be seconds away inside a blocking plant call).
+        """
         if self._tcp is None:
-            return
+            return True
         try:
-            self._control_roundtrip(rtp.CTL_DISARM)
+            status = self._control_roundtrip(rtp.CTL_DISARM)
         except RtLinkError as exc:
             print(f"[rt_link] disarm: {exc}", flush=True)
+            return False
+        if status.arg & rtp.FLAG_ARMED:
+            print("[rt_link] disarm ack still shows ARMED", flush=True)
+            return False
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            state, rx_t = self.latest_state()
+            if state is not None and rx_t > 0 and not state.armed:
+                return True
+            time.sleep(0.01)
+        print("[rt_link] disarm not yet reflected in the state stream", flush=True)
+        return False
 
     def close(self) -> None:
         try:
@@ -226,12 +246,16 @@ class RtBackend:
         state, rx_t = self.latest_state()
         age = time.monotonic() - rx_t if rx_t > 0 else float("inf")
         stale = age > self.config.state_timeout_s
-        armed = bool(state and state.armed) and not stale
         fault = self._latched_fault or (
             f"rt state stream stale ({age:.2f}s)" if stale and rx_t > 0 else ""
         )
         return {
-            "armed": armed,
+            # The server's flag VERBATIM. "I cannot see the server" must
+            # never be reported as "the arm is not armed" — an armed arm
+            # holding 30 N.m/rad behind a stale stream is the dangerous
+            # direction. Staleness is its own field (and rides any_fault).
+            "armed": bool(state and state.armed),
+            "state_fresh": not stale,
             "latched_fault": fault,
             "any_fault": bool(fault) or bool(state and state.faulted),
             "holding": bool(state and state.holding),
@@ -417,6 +441,27 @@ def _demo() -> None:
         state, _ = backend.latest_state()
         # After re-arm with no fresh commands the server holds (by design).
         assert state is not None and state.armed and not state.faulted
+
+        # A BACK-TO-BACK DISARM->ARM (can complete between two 1 kHz samples)
+        # must still be a full epoch — gains reset, plant retry, hold pose
+        # recapture — and tracking must resume afterwards. Guards the
+        # arm-generation counter: sampling the armed LEVEL misses this edge.
+        # Raw roundtrip on purpose: the verified safe_stop WAITS for the RT
+        # loop to observe the disarm, which would guarantee the edge is seen
+        # and never exercise the sub-tick pair.
+        backend._control_roundtrip(rtp.CTL_DISARM)
+        backend.enable_all()
+        target2 = np.array([0.1, 0.2, -0.2])
+        for _ in range(120):
+            backend.apply_command(
+                {"position": target2, "velocity": np.zeros(3),
+                 "torque": np.zeros(3), "kp": kp, "kd": kd}
+            )
+            time.sleep(0.01)
+        state, _ = backend.latest_state()
+        err2 = float(np.max(np.abs(np.asarray(state.q) - target2)))
+        assert state.armed and not state.faulted and not state.holding
+        assert err2 < 0.05, f"no tracking after fast re-arm (err {err2:.3f} rad)"
         print(
             f"rt_backend: ok (tracked to {err * 1e3:.1f} mrad, hold at "
             f"{np.round(held, 3).tolist()}, fault latch + DISARM/ARM recovery)"

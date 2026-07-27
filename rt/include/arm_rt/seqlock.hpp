@@ -35,9 +35,13 @@ public:
     seq_.store(s + 2, std::memory_order_release);          // even: published
   }
 
-  // Copies the latest value; returns its even sequence (0 = never written).
+  // Copies the latest value; returns its even sequence (0 = never written,
+  // or the writer was mid-write for the whole bounded retry — `out` is then
+  // untouched and the caller keeps its previous copy, which is exactly the
+  // right latest-wins fallback). Bounded so a preempted writer can never
+  // spin a SCHED_FIFO reader forever (priority inversion on a shared core).
   uint64_t read(T& out) const {
-    for (;;) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
       const uint64_t s1 = seq_.load(std::memory_order_acquire);
       if (s1 == 0) return 0;
       if (s1 & 1) continue;                                 // mid-write
@@ -47,6 +51,7 @@ public:
       const uint64_t s2 = seq_.load(std::memory_order_acquire);
       if (s1 == s2) return s2;
     }
+    return 0;
   }
 
   uint64_t sequence() const { return seq_.load(std::memory_order_acquire); }

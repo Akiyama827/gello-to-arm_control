@@ -5,10 +5,10 @@
 //   rt_loop   (RT)      backend read -> servo law -> backend write
 //
 // The RT thread touches ONLY atomics and seqlocks; every blocking object
-// (sockets, the fault-text mutex from the writer side) lives on the non-RT
-// threads. Fault text is written under a mutex by whoever latches, but the
-// RT loop latches through a fixed-size copy + release-store flag so it never
-// takes the lock on the tick path.
+// (sockets) lives on the non-RT threads. latch() is lock-free: a CAS claims
+// the one fault slot (two threads can latch concurrently — RT loop and the
+// control thread), the winner writes the text, then release-stores the
+// flag. Readers copy the buffer only after seeing fault==true.
 #pragma once
 
 #include <netinet/in.h>
@@ -62,8 +62,21 @@ struct ServerCtx {
   // the spring never engaged), and a pre-fault leftover q_des yanking the
   // arm for the first hold-ms after a re-arm.
   std::atomic<uint64_t> cmd_epoch{0};
+  // ARM generation: bumped by every accepted CTL_ARM. The RT loop compares
+  // against the last generation it acted on, so a DISARM->ARM pair that
+  // completes between two 1 kHz samples is still seen as an edge (sampling
+  // the armed LEVEL misses it: prev_armed==armed==true) and the per-epoch
+  // resets (plant retry, gains, hold pose, backend stop) still run.
+  std::atomic<uint64_t> arm_gen{0};
+  // IP of the current TCP control client. While armed, udp_rx only accepts
+  // command datagrams from this address — any valid packet from anywhere
+  // must not be able to steal the state stream or inject authority into an
+  // armed arm (a stray tool's zero-gain prime packet was enough to kill the
+  // hold spring before the gains snapshot; the pin closes the whole class).
+  std::atomic<uint32_t> ctl_peer_ip{0};
   std::atomic<bool> armed{false};
   std::atomic<bool> fault{false};
+  std::atomic<bool> fault_claim{false};  // CAS gate: exactly one latch writes
   std::atomic<uint32_t> fault_code{0};
   std::atomic<bool> fault_event_pending{false};  // control thread pushes CTL_FAULT
   std::atomic<bool> shutdown{false};
@@ -88,7 +101,10 @@ struct ServerCtx {
   int udp_fd = -1;
 
   void latch(uint32_t code, const char* text) {
-    if (fault.load(std::memory_order_acquire)) return;  // first cause wins
+    bool expected = false;  // first cause wins, decided by ONE atomic claim
+    if (!fault_claim.compare_exchange_strong(expected, true,
+                                             std::memory_order_acq_rel))
+      return;
     std::snprintf(fault_text, sizeof(fault_text), "%s", text);
     fault_code.store(code, std::memory_order_release);
     fault.store(true, std::memory_order_release);

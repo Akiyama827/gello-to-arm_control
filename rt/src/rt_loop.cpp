@@ -98,6 +98,12 @@ void rt_loop(ServerCtx& ctx) {
   bool holding = false;
   bool have_cmd_gains = false;
   double q_hold[MAX_JOINTS] = {};
+  // Gains SNAPSHOTTED at command acceptance. The hold branch must never
+  // dereference the live seqlock buffer: any datagram that lands there
+  // (address-teach prime, wrong-n, post-fault stray) would otherwise become
+  // the hold spring's authority — a zero-gain packet silently un-springs a
+  // parked arm (found by adversarial review after the FR3 impedance rung).
+  double cmd_kp[MAX_JOINTS] = {}, cmd_kd[MAX_JOINTS] = {};
   double hold_kp[MAX_JOINTS], hold_kd[MAX_JOINTS];
   double zeros[MAX_JOINTS] = {};
   double tau_out[MAX_JOINTS] = {};
@@ -109,6 +115,7 @@ void rt_loop(ServerCtx& ctx) {
   uint32_t last_cmd_seq = 0;
 
   bool plant_ok = true;  // false after any backend failure; reset only by ARM
+  uint64_t seen_gen = ctx.arm_gen.load(std::memory_order_acquire);
 
   while (!ctx.shutdown.load()) {
     if (!backend->read(ps)) {
@@ -135,9 +142,16 @@ void rt_loop(ServerCtx& ctx) {
     const double* kp = hold_kp;
     const double* kd = hold_kd;
 
-    if (armed && !prev_armed) {
+    // The ARM edge is a GENERATION, not a level: a DISARM->ARM pair that
+    // completes between two 1 kHz samples still changes arm_gen, so the
+    // per-epoch resets can never be skipped by fast recovery cycles.
+    const uint64_t gen = ctx.arm_gen.load(std::memory_order_acquire);
+    if (gen != seen_gen) {
+      seen_gen = gen;
+      if (prev_armed) backend->stop();  // the DISARM we never sampled
       plant_ok = true;         // ARM = explicit plant retry
       have_cmd_gains = false;  // fresh epoch: hold gains until the task speaks
+      holding = false;         // re-capture the hold pose in this epoch
     }
     if (armed && !plant_ok) {
       holding = false;  // nothing is held — the robot's own safety has it
@@ -147,11 +161,13 @@ void rt_loop(ServerCtx& ctx) {
         holding = false;
         have_cmd_gains = true;
         last_cmd_seq = cmd.seq;
+        std::memcpy(cmd_kp, cmd.kp, sizeof(cmd_kp));  // accepted -> snapshot
+        std::memcpy(cmd_kd, cmd.kd, sizeof(cmd_kd));
         q_des = cmd.q_des;
         qd_des = cmd.qd_des;
         tau_ff = cmd.tau_ff;
-        kp = cmd.kp;
-        kd = cmd.kd;
+        kp = cmd_kp;
+        kd = cmd_kd;
       } else {
         if (!holding) {
           holding = true;
@@ -163,8 +179,8 @@ void rt_loop(ServerCtx& ctx) {
         }
         q_des = q_hold;
         if (have_cmd_gains) {  // hold with the authority the task last chose
-          kp = cmd.kp;
-          kd = cmd.kd;
+          kp = cmd_kp;         // the SNAPSHOT — never the live buffer
+          kd = cmd_kd;
         }
       }
       servo_torque(n, ps.q, ps.dq, q_des, qd_des, tau_ff, kp, kd, ps.tau_ref,
