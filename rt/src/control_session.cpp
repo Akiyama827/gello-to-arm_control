@@ -87,6 +87,12 @@ void serve_client(ServerCtx& ctx, int fd) {
           // (same semantics as the bench bridges): without this, re-arming
           // after any pause instantly re-latches on the OLD command age.
           ctx.last_cmd_rx_ns.store(mono_ns());
+          {
+            // ...and so does the command epoch: whatever sits in the seqlock
+            // (address-teach prime, pre-fault leftovers) is not authority.
+            CommandPacket scratch;
+            ctx.cmd_epoch.store(ctx.cmd_in.read(scratch));
+          }
           ctx.armed.store(true);
           send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "armed"));
         }

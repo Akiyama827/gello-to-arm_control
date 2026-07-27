@@ -125,7 +125,9 @@ void rt_loop(ServerCtx& ctx) {
     const uint64_t cmd_v = ctx.cmd_in.read(cmd);
     const uint64_t rx_ns = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
     const double age_ns = rx_ns == 0 ? 1e18 : double(now - rx_ns);
-    const bool fresh = cmd_v > 0 && cmd.n == uint16_t(n) && age_ns <= hold_ns;
+    // Only commands from AFTER the current ARM are authority (cmd_epoch).
+    const bool fresh = cmd_v > ctx.cmd_epoch.load(std::memory_order_acquire) &&
+                       cmd.n == uint16_t(n) && age_ns <= hold_ns;
 
     const double* q_des = zeros;
     const double* qd_des = zeros;
@@ -133,7 +135,10 @@ void rt_loop(ServerCtx& ctx) {
     const double* kp = hold_kp;
     const double* kd = hold_kd;
 
-    if (armed && !prev_armed) plant_ok = true;  // ARM = explicit plant retry
+    if (armed && !prev_armed) {
+      plant_ok = true;         // ARM = explicit plant retry
+      have_cmd_gains = false;  // fresh epoch: hold gains until the task speaks
+    }
     if (armed && !plant_ok) {
       holding = false;  // nothing is held — the robot's own safety has it
       std::memset(tau_out, 0, sizeof(tau_out));

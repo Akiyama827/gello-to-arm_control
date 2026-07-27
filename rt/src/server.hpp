@@ -55,6 +55,13 @@ struct ServerCtx {
   SeqLock<StatePacket> state_out;
 
   std::atomic<uint64_t> last_cmd_rx_ns{0};
+  // Commands from BEFORE the current ARM are never authority: ARM stores the
+  // command seqlock's version here and the RT loop only tracks newer ones.
+  // Kills two live hazards: the client's zero-authority address-teach packet
+  // being adopted as "the task's gains" (found on the FR3 impedance rung:
+  // the spring never engaged), and a pre-fault leftover q_des yanking the
+  // arm for the first hold-ms after a re-arm.
+  std::atomic<uint64_t> cmd_epoch{0};
   std::atomic<bool> armed{false};
   std::atomic<bool> fault{false};
   std::atomic<uint32_t> fault_code{0};

@@ -70,7 +70,11 @@ Authority ladder while ARMED, most-alive first:
 DISARM is the only authority drop (backend `stop()`: for the FR3 that is the
 last accepted torque + `motion_finished` — a controlled stop, never zero
 torque, which would drop a loaded arm). The staleness clock starts AT ARM,
-matching the bench bridges. The servo's slew limiter doubles as the startup
+matching the bench bridges — and so does the **command epoch**: whatever the
+command seqlock held before ARM (the client's zero-authority address-teach
+packet, a pre-fault leftover setpoint) is never tracked. Found live on the
+FR3 impedance rung: the prime packet's zero gains were adopted as "the
+task's gains" and the hold spring never engaged. The servo's slew limiter doubles as the startup
 ramp: first tick slews from the robot's measured `tau_J_d`, so there is no
 separate soft-start path.
 
