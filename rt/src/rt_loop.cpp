@@ -66,7 +66,9 @@ void rt_loop(ServerCtx& ctx) {
     backend = make_fake_backend(ctx.cfg.n);
   } else if (ctx.cfg.backend == "franka") {
     backend = make_franka_backend(ctx.cfg.franka_ip);
-    if (!backend) std::fprintf(stderr, "[rt] built without libfranka (-DWITH_FRANKA=ON)\n");
+    if (!backend)
+      std::fprintf(stderr, "[rt] franka backend failed to start "
+                           "(reason above; RT perms? FCI on? robot reachable?)\n");
   } else if (ctx.cfg.backend == "dm") {
     backend = make_dm_backend(ctx.cfg.can_if);
     if (!backend) std::fprintf(stderr, "[rt] dm backend not implemented yet\n");

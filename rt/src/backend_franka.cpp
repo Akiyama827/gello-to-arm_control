@@ -167,7 +167,8 @@ std::unique_ptr<Backend> make_franka_backend(const std::string& ip) {
 
 namespace arm_rt {
 std::unique_ptr<Backend> make_franka_backend(const std::string&) {
-  return nullptr; // built without libfranka; main.cpp reports it
+  std::fprintf(stderr, "[rt] built without libfranka (-DWITH_FRANKA=ON)\n");
+  return nullptr;
 }
 } // namespace arm_rt
 
