@@ -17,7 +17,10 @@ RestartSec=2
 # RT scheduling + locked memory; pair with a PREEMPT_RT kernel and the
 # limits documented in rt/README.md.
 LimitMEMLOCK=infinity
-LimitRTPRIO=95
+# 99, not 95: libfranka's kEnforce requests the HIGHEST fifo priority (99)
+# and refuses to start below it — confirmed live (95 ok, 99 EPERM = the
+# "unable to set realtime scheduling" error).
+LimitRTPRIO=99
 CPUAffinity=2 3
 Nice=-20
 

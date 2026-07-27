@@ -109,10 +109,12 @@ flag on purpose.
 ## RT host checklist (rung 1 prerequisite)
 
 - PREEMPT_RT kernel (`uname -v` says `PREEMPT_RT`); `/etc/security/limits.d/`
-  grants `rtprio 95` + `memlock unlimited` — needed even with the systemd
+  grants `rtprio 99` + `memlock unlimited` — needed even with the systemd
   unit (which sets both) the moment you run the server manually in a
-  foreground bring-up session, and libfranka's `kEnforce` refuses to start
-  without it.
+  foreground bring-up session. **99, not 95**: libfranka's `kEnforce`
+  requests the *highest* FIFO priority and refuses to start below it
+  (confirmed live: 95 ok, 99 EPERM = "unable to set realtime scheduling").
+  Re-login after editing — PAM applies limits at session start.
 - Isolate the servo cores: `isolcpus=2,3 nohz_full=2,3 irqaffinity=0-1` on
   the kernel cmdline; the unit pins to 2–3.
 - Cap idle states: `intel_idle.max_cstate=1 processor.max_cstate=1` on the
