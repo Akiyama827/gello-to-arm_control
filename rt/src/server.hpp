@@ -60,6 +60,9 @@ struct ServerCtx {
   std::atomic<uint32_t> fault_code{0};
   std::atomic<bool> fault_event_pending{false};  // control thread pushes CTL_FAULT
   std::atomic<bool> shutdown{false};
+  std::atomic<bool> failed{false};   // startup/bind failure -> nonzero exit,
+                                     // so systemd's Restart=on-failure retries
+                                     // (a port race must not look like success)
   std::atomic<bool> backend_ready{false};
   std::atomic<int> backend_n{0};
   char backend_name[32] = {};

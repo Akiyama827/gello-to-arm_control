@@ -69,6 +69,7 @@ void rt_loop(ServerCtx& ctx) {
     std::fprintf(stderr, "[rt] unknown backend %s\n", ctx.cfg.backend.c_str());
   }
   if (!backend) {
+    ctx.failed.store(true);
     ctx.shutdown.store(true);
     return;
   }

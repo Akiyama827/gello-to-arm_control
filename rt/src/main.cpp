@@ -87,5 +87,5 @@ int main(int argc, char** argv) {
   tx.join();
   ctl.join();
   std::printf("[rt] down\n");
-  return 0;
+  return ctx.failed.load() ? 1 : 0;
 }

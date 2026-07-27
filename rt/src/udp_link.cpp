@@ -27,6 +27,7 @@ void udp_rx_thread(ServerCtx& ctx) {
   addr.sin_port = htons(ctx.cfg.udp_port);
   if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
     std::perror("[rt] udp bind");
+    ctx.failed.store(true);
     ctx.shutdown.store(true);
     return;
   }

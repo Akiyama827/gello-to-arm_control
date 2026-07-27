@@ -124,6 +124,7 @@ void control_thread(ServerCtx& ctx) {
   if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
       listen(fd, 1) != 0) {
     std::perror("[rt] tcp bind/listen");
+    ctx.failed.store(true);
     ctx.shutdown.store(true);
     return;
   }
