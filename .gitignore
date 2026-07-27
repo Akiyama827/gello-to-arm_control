@@ -25,6 +25,8 @@ Log/
 # AND unignored in Control today, which is how it went missing; name it here.
 dlls/
 
+rt/build*/
+
 __pycache__/
 *.py[cod]
 *.egg-info/

@@ -1,0 +1,25 @@
+# The RT machine's whole job, as a unit. Install:
+#   sudo cp arm-rt-server.service /etc/systemd/system/
+#   sudo systemctl enable --now arm-rt-server
+# The server is an APPLIANCE: it outlives PC-side graph restarts, holds the
+# arm through faults, and never needs the PC to be healthy to be safe.
+[Unit]
+Description=arm_rt_server — 1 kHz torque servo (RT link)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the path and backend for the box (franka on the bench RT machine).
+ExecStart=/opt/arm_rt/arm_rt_server --backend franka --franka-ip 172.16.0.3
+Restart=on-failure
+RestartSec=2
+# RT scheduling + locked memory; pair with a PREEMPT_RT kernel and the
+# limits documented in rt/README.md.
+LimitMEMLOCK=infinity
+LimitRTPRIO=95
+CPUAffinity=2 3
+Nice=-20
+
+[Install]
+WantedBy=multi-user.target

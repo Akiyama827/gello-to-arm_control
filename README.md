@@ -20,6 +20,7 @@ of its identity fails loudly by key name.
 | `dataflows/` | Dora graph YAMLs for motion / view / float / listen |
 | `configs/` | `modes/` (controller modes) + `real/<arm>/{hardware,calibration}.yaml` (per-robot fragments) |
 | `scripts/` | `bench_ramp.py` (DM gain ladder), `setup_fr3_assets.py`, DM bench probes |
+| `rt/` | The RT machine's C++ 1 kHz torque server + wire protocol + the shared servo-law binding — see `rt/README.md` |
 
 Runnable ENTRY configs (the ones that compose hardware + calibration +
 scenario into one tree) live with the deployment, not here — this repo ships
@@ -35,10 +36,11 @@ per-robot fragments a project includes.
   scenario configs, no module/base CAD, no RL. Those stay in the
   `modular_robotic_arm` project, which consumes this repo.
 - **On the FR3 specifically:** there is deliberately NO motion path from this
-  host. The FR3 runs torque control only, and the torque servo is a C++ 1 kHz
-  loop on a realtime machine. `nodes/franka_interface.py` streams state,
-  reports health, and drives the Franka Hand; `motor_command` inputs are
-  dropped with a warning.
+  host process. The FR3 runs torque control only; the servo is `rt/`'s
+  `arm_rt_server` on a realtime machine, reached through
+  `nodes/rt_interface.py` (same plant-node contract as every other bridge).
+  `nodes/franka_interface.py` remains the direct-FCI read-only + gripper
+  bridge; its `motor_command` inputs are dropped with a warning.
 
 ## Dependency direction
 

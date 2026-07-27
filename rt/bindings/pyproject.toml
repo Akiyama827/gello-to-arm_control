@@ -1,0 +1,18 @@
+# Optional: `pip install -e rt/bindings` builds `arm_rt_servo`, the pybind
+# module over rt/include/arm_rt/servo_law.hpp — the sim then closes the SAME
+# compiled law as the RT thread. Plain `pip install -e .` of arm_control stays
+# pure-Python; absence of this module makes the sim fall back to its Python PD
+# with a loud warning.
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "arm-rt-servo"
+version = "0.1.0"
+description = "Compiled RT servo law shared by the arm_rt_server and the MuJoCo twin"
+requires-python = ">=3.10"
+
+[tool.scikit-build]
+minimum-version = "0.9"
+cmake.source-dir = "."

@@ -79,6 +79,16 @@ franka:
 # RT machine, which runs its own watchdog), so there is nothing for a host
 # timer to stop. The FR3 enforces its own limits for everything else.
 
+# --- RT link (nodes/rt_interface.py -> arm_rt_server on the RT box) ---------
+# PLACEHOLDER address: the RT machine's IP on its direct link to this PC
+# (second NIC; the FCI wire to the control box stays separate). Staleness/
+# fault thresholds live SERVER-side (launch flags); this is only addressing.
+rt:
+  host: 172.16.1.2           # PLACEHOLDER — set when the RT box is imaged
+  udp_port: 47800
+  tcp_port: 47801
+  state_timeout_s: 0.5
+
 urdf_path: franka/urdf/fr3.urdf
 update_rate_hz: 100
 hardware_update_rate_hz: 100
