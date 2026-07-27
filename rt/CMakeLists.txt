@@ -21,6 +21,16 @@ add_executable(arm_rt_server
   src/backend_franka.cpp
   src/backend_dm.cpp
 )
+# Deployed layout on the RT box: binary + its shared libs in ./lib (the box
+# has no toolchain and no root-installed libfranka). $ORIGIN must reach the
+# ELF verbatim — passing it via -DCMAKE_EXE_LINKER_FLAGS gets eaten by the
+# shell inside the ninja link command.
+set_target_properties(arm_rt_server PROPERTIES
+  BUILD_RPATH "\$ORIGIN/lib"
+  INSTALL_RPATH "\$ORIGIN/lib")
+# Old dtags = DT_RPATH, which unlike RUNPATH also covers TRANSITIVE loads —
+# libfranka's own Poco/fmt dependencies must resolve from ./lib too.
+target_link_options(arm_rt_server PRIVATE -Wl,--disable-new-dtags)
 target_include_directories(arm_rt_server PRIVATE include)
 find_package(Threads REQUIRED)
 target_link_libraries(arm_rt_server PRIVATE Threads::Threads)

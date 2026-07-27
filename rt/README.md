@@ -89,9 +89,18 @@ flag on purpose.
    `python -m arm_control.rt_timing_bench --host <box>` — it listens to the
    disarmed state stream (states only, sends one zero-gain packet) and
    reports the servo's per-tick wakeup jitter from the tick stamps.
-2. **FR3 gravity-hold**: `--backend franka`, arm, send NO commands — the
-   server holds at current pose via rung-2 gains. Operator on the stop;
-   collision thresholds low. First hardware validation of `backend_franka`.
+2. **FR3 gravity-float, then impedance-hold** — first hardware validation of
+   `backend_franka`, zero PC-side commands, driven by
+   `python -m arm_control.rt_handguide` (arms, logs, disarms — it cannot
+   send motion). Run the server manually in the foreground for this rung,
+   `--fault-ms 3600000` (armed-with-no-commander is the test's steady
+   state; see rt_handguide docstring), operator on the stop:
+   - `--hold-kp 0 --hold-kd 0` → zero torque on top of the robot's own
+     gravity compensation; push the arm around by hand.
+   - `--hold-kp 30 --hold-kd 2` → the arm springs back around the pose
+     captured at ARM.
+   A hard shove trips the collision reflex — the safe outcome; recover
+   DISARM→ARM (the backend runs `automaticErrorRecovery` on re-arm).
 3. **FR3 tracking**: slow sine from the PC graph via `rt_interface`;
    compare `q_cmd` vs `q` in the state stream against the sim twin.
 4. **Graph integration**: the real motion graph with `plant_interface` →
@@ -100,8 +109,10 @@ flag on purpose.
 ## RT host checklist (rung 1 prerequisite)
 
 - PREEMPT_RT kernel (`uname -v` says `PREEMPT_RT`); `/etc/security/limits.d/`
-  grants `rtprio 95` + `memlock unlimited` (or run via the systemd unit,
-  which sets both).
+  grants `rtprio 95` + `memlock unlimited` — needed even with the systemd
+  unit (which sets both) the moment you run the server manually in a
+  foreground bring-up session, and libfranka's `kEnforce` refuses to start
+  without it.
 - Isolate the servo cores: `isolcpus=2,3 nohz_full=2,3 irqaffinity=0-1` on
   the kernel cmdline; the unit pins to 2–3.
 - Cap idle states: `intel_idle.max_cstate=1 processor.max_cstate=1` on the

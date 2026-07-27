@@ -8,7 +8,12 @@
 //   armed + stale (> hold_ms)    -> HOLD the pose captured at staleness
 //   armed + stale (> fault_ms)   -> still holding, but LATCHED (cmds ignored
 //                                   until an explicit DISARM+ARM cycle)
-//   armed + fault (any source)   -> hold, latched
+//   armed + fault (comms source) -> hold, latched — the plant is healthy, so
+//                                   parking the arm is meaningful
+//   armed + PLANT fault          -> latched with NO writes at all: the
+//                                   session/bus is gone and the robot's own
+//                                   safety owns the arm. Re-arming re-opens
+//                                   the plant exactly once per ARM.
 //   disarmed                     -> backend.stop() once, no writes
 //
 // Holding is position PD around the captured pose with the last command's
@@ -101,9 +106,12 @@ void rt_loop(ServerCtx& ctx) {
   uint32_t state_seq = 0;
   uint32_t last_cmd_seq = 0;
 
+  bool plant_ok = true;  // false after any backend failure; reset only by ARM
+
   while (!ctx.shutdown.load()) {
     if (!backend->read(ps)) {
       ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
+      plant_ok = false;
       timespec ts{0, long(backend->tick_s() * 1e9)};
       nanosleep(&ts, nullptr);
       continue;
@@ -123,7 +131,11 @@ void rt_loop(ServerCtx& ctx) {
     const double* kp = hold_kp;
     const double* kd = hold_kd;
 
-    if (armed) {
+    if (armed && !prev_armed) plant_ok = true;  // ARM = explicit plant retry
+    if (armed && !plant_ok) {
+      holding = false;  // nothing is held — the robot's own safety has it
+      std::memset(tau_out, 0, sizeof(tau_out));
+    } else if (armed) {
       if (!faulted && fresh) {
         holding = false;
         have_cmd_gains = true;
@@ -152,6 +164,7 @@ void rt_loop(ServerCtx& ctx) {
                    backend->tau_limit(), ctx.cfg.slew, tau_out);
       if (!backend->write(tau_out, n)) {
         ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
+        plant_ok = false;
       }
     } else {
       if (prev_armed) backend->stop();
