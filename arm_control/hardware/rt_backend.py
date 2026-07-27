@@ -326,10 +326,13 @@ def _demo() -> None:
     import sys
     from pathlib import Path
 
+    # ARM_RT_DEMO_HOST points the SAME sequence at a remote server (rung 1:
+    # the RT box running --backend fake --n 3) instead of spawning one here.
+    remote = os.environ.get("ARM_RT_DEMO_HOST")
     repo = Path(__file__).resolve().parents[2]
     binary = os.environ.get("ARM_RT_SERVER_BIN") or str(repo / "rt" / "build" / "arm_rt_server")
     selfcheck = str(Path(binary).parent / "protocol_selfcheck")
-    if not Path(binary).exists():
+    if remote is None and not Path(binary).exists():
         print(
             "rt_backend: SKIPPED live loopback — build the server first:\n"
             "  cmake -B rt/build rt && cmake --build rt/build",
@@ -337,7 +340,8 @@ def _demo() -> None:
         return
 
     # 1. Wire parity: the C++ golden hex must equal ours, byte for byte.
-    if Path(selfcheck).exists():
+    # (Remote rung: run the box's protocol_selfcheck over ssh and diff instead.)
+    if remote is None and Path(selfcheck).exists():
         theirs = subprocess.run(
             [selfcheck], capture_output=True, text=True, check=True
         ).stdout.strip().splitlines()
@@ -346,16 +350,21 @@ def _demo() -> None:
         assert theirs == golden_lines(), "C++/Python protocol drift — fix both, bump VERSION"
         print("rt_backend: protocol parity ok")
 
-    # 2. Live loopback against the fake plant on high ports.
-    server = subprocess.Popen(
-        [binary, "--backend", "fake", "--n", "3", "--udp-port", "48810",
-         "--tcp-port", "48811", "--hold-ms", "100", "--fault-ms", "600",
-         "--slew", "5"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    backend = RtBackend(
-        RtConfig(host="127.0.0.1", udp_port=48810, tcp_port=48811), ["j0", "j1", "j2"]
-    )
+    # 2. Live session against the fake plant (local spawn, or the RT box).
+    server = None
+    if remote is None:
+        server = subprocess.Popen(
+            [binary, "--backend", "fake", "--n", "3", "--udp-port", "48810",
+             "--tcp-port", "48811", "--hold-ms", "100", "--fault-ms", "600",
+             "--slew", "5"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        host, udp, tcp = "127.0.0.1", 48810, 48811
+    else:
+        # Remote servers run default ports and default thresholds (100/1000 ms
+        # — the fault-latch wait below covers both 600 and 1000 ms).
+        host, udp, tcp = remote, 47800, 47801
+    backend = RtBackend(RtConfig(host=host, udp_port=udp, tcp_port=tcp), ["j0", "j1", "j2"])
     try:
         time.sleep(0.3)
         backend.open()
@@ -393,7 +402,7 @@ def _demo() -> None:
         assert not state.holding and state.armed
 
         # Prolonged silence -> FAULT latch; commands are ignored; ARM refused.
-        time.sleep(0.9)
+        time.sleep(0.9 if remote is None else 1.4)
         state, _ = backend.latest_state()
         assert state.faulted and state.fault_code == rtp.FAULT_CMD_LOST
         try:
@@ -414,11 +423,12 @@ def _demo() -> None:
         )
     finally:
         backend.close()
-        server.terminate()
-        try:
-            server.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            server.kill()
+        if server is not None:
+            server.terminate()
+            try:
+                server.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                server.kill()
     _ = shutil, sys  # keep imports honest if asserts are stripped
 
 
