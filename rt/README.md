@@ -85,8 +85,10 @@ flag on purpose.
    compiled law, staleness→hold, fault latch, refused ARM, DISARM/ARM
    recovery. GREEN 2026-07-27; keep it green.
 1. **Fake on the RT box**: same demo with `rt.host` pointed at the box.
-   Proves the link, the kernel, and the service unit; watch `tau_cmd`
-   continuity in the state stream for scheduling gaps.
+   Proves the link, the kernel, and the service unit. Quantify with
+   `python -m arm_control.rt_timing_bench --host <box>` — it listens to the
+   disarmed state stream (states only, sends one zero-gain packet) and
+   reports the servo's per-tick wakeup jitter from the tick stamps.
 2. **FR3 gravity-hold**: `--backend franka`, arm, send NO commands — the
    server holds at current pose via rung-2 gains. Operator on the stop;
    collision thresholds low. First hardware validation of `backend_franka`.
@@ -102,6 +104,12 @@ flag on purpose.
   which sets both).
 - Isolate the servo cores: `isolcpus=2,3 nohz_full=2,3 irqaffinity=0-1` on
   the kernel cmdline; the unit pins to 2–3.
+- Cap idle states: `intel_idle.max_cstate=1 processor.max_cstate=1` on the
+  cmdline. PREEMPT_RT does NOT do this for you, and it dominates everything
+  else: measured on rung 1, deep core+package C-states cost 90–140 µs of
+  wakeup latency (the idle box was *worse* than a desktop PC); with the
+  package held awake the same box's servo tick measured p99 3.4 µs /
+  max 5.1 µs — under full housekeeping-core load.
 - Pin the arm-link NIC's IRQs off the servo cores; disable interrupt
   coalescing on that NIC (`ethtool -C <if> rx-usecs 0`).
 - Direct cable to the PC (no switch), static IPs, and for the FR3 a second
