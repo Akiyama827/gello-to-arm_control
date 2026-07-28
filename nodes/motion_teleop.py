@@ -229,6 +229,10 @@ class ControlPanel:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(body)))
+                    # A cached page runs LAST session's JS against this
+                    # session's node — an operator saw a stale badge ignore a
+                    # live fault. The page is tiny; never cache it.
+                    self.send_header("Cache-Control", "no-store")
                     self.end_headers()
                     self.wfile.write(body)
                 elif route == "state":

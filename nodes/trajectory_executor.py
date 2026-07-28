@@ -181,6 +181,7 @@ def main() -> None:
         {},
     )
     state: dict[str, np.ndarray] | None = None
+    cmd_live = True  # one boot line ("pausing") until the first state arrives
     hold_q: np.ndarray | None = None
     grip_q: float | None = None  # gripper motor target (rad); None = hold measured
     last_state_t = 0.0
@@ -244,7 +245,20 @@ def main() -> None:
             continue
         last_step = now
         if state is None or now - last_state_t > state_timeout:
+            if cmd_live:
+                # Transition, not steady state: this pause is invisible from
+                # the outside yet stops the command stream — after >fault-ms
+                # the RT server latches CMD_LOST with no PC-side trace.
+                cmd_live = False
+                print(
+                    f"[trajectory_executor] pausing commands — motor_state "
+                    f"stale ({now - last_state_t:.2f}s)",
+                    flush=True,
+                )
             continue
+        if not cmd_live:
+            cmd_live = True
+            print("[trajectory_executor] motor_state fresh — commands resume", flush=True)
 
         q = state["position"]
         arm_state = JointState(position=q[:n_arm], velocity=state["velocity"][:n_arm])

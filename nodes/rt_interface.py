@@ -61,6 +61,7 @@ def main() -> None:
     armed_wanted = False
     drop_warned = False
     last_fresh = True
+    last_cmd_sent = 0.0
 
     try:
         backend.open()
@@ -77,6 +78,17 @@ def main() -> None:
                     break
                 if etype == "INPUT" and eid == "motor_command":
                     if armed_wanted:
+                        t_cmd = time.perf_counter()
+                        if last_cmd_sent and t_cmd - last_cmd_sent > 0.3:
+                            # The other half of the CMD_LOST forensics: a gap
+                            # HERE means commands stopped ARRIVING from the
+                            # executor (delivery/backpressure), not sending.
+                            print(
+                                f"[rt_interface] command gap "
+                                f"{t_cmd - last_cmd_sent:.2f}s (upstream paused?)",
+                                flush=True,
+                            )
+                        last_cmd_sent = t_cmd
                         backend.apply_command(
                             unpack_motor_command(event["value"], backend.num_motors)
                         )
@@ -96,6 +108,7 @@ def main() -> None:
                             backend.enable_all()
                             armed_wanted = True
                             drop_warned = False
+                            last_cmd_sent = 0.0  # don't count the disarmed era
                             print("[rt_interface] ARMED (server holds until commands flow)", flush=True)
                         except RtLinkError as exc:
                             print(f"[rt_interface] arm refused: {exc}", flush=True)
