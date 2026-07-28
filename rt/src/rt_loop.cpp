@@ -131,7 +131,17 @@ void rt_loop(ServerCtx& ctx) {
 
     const uint64_t cmd_v = ctx.cmd_in.read(cmd);
     const uint64_t rx_ns = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
-    const double age_ns = rx_ns == 0 ? 1e18 : double(now - rx_ns);
+    // SIGNED, clamped age. rx_ns is stamped by udp_rx (or the ARM handler)
+    // in parallel with this tick: a packet stamped between our `now` sample
+    // above and this load is nanoseconds IN THE FUTURE, and the old unsigned
+    // `now - rx_ns` underflowed to ~1.8e19 ns — an instant spurious CMD_LOST
+    // latch on a perfectly healthy 100 Hz stream. Odds ~ packet rate x the
+    // sample-to-load window (sub-us pinned, up to ms when this thread is
+    // preemptible), i.e. one false latch per minutes of armed time — found
+    // live on rung 3 and root-caused with a fake-plant soak + process
+    // autopsy after every stream instrument reported healthy flow.
+    const int64_t raw_age = int64_t(now) - int64_t(rx_ns);
+    const double age_ns = rx_ns == 0 ? 1e18 : double(raw_age < 0 ? 0 : raw_age);
     // Only commands from AFTER the current ARM are authority (cmd_epoch).
     const bool fresh = cmd_v > ctx.cmd_epoch.load(std::memory_order_acquire) &&
                        cmd.n == uint16_t(n) && age_ns <= hold_ns;
