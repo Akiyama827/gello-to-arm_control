@@ -44,7 +44,18 @@ def main() -> None:
         fr = _import_pylibfranka()
         gripper = fr.Gripper(ip)
     except (FrankaBackendUnavailableError, Exception) as exc:
-        raise SystemExit(f"[franka_gripper] no Hand at {ip}: {exc}") from exc
+        # Degrade, never die: a node exit cascades into dora killing the WHOLE
+        # graph — a missing peripheral must not take down the arm session.
+        print(
+            f"[franka_gripper] no Hand at {ip}: {exc} — gripper disabled for "
+            "this session (slider will do nothing)",
+            flush=True,
+        )
+        node = Node()
+        while True:
+            event = node.next(timeout=1.0)
+            if event is not None and event["type"] == "STOP":
+                return
 
     target_w: list[float | None] = [None]  # latest-wins slot
     wake = threading.Event()
