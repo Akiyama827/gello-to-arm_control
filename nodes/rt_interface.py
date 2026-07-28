@@ -60,6 +60,7 @@ def main() -> None:
     model_revision_sent = False
     armed_wanted = False
     drop_warned = False
+    last_fresh = True
 
     try:
         backend.open()
@@ -113,6 +114,18 @@ def main() -> None:
             step_count += 1
 
             health = backend.motor_health()
+            if health["state_fresh"] != last_fresh:
+                # Transitions are logged, not the steady state: a silent gate
+                # here made a server CMD_LOST latch undiagnosable on rung 3
+                # (commands stop when state stops — the cause needs a line).
+                last_fresh = health["state_fresh"]
+                print(
+                    "[rt_interface] RT state stream "
+                    + ("recovered" if last_fresh
+                       else f"STALE ({health['state_age_s']:.2f}s) — gating "
+                            "motor_state; executor will pause commands"),
+                    flush=True,
+                )
             # Publish state ONLY while the RT stream is fresh. Republishing a
             # frozen snapshot at graph rate would defeat the executor's own
             # staleness deadman (it keys on Dora arrival time) and let it

@@ -243,8 +243,15 @@ async function poll(){
  else {
   gate.style.display = 'block';
   const badge = document.getElementById('gatebadge');
-  badge.textContent = s.armed ? 'ARMED' : 'DISARMED';
-  badge.style.background = s.armed ? '#2ca02c' : '#c62828';
+  if (s.fault){  // latched server keeps ARMED set — fault wins the badge
+   badge.textContent = 'FAULTED';
+   badge.style.background = '#e65100';
+   badge.title = s.fault + ' — DISARM then ARM to recover';
+  } else {
+   badge.textContent = s.armed ? 'ARMED' : 'DISARMED';
+   badge.style.background = s.armed ? '#2ca02c' : '#c62828';
+   badge.title = '';
+  }
  }
 }
 setInterval(poll, 150); poll();

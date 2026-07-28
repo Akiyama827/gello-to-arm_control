@@ -206,6 +206,7 @@ class ControlPanel:
         self._clicks = {name: 0 for name in _BUTTONS + _GATE_BUTTONS}
         self._seen = {name: 0 for name in _BUTTONS + _GATE_BUTTONS}
         self._armed: bool | None = None  # None = no health wire (sim: no gate)
+        self._fault = ""  # server latched-fault text; badge shows FAULTED
         self._log: list[str] = []
         panel = self
 
@@ -300,6 +301,7 @@ class ControlPanel:
                 },
                 "buttons": list(_BUTTONS),
                 "armed": self._armed,
+                "fault": self._fault,
                 "log": list(self._log[-8:]),
                 "plan_version": self._plan["version"],
             }
@@ -352,9 +354,10 @@ class ControlPanel:
             pending, self._cart_pending = self._cart_pending, None
             return pending
 
-    def set_armed(self, armed: bool | None) -> None:
+    def set_armed(self, armed: bool | None, fault: str = "") -> None:
         with self._lock:
             self._armed = armed
+            self._fault = fault
 
     def set_measured(self, q) -> None:
         with self._lock:
@@ -528,6 +531,7 @@ def main() -> None:
     # the panel (the bridge would swallow the commands and the executor would
     # abort 2 s later with only a terminal line — a silent no-op at the page).
     armed: bool | None = None
+    fault = ""
     pending: JointTrajectory | None = None
     shown: np.ndarray | None = None
     # Cartesian drag reference: (position, rotation) latched when a drag streak
@@ -561,9 +565,19 @@ def main() -> None:
                     last_ghost = now
                     ghost.update(measured)
             elif event["type"] == "INPUT" and event["id"] == "motor_health":
-                was = armed
-                armed = bool(unpack_json_message(event["value"]).get("armed", False))
-                panel.set_armed(armed)
+                health = unpack_json_message(event["value"])
+                was, was_fault = armed, fault
+                armed = bool(health.get("armed", False))
+                # A fault-holding server keeps its ARMED flag on purpose — the
+                # latched fault is a SEPARATE dimension and the badge must
+                # show it, or Execute looks legitimate while the server is
+                # parked and ignoring every command (seen live on rung 3).
+                fault = str(health.get("latched_fault") or "")
+                panel.set_armed(armed, fault)
+                if fault and fault != was_fault:
+                    panel.log(f"SERVER FAULT: {fault} — DISARM then ARM to recover")
+                elif was_fault and not fault:
+                    panel.log("fault cleared")
                 if was is not None and was != armed:
                     panel.log("ARMED" if armed else "DISARMED — Execute is gated")
             elif event["type"] == "STOP":
@@ -658,6 +672,11 @@ def main() -> None:
         if panel.clicked("Execute"):
             if pending is None:
                 panel.log("nothing to execute — plan first")
+            elif fault:
+                panel.log(
+                    f"REFUSED: server fault latched ({fault}) — press DISARM "
+                    "then ARM to recover, then Execute"
+                )
             elif armed is False:
                 # Keep the plan: after arming, Execute again without replanning.
                 panel.log("REFUSED: DISARMED — press ARM above, then Execute")
