@@ -22,6 +22,7 @@ from __future__ import annotations
 # ruff: noqa: E402
 
 import time
+from dataclasses import replace
 
 import numpy as np
 from dora import Node
@@ -160,6 +161,9 @@ def main() -> None:
             "the dataflow), or drop it to inherit arm.kp from the arm config."
         )
 
+    # Plants that compensate gravity themselves (FR3 control box) get RNEA
+    # MINUS gravity — full RNEA would double-count it and push the arm up.
+    plant_gc = bool(_arm_block(cfg).get("plant_gravity_comp", False))
     dynamics = PinocchioDynamics(cfg.urdf_path, arm_names)
     executor = JointTrajectoryExecutor(
         "arm",
@@ -191,7 +195,7 @@ def main() -> None:
             if event["type"] == "INPUT" and event["id"] == "motor_state":
                 state = unpack_motor_state(event["value"], n)
                 last_state_t = now
-            elif event["type"] == "INPUT" and event["id"] == "trajectory":
+            elif event["type"] == "INPUT" and event["id"] in ("trajectory", "trajectory_replay"):
                 traj = unpack_trajectory(event["value"])
                 if len(traj["times"]) == 0:
                     executor.clear_trajectory()
@@ -256,17 +260,19 @@ def main() -> None:
                     "(obstructed or disarmed?) — compliant hold at measured pose",
                     flush=True,
                 )
-        if arm_cmd is not None:
-            q_des, qd_des, tau, kp_out, kd_out = merge_command(arm_cmd, q, n, kp, kd)
-        else:
+        if arm_cmd is None:
             # Idle: the executor's hold primitive at the latched anchor
             # (gravity FF + torque clamp — the same anchored hold every other
             # tier uses; this node used to hand-roll it inline).
             hold_q = update_hold_pose(hold_q, arm_state.position, relatch_tol)
-            hold_cmd = executor.hold_command(
+            arm_cmd = executor.hold_command(
                 JointState(position=hold_q, velocity=np.zeros(n_arm))
             )
-            q_des, qd_des, tau, kp_out, kd_out = merge_command(hold_cmd, q, n, kp, kd)
+        if plant_gc:
+            arm_cmd = replace(
+                arm_cmd, tau_ff=arm_cmd.tau_ff - dynamics.gravity(arm_state.position)
+            )
+        q_des, qd_des, tau, kp_out, kd_out = merge_command(arm_cmd, q, n, kp, kd)
         if grip_q is not None:
             q_des[n_arm] = grip_q  # gripper motor slot: teleop target, not measured
         node.send_output(

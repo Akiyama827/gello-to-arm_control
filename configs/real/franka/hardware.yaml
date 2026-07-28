@@ -27,6 +27,12 @@ arm:
   # Use fr3_link8 instead if you fit a custom flange tool.
   ee_frame: fr3_hand_tcp
   urdf: franka/urdf/fr3.urdf
+  # The FR3 control box adds gravity (and motor friction) compensation to
+  # every commanded torque itself — hosts must ship RNEA MINUS gravity or the
+  # arm gets gravity twice. Consumed by the trajectory executor. Hardware
+  # fact of this plant: the MuJoCo twin compensates nothing (flag absent in
+  # the sim config), same arm, different plant.
+  plant_gravity_comp: true
   # world_origin / world_rpy live in calibration.yaml — they are MEASURED.
 
 # 7 arm joints; the Hand is NOT a motor slot (contrast the DM arm's 7 = 6 + gripper).
@@ -84,7 +90,7 @@ franka:
 # (second NIC; the FCI wire to the control box stays separate). Staleness/
 # fault thresholds live SERVER-side (launch flags); this is only addressing.
 rt:
-  host: 172.16.1.2           # PLACEHOLDER — set when the RT box is imaged
+  host: 172.16.1.2           # the RT box (rung-1 bring-up, 2026-07-27)
   udp_port: 47800
   tcp_port: 47801
   state_timeout_s: 0.5

@@ -1,0 +1,79 @@
+# Motion mode for the REAL FR3 behind the RT machine (arm_rt_server).
+#
+# Peer of motion_franka.yaml (the sim twin) — a separate file because the two
+# plants close different loops. In sim, MuJoCo's PD consumes kp/kd and kd
+# comes from the sim config; on the real arm OUR servo law on the RT box
+# closes the PD at 1 kHz, so kd here is load-bearing damping — kd 0 with
+# kp 1200 rings (measured ~10 Hz in sim; on the real arm it would be worse).
+# Gains are the libfranka joint-impedance example values: proven-safe
+# stiffness/damping pairing on this hardware class, deliberately softer than
+# the sim table for first tracking.
+#
+# The executor's RNEA feedforward is shipped MINUS gravity on this plant
+# (arm.plant_gravity_comp in the hardware fragment): the FR3 control box adds
+# its own gravity compensation to every commanded torque — full RNEA would
+# double-count it and push the arm upward.
+plant:
+  mode: command
+  listen_mode: false
+
+controller:
+  command_rate_hz: 100
+  state_timeout_sec: 0.25
+  start_pos_tol_rad: 0.1   # refuse a trajectory starting farther than this from measured
+  abort_pos_err_rad: 0.35  # runaway guard: abort tracking when q_des leaves the arm behind
+  hold_relatch_rad: 0.3    # idle hold re-anchors if the arm is moved externally past this
+  kp_max: 3000.0           # stiffness ceilings, not MIT-wire kp (see motion_franka.yaml)
+  kd_max: 200.0
+  torque_limit_max: 90.0   # FR3 joint torque limits are 87 / 12 N·m
+  # Joint stiffness / damping (N·m/rad, N·m·s/rad) closed by the RT servo law.
+  kp:
+    fr3_joint1: 600.0
+    fr3_joint2: 600.0
+    fr3_joint3: 600.0
+    fr3_joint4: 600.0
+    fr3_joint5: 250.0
+    fr3_joint6: 150.0
+    fr3_joint7: 50.0
+  kd:
+    fr3_joint1: 50.0
+    fr3_joint2: 50.0
+    fr3_joint3: 50.0
+    fr3_joint4: 20.0
+    fr3_joint5: 20.0
+    fr3_joint6: 20.0
+    fr3_joint7: 10.0
+  torque_limits:
+    fr3_joint1: 87.0
+    fr3_joint2: 87.0
+    fr3_joint3: 87.0
+    fr3_joint4: 87.0
+    fr3_joint5: 12.0
+    fr3_joint6: 12.0
+    fr3_joint7: 12.0
+
+# OMPL RRT-Connect over joint space + MuJoCo self-collision oracle. Slower
+# caps than sim: first real tracking sessions.
+planner:
+  vel_limits: 0.4          # rad/s
+  acc_limits: 0.8          # rad/s^2
+  soft_speed_frac: 0.5
+  soft_acc_floor: 0.15
+  self_collision_padding_m: -0.002
+  solve_time_sec: 2.0
+  simplify_time_sec: 0.5
+  resolution_frac: 0.005
+
+# Drag-teach replay (nodes/trajectory_replay.py): a hand-guided recording
+# (rt_handguide CSV) smoothed, retimed under these caps, and joined to the
+# current pose with a min-jerk segment before streaming to the executor.
+replay:
+  resample_hz: 50
+  smooth_window_s: 0.25
+  vel_cap: 0.4             # rad/s after retiming (uniform time-scale)
+  slow_factor: 1.5         # extra slowdown on top of the vel cap
+  join_time_min_s: 2.5     # never join to the recording start faster than this
+  still_speed: 0.02        # rad/s — trim motionless head/tail of the recording
+
+teleop:
+  http_port: 7501

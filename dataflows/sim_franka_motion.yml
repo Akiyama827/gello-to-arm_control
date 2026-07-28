@@ -22,6 +22,18 @@ nodes:
       - trajectory
       - gripper
 
+  # Drag-teach replay driver (file-triggered, inert otherwise): validates a
+  # real hand-guided recording against the MuJoCo twin before bench day.
+  #   echo float.csv > /tmp/arm_replay_go
+  - id: trajectory_replay
+    path: ../nodes/trajectory_replay.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+    outputs:
+      - trajectory
+
   - id: trajectory_executor
     path: ../nodes/trajectory_executor.py
     env:
@@ -29,6 +41,7 @@ nodes:
     inputs:
       motor_state: plant_interface/motor_state
       trajectory:  motion_teleop/trajectory
+      trajectory_replay: trajectory_replay/trajectory
     outputs:
       - motor_command
 

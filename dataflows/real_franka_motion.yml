@@ -1,0 +1,81 @@
+# REAL FR3 motion through the RT machine — the first graph that moves this arm.
+#
+# The plant is nodes/rt_interface.py -> arm_rt_server on the RT box
+# (--backend franka): the PC streams the full servo word (q_des, qd_des,
+# tau_ff MINUS gravity, kp, kd) at 100 Hz; the 1 kHz torque loop, clamp,
+# slew, staleness->hold and fault latching all live server-side. Two motion
+# sources feed one executor:
+#   - motion_teleop: meshcat sliders -> OMPL plan (MuJoCo self-collision
+#     oracle) -> preview -> Execute button (point-to-point, planned)
+#   - trajectory_replay: drag-teach playback of an rt_handguide recording
+#     (echo <csv> > /tmp/arm_replay_go), joined from the current pose
+#
+# SAFETY — the graph comes up DISARMED. operator_arm gates the bridge (Enter /
+# panel / trigger file). The RT server must be up with the franka backend and
+# its NORMAL deadman (default --fault-ms 1000, NOT the handguide's 3600000 —
+# this graph is a commander, and losing it must park the arm). Executor
+# refuses trajectories starting >0.1 rad from measured, aborts on >0.35 rad
+# tracking error; the server holds on staleness and latches on faults.
+#
+#   ARM_CONTROL_CONFIG=configs/real/franka.yaml dora run dataflows/real_franka_motion.yml
+nodes:
+  - id: operator_arm
+    path: ../nodes/operator_arm.py
+    outputs:
+      - arm
+
+  - id: motion_teleop
+    path: ../nodes/motion_teleop.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka_rt.yaml
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+    outputs:
+      - trajectory
+      - gripper
+
+  - id: trajectory_replay
+    path: ../nodes/trajectory_replay.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka_rt.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+    outputs:
+      - trajectory
+
+  - id: trajectory_executor
+    path: ../nodes/trajectory_executor.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka_rt.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      trajectory:  motion_teleop/trajectory
+      trajectory_replay: trajectory_replay/trajectory
+    outputs:
+      - motor_command
+
+  - id: plant_interface
+    path: ../nodes/rt_interface.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka_rt.yaml
+    inputs:
+      motor_command: trajectory_executor/motor_command
+      arm:           operator_arm/arm
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - motor_health
+      - model_revision
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+
+  # Tracking log: measured pos/vel/torque + commanded q_des per motor_state
+  # tick -> CSV. THE rung-3 artefact: tracking error = qdes - pos.
+  - id: motor_state_logger
+    path: ../nodes/motor_state_logger.py
+    inputs:
+      motor_state:   plant_interface/motor_state
+      motor_command: trajectory_executor/motor_command
