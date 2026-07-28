@@ -35,10 +35,22 @@ nodes:
       motor_state: plant_interface/motor_state_viz
       # Armed badge + Execute gating + gate visibility on the panel.
       motor_health: plant_interface/motor_health
+      # Live Hand width -> the measured ghost's fingers track reality.
+      gripper_state: franka_gripper/gripper_state
     outputs:
       - trajectory
       - gripper
       - arm
+
+  # The Franka Hand — gripper-ONLY bridge (the RT machine owns the arm's FCI
+  # session; the Hand is its own TCP service and coexists). Teleop slider ->
+  # blocking move() on a worker thread; width published back at ~5 Hz.
+  - id: franka_gripper
+    path: ../nodes/franka_gripper.py
+    inputs:
+      gripper: motion_teleop/gripper
+    outputs:
+      - gripper_state
 
   - id: trajectory_replay
     path: ../nodes/trajectory_replay.py
@@ -77,6 +89,7 @@ nodes:
     path: ../nodes/visualizer.py
     inputs:
       motor_state: plant_interface/motor_state_viz
+      gripper_state: franka_gripper/gripper_state
 
   # Tracking log: measured pos/vel/torque + commanded q_des per motor_state
   # tick -> CSV. THE rung-3 artefact: tracking error = qdes - pos.

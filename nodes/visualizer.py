@@ -189,6 +189,7 @@ def _log_render_pose(
     motor_names: list[str],
     q_profile: np.ndarray,
     joint_mimics: dict | None = None,
+    finger_values: dict[str, float] | None = None,
 ) -> None:
     model, data, q_idx, visual_model, visual_data = render_model
     q = np.zeros(model.nq)
@@ -208,6 +209,14 @@ def _log_render_pose(
         _apply_joint_mimics(q_sub, joint_names, motor_names, q_profile, joint_mimics)
         for ji, value in enumerate(q_sub):
             q[q_idx[ji]] = value
+    if finger_values:
+        # Fingers that are NOT bus motors (Franka Hand): live width arrives on
+        # the gripper_state topic instead of a motor slot / mimic.
+        jindex = {name: i for i, name in enumerate(joint_names)}
+        for jname, value in finger_values.items():
+            ji = jindex.get(jname)
+            if ji is not None:
+                q[q_idx[ji]] = value
     try:
         pin.forwardKinematics(model, data, q)
         pin.updateGeometryPlacements(model, data, visual_model, visual_data, q)
@@ -459,6 +468,9 @@ def main() -> None:
     print(f"[viz] Rerun '{app_id}' started — {n_motors} motors")
 
     q_profile = np.zeros(n_motors)
+    from arm_control.config import gripper_joints as _gj
+    finger_joints = [j for j in _gj(cfg) if j in joint_names]
+    finger_values: dict[str, float] = {}
     node = Node()
     t0   = time.monotonic()
     last_fk_log = 0.0
@@ -495,10 +507,19 @@ def main() -> None:
                 _last_stats_q = raw_position.copy()
             if render_model is not None and now - last_fk_log >= fk_period_s:
                 if _fk_position_changed(_last_fk_q, q_profile, min_delta_rad=fk_min_delta):
-                    _log_render_pose(render_model, joint_names, motor_names, q_profile, joint_mimics)
+                    _log_render_pose(
+                        render_model, joint_names, motor_names, q_profile,
+                        joint_mimics, finger_values,
+                    )
                     _last_fk_q = q_profile.copy()
                     fk_logs += 1
                 last_fk_log = now
+
+        elif eid == "gripper_state":
+            payload = unpack_json_message(event["value"], expected_schema="gripper_state")
+            half = float(payload.get("width", 0.0)) / 2.0
+            finger_values = {j: half for j in finger_joints}
+            _last_fk_q = None  # force a re-render even with a motionless arm
 
         elif eid == "can_bus_status":
             payload = unpack_json_message(event["value"], expected_schema="can_bus_status")

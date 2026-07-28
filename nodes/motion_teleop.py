@@ -207,6 +207,7 @@ class ControlPanel:
         self._seen = {name: 0 for name in _BUTTONS + _GATE_BUTTONS}
         self._armed: bool | None = None  # None = no health wire (sim: no gate)
         self._fault = ""  # server latched-fault text; badge shows FAULTED
+        self._measured_grip: float | None = None  # live finger m (Franka Hand)
         self._log: list[str] = []
         panel = self
 
@@ -289,6 +290,7 @@ class ControlPanel:
             values = list(self._values)
             measured = None if self._measured is None else list(self._measured)
             grip = self._grip
+            mgrip = self._measured_grip if self._measured_grip is not None else grip
             payload = {
                 "sliders": [
                     {"name": n, "min": lo, "max": hi, "value": v}
@@ -313,7 +315,7 @@ class ControlPanel:
         payload["target_geoms"] = target_fk["geoms"]
         payload["ee"] = target_fk["ee"]
         payload["measured_geoms"] = (
-            None if measured is None else self._vfk.poses(measured, grip)["geoms"]
+            None if measured is None else self._vfk.poses(measured, mgrip)["geoms"]
         )
         return payload
 
@@ -362,6 +364,10 @@ class ControlPanel:
         with self._lock:
             self._armed = armed
             self._fault = fault
+
+    def set_measured_grip(self, finger_m: float) -> None:
+        with self._lock:
+            self._measured_grip = finger_m
 
     def set_measured(self, q) -> None:
         with self._lock:
@@ -434,8 +440,11 @@ def plan_trajectory(
         raise ValueError("target pose is in self-collision")
     if world.in_collision(q_start):
         raise ValueError("current pose is in self-collision (check padding)")
-    if np.allclose(q_start, q_goal, atol=1e-4):
-        raise ValueError("already at the target")
+    if np.allclose(q_start, q_goal, atol=5e-3):
+        # 5 mrad: below anything worth planning. The old 1e-4 gate let a
+        # near-zero path through, and the retimer's soft-launch taper turned
+        # it into a 2-sample "plan" with a 5-day duration (seen on the bench).
+        raise ValueError("already at the target (within 5 mrad)")
     waypoints = ompl.plan(q_start, q_goal)
     if waypoints is None:
         raise ValueError("no collision-free path found (try a different target)")
@@ -568,6 +577,9 @@ def main() -> None:
                 if now - last_ghost >= 0.1:
                     last_ghost = now
                     ghost.update(measured)
+            elif event["type"] == "INPUT" and event["id"] == "gripper_state":
+                width = float(unpack_json_message(event["value"]).get("width", 0.0))
+                panel.set_measured_grip(width / 2.0)
             elif event["type"] == "INPUT" and event["id"] == "motor_health":
                 health = unpack_json_message(event["value"])
                 was, was_fault = armed, fault
