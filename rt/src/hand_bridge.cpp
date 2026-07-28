@@ -71,17 +71,26 @@ void serve(int fd, const char* robot_ip) {
       if (got <= 0) return;  // client gone
       have += size_t(got);
       buf[have] = '\0';
+      // LATEST MOVE WINS. Each move() blocks for the full physical travel;
+      // executing queued intermediate widths in order replays a slider drag
+      // as a seconds-long sequence of moves (the bench 'gripper lag'). The
+      // Hand is an action device: drain everything, run only the last goal.
+      bool have_move = false;
+      double mv_w = 0, mv_s = 0;
       char* line = buf;
       for (char* nl; (nl = std::strchr(line, '\n')) != nullptr; line = nl + 1) {
         *nl = '\0';
         double w = 0, s = 0;
         try {
-          if (std::sscanf(line, "MOVE %lf %lf", &w, &s) == 2 && hand) {
-            hand->move(w, s);  // blocking, seconds — state pauses, by design
+          if (std::sscanf(line, "MOVE %lf %lf", &w, &s) == 2) {
+            have_move = true;
+            mv_w = w;
+            mv_s = s;
           } else if (!std::strcmp(line, "HOME") && hand) {
             std::printf("[hand] homing\n");
             hand->homing();
           } else if (!std::strcmp(line, "GSTOP") && hand) {
+            have_move = false;  // an explicit stop outranks a queued goal
             hand->stop();
           }
         } catch (const franka::Exception& e) {
@@ -92,6 +101,15 @@ void serve(int fd, const char* robot_ip) {
       }
       have = std::strlen(line);
       std::memmove(buf, line, have);
+      if (have_move && hand) {
+        try {
+          hand->move(mv_w, mv_s);  // blocking — state pauses, by design
+        } catch (const franka::Exception& e) {
+          std::printf("[hand] move failed (%s) — reconnecting\n", e.what());
+          hand.reset();
+          next_connect = mono_s() + 2.0;
+        }
+      }
     }
 
     if (hand && mono_s() - last_state >= 0.2) {

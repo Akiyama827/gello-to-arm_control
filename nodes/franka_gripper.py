@@ -36,7 +36,9 @@ from arm_control.config import load_robot_config
 from arm_control.messages import pack_json_message, unpack_motor_command
 
 DEADBAND_M = 0.002  # commanded-width change below this is slider noise
-MOVE_SPEED = 0.08   # m/s — gentle; the Hand's max is 0.2
+MOVE_SPEED = 0.10   # m/s — brisk but gentle; the Hand's max is 0.2
+SETTLE_S = 0.15     # slider must rest this long before a goal is sent —
+                    # one gesture becomes ONE move, not a queue of steps
 HOME_FILE = Path("/tmp/arm_gripper_home")
 
 
@@ -53,6 +55,8 @@ class BridgeClient(threading.Thread):
 
     def run(self) -> None:
         sent: float | None = None
+        seen: float | None = None
+        stable_t = 0.0
         buf = b""
         sock: socket.socket | None = None
         warned = False
@@ -75,7 +79,14 @@ class BridgeClient(threading.Thread):
                     continue
             try:
                 w = self.target
-                if w is not None and (sent is None or abs(w - sent) >= DEADBAND_M):
+                if w != seen:  # slider still moving — restart the settle clock
+                    seen = w
+                    stable_t = time.monotonic()
+                if (
+                    w is not None
+                    and time.monotonic() - stable_t >= SETTLE_S
+                    and (sent is None or abs(w - sent) >= DEADBAND_M)
+                ):
                     sent = w
                     sock.sendall(f"MOVE {w:.5f} {MOVE_SPEED:.3f}\n".encode())
                 if self.want_home:
