@@ -23,6 +23,9 @@ nodes:
       ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
     inputs:
       motor_state: plant_interface/motor_state_viz
+      # Lets the panel gate Execute while DISARMED (visible refusal instead
+      # of a silent bridge drop + executor abort 2 s later).
+      motor_health: plant_interface/motor_health
     outputs:
       - trajectory
       - gripper

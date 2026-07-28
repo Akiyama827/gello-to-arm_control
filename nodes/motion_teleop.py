@@ -45,6 +45,7 @@ from arm_control.joint_motor_map import gripper_motor_to_finger
 from arm_control.messages import (
     pack_motor_command,
     pack_trajectory,
+    unpack_json_message,
     unpack_motor_state,
 )
 from arm_control.planning.high_level import build_collision_stack
@@ -510,6 +511,11 @@ def main() -> None:
     )
     node = Node()
     measured: np.ndarray | None = None
+    # None = this graph wires no motor_health (sim: no arm gate) -> allow.
+    # False = a health stream says DISARMED -> Execute is refused VISIBLY on
+    # the panel (the bridge would swallow the commands and the executor would
+    # abort 2 s later with only a terminal line — a silent no-op at the page).
+    armed: bool | None = None
     pending: JointTrajectory | None = None
     shown: np.ndarray | None = None
     # Cartesian drag reference: (position, rotation) latched when a drag streak
@@ -542,6 +548,11 @@ def main() -> None:
                 if now - last_ghost >= 0.1:
                     last_ghost = now
                     ghost.update(measured)
+            elif event["type"] == "INPUT" and event["id"] == "motor_health":
+                was = armed
+                armed = bool(unpack_json_message(event["value"]).get("armed", False))
+                if was is not None and was != armed:
+                    panel.log("ARMED" if armed else "DISARMED — Execute is gated")
             elif event["type"] == "STOP":
                 break
 
@@ -634,6 +645,12 @@ def main() -> None:
         if panel.clicked("Execute"):
             if pending is None:
                 panel.log("nothing to execute — plan first")
+            elif armed is False:
+                # Keep the plan: after arming, Execute again without replanning.
+                panel.log(
+                    "REFUSED: arm is DISARMED — arm the operator gate first "
+                    "(Enter in the launch terminal / operator panel / trigger file)"
+                )
             else:
                 node.send_output(
                     "trajectory",

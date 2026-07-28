@@ -59,6 +59,7 @@ def main() -> None:
     health_prev: tuple | None = None
     model_revision_sent = False
     armed_wanted = False
+    last_drop_warn = 0.0
 
     try:
         backend.open()
@@ -77,6 +78,16 @@ def main() -> None:
                     if armed_wanted:
                         backend.apply_command(
                             unpack_motor_command(event["value"], backend.num_motors)
+                        )
+                    elif time.perf_counter() - last_drop_warn > 2.0:
+                        # Never swallow silently: an executor upstream is
+                        # streaming into a disarmed bridge, and from the
+                        # operator's seat that looks like "nothing happened".
+                        last_drop_warn = time.perf_counter()
+                        print(
+                            "[rt_interface] dropping motor_command — DISARMED "
+                            "(arm via the operator gate)",
+                            flush=True,
                         )
                 elif etype == "INPUT" and eid == "arm":
                     if bool(unpack_json_message(event["value"]).get("armed", False)):
