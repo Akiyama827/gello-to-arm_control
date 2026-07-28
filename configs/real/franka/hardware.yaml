@@ -66,6 +66,9 @@ franka:
   enforce_realtime: false
   # Contact reflex thresholds. Deliberately low for bring-up: the arm stops on
   # light contact and automatic_error_recovery clears it on the next arm.
+  # NOTE: these keys drive ONLY the PC-side franka_backend (listen graph).
+  # The RT motion path sets its own literals in rt/src/backend_franka.cpp —
+  # keep the two in agreement by hand; editing here does NOT touch the RT arm.
   lower_torque_thresholds: [20, 20, 18, 18, 16, 14, 12]
   upper_torque_thresholds: [40, 40, 36, 36, 32, 28, 24]
   lower_force_thresholds: [20, 20, 20, 25, 25, 25]
@@ -96,7 +99,15 @@ rt:
   # hand_bridge (rt/src/hand_bridge.cpp) — the Franka Hand is owned FROM the
   # box: its state stream is server-push UDP, which cannot cross the PC NAT.
   hand_port: 47802
-  state_timeout_s: 0.5
+  # CONTENT freshness of the state stream (state_seq advancing, not packets
+  # arriving). 0.2: the stream runs at 250 Hz, so 50 consecutive missing
+  # updates is a real outage — and every 0.1 s shaved here shrinks the
+  # window where the executor commands against a frozen measurement.
+  state_timeout_s: 0.2
+  # Refuse a server whose command deadman is slower than this: connecting a
+  # commander graph to a handguide-flagged server (--fault-ms 3600000) means
+  # NO staleness reflex — a PC crash mid-trajectory leaves nothing watching.
+  max_fault_ms: 5000
 
 urdf_path: franka/urdf/fr3.urdf
 update_rate_hz: 100

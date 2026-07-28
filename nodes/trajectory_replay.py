@@ -29,11 +29,20 @@ import numpy as np
 from dora import Node
 
 from arm_control.config import arm_joints, load_robot_config
-from arm_control.messages import pack_trajectory, unpack_motor_state
+from arm_control.messages import (
+    pack_trajectory,
+    unpack_json_message,
+    unpack_motor_state,
+)
 from arm_control.node_utils import _load_mode_config
 
-GO_FILE = Path("/tmp/arm_replay_go")
-STOP_FILE = Path("/tmp/arm_replay_stop")
+# Trigger files live in the user-private runtime dir (mode 0700), NOT /tmp:
+# a world-writable trigger is motion authority for ANY local process/user,
+# and a foreign pre-created /tmp file even crashes the unlink at startup.
+_RUN_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+GO_FILE = _RUN_DIR / "arm_replay_go"
+STOP_FILE = _RUN_DIR / "arm_replay_stop"
+MAX_CSV_BYTES = 20 * 1024 * 1024  # a recording is minutes of 50 Hz rows, not GB
 
 
 def load_recording(path: Path, n_arm: int) -> tuple[np.ndarray, np.ndarray]:
@@ -111,6 +120,8 @@ def main() -> None:
 
     node = Node()
     q_now: np.ndarray | None = None
+    armed: bool | None = None  # None = no motor_health wired (sim graphs)
+    faulted = False
     print(
         f"[trajectory_replay] ready — echo <recording.csv> > {GO_FILE} to replay, "
         f"touch {STOP_FILE} to stop",
@@ -123,6 +134,10 @@ def main() -> None:
                 break
             if event["type"] == "INPUT" and event["id"] == "motor_state":
                 q_now = unpack_motor_state(event["value"], n)["position"][:n_arm]
+            elif event["type"] == "INPUT" and event["id"] == "motor_health":
+                health = unpack_json_message(event["value"])
+                armed = bool(health.get("armed", False))
+                faulted = bool(health.get("any_fault", False))
 
         if STOP_FILE.exists():
             STOP_FILE.unlink(missing_ok=True)
@@ -133,11 +148,34 @@ def main() -> None:
             print("[trajectory_replay] STOP sent — executor holds in place", flush=True)
         if not GO_FILE.exists():
             continue
-        raw = GO_FILE.read_text().strip()
-        GO_FILE.unlink(missing_ok=True)
+        try:
+            raw = GO_FILE.read_text().strip()
+            GO_FILE.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[trajectory_replay] trigger unreadable ({exc})", flush=True)
+            time.sleep(1.0)
+            continue
         csv_path = Path(raw or os.environ.get("ARM_REPLAY_CSV", ""))
         if not csv_path.is_file():
             print(f"[trajectory_replay] REFUSED: no recording at '{csv_path}'", flush=True)
+            continue
+        if csv_path.stat().st_size > MAX_CSV_BYTES:
+            print(
+                f"[trajectory_replay] REFUSED: {csv_path.name} is "
+                f"{csv_path.stat().st_size >> 20} MB — not a handguide recording",
+                flush=True,
+            )
+            continue
+        # This trigger is a motion-authority path with no page in front of it:
+        # refuse anything the operator gate would refuse. (armed None = graph
+        # wires no health — sim — where the plant applies its own gate.)
+        if armed is False or faulted:
+            print(
+                "[trajectory_replay] REFUSED: "
+                + ("server fault latched" if faulted else "DISARMED")
+                + " — ARM on the teleop page first",
+                flush=True,
+            )
             continue
         if q_now is None:
             print("[trajectory_replay] REFUSED: no motor state yet", flush=True)

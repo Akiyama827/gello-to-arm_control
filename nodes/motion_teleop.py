@@ -29,8 +29,10 @@ from __future__ import annotations
 # ruff: noqa: E402
 
 import json
+import os
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -185,6 +187,8 @@ class ControlPanel:
         port: int,
         vfk: VisualFK,
         grip_range: tuple[float, float] = (0.0, 0.0),
+        bind: str = "127.0.0.1",
+        ident: str = "",
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
         # arm config (gripper_range_m) or its joint_mimics entry — never a
@@ -208,7 +212,9 @@ class ControlPanel:
         self._armed: bool | None = None  # None = no health wire (sim: no gate)
         self._fault = ""  # server latched-fault text; badge shows FAULTED
         self._measured_grip: float | None = None  # live finger m (Franka Hand)
-        self._log: list[str] = []
+        self._log: deque[str] = deque(maxlen=200)  # page shows [-8:]; a stuck
+        # gizmo drag logged at loop rate once grew this without bound
+        self._ident = ident
         panel = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -261,7 +267,23 @@ class ControlPanel:
                     self._json({"error": "not found"}, 404)
 
             def do_POST(self) -> None:
-                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                # This server ARMS a torque-controlled arm. Two cheap gates:
+                # a cross-origin browser POST always carries an Origin header
+                # that won't match ours (kills the CSRF class — any website
+                # the operator visits could otherwise click ARM/Execute), and
+                # a declared multi-GB body must not OOM the only node that
+                # can DISARM.
+                origin = self.headers.get("Origin")
+                if origin is not None:
+                    host = self.headers.get("Host", "")
+                    if origin not in (f"http://{host}", f"https://{host}"):
+                        self._json({"error": "cross-origin refused"}, 403)
+                        return
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length > 64 * 1024:
+                    self._json({"error": "body too large"}, 413)
+                    return
+                raw = self.rfile.read(length)
                 try:
                     payload = json.loads(raw or b"{}")
                 except json.JSONDecodeError:
@@ -281,7 +303,10 @@ class ControlPanel:
                     panel._click(str(payload.get("button", "")))
                 self._json({"ok": True})
 
-        self._server = ThreadingHTTPServer(("0.0.0.0", int(port)), Handler)
+        # Loopback by default: every mutating endpoint on this server can
+        # ARM and move the arm, unauthenticated. LAN exposure is an
+        # explicit config decision (teleop.http_bind), not a default.
+        self._server = ThreadingHTTPServer((str(bind), int(port)), Handler)
         self.port = self._server.server_address[1]
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
@@ -310,6 +335,7 @@ class ControlPanel:
                 "fault": self._fault,
                 "log": list(self._log[-8:]),
                 "plan_version": self._plan["version"],
+                "ident": self._ident,
             }
         target_fk = self._vfk.poses(values, grip)   # vfk has its own lock
         payload["target_geoms"] = target_fk["geoms"]
@@ -530,6 +556,11 @@ def main() -> None:
         # A mimic without travel bounds is a config error for a slider; (0,0)
         # renders no slider rather than inventing another robot's numbers.
         grip_range = (float(mimic.get("lower", 0.0)), float(mimic.get("upper", 0.0)))
+    # The page must SAY which arm it drives: a browser tab from a sim
+    # rehearsal silently reattaches to a real graph on the same port, and the
+    # first click lands on hardware.
+    ident = os.environ.get("ARM_CONTROL_CONFIG", "") or "unknown config"
+    bind = str(teleop_cfg.get("http_bind", "127.0.0.1"))
     panel = ControlPanel(
         planned,
         world.lower,
@@ -537,10 +568,13 @@ def main() -> None:
         port=int(teleop_cfg.get("http_port", 7500)),
         vfk=vfk,
         grip_range=grip_range,
+        bind=bind,
+        ident=ident,
     )
     print(
-        f"[motion_teleop] control panel at http://0.0.0.0:{panel.port} — visuals "
-        "in Rerun: solid robot = target, green ghost = live arm, orange = plan",
+        f"[motion_teleop] control panel at http://{bind}:{panel.port} "
+        f"[{ident}] — visuals in Rerun: solid robot = target, green ghost = "
+        "live arm, orange = plan",
         flush=True,
     )
     node = Node()
@@ -562,8 +596,15 @@ def main() -> None:
     synced_once = False
     last_ui = 0.0
     last_ghost = 0.0
+    last_health_t = 0.0
+    health_stale_shown = False
     mgrip_f = 0.0     # live measured finger metres (gripper_state topic)
     shown_grip: float | None = None
+    # Planning runs on a WORKER thread: the 2.5 s OMPL solve used to run
+    # inline on the same loop that services ARM/DISARM/Stop clicks — the
+    # authority drop was unresponsive for the whole solve, during live motion.
+    plan_thread: threading.Thread | None = None
+    plan_box: list = []  # worker appends ("ok", traj, goal_q) | ("err", msg)
 
     while True:
         event = node.next(timeout=0.05)
@@ -596,6 +637,7 @@ def main() -> None:
                     ghost.update(np.append(measured, np.full(len(gj), mgrip_f)))
             elif event["type"] == "INPUT" and event["id"] == "motor_health":
                 health = unpack_json_message(event["value"])
+                last_health_t = now
                 was, was_fault = armed, fault
                 armed = bool(health.get("armed", False))
                 # A fault-holding server keeps its ARMED flag on purpose — the
@@ -606,6 +648,12 @@ def main() -> None:
                 panel.set_armed(armed, fault)
                 if fault and fault != was_fault:
                     panel.log(f"SERVER FAULT: {fault} — DISARM then ARM to recover")
+                    # Stop the executor NOW, same as DISARM does: a latched
+                    # server ignores commands while the executor's clock keeps
+                    # marching — the quick DISARM->ARM recovery would otherwise
+                    # re-arm onto a target up to abort-tol away (a saturated-
+                    # torque yank). The plan preview is kept for re-Execute.
+                    node.send_output("trajectory", pack_trajectory([], [], []))
                 elif was_fault and not fault:
                     panel.log("fault cleared")
                 if was is not None and was != armed:
@@ -616,6 +664,21 @@ def main() -> None:
         if now - last_ui < 0.05:
             continue
         last_ui = now
+
+        # The badge is otherwise a LATCH: if motor_health stops arriving
+        # (plant node dead, partial graph teardown) it would show green
+        # ARMED forever. Unattended, "armed and healthy" and "everything
+        # downstream is dead" must not render identically.
+        if armed is not None and last_health_t and now - last_health_t > 1.0:
+            if not health_stale_shown:
+                health_stale_shown = True
+                panel.set_armed(
+                    armed, fault or "no health from the plant bridge — state UNKNOWN"
+                )
+                panel.log("motor_health stale — plant bridge down?")
+        elif health_stale_shown:
+            health_stale_shown = False
+            panel.set_armed(armed, fault)
 
         if panel.clicked("Sync target to robot") and measured is not None:
             panel.set_sliders(measured)
@@ -675,35 +738,59 @@ def main() -> None:
         if panel.clicked("Plan + preview"):
             if measured is None:
                 panel.log("no motor state yet — cannot plan")
+            elif plan_thread is not None:
+                panel.log("still planning — wait for the current plan")
             else:
                 t_plan = time.monotonic()
-                try:
-                    pending = plan_trajectory(
-                        world, ompl, measured, target, vmax, amax,
-                        soft_speed_frac, soft_acc_floor,
-                    )
-                    panel.log(
-                        f"plan OK: {len(pending.times)} samples, "
-                        f"{pending.duration_sec:.2f}s, planned in "
-                        f"{time.monotonic() - t_plan:.2f}s — scrub 'plan_t' in "
-                        "Rerun, press Execute to run"
-                    )
-                    scene.show_target("goal", ik.fk(target))
-                    scene.show_ee_path("planned_path", pending.positions)
-                    scene.animate(pending.times, pending.positions)
-                    # Green playback frames for the web page (downsampled).
-                    grip = panel.gripper_value()
-                    idx = np.linspace(
-                        0, len(pending.times) - 1, min(len(pending.times), 45)
-                    ).astype(int)
-                    panel.set_plan(
-                        [pending.times[i] for i in idx],
-                        [vfk.poses(pending.positions[i], grip)["geoms"] for i in idx],
-                    )
-                except ValueError as exc:
-                    pending = None
-                    panel.clear_plan()
-                    panel.log(f"plan FAILED: {exc}")
+                m_snap, t_snap = measured.copy(), target.copy()
+
+                def _plan_worker(m=m_snap, t=t_snap, t0=t_plan):
+                    try:
+                        traj = plan_trajectory(
+                            world, ompl, m, t, vmax, amax,
+                            soft_speed_frac, soft_acc_floor,
+                        )
+                        plan_box.append(("ok", traj, t, t0))
+                    except ValueError as exc:
+                        plan_box.append(("err", str(exc), t, t0))
+
+                plan_thread = threading.Thread(target=_plan_worker, daemon=True)
+                plan_thread.start()
+                panel.log("planning…")
+
+        if plan_thread is not None and plan_box:
+            result = plan_box.pop()
+            plan_thread = None
+            if result[0] == "ok":
+                _, pending, goal_q, t_plan = result
+                panel.log(
+                    f"plan OK: {len(pending.times)} samples, "
+                    f"{pending.duration_sec:.2f}s, planned in "
+                    f"{time.monotonic() - t_plan:.2f}s — scrub 'plan_t' in "
+                    "Rerun, press Execute to run"
+                )
+                scene.show_target("goal", ik.fk(goal_q))
+                scene.show_ee_path("planned_path", pending.positions)
+                scene.animate(pending.times, pending.positions)
+                # Green playback frames for the web page (downsampled).
+                grip = panel.gripper_value()
+                idx = np.linspace(
+                    0, len(pending.times) - 1, min(len(pending.times), 45)
+                ).astype(int)
+                panel.set_plan(
+                    [pending.times[i] for i in idx],
+                    [vfk.poses(pending.positions[i], grip)["geoms"] for i in idx],
+                )
+                # An Execute click that queued up DURING the solve would fire
+                # on this brand-new, never-reviewed plan — consume and drop it
+                # (clicked() is consume-and-report). Execute must postdate the
+                # preview it executes.
+                panel.clicked("Execute")
+            else:
+                _, msg, _, _ = result
+                pending = None
+                panel.clear_plan()
+                panel.log(f"plan FAILED: {msg}")
 
         if panel.clicked("Execute"):
             if pending is None:
@@ -748,6 +835,11 @@ def main() -> None:
                 node.send_output("trajectory", pack_trajectory([], [], []))
                 node.send_output("arm", pack_json_message("arm", {"armed": False}))
                 panel.log("DISARM requested — authority drop (bridge verifies)")
+            else:
+                # Reachable by a programmatic supervisor before the first
+                # health message: never a SILENT no-op on the stop path.
+                panel.log("DISARM ignored — no health wire yet (sim, or "
+                          "plant bridge still starting)")
 
 
 if __name__ == "__main__":

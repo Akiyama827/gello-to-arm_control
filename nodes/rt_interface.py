@@ -62,6 +62,9 @@ def main() -> None:
     drop_warned = False
     last_fresh = True
     last_cmd_sent = 0.0
+    last_ack_seq = -1
+    last_ack_t = 0.0
+    ack_warned = False
 
     try:
         backend.open()
@@ -71,7 +74,11 @@ def main() -> None:
             flush=True,
         )
         while not shutdown.stop_requested:
-            event = node.next(0)
+            # Block IN dora (GIL released) instead of poll-then-sleep: the old
+            # `next(0)` + `time.sleep(2ms)` pattern added a measured mean
+            # ~1 ms / worst ~2 ms to EVERY command's forwarding latency —
+            # the single largest avoidable term in the whole command path.
+            event = node.next(timeout=period * 0.2)
             if event is not None:
                 etype, eid = event["type"], event.get("id", "")
                 if etype == "STOP":
@@ -115,10 +122,18 @@ def main() -> None:
                     else:
                         armed_wanted = False
                         drop_warned = False  # next disarm episode warns once again
-                        backend.safe_stop()
-                        print("[rt_interface] DISARMED", flush=True)
-            else:
-                time.sleep(period * 0.2)
+                        # safe_stop VERIFIES the drop (ack + state stream);
+                        # printing DISARMED unconditionally taught operators
+                        # to trust a line that could be false while the server
+                        # held at full stiffness (audit 2026-07-29).
+                        if backend.safe_stop() or backend.safe_stop():
+                            print("[rt_interface] DISARMED (confirmed)", flush=True)
+                        else:
+                            print(
+                                "[rt_interface] DISARM NOT CONFIRMED — server may "
+                                "still be armed; do not approach the arm",
+                                flush=True,
+                            )
 
             now = time.perf_counter()
             if now - last_step < period:
@@ -127,6 +142,29 @@ def main() -> None:
             step_count += 1
 
             health = backend.motor_health()
+            # A server that receives our stream but REJECTS every packet
+            # (joint-count mismatch, flow pinned to another port) holds
+            # silently with no fault: the ONE observable is the acked seq
+            # freezing while our sent seq advances. Say it.
+            if armed_wanted and health["armed"] and health["state_fresh"]:
+                if health["last_cmd_seq"] != last_ack_seq:
+                    last_ack_seq = health["last_cmd_seq"]
+                    last_ack_t = now
+                    ack_warned = False
+                elif (
+                    not ack_warned
+                    and last_cmd_sent
+                    and health["sent_cmd_seq"] - last_ack_seq > rate_hz
+                    and now - last_ack_t > 1.0
+                ):
+                    ack_warned = True
+                    print(
+                        f"[rt_interface] server is IGNORING our commands "
+                        f"(acked seq stuck at {last_ack_seq}, sent "
+                        f"{health['sent_cmd_seq']}) — joint count or command "
+                        "flow pin mismatch?",
+                        flush=True,
+                    )
             if health["state_fresh"] != last_fresh:
                 # Transitions are logged, not the steady state: a silent gate
                 # here made a server CMD_LOST latch undiagnosable on rung 3

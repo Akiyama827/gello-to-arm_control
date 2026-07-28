@@ -28,6 +28,7 @@
 <div id="view"></div>
 <div id="panel">
  <h3>arm teleop</h3>
+ <div id="ident" style="font-size:.75em;color:#666;margin:-.4em 0 .5em;word-break:break-all"></div>
  <div id="gate" style="display:none;margin:.3em 0 .6em">
   <span id="gatebadge" style="display:inline-block;padding:.35em .8em;border-radius:5px;
         font-weight:bold;color:#fff;background:#888">&hellip;</span>
@@ -222,6 +223,14 @@ async function build(s){
 async function poll(){
  let s;
  try { s = await (await fetch('state')).json(); } catch { return; }
+ if (s.ident){  // which arm/config this page drives — a sim tab reattaching
+  const el = document.getElementById('ident');   // to a REAL graph must scream
+  const real = s.ident.includes('real');
+  el.textContent = (real ? 'REAL ARM — ' : '') + s.ident;
+  el.style.color = real ? '#c62828' : '#666';
+  el.style.fontWeight = real ? 'bold' : 'normal';
+  document.title = (real ? 'REAL ' : 'sim ') + 'arm teleop';
+ }
  if (!built && !building){ await build(s); }
  else if (built && !sliderDrag){ sync(joints, s.sliders, 2); sync([grip], [s.gripper], 3); }
  setPoses(measured, s.measured_geoms);

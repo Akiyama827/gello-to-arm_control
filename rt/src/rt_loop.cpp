@@ -116,20 +116,50 @@ void rt_loop(ServerCtx& ctx) {
 
   bool plant_ok = true;  // false after any backend failure; reset only by ARM
   uint64_t seen_gen = ctx.arm_gen.load(std::memory_order_acquire);
+  int read_fail_streak = 0;
+  uint64_t cmd_v_seen = 0;  // survives a seqlock read-collision tick (read()
+                            // returns 0 on retry exhaustion; without the cache
+                            // that tick reads as "stale" and flaps into hold)
 
   while (!ctx.shutdown.load()) {
     if (!backend->read(ps)) {
-      ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
+      // Latch only while ARMED: a transient read hiccup on a DISARMED idle
+      // server was blocking the NEXT arm (nothing is being written, so there
+      // is nothing to protect — and the first armed write re-latches anyway
+      // if the plant is really down).
+      if (ctx.armed.load(std::memory_order_acquire)) {
+        ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
+      } else if (read_fail_streak == 0) {
+        std::fprintf(stderr, "[rt] plant read failed while disarmed (%s) — "
+                             "not latching\n", backend->fault_text().c_str());
+      }
       plant_ok = false;
-      timespec ts{0, long(backend->tick_s() * 1e9)};
+      // A dead plant retried at 1 kHz is a 1 kHz exception-throw loop on the
+      // SCHED_FIFO thread (allocation + unwinding, heap growth over hours).
+      // Pace failures at 100 ms; nothing is being written anyway. Past ~5 s
+      // of continuous failure, exit nonzero: franka::Robot is constructed
+      // once and never rebuilt, so a control-box power cycle bricks this
+      // process forever — systemd restarting us is the only recovery that
+      // works unattended.
+      if (++read_fail_streak >= 50) {
+        std::fprintf(stderr, "[rt] plant unreachable for %.0fs — exiting for "
+                             "a clean restart\n", 50 * 0.1);
+        ctx.failed.store(true);
+        ctx.shutdown.store(true);
+        return;
+      }
+      timespec ts{0, 100'000'000};
       nanosleep(&ts, nullptr);
       continue;
     }
+    read_fail_streak = 0;
     const uint64_t now = mono_ns();
     const bool armed = ctx.armed.load(std::memory_order_acquire);
     bool faulted = ctx.fault.load(std::memory_order_acquire);
 
-    const uint64_t cmd_v = ctx.cmd_in.read(cmd);
+    const uint64_t cmd_v_raw = ctx.cmd_in.read(cmd);
+    if (cmd_v_raw != 0) cmd_v_seen = cmd_v_raw;  // collision -> keep previous
+    const uint64_t cmd_v = cmd_v_seen;
     const uint64_t rx_ns = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
     // SIGNED, clamped age. rx_ns is stamped by udp_rx (or the ARM handler)
     // in parallel with this tick: a packet stamped between our `now` sample

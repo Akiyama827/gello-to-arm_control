@@ -58,6 +58,9 @@ nodes:
       ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka_rt.yaml
     inputs:
       motor_state: plant_interface/motor_state
+      # Replay is a second motion-authority path (file trigger, no page in
+      # front of it): it refuses while DISARMED or fault-latched.
+      motor_health: plant_interface/motor_health
     outputs:
       - trajectory
 

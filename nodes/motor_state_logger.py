@@ -36,7 +36,13 @@ def main() -> None:
     cfg = _load_cfg()
     n = int(cfg.get("num_motors", 7))
     motor_names = list(cfg.get("motor_names") or [f"motor_{i}" for i in range(n)])
-    path = Path(str(cfg.get("motor_log_path") or "/tmp/arm_control_motor_state.csv"))
+    base = Path(str(cfg.get("motor_log_path") or "/tmp/arm_control_motor_state.csv"))
+    # One file PER RUN: appending forever grows ~200 MB/hour at 100 Hz with
+    # no ceiling — days-to-disk-full on an unattended box, and every past
+    # session's rows pollute the current analysis anyway.
+    path = base.with_name(
+        f"{base.stem}_{time.strftime('%Y%m%d_%H%M%S')}{base.suffix}"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = ["elapsed_s"] + [
         f"{name}_{suffix}"
@@ -46,11 +52,12 @@ def main() -> None:
 
     node = Node()
     start = time.monotonic()
+    last_flush = start
     q_des = np.full(n, np.nan)  # latest commanded target (graphs without one: nan)
-    with path.open("a", newline="") as f:
+    print(f"[motor_state_logger] logging to {path}", flush=True)
+    with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
-        if f.tell() == 0:
-            writer.writeheader()
+        writer.writeheader()
         for event in node:
             if event["type"] == "STOP":
                 break
@@ -61,7 +68,10 @@ def main() -> None:
             elif event["id"] == "motor_state":
                 state = unpack_motor_state(event["value"], n)
                 writer.writerow(_row(time.monotonic() - start, motor_names, state, q_des))
-                f.flush()
+                now = time.monotonic()
+                if now - last_flush >= 1.0:  # not per-row: 100 syscalls/s
+                    last_flush = now
+                    f.flush()
 
 
 if __name__ == "__main__":

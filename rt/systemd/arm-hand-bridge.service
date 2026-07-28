@@ -11,9 +11,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ok
-ExecStart=/home/ok/arm_rt/hand_bridge 172.16.0.3
+# args: <robot-ip> <port> <bind-ip>; bind to the PC direct link only.
+ExecStart=/home/ok/arm_rt/hand_bridge 172.16.0.3 47802 172.16.1.2
 Restart=always
 RestartSec=2
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target

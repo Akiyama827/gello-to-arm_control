@@ -44,6 +44,7 @@ class JointTrajectoryExecutor:
         max_torque: np.ndarray,
         done_pos_tol: float = 1e-3,
         done_vel_tol: float = 1e-2,
+        gravity_comp: bool = False,
     ) -> None:
         n = len(list(joint_names))
         for arr, name in (
@@ -65,6 +66,11 @@ class JointTrajectoryExecutor:
         self._payload_mass = 0.0
         self._payload_frame = ""
         self._payload_com: np.ndarray | None = None
+        # Plant compensates gravity itself (FR3 control box): ship RNEA MINUS
+        # gravity. The subtraction happens HERE, before the torque clamp — a
+        # post-clamp subtraction downstream let |tau| reach clamp+|g| and made
+        # the configured torque_limits decorative (audit 2026-07-29).
+        self._gravity_comp = bool(gravity_comp)
         self._traj: JointTrajectory | None = None
         self._t_start: float = 0.0
         # Leg-completion tolerances. Joint stiction (frictionloss vs the soft
@@ -90,20 +96,30 @@ class JointTrajectoryExecutor:
     def kd(self) -> np.ndarray:
         return self._kd.copy()
 
-    def hold_command(self, state: JointState) -> JointServoCommand:
-        """Static hold at the MEASURED pose: zero desired velocity, gravity-only
-        feedforward, current gains, torque-clamped.
+    def hold_command(
+        self, state: JointState, q_des: np.ndarray | None = None
+    ) -> JointServoCommand:
+        """Static hold: zero desired velocity, gravity-only feedforward,
+        current gains, torque-clamped.
+
+        ``state`` is the MEASURED state — gravity is always evaluated at the
+        real pose (evaluating it at a latched anchor while a downstream stage
+        subtracted it at the measured pose left a spurious g(anchor)-g(meas)
+        feedforward that grew with the latch offset). ``q_des`` is the anchor
+        to servo toward; default is the measured pose itself.
 
         The safe freeze/keepalive primitive — unlike replaying the last
         trajectory sample it can never carry a nonzero qd_des or a
         motion-computed tau_ff into a hold.
         """
         q = np.asarray(state.position, dtype=float).copy()
-        tau = np.clip(
-            self._dyn.gravity(q) + self._payload_tau(q), -self._max_tau, self._max_tau
-        )
+        tau = self._dyn.gravity(q) + self._payload_tau(q)
+        if self._gravity_comp:
+            tau = tau - self._dyn.gravity(q)  # plant adds gravity itself
+        tau = np.clip(tau, -self._max_tau, self._max_tau)
+        anchor = q if q_des is None else np.asarray(q_des, dtype=float).copy()
         return JointServoCommand(
-            q_des=q,
+            q_des=anchor,
             qd_des=np.zeros_like(q),
             tau_ff=tau,
             kp=self._kp.copy(),
@@ -170,11 +186,10 @@ class JointTrajectoryExecutor:
         actual_dt = max(t1 - tau_local, 1e-9)
         qdd = (pt_next.velocity - pt.velocity) / actual_dt
         tau_ff = self._dyn.rnea(state.position, pt.velocity, qdd)
-        tau_ff = np.clip(
-            tau_ff + self._payload_tau(np.asarray(state.position, dtype=float)),
-            -self._max_tau,
-            self._max_tau,
-        )
+        tau_ff = tau_ff + self._payload_tau(np.asarray(state.position, dtype=float))
+        if self._gravity_comp:
+            tau_ff = tau_ff - self._dyn.gravity(state.position)
+        tau_ff = np.clip(tau_ff, -self._max_tau, self._max_tau)
         return JointServoCommand(
             q_des=pt.position.copy(),
             qd_des=pt.velocity.copy(),

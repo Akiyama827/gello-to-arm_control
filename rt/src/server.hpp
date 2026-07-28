@@ -46,6 +46,10 @@ struct ServerConfig {
   int rt_priority = 80;     // SCHED_FIFO; failure to set is a warning, not fatal
   int rt_cpu = -1;          // pin the SERVO thread here (an isolcpus core);
                             // comms threads float on the housekeeping cores
+  // Bind address for BOTH listeners. Default any: the box is dual-NIC (PC
+  // direct link + robot LAN) and INADDR_ANY answers on the robot LAN too —
+  // production units should pass --bind <direct-link-ip>.
+  uint32_t bind_addr = 0;   // network order; 0 = INADDR_ANY
 };
 
 struct ServerCtx {
@@ -74,6 +78,13 @@ struct ServerCtx {
   // armed arm (a stray tool's zero-gain prime packet was enough to kill the
   // hold spring before the gains snapshot; the pin closes the whole class).
   std::atomic<uint32_t> ctl_peer_ip{0};
+  // The command FLOW pin: the IP check alone is not enough, because every
+  // PC-side tool shares the control client's IP — a stray same-host tool's
+  // zero-gain prime packet would be accepted as a fresh command and become
+  // the gains snapshot of an ARMED arm (audit 2026-07-29, three independent
+  // reviewers). ARM clears this; udp_rx pins the first post-ARM sender's
+  // UDP source port and drops every other port until the next ARM.
+  std::atomic<uint16_t> cmd_owner_port{0};  // network order; 0 = unpinned
   std::atomic<bool> armed{false};
   std::atomic<bool> fault{false};
   std::atomic<bool> fault_claim{false};  // CAS gate: exactly one latch writes
@@ -98,7 +109,7 @@ struct ServerCtx {
   sockaddr_in peer = {};
   bool have_peer = false;
 
-  int udp_fd = -1;
+  std::atomic<int> udp_fd{-1};  // udp_rx writes, state_tx reads
 
   void latch(uint32_t code, const char* text) {
     bool expected = false;  // first cause wins, decided by ONE atomic claim

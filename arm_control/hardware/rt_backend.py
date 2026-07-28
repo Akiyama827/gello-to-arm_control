@@ -47,6 +47,11 @@ class RtConfig:
     tcp_port: int = 47801
     state_timeout_s: float = 0.5
     ack_timeout_s: float = 2.0
+    # Refuse servers whose command deadman is slower than this (0 disables).
+    # The handguide bench runs --fault-ms 3600000; a COMMANDER graph against
+    # that server has no staleness reflex at all — the HELLO now carries the
+    # server's launch flags exactly so this check can exist.
+    max_fault_ms: float = 0.0
 
     @classmethod
     def from_config(cls, cfg) -> "RtConfig":
@@ -57,6 +62,7 @@ class RtConfig:
             tcp_port=int(raw.get("tcp_port", 47801)),
             state_timeout_s=float(raw.get("state_timeout_s", 0.5)),
             ack_timeout_s=float(raw.get("ack_timeout_s", 2.0)),
+            max_fault_ms=float(raw.get("max_fault_ms", 0.0)),
         )
 
 
@@ -81,6 +87,8 @@ class RtBackend:
         self._cmd_seq = 0
         self._last_send_t = 0.0
         self._last_send_err = 0.0
+        self._link_rx_t = 0.0  # ANY state arrival (vs _state_rx_t = new content)
+        self._send_lock = threading.Lock()  # node thread + _ctl_loop PONG
 
     @classmethod
     def from_config(cls, cfg) -> "RtBackend":
@@ -112,7 +120,21 @@ class RtBackend:
                 f"server drives {hello.arg} joints, config says {self.n} "
                 f"({self.joint_names})"
             )
-        self.backend_name = hello.text
+        # HELLO text: "<backend> hold_ms=<v> fault_ms=<v>" (older servers send
+        # the bare name — the flags are then unknown and unchecked).
+        parts = hello.text.split()
+        self.backend_name = parts[0] if parts else hello.text
+        flags = dict(
+            p.split("=", 1) for p in parts[1:] if "=" in p
+        )
+        fault_ms = float(flags.get("fault_ms", 0) or 0)
+        if self.config.max_fault_ms > 0 and fault_ms > self.config.max_fault_ms:
+            raise RtLinkError(
+                f"server --fault-ms {fault_ms:.0f} exceeds rt.max_fault_ms "
+                f"{self.config.max_fault_ms:.0f} — this looks like a handguide "
+                "server (no command deadman); restart arm_rt_server with its "
+                "normal flags before running a commander graph"
+            )
         self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._udp.connect((cfg.host, cfg.udp_port))
         self._udp.settimeout(0.2)
@@ -166,6 +188,11 @@ class RtBackend:
         while time.monotonic() < deadline:
             state, rx_t = self.latest_state()
             if state is not None and rx_t > 0 and not state.armed:
+                # Confirmed drop clears the client-side latch too — the server
+                # cleared its own on DISARM, and a stale fault string here
+                # keeps the panel demanding a recovery cycle the operator
+                # already performed (trains them to ignore the fault badge).
+                self._latched_fault = ""
                 return True
             time.sleep(0.01)
         print("[rt_link] disarm not yet reflected in the state stream", flush=True)
@@ -256,11 +283,20 @@ class RtBackend:
 
     def motor_health(self) -> dict:
         state, rx_t = self.latest_state()
-        age = time.monotonic() - rx_t if rx_t > 0 else float("inf")
+        now = time.monotonic()
+        age = now - rx_t if rx_t > 0 else float("inf")
         stale = age > self.config.state_timeout_s
-        fault = self._latched_fault or (
-            f"rt state stream stale ({age:.2f}s)" if stale and rx_t > 0 else ""
-        )
+        link_age = now - self._link_rx_t if self._link_rx_t > 0 else float("inf")
+        if stale and rx_t > 0:
+            # Two distinct failures share the staleness symptom; say which.
+            stale_msg = (
+                f"rt servo frozen ({age:.2f}s, link alive)"
+                if link_age <= self.config.state_timeout_s
+                else f"rt state stream stale ({age:.2f}s)"
+            )
+        else:
+            stale_msg = ""
+        fault = self._latched_fault or stale_msg
         return {
             # The server's flag VERBATIM. "I cannot see the server" must
             # never be reported as "the arm is not armed" — an armed arm
@@ -291,8 +327,18 @@ class RtBackend:
             except ValueError:
                 continue
             with self._state_lock:
+                # CONTENT freshness, not arrival freshness: the server
+                # deliberately re-sends the last packet at ~10 Hz while its
+                # RT thread is inside a blocking plant call, precisely so the
+                # client can tell "link alive, servo busy" from "link dead".
+                # Stamping every arrival made a frozen servo read as healthy
+                # forever (the client half of that contract was never
+                # implemented — audit 2026-07-29).
+                now = time.monotonic()
+                self._link_rx_t = now
+                if self._state is None or state.state_seq != self._state.state_seq:
+                    self._state_rx_t = now
                 self._state = state
-                self._state_rx_t = time.monotonic()
 
     def _ctl_loop(self) -> None:
         buf = b""
@@ -320,13 +366,31 @@ class RtBackend:
             elif msg.ctl_type == rtp.CTL_STATUS:
                 self._status_q.put(msg)
             elif msg.ctl_type == rtp.CTL_PING:
-                self._send_control(rtp.CTL_PONG)
+                try:
+                    self._send_control(rtp.CTL_PONG)
+                except RtLinkError:
+                    # Session is gone; the server's deadman will latch. This
+                    # thread exiting cleanly beats a traceback-killed daemon.
+                    self._latched_fault = (
+                        self._latched_fault or "rt control session closed"
+                    )
+                    return
 
     def _send_control(self, ctl_type: int, text: str = "") -> None:
         pkt = rtp.pack_control(
             ctl_type=ctl_type, seq=0, arg=0, t_mono_ns=time.monotonic_ns(), text=text
         )
-        self._tcp.sendall(pkt)
+        try:
+            # Two writers share this socket (node thread + the PONG reply in
+            # _ctl_loop); interleaved partial sends would corrupt the framing.
+            with self._send_lock:
+                self._tcp.sendall(pkt)
+        except OSError as exc:
+            # socket.timeout / BrokenPipeError are OSError, NOT RtLinkError —
+            # unconverted they sailed past every caller's except clause and
+            # killed the plant node on the DISARM path of all places (audit
+            # 2026-07-29). One guard here fixes every caller.
+            raise RtLinkError(f"control link down: {exc}") from exc
 
     def _control_roundtrip(self, ctl_type: int) -> rtp.Control:
         while not self._status_q.empty():  # drop stale acks

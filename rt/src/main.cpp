@@ -7,6 +7,8 @@
 // a brain. Torque ceilings, staleness thresholds and slew are launch-time
 // safety config; everything task-shaped (gains schedules, grasp policy,
 // phases, planning) stays on the PC and arrives per-tick in CommandPackets.
+#include <arpa/inet.h>
+
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -28,8 +30,17 @@ void usage(const char* argv0) {
       "usage: %s [--backend fake|franka|dm] [--n N] [--udp-port P] [--tcp-port P]\n"
       "          [--state-hz HZ] [--hold-ms MS] [--fault-ms MS] [--slew NM]\n"
       "          [--hold-kp V] [--hold-kd V] [--franka-ip IP] [--can-if IF]\n"
-      "          [--rt-priority N] [--rt-cpu CPU]\n",
+      "          [--rt-priority N] [--rt-cpu CPU] [--bind IP]\n",
       argv0);
+}
+
+uint16_t parse_port(const char* flag, const char* value) {
+  const long p = std::atol(value);
+  if (p < 1 || p > 65535) {  // atoi-into-uint16 silently truncates 70000->4464
+    std::fprintf(stderr, "%s must be 1..65535 (got %s)\n", flag, value);
+    std::exit(2);
+  }
+  return uint16_t(p);
 }
 
 } // namespace
@@ -47,8 +58,16 @@ int main(int argc, char** argv) {
     };
     if (!std::strcmp(argv[i], "--backend")) cfg.backend = next("--backend");
     else if (!std::strcmp(argv[i], "--n")) cfg.n = std::atoi(next("--n"));
-    else if (!std::strcmp(argv[i], "--udp-port")) cfg.udp_port = uint16_t(std::atoi(next("--udp-port")));
-    else if (!std::strcmp(argv[i], "--tcp-port")) cfg.tcp_port = uint16_t(std::atoi(next("--tcp-port")));
+    else if (!std::strcmp(argv[i], "--udp-port")) cfg.udp_port = parse_port("--udp-port", next("--udp-port"));
+    else if (!std::strcmp(argv[i], "--tcp-port")) cfg.tcp_port = parse_port("--tcp-port", next("--tcp-port"));
+    else if (!std::strcmp(argv[i], "--bind")) {
+      in_addr a{};
+      if (inet_pton(AF_INET, next("--bind"), &a) != 1) {
+        std::fprintf(stderr, "--bind needs a dotted IPv4 address\n");
+        return 2;
+      }
+      cfg.bind_addr = a.s_addr;
+    }
     else if (!std::strcmp(argv[i], "--state-hz")) cfg.state_hz = std::atof(next("--state-hz"));
     else if (!std::strcmp(argv[i], "--hold-ms")) cfg.hold_ms = std::atof(next("--hold-ms"));
     else if (!std::strcmp(argv[i], "--fault-ms")) cfg.fault_ms = std::atof(next("--fault-ms"));

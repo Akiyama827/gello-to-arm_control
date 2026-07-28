@@ -35,11 +35,15 @@ from dora import Node
 from arm_control.config import load_robot_config
 from arm_control.messages import pack_json_message, unpack_motor_command
 
+import os
+
 DEADBAND_M = 0.002  # commanded-width change below this is slider noise
 MOVE_SPEED = 0.10   # m/s — brisk but gentle; the Hand's max is 0.2
 SETTLE_S = 0.15     # slider must rest this long before a goal is sent —
                     # one gesture becomes ONE move, not a queue of steps
-HOME_FILE = Path("/tmp/arm_gripper_home")
+# User-private runtime dir, not /tmp: this file triggers a PHYSICAL open-close
+# sweep of the jaws — it must not be any local user's to touch.
+HOME_FILE = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "arm_gripper_home"
 
 
 class BridgeClient(threading.Thread):

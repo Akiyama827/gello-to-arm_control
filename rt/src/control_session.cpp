@@ -55,6 +55,11 @@ uint32_t flags_snapshot(const ServerCtx& ctx) {
 void serve_client(ServerCtx& ctx, int fd) {
   const int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  // A peer that stops draining must not wedge this thread mid-send forever
+  // (the deadman below never runs while send() blocks, and shutdown joins
+  // hang until SIGKILL). A short send timeout turns that into session loss.
+  timeval stv{0, 500'000};
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
   // HELLO only once the backend exists — a client connecting during franka
   // construction (~1 s) must not be told "0 joints".
   for (int i = 0; i < 300 && !ctx.backend_ready.load() && !ctx.shutdown.load();
@@ -62,7 +67,14 @@ void serve_client(ServerCtx& ctx, int fd) {
     timespec ts{0, 10'000'000};
     nanosleep(&ts, nullptr);
   }
-  send_frame(fd, make(CTL_HELLO, uint32_t(ctx.backend_n.load()), ctx.backend_name));
+  // HELLO text carries the launch-time SAFETY flags, not just the backend
+  // name: the client must be able to refuse a server whose deadman is
+  // configured for hand-guiding (--fault-ms 3600000) — a commander graph
+  // against that server has no staleness reflex at all (audit 2026-07-29).
+  char hello[96];
+  std::snprintf(hello, sizeof(hello), "%s hold_ms=%.0f fault_ms=%.0f",
+                ctx.backend_name, ctx.cfg.hold_ms, ctx.cfg.fault_ms);
+  send_frame(fd, make(CTL_HELLO, uint32_t(ctx.backend_n.load()), hello));
 
   // Session deadman: the client answers CTL_PING with CTL_PONG, so a healthy
   // idle link always has traffic. A yanked cable / dead PC leaves a half-open
@@ -76,8 +88,12 @@ void serve_client(ServerCtx& ctx, int fd) {
   ControlPacket rx;
   size_t have = 0;
   while (!ctx.shutdown.load()) {
-    if (ctx.fault_event_pending.exchange(false)) {
-      send_frame(fd, make(CTL_FAULT, ctx.fault_code.load(), ctx.fault_text));
+    if (ctx.fault_event_pending.load()) {
+      // Clear only on a DELIVERED frame — consuming the flag before a failed
+      // send loses the one CTL_FAULT event this latch will ever emit.
+      if (!send_frame(fd, make(CTL_FAULT, ctx.fault_code.load(), ctx.fault_text)))
+        break;
+      ctx.fault_event_pending.store(false);
     }
     const uint64_t now = mono_ns();
     if (now - last_ping_ns > PING_EVERY_NS) {
@@ -105,17 +121,27 @@ void serve_client(ServerCtx& ctx, int fd) {
           // (authority is deliberately retained) — the FAULTED bit is the
           // refusal, and clients must check it, not just ARMED.
           send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), ctx.fault_text));
+        } else if (ctx.armed.load()) {
+          // Already armed: ACK without a generation bump. A duplicate ARM
+          // (double click, client retry after a lost ack) must not tear down
+          // and re-open the live torque session mid-flight — the arm_gen edge
+          // makes the RT loop run backend->stop() + session re-open inside
+          // one tick, a multi-ms gap libfranka can reject under load.
+          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "already armed"));
         } else {
           // The staleness clock starts AT ARM, not at the first command
           // (same semantics as the bench bridges): without this, re-arming
           // after any pause instantly re-latches on the OLD command age.
           ctx.last_cmd_rx_ns.store(mono_ns());
-          {
-            // ...and so does the command epoch: whatever sits in the seqlock
-            // (address-teach prime, pre-fault leftovers) is not authority.
-            CommandPacket scratch;
-            ctx.cmd_epoch.store(ctx.cmd_in.read(scratch));
-          }
+          // ...and so does the command epoch: whatever sits in the seqlock
+          // (address-teach prime, pre-fault leftovers) is not authority.
+          // sequence() — NOT read(): a bounded read() that collides with a
+          // mid-write returns 0, and an epoch of 0 re-admits every pre-ARM
+          // packet ever written. The raw counter can never be a spurious 0.
+          ctx.cmd_epoch.store(ctx.cmd_in.sequence());
+          // New ARM = new command flow: udp_rx re-pins the source port to
+          // the first post-ARM sender (see server.hpp: cmd_owner_port).
+          ctx.cmd_owner_port.store(0);
           // Generation bump makes this ARM visible to the RT loop even if a
           // DISARM->ARM pair fits between two 1 kHz samples of `armed`.
           ctx.arm_gen.fetch_add(1);
@@ -155,7 +181,7 @@ void control_thread(ServerCtx& ctx) {
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
   sockaddr_in addr = {};
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_addr.s_addr = ctx.cfg.bind_addr ? ctx.cfg.bind_addr : INADDR_ANY;
   addr.sin_port = htons(ctx.cfg.tcp_port);
   if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
       listen(fd, 1) != 0) {
@@ -172,6 +198,21 @@ void control_thread(ServerCtx& ctx) {
     const int client =
         accept(fd, reinterpret_cast<sockaddr*>(&peer), &peerlen);
     if (client < 0) continue;
+    // An ARMED (typically fault-holding after CTL_LOST) arm must not hand
+    // authority to whoever connects next: only the SAME host that armed it
+    // may reclaim the session (its graph restarting is the recovery path).
+    // A different host gets a refusal and the pin stays untouched.
+    const uint32_t owner = ctx.ctl_peer_ip.load();
+    if (ctx.armed.load() && owner != 0 && peer.sin_addr.s_addr != owner) {
+      char buf[INET_ADDRSTRLEN] = {};
+      inet_ntop(AF_INET, &peer.sin_addr, buf, sizeof(buf));
+      std::fprintf(stderr, "[rt] refusing control client %s (armed; owner "
+                           "is the arming host)\n", buf);
+      send_frame(client, make(CTL_STATUS, flags_snapshot(ctx),
+                              "refused: armed by another host"));
+      close(client);
+      continue;
+    }
     // The control client's address is the ONLY source udp_rx will accept
     // commands from while armed (see server.hpp: ctl_peer_ip).
     ctx.ctl_peer_ip.store(peer.sin_addr.s_addr);

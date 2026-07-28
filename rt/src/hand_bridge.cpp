@@ -59,6 +59,7 @@ struct Action {
 std::mutex act_mx;
 std::condition_variable act_cv;
 Action act_pending;
+uint64_t stop_seq = 0;  // under act_mx; bumped by every GSTOP
 
 void post(int kind, double w = 0, double s = 0) {
   {
@@ -68,14 +69,21 @@ void post(int kind, double w = 0, double s = 0) {
   act_cv.notify_one();
 }
 
-void clear_pending() {
+// GSTOP must be STICKY: clearing the mailbox alone loses the race where the
+// actor already drained the goal but has not executed it yet (it can be
+// inside a 2 s reconnect backoff) — stop() then hits an idle Hand as a no-op
+// and the jaws close AFTER the emergency stop. The sequence number kills any
+// action taken before the stop, wherever it is in the actor's pipeline.
+void gstop_pending() {
   std::lock_guard<std::mutex> lk(act_mx);
   act_pending = {};
+  ++stop_seq;
 }
 
 void actor(const char* robot_ip) {
   std::unique_ptr<franka::Gripper> hand;
   Action a{};
+  uint64_t my_seq = 0;
   bool warned = false;
   for (;;) {
     {
@@ -83,10 +91,12 @@ void actor(const char* robot_ip) {
       if (act_pending.kind != 0) {
         a = act_pending;  // a newer goal replaces a retry-pending one
         act_pending = {};
+        my_seq = stop_seq;
       } else if (a.kind == 0) {
         act_cv.wait(lk, [] { return act_pending.kind != 0; });
         a = act_pending;
         act_pending = {};
+        my_seq = stop_seq;
       }
     }
     if (!hand) {
@@ -102,6 +112,16 @@ void actor(const char* robot_ip) {
         }
         std::this_thread::sleep_for(std::chrono::seconds(2));
         continue;  // `a` stays pending; a newer goal may replace it above
+      }
+    }
+    {
+      // Re-check under the lock immediately before executing: a GSTOP that
+      // landed while we were connecting outranks the action we carried here.
+      std::lock_guard<std::mutex> lk(act_mx);
+      if (my_seq != stop_seq) {
+        std::printf("[hand] action dropped (GSTOP outranks it)\n");
+        a = {};
+        continue;
       }
     }
     try {
@@ -120,6 +140,13 @@ void actor(const char* robot_ip) {
     } catch (const franka::Exception& e) {
       // CommandException — e.g. a GSTOP aborted the move. Session is fine.
       std::printf("[hand] action ended: %s\n", e.what());
+      a = {};
+    } catch (const std::exception& e) {
+      // Anything else escaping a DETACHED thread is std::terminate — which
+      // takes the reader session and the PC link down with it.
+      std::printf("[hand] cmd session unexpected error (%s) — resetting\n",
+                  e.what());
+      hand.reset();
       a = {};
     }
   }
@@ -166,7 +193,7 @@ void serve(int fd, const char* robot_ip) {
         } else if (!std::strcmp(line, "HOME")) {
           post(2);
         } else if (!std::strcmp(line, "GSTOP")) {
-          clear_pending();
+          gstop_pending();  // sticky: kills a drained-but-unexecuted action too
           if (hand) {
             try {
               // Cross-session stop: aborts the actor's in-flight move (the
@@ -183,6 +210,13 @@ void serve(int fd, const char* robot_ip) {
       }
       have = std::strlen(line);
       std::memmove(buf, line, have);
+      if (have == sizeof(buf) - 1) {
+        // A full buffer with no newline would make the next recv length 0 —
+        // recv returns 0, and that reads as "client disconnected". Resync
+        // instead of dropping a healthy session over one garbage line.
+        std::printf("[hand] oversized line — resyncing\n");
+        have = 0;
+      }
     }
 
     if (hand && mono_s() - last_state >= 0.1) {
@@ -207,7 +241,20 @@ void serve(int fd, const char* robot_ip) {
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);  // journald/file logs must not sit in a 4K buffer
   const char* robot_ip = argc > 1 ? argv[1] : "172.16.0.3";
-  const uint16_t port = argc > 2 ? uint16_t(std::atoi(argv[2])) : 47802;
+  const long port_arg = argc > 2 ? std::atol(argv[2]) : 47802;
+  if (port_arg < 1 || port_arg > 65535) {
+    std::fprintf(stderr, "[hand] port must be 1..65535\n");
+    return 2;
+  }
+  const uint16_t port = uint16_t(port_arg);
+  // Optional bind address: this box is dual-NIC and INADDR_ANY answers on
+  // the robot LAN too — anything routable there could drive the jaws.
+  in_addr bind_ip{};
+  bind_ip.s_addr = INADDR_ANY;
+  if (argc > 3 && inet_pton(AF_INET, argv[3], &bind_ip) != 1) {
+    std::fprintf(stderr, "[hand] bind arg must be a dotted IPv4 address\n");
+    return 2;
+  }
 
   std::thread(actor, robot_ip).detach();
 
@@ -216,7 +263,7 @@ int main(int argc, char** argv) {
   setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
   sockaddr_in addr = {};
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_addr = bind_ip;
   addr.sin_port = htons(port);
   if (bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
       listen(lfd, 1) != 0) {

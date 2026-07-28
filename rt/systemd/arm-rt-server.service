@@ -15,9 +15,17 @@ Type=simple
 # CPUAffinity= line — pinning the whole process would put the SCHED_OTHER
 # comms threads on the servo core, where a preempted seqlock writer competes
 # with the FIFO reader for the same cycles.
-ExecStart=/opt/arm_rt/arm_rt_server --backend franka --franka-ip 172.16.0.3 --rt-cpu 3
-Restart=on-failure
+# --bind: answer ONLY on the PC direct link — the box is dual-NIC and the
+# default INADDR_ANY would take commands from the robot LAN too.
+ExecStart=/opt/arm_rt/arm_rt_server --backend franka --franka-ip 172.16.0.3 --rt-cpu 3 --bind 172.16.1.2
+# always, not on-failure: an appliance must come back from EVERY exit —
+# including the deliberate clean exit the server now makes after 5 s of
+# unreachable plant (franka::Robot is built once; a control-box power cycle
+# needs a fresh process). No start-limit: keep retrying while the plant
+# is down rather than giving up after 5 attempts.
+Restart=always
 RestartSec=2
+StartLimitIntervalSec=0
 # RT scheduling + locked memory; pair with a PREEMPT_RT kernel and the
 # limits documented in rt/README.md.
 LimitMEMLOCK=infinity
