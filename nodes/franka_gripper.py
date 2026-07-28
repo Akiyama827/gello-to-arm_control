@@ -9,7 +9,7 @@ owned by ``rt/src/hand_bridge.cpp`` on the box (robot LAN, no NAT), and
 this node speaks its dumb TCP line protocol over the direct link:
 
     -> "MOVE <width_m> <speed_mps>"  |  "HOME"  |  "GSTOP"
-    <-  "STATE <width_m> <0|1>"      (~5 Hz)
+    <-  "STATE <width_m> <0|1>"      (~10 Hz, streams DURING moves too)
 
 Input ``gripper``: motor_command_gripper format (finger metres, e.g. the
 teleop slider), latest-wins with a 2 mm width deadband. Output
@@ -145,7 +145,7 @@ def main() -> None:
             print("[franka_gripper] homing requested (keep fingers clear)", flush=True)
         now = time.monotonic()
         state = client.state
-        if now - last_pub >= 0.2 and state is not None:
+        if now - last_pub >= 0.1 and state is not None:
             last_pub = now
             node.send_output(
                 "gripper_state", pack_json_message("gripper_state", state)

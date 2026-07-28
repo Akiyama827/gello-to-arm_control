@@ -496,8 +496,14 @@ def main() -> None:
     )
     init_preview_stream(teleop_cfg.get("preview"))
     ee_link = ee_frame(cfg)
-    target_robot = RobotGhost(cfg.urdf_path, planned, "target")  # solid = target
-    ghost = MeasuredGhost(cfg.urdf_path, planned)
+    vfk = VisualFK(cfg.urdf_path, planned, ee_link, gripper_joints(cfg))
+    # URDF-present finger joints (vfk already filtered them). The Rerun ghosts
+    # carry them too: target fingers mirror the SLIDER, measured-ghost fingers
+    # mirror the LIVE width — frozen URDF-default fingers on the live ghost
+    # read as a rendering bug (bench-reported, same round as PreviewScene's).
+    gj = list(vfk.finger_joints)
+    target_robot = RobotGhost(cfg.urdf_path, planned + gj, "target")  # solid = target
+    ghost = MeasuredGhost(cfg.urdf_path, planned + gj)
     # restarts=1: only the current-target seed, so a Cartesian drag follows the
     # NEAREST IK branch and never jumps the arm to a different fold mid-drag.
     ik = PinocchioIK(cfg.urdf_path, ee_link, planned, restarts=1)
@@ -505,9 +511,9 @@ def main() -> None:
     # PreviewScene: the MuJoCo collision world has no body for a fixed-joint EE
     # frame such as the FR3's fr3_hand_tcp).
     scene = PreviewScene(
-        ik.fk, urdf_path=cfg.urdf_path, joint_names=planned, ee_link=ee_link
+        ik.fk, urdf_path=cfg.urdf_path, joint_names=planned, ee_link=ee_link,
+        gripper_joints=gj,
     )
-    vfk = VisualFK(cfg.urdf_path, planned, ee_link, gripper_joints(cfg))
     # First mimic entry = the gripper's motor slot, whatever this arm calls it.
     mimic = next(
         (dict(m) for m in (cfg.get("joint_mimics") or {}).values() if isinstance(m, dict)),
@@ -556,6 +562,8 @@ def main() -> None:
     synced_once = False
     last_ui = 0.0
     last_ghost = 0.0
+    mgrip_f = 0.0     # live measured finger metres (gripper_state topic)
+    shown_grip: float | None = None
 
     while True:
         event = node.next(timeout=0.05)
@@ -576,10 +584,16 @@ def main() -> None:
                     synced_once = True
                 if now - last_ghost >= 0.1:
                     last_ghost = now
-                    ghost.update(measured)
+                    ghost.update(np.append(measured, np.full(len(gj), mgrip_f)))
             elif event["type"] == "INPUT" and event["id"] == "gripper_state":
                 width = float(unpack_json_message(event["value"]).get("width", 0.0))
-                panel.set_measured_grip(width / 2.0)
+                mgrip_f = width / 2.0
+                panel.set_measured_grip(mgrip_f)
+                scene.set_finger_state(mgrip_f)
+                if measured is not None and now - last_ghost >= 0.1:
+                    # Width changes with the arm parked still animate the ghost.
+                    last_ghost = now
+                    ghost.update(np.append(measured, np.full(len(gj), mgrip_f)))
             elif event["type"] == "INPUT" and event["id"] == "motor_health":
                 health = unpack_json_message(event["value"])
                 was, was_fault = armed, fault
@@ -640,9 +654,15 @@ def main() -> None:
                 cart_ref_q = panel.sliders()
                 target = cart_ref_q
 
-        if shown is None or np.max(np.abs(target - shown)) > 1e-4:
-            target_robot.update(target)
-            shown = target
+        tgrip = panel.gripper_value()
+        if (
+            shown is None
+            or np.max(np.abs(target - shown)) > 1e-4
+            or shown_grip is None
+            or abs(tgrip - shown_grip) > 1e-4
+        ):
+            target_robot.update(np.append(target, np.full(len(gj), tgrip)))
+            shown, shown_grip = target, tgrip
 
         grip = panel.pop_gripper()
         if grip is not None:

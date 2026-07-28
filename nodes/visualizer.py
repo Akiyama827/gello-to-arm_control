@@ -113,8 +113,17 @@ def _mesh_package_dirs(urdf_path: str) -> list[str]:
     return [str(path) for path in candidates if path.is_dir()]
 
 
-def _build_render_model(urdf_path: str, joint_names: list[str]):
-    """Returns (model, data, q_indices, visual_model, visual_data) or None."""
+def _build_render_model(urdf_path: str, joint_names: list[str],
+                        extra_joints: list[str] | None = None):
+    """Returns (model, data, q_indices, visual_model, visual_data, render_names)
+    or None.
+
+    ``extra_joints``: non-motor joints (e.g. Franka Hand fingers — driven by
+    the gripper_state topic, not a motor slot) articulated on top of the
+    motor-driven ones, kept only if the URDF really has them. Without this the
+    fingers were filtered out of the articulated set entirely and every live
+    width update landed in a no-op (bench: Rerun gripper frozen).
+    """
     if not _PIN_OK or not urdf_path or not Path(urdf_path).is_file() or not joint_names:
         return None
     try:
@@ -126,16 +135,20 @@ def _build_render_model(urdf_path: str, joint_names: list[str]):
         )
         data = model.createData()
         visual_data = visual_model.createData()
+        render_names = list(joint_names) + [
+            j for j in (extra_joints or [])
+            if j not in joint_names and model.existJointName(j)
+        ]
         q_idx = []
-        for jname in joint_names:
+        for jname in render_names:
             jid = model.getJointId(jname)
             if jid >= model.njoints:
                 raise ValueError(f"Joint {jname!r} not in URDF")
             q_idx.append(model.joints[jid].idx_q)
-        print(f"[viz] URDF render ready: {len(joint_names)} joints, {visual_model.ngeoms} meshes")
-        return model, data, q_idx, visual_model, visual_data
+        print(f"[viz] URDF render ready: {len(render_names)} joints, {visual_model.ngeoms} meshes")
+        return model, data, q_idx, visual_model, visual_data, render_names
     except Exception as exc:
-        print(f"[viz] URDF render init failed: {exc}")      
+        print(f"[viz] URDF render init failed: {exc}")
         return None
 
 
@@ -191,7 +204,7 @@ def _log_render_pose(
     joint_mimics: dict | None = None,
     finger_values: dict[str, float] | None = None,
 ) -> None:
-    model, data, q_idx, visual_model, visual_data = render_model
+    model, data, q_idx, visual_model, visual_data = render_model[:5]
     q = np.zeros(model.nq)
     # Try name-based match; fall back to positional (joint i ← motor slot i).
     jname_to_slot = {name: i for i, name in enumerate(motor_names)}
@@ -458,21 +471,23 @@ def main() -> None:
 
     joint_names   = _resolve_joint_names(cfg, urdf_path)
 
-    render_model = _build_render_model(urdf_path, joint_names)
+    from arm_control.config import gripper_joints as _gj
+    render_model = _build_render_model(urdf_path, joint_names, extra_joints=_gj(cfg))
+    finger_joints: list[str] = []
+    if render_model is not None:
+        joint_names = render_model[5]  # motors + URDF-present finger joints
+        finger_joints = [j for j in _gj(cfg) if j in joint_names]
 
     _init_rerun(app_id)
 
     _setup_series_style(motor_names)
     if render_model is not None:
-        _, _, _, visual_model, _ = render_model
-        _log_visual_assets(visual_model)
+        _log_visual_assets(render_model[3])
     _setup_blueprint(motor_names, has_3d=(render_model is not None), time_ranges=time_ranges)
 
     print(f"[viz] Rerun '{app_id}' started — {n_motors} motors")
 
     q_profile = np.zeros(n_motors)
-    from arm_control.config import gripper_joints as _gj
-    finger_joints = [j for j in _gj(cfg) if j in joint_names]
     finger_values: dict[str, float] = {}
     node = Node()
     t0   = time.monotonic()
