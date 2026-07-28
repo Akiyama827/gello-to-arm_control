@@ -43,6 +43,7 @@ from arm_control import CONTROL_ROOT
 from arm_control.config import arm_joints, ee_frame, gripper_joints, load_robot_config
 from arm_control.joint_motor_map import gripper_motor_to_finger
 from arm_control.messages import (
+    pack_json_message,
     pack_motor_command,
     pack_trajectory,
     unpack_json_message,
@@ -58,6 +59,11 @@ from arm_control.planning.trajectory import (
 from arm_control.node_utils import _load_mode_config, expand_named_values
 
 _BUTTONS = ("Sync target to robot", "Plan + preview", "Execute", "Stop (hold)")
+# The operator gate, when this node OWNS it (real motion graphs wire our `arm`
+# output straight into the bridge — one page, one producer). Rendered as a
+# separate styled row with the armed badge, never mixed into the generic
+# button strip: DISARM is the authority drop and must be findable instantly.
+_GATE_BUTTONS = ("ARM", "DISARM")
 
 _CART_NAMES = ("x", "y", "z", "roll", "pitch", "yaw")
 
@@ -197,8 +203,9 @@ class ControlPanel:
         self._grip_lo, self._grip_hi = float(grip_range[0]), float(grip_range[1])
         self._grip = self._grip_hi               # start open
         self._grip_dirty = False
-        self._clicks = {name: 0 for name in _BUTTONS}
-        self._seen = {name: 0 for name in _BUTTONS}
+        self._clicks = {name: 0 for name in _BUTTONS + _GATE_BUTTONS}
+        self._seen = {name: 0 for name in _BUTTONS + _GATE_BUTTONS}
+        self._armed: bool | None = None  # None = no health wire (sim: no gate)
         self._log: list[str] = []
         panel = self
 
@@ -292,6 +299,7 @@ class ControlPanel:
                     "value": grip,
                 },
                 "buttons": list(_BUTTONS),
+                "armed": self._armed,
                 "log": list(self._log[-8:]),
                 "plan_version": self._plan["version"],
             }
@@ -343,6 +351,10 @@ class ControlPanel:
         with self._lock:
             pending, self._cart_pending = self._cart_pending, None
             return pending
+
+    def set_armed(self, armed: bool | None) -> None:
+        with self._lock:
+            self._armed = armed
 
     def set_measured(self, q) -> None:
         with self._lock:
@@ -551,6 +563,7 @@ def main() -> None:
             elif event["type"] == "INPUT" and event["id"] == "motor_health":
                 was = armed
                 armed = bool(unpack_json_message(event["value"]).get("armed", False))
+                panel.set_armed(armed)
                 if was is not None and was != armed:
                     panel.log("ARMED" if armed else "DISARMED — Execute is gated")
             elif event["type"] == "STOP":
@@ -647,10 +660,7 @@ def main() -> None:
                 panel.log("nothing to execute — plan first")
             elif armed is False:
                 # Keep the plan: after arming, Execute again without replanning.
-                panel.log(
-                    "REFUSED: arm is DISARMED — arm the operator gate first "
-                    "(Enter in the launch terminal / operator panel / trigger file)"
-                )
+                panel.log("REFUSED: DISARMED — press ARM above, then Execute")
             else:
                 node.send_output(
                     "trajectory",
@@ -665,6 +675,24 @@ def main() -> None:
             pending = None
             panel.clear_plan()
             panel.log("STOP sent — executor holds measured pose")
+
+        # The operator gate, owned by this page in the real motion graphs
+        # (our `arm` output feeds the bridge directly — single producer).
+        # `armed is None` = no motor_health wire = this graph has no gate
+        # (sim), and the `arm` output is likely unwired too: don't send.
+        if panel.clicked("ARM"):
+            if armed is None:
+                panel.log("no arm gate in this graph (sim, or health not up yet)")
+            else:
+                node.send_output("arm", pack_json_message("arm", {"armed": True}))
+                panel.log("ARM requested — bridge enables, server holds this pose")
+        if panel.clicked("DISARM"):
+            if armed is not None:
+                # Executor to hold FIRST: a disarm+rearm inside the executor's
+                # 2 s runaway window must never resume a stale trajectory.
+                node.send_output("trajectory", pack_trajectory([], [], []))
+                node.send_output("arm", pack_json_message("arm", {"armed": False}))
+                panel.log("DISARM requested — authority drop (bridge verifies)")
 
 
 if __name__ == "__main__":

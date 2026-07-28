@@ -3,20 +3,16 @@
 # bridge. Self-collision-aware planning runs in the teleop node (MuJoCo
 # collision world + OMPL).
 #
-# SAFETY — the graph comes up DISARMED. The operator_arm gate feeds the bridge
-# `arm` input directly (press Enter in the launch terminal, or
-# `touch /tmp/arm_operator_arm`). Arming enables the motors into the executor's
-# measured-pose hold; motion happens only on the meshcat Execute button. The
-# 0.1s deadman + fault reflex are live the whole time.
+# SAFETY — the graph comes up DISARMED. The teleop page OWNS the operator
+# gate (ARM/DISARM buttons + armed badge, same page as planning; motion_teleop
+# is the single producer of the bridge `arm` topic). Arming enables the motors
+# into the executor's measured-pose hold; motion happens only on the Execute
+# button, which is refused visibly while disarmed. The 0.1s deadman + fault
+# reflex are live the whole time.
 #
 #   ARM_CONTROL_CONFIG=configs/real/assembler.yaml dora run dataflows/real_motion.yml
 #   (or: python scripts/view.py real motion)
 nodes:
-  - id: operator_arm
-    path: ../nodes/operator_arm.py
-    outputs:
-      - arm
-
   - id: motion_teleop
     path: ../nodes/motion_teleop.py
     env:
@@ -29,6 +25,7 @@ nodes:
     outputs:
       - trajectory
       - gripper
+      - arm
 
   - id: trajectory_executor
     path: ../nodes/trajectory_executor.py
@@ -43,12 +40,12 @@ nodes:
 
   - id: plant_interface
     path: ../nodes/hardware_interface.py
-    # Command mode: safety layer built, disarmed until operator_arm fires.
+    # Command mode: safety layer built, disarmed until the teleop gate fires.
     env:
       ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
     inputs:
       motor_command: trajectory_executor/motor_command
-      arm:           operator_arm/arm
+      arm:           motion_teleop/arm
     outputs:
       - motor_state
       - motor_state_viz

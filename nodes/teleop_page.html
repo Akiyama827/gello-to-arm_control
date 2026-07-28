@@ -28,6 +28,12 @@
 <div id="view"></div>
 <div id="panel">
  <h3>arm teleop</h3>
+ <div id="gate" style="display:none;margin:.3em 0 .6em">
+  <span id="gatebadge" style="display:inline-block;padding:.35em .8em;border-radius:5px;
+        font-weight:bold;color:#fff;background:#888">&hellip;</span>
+  <button id="arm-btn" style="background:#e8f5e9">ARM</button>
+  <button id="disarm-btn" style="background:#c62828;color:#fff;font-weight:bold">DISARM</button>
+ </div>
  <div class="hint">Drag ONE gizmo handle at a time on the end effector —
   arrows move, rings rotate (buttons below switch). Colors: real STL =
   measured arm, <b style="color:#e08000">orange</b> = your target,
@@ -231,8 +237,21 @@ async function poll(){
   if (!planFrames.length && planBot) planBot.group.visible = false;
  }
  document.getElementById('log').textContent = s.log.join('\n');
+ // Operator gate: only shown when the graph wires motor_health (real arms).
+ const gate = document.getElementById('gate');
+ if (s.armed === null || s.armed === undefined){ gate.style.display = 'none'; }
+ else {
+  gate.style.display = 'block';
+  const badge = document.getElementById('gatebadge');
+  badge.textContent = s.armed ? 'ARMED' : 'DISARMED';
+  badge.style.background = s.armed ? '#2ca02c' : '#c62828';
+ }
 }
 setInterval(poll, 150); poll();
+for (const name of ['ARM', 'DISARM']){
+ document.getElementById(name.toLowerCase() + '-btn').onclick =
+  () => fetch('click', {method: 'POST', body: JSON.stringify({button: name})});
+}
 
 setInterval(() => {                       // green ghost playback loop
  if (planBot && planFrames.length){

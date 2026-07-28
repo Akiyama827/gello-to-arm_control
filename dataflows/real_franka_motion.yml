@@ -10,12 +10,15 @@
 #   - trajectory_replay: drag-teach playback of an rt_handguide recording
 #     (echo <csv> > /tmp/arm_replay_go), joined from the current pose
 #
-# SAFETY — the graph comes up DISARMED. operator_arm gates the bridge (Enter /
-# panel / trigger file). The RT server must be up with the franka backend and
-# its NORMAL deadman (default --fault-ms 1000, NOT the handguide's 3600000 —
-# this graph is a commander, and losing it must park the arm). Executor
-# refuses trajectories starting >0.1 rad from measured, aborts on >0.35 rad
-# tracking error; the server holds on staleness and latches on faults.
+# SAFETY — the graph comes up DISARMED. The teleop page OWNS the operator
+# gate (ARM/DISARM + armed badge on the same page as planning — one page,
+# and DISARM is one click during a live session; motion_teleop is the single
+# producer of the bridge `arm` topic). The RT server must be up with the
+# franka backend and its NORMAL deadman (default --fault-ms 1000, NOT the
+# handguide's 3600000 — this graph is a commander, and losing it must park
+# the arm). Executor refuses trajectories starting >0.1 rad from measured,
+# aborts on >0.35 rad tracking error; the server holds on staleness and
+# latches on faults.
 #
 #   python scripts/view.py real franka motion        # canonical launcher
 #   (raw dora run needs BOTH roots exported — dora rebases node cwd to this
@@ -24,23 +27,18 @@
 #   ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/real/franka.yaml \
 #     dora run libs/arm_control/dataflows/real_franka_motion.yml)
 nodes:
-  - id: operator_arm
-    path: ../nodes/operator_arm.py
-    outputs:
-      - arm
-
   - id: motion_teleop
     path: ../nodes/motion_teleop.py
     env:
       ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka_rt.yaml
     inputs:
       motor_state: plant_interface/motor_state_viz
-      # Lets the panel gate Execute while DISARMED (visible refusal instead
-      # of a silent bridge drop + executor abort 2 s later).
+      # Armed badge + Execute gating + gate visibility on the panel.
       motor_health: plant_interface/motor_health
     outputs:
       - trajectory
       - gripper
+      - arm
 
   - id: trajectory_replay
     path: ../nodes/trajectory_replay.py
@@ -68,7 +66,7 @@ nodes:
       ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka_rt.yaml
     inputs:
       motor_command: trajectory_executor/motor_command
-      arm:           operator_arm/arm
+      arm:           motion_teleop/arm
     outputs:
       - motor_state
       - motor_state_viz

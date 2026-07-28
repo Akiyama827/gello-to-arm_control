@@ -59,7 +59,7 @@ def main() -> None:
     health_prev: tuple | None = None
     model_revision_sent = False
     armed_wanted = False
-    last_drop_warn = 0.0
+    drop_warned = False
 
     try:
         backend.open()
@@ -79,14 +79,14 @@ def main() -> None:
                         backend.apply_command(
                             unpack_motor_command(event["value"], backend.num_motors)
                         )
-                    elif time.perf_counter() - last_drop_warn > 2.0:
-                        # Never swallow silently: an executor upstream is
-                        # streaming into a disarmed bridge, and from the
-                        # operator's seat that looks like "nothing happened".
-                        last_drop_warn = time.perf_counter()
+                    elif not drop_warned:
+                        # Never swallow silently — but say it ONCE per disarm
+                        # episode: the executor streams its hold continuously,
+                        # and a repeating line is noise that buries signal.
+                        drop_warned = True
                         print(
                             "[rt_interface] dropping motor_command — DISARMED "
-                            "(arm via the operator gate)",
+                            "(ARM on the teleop page grants authority)",
                             flush=True,
                         )
                 elif etype == "INPUT" and eid == "arm":
@@ -94,11 +94,13 @@ def main() -> None:
                         try:
                             backend.enable_all()
                             armed_wanted = True
+                            drop_warned = False
                             print("[rt_interface] ARMED (server holds until commands flow)", flush=True)
                         except RtLinkError as exc:
                             print(f"[rt_interface] arm refused: {exc}", flush=True)
                     else:
                         armed_wanted = False
+                        drop_warned = False  # next disarm episode warns once again
                         backend.safe_stop()
                         print("[rt_interface] DISARMED", flush=True)
             else:
