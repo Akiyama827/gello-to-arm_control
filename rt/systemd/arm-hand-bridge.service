@@ -1,0 +1,19 @@
+# Franka Hand daemon (rt/src/hand_bridge.cpp) — owns franka::Gripper from
+# the robot LAN because the Hand's state stream is server-push UDP that
+# cannot cross the PC-side NAT. Not RT; plain user service. Install:
+#   sudo cp arm-hand-bridge.service /etc/systemd/system/
+#   sudo systemctl enable --now arm-hand-bridge
+[Unit]
+Description=hand_bridge — Franka Hand TCP re-export for the PC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ok
+ExecStart=/home/ok/arm_rt/hand_bridge 172.16.0.3
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

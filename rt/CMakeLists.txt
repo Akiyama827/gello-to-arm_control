@@ -39,6 +39,16 @@ if(WITH_FRANKA)
   find_package(Franka REQUIRED)
   target_compile_definitions(arm_rt_server PRIVATE ARM_RT_WITH_FRANKA)
   target_link_libraries(arm_rt_server PRIVATE Franka::Franka)
+
+  # Franka Hand daemon for the box: the Hand's state stream is server-push
+  # UDP, which cannot cross the PC-side NAT — the Hand must be owned from
+  # the robot LAN, like the torque loop. See src/hand_bridge.cpp.
+  add_executable(hand_bridge src/hand_bridge.cpp)
+  target_link_libraries(hand_bridge PRIVATE Franka::Franka)
+  set_target_properties(hand_bridge PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib"
+    INSTALL_RPATH "\$ORIGIN/lib")
+  target_link_options(hand_bridge PRIVATE -Wl,--disable-new-dtags)
 endif()
 
 add_executable(protocol_selfcheck src/selfcheck.cpp)

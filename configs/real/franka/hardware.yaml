@@ -93,6 +93,9 @@ rt:
   host: 172.16.1.2           # the RT box (rung-1 bring-up, 2026-07-27)
   udp_port: 47800
   tcp_port: 47801
+  # hand_bridge (rt/src/hand_bridge.cpp) — the Franka Hand is owned FROM the
+  # box: its state stream is server-push UDP, which cannot cross the PC NAT.
+  hand_port: 47802
   state_timeout_s: 0.5
 
 urdf_path: franka/urdf/fr3.urdf
