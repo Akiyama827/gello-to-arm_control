@@ -79,6 +79,8 @@ class RtBackend:
         self._status_q: queue.Queue = queue.Queue()
         self._latched_fault = ""
         self._cmd_seq = 0
+        self._last_send_t = 0.0
+        self._last_send_err = 0.0
 
     @classmethod
     def from_config(cls, cfg) -> "RtBackend":
@@ -209,10 +211,20 @@ class RtBackend:
             kp=kp[: self.n],
             kd=kd[: self.n],
         )
+        now = time.monotonic()
+        if self._last_send_t and now - self._last_send_t > 0.3:
+            print(f"[rt_link] send gap {now - self._last_send_t:.2f}s "
+                  f"(seq {self._cmd_seq})", flush=True)
+        self._last_send_t = now
         try:
             self._udp.send(pkt)
-        except OSError:
-            pass  # transient; staleness accounting reports it
+        except OSError as exc:
+            # NEVER silent: a persistently failing send is indistinguishable
+            # from a healthy stream to every layer above (found hunting a
+            # CMD_LOST latch whose packets vanished between bridge and server).
+            if now - self._last_send_err > 1.0:
+                self._last_send_err = now
+                print(f"[rt_link] UDP send failed: {exc}", flush=True)
 
     # -- feedback -------------------------------------------------------------
     def latest_state(self) -> tuple[rtp.State | None, float]:

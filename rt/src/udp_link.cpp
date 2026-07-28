@@ -40,6 +40,7 @@ void udp_rx_thread(ServerCtx& ctx) {
   sockaddr_in src = {};
   socklen_t srclen = sizeof(src);
   uint32_t dropped_ip = 0;
+  bool nan_warned = false;
   while (!ctx.shutdown.load()) {
     const ssize_t got = recvfrom(fd, &pkt, sizeof(pkt), 0,
                                  reinterpret_cast<sockaddr*>(&src), &srclen);
@@ -70,15 +71,26 @@ void udp_rx_thread(ServerCtx& ctx) {
       return true;
     };
     if (!(all_finite(pkt.q_des) && all_finite(pkt.qd_des) &&
-          all_finite(pkt.tau_ff) && all_finite(pkt.kp) && all_finite(pkt.kd)))
+          all_finite(pkt.tau_ff) && all_finite(pkt.kp) && all_finite(pkt.kd))) {
+      if (!nan_warned) {  // once per stream: a silent drop path is a trap
+        nan_warned = true;
+        std::fprintf(stderr, "[rt] dropping non-finite command (seq %u)\n",
+                     pkt.seq);
+      }
       continue;
+    }
     {
       std::lock_guard<std::mutex> lock(ctx.peer_mu);
       ctx.peer = src;
       ctx.have_peer = true;
     }
+    const uint64_t rx = mono_ns();
+    const uint64_t prev = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
+    if (prev != 0 && rx - prev > 300'000'000ull)
+      std::fprintf(stderr, "[rt] cmd accept gap %.2fs (seq %u)\n",
+                   double(rx - prev) / 1e9, pkt.seq);
     ctx.cmd_in.write(pkt);
-    ctx.last_cmd_rx_ns.store(mono_ns(), std::memory_order_release);
+    ctx.last_cmd_rx_ns.store(rx, std::memory_order_release);
   }
   close(fd);
 }
