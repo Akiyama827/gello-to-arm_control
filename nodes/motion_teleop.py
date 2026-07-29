@@ -594,6 +594,7 @@ def main() -> None:
     cart_ref_q: np.ndarray | None = None
     cart_axis = -1
     synced_once = False
+    grip_synced = False
     last_ui = 0.0
     last_ghost = 0.0
     last_health_t = 0.0
@@ -631,6 +632,15 @@ def main() -> None:
                 mgrip_f = width / 2.0
                 panel.set_measured_grip(mgrip_f)
                 scene.set_finger_state(mgrip_f)
+                if not grip_synced:
+                    # First real width: start the TARGET slider at reality —
+                    # the same no-surprises rule as the arm sliders' first-
+                    # state sync. It initialized to gripper_range_m's max
+                    # ("start open") and lied until the first touch, which
+                    # then commanded from that wrong baseline. dirty=False:
+                    # a sync must never itself send a MOVE.
+                    grip_synced = True
+                    panel.set_gripper(mgrip_f, dirty=False)
                 if measured is not None and now - last_ghost >= 0.1:
                     # Width changes with the arm parked still animate the ghost.
                     last_ghost = now
