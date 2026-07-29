@@ -333,7 +333,7 @@ class ControlPanel:
                 "buttons": list(_BUTTONS),
                 "armed": self._armed,
                 "fault": self._fault,
-                "log": list(self._log[-8:]),
+                "log": list(self._log)[-8:],  # deque: copy THEN slice
                 "plan_version": self._plan["version"],
                 "ident": self._ident,
             }
