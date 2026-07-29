@@ -11,19 +11,23 @@
 // TCP line protocol over the NAT-free direct link:
 //
 //   PC -> "MOVE <width_m> <speed_mps>\n" | "HOME\n" | "GSTOP\n"
-//   <-  "STATE <width_m> <0|1>\n"   (~10 Hz, streams DURING actions too)
+//   <-  "STATE <width_m> <0|1>\n"   (~10 Hz, streams DURING moves too)
 //
-// TWO franka::Gripper sessions on purpose (the Hand server accepts
-// concurrent clients — verified on the bench 2026-07-28):
-//   - reader: owned by the serve loop, readOnce only. Never blocks on an
-//     action, so width keeps streaming WHILE the jaws travel — with the old
-//     single session the state froze exactly when the truth was changing
-//     (move() blocks for the full travel) and every ghost snapped to the new
-//     width only after the command finished.
-//   - actor: owned by a worker thread, executes blocking move()/homing()
-//     from a latest-wins mailbox (each move is a full physical travel;
-//     replaying queued intermediate widths is the bench 'gripper lag').
-// Each session reconnects independently; a dead Hand never kills the daemon.
+// ONE franka::Gripper session, owned entirely by the actor thread (reads AND
+// actions). A dual-session design was tried and is IMPOSSIBLE: the Hand
+// server is single-client with NEWEST-WINS EVICTION — a second connect is
+// "accepted" by starving the first session's UDP and then RST-ing its TCP
+// (bench 2026-07-29: reader and actor evicted each other in a ping-pong,
+// one reconnect per move; the earlier "accepts a second client" constructor
+// test was measuring the eviction, not coexistence).
+//
+// Width still streams while move() blocks: the Hand travels at the
+// commanded speed, so the serve loop SYNTHESIZES width from (start, goal,
+// speed, t0) during an action and snaps to the first real readOnce after
+// it. Synthetic width is a kinematic estimate — an early stall (jaws meet
+// an object) shows as the goal until the post-move sample corrects it, so
+// contact logic must key on real samples (grasp()/is_grasped), never on
+// the mid-move stream.
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -32,6 +36,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -51,131 +56,144 @@ double mono_s() {
   return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
 }
 
-// Latest-wins action mailbox: the actor drains to the newest goal only.
+// Latest-wins action mailbox + shared Hand state, all under one mutex.
 struct Action {
   int kind = 0;  // 0 = none, 1 = MOVE, 2 = HOME
   double w = 0, s = 0;
 };
-std::mutex act_mx;
-std::condition_variable act_cv;
-Action act_pending;
-uint64_t stop_seq = 0;  // under act_mx; bumped by every GSTOP
+std::mutex mx;
+std::condition_variable cv;
+Action pending;
+uint64_t stop_seq = 0;   // bumped by GSTOP: kills queued/carried actions
+bool have_real = false;  // last real sample valid
+double real_w = 0.0;
+bool real_grasped = false;
+bool acting = false;     // actor is inside a blocking move/homing
+double act_from = 0.0, act_goal = 0.0, act_speed = 0.0, act_t0 = 0.0;
 
-void post(int kind, double w = 0, double s = 0) {
-  {
-    std::lock_guard<std::mutex> lk(act_mx);
-    act_pending = {kind, w, s};
-  }
-  act_cv.notify_one();
-}
-
-// GSTOP must be STICKY: clearing the mailbox alone loses the race where the
+// GSTOP is STICKY: clearing the mailbox alone loses the race where the
 // actor already drained the goal but has not executed it yet (it can be
-// inside a 2 s reconnect backoff) — stop() then hits an idle Hand as a no-op
-// and the jaws close AFTER the emergency stop. The sequence number kills any
-// action taken before the stop, wherever it is in the actor's pipeline.
+// inside a reconnect backoff). The sequence number kills any action taken
+// before the stop, wherever it is in the actor's pipeline. A single session
+// cannot abort its OWN blocking move — worst case one bounded travel
+// (<=0.8 s full stroke) completes after the stop.
 void gstop_pending() {
-  std::lock_guard<std::mutex> lk(act_mx);
-  act_pending = {};
+  std::lock_guard<std::mutex> lk(mx);
+  pending = {};
   ++stop_seq;
 }
 
 void actor(const char* robot_ip) {
   std::unique_ptr<franka::Gripper> hand;
+  double next_connect = 0.0;
+  bool warned = false;
   Action a{};
   uint64_t my_seq = 0;
-  bool warned = false;
   for (;;) {
     {
-      std::unique_lock<std::mutex> lk(act_mx);
-      if (act_pending.kind != 0) {
-        a = act_pending;  // a newer goal replaces a retry-pending one
-        act_pending = {};
+      std::unique_lock<std::mutex> lk(mx);
+      if (pending.kind != 0) {
+        a = pending;  // a newer goal replaces a retry-pending one
+        pending = {};
         my_seq = stop_seq;
       } else if (a.kind == 0) {
-        act_cv.wait(lk, [] { return act_pending.kind != 0; });
-        a = act_pending;
-        act_pending = {};
-        my_seq = stop_seq;
+        // No work: pace the idle readOnce at ~10 Hz, waking early for goals.
+        cv.wait_for(lk, std::chrono::milliseconds(100),
+                    [] { return pending.kind != 0; });
+        if (pending.kind != 0) {
+          a = pending;
+          pending = {};
+          my_seq = stop_seq;
+        }
       }
     }
     if (!hand) {
+      if (mono_s() < next_connect) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
       try {
         hand = std::make_unique<franka::Gripper>(robot_ip);
-        std::printf("[hand] cmd session connected to %s\n", robot_ip);
+        std::printf("[hand] connected to %s\n", robot_ip);
         warned = false;
       } catch (const franka::Exception& e) {
         if (!warned) {
           warned = true;
-          std::printf("[hand] cmd session: no Hand at %s (%s) — retrying\n",
-                      robot_ip, e.what());
+          std::printf("[hand] no Hand at %s (%s) — retrying\n", robot_ip,
+                      e.what());
         }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        next_connect = mono_s() + 2.0;
         continue;  // `a` stays pending; a newer goal may replace it above
       }
     }
-    {
-      // Re-check under the lock immediately before executing: a GSTOP that
-      // landed while we were connecting outranks the action we carried here.
-      std::lock_guard<std::mutex> lk(act_mx);
-      if (my_seq != stop_seq) {
-        std::printf("[hand] action dropped (GSTOP outranks it)\n");
-        a = {};
-        continue;
+    if (a.kind != 0) {
+      {
+        // Re-check under the lock immediately before executing: a GSTOP
+        // that landed while we were connecting outranks the carried action.
+        std::lock_guard<std::mutex> lk(mx);
+        if (my_seq != stop_seq) {
+          std::printf("[hand] action dropped (GSTOP outranks it)\n");
+          a = {};
+          continue;
+        }
+        acting = true;
+        act_from = have_real ? real_w : a.w;
+        act_goal = a.kind == 1 ? a.w : act_from;  // homing: no width model
+        act_speed = a.kind == 1 ? a.s : 0.0;
+        act_t0 = mono_s();
       }
+      try {
+        if (a.kind == 1) {
+          std::printf("[hand] move -> %.4f m @ %.2f m/s\n", a.w, a.s);
+          hand->move(a.w, a.s);  // blocking; serve() synthesizes meanwhile
+        } else if (a.kind == 2) {
+          std::printf("[hand] homing\n");
+          hand->homing();
+        }
+      } catch (const franka::NetworkException& e) {
+        std::printf("[hand] session lost (%s) — reconnecting\n", e.what());
+        hand.reset();
+        next_connect = mono_s() + 2.0;
+      } catch (const franka::Exception& e) {
+        // CommandException — e.g. jaws met an obstacle. Session is fine.
+        std::printf("[hand] action ended: %s\n", e.what());
+      } catch (const std::exception& e) {
+        // Anything else escaping a detached thread is std::terminate.
+        std::printf("[hand] unexpected error (%s) — resetting\n", e.what());
+        hand.reset();
+        next_connect = mono_s() + 2.0;
+      }
+      a = {};
+      std::lock_guard<std::mutex> lk(mx);
+      acting = false;
+      continue;  // loop straight into a real readOnce to truth the width
     }
+    // Idle: refresh the real sample (same thread, same session — the ONLY
+    // Hand access; the serve loop never touches the session).
     try {
-      if (a.kind == 1) {
-        std::printf("[hand] move -> %.4f m @ %.2f m/s\n", a.w, a.s);
-        hand->move(a.w, a.s);  // blocking; reader keeps streaming meanwhile
-      } else if (a.kind == 2) {
-        std::printf("[hand] homing\n");
-        hand->homing();
-      }
-      a = {};
-    } catch (const franka::NetworkException& e) {
-      std::printf("[hand] cmd session lost (%s) — reconnecting\n", e.what());
-      hand.reset();
-      a = {};  // never retry-loop a poisoned action
+      const franka::GripperState st = hand->readOnce();
+      std::lock_guard<std::mutex> lk(mx);
+      have_real = true;
+      real_w = st.width;
+      real_grasped = st.is_grasped;
     } catch (const franka::Exception& e) {
-      // CommandException — e.g. a GSTOP aborted the move. Session is fine.
-      std::printf("[hand] action ended: %s\n", e.what());
-      a = {};
-    } catch (const std::exception& e) {
-      // Anything else escaping a DETACHED thread is std::terminate — which
-      // takes the reader session and the PC link down with it.
-      std::printf("[hand] cmd session unexpected error (%s) — resetting\n",
-                  e.what());
+      std::printf("[hand] read failed (%s) — reconnecting\n", e.what());
+      {
+        std::lock_guard<std::mutex> lk(mx);
+        have_real = false;
+      }
       hand.reset();
-      a = {};
+      next_connect = mono_s() + 2.0;
     }
   }
 }
 
-void serve(int fd, const char* robot_ip) {
-  std::unique_ptr<franka::Gripper> hand;  // READER session: readOnce only
+void serve(int fd) {
   double last_state = 0.0;
-  double next_connect = 0.0;
   char buf[256];
   size_t have = 0;
-  bool warned = false;
 
   for (;;) {
-    if (!hand && mono_s() >= next_connect) {
-      try {
-        hand = std::make_unique<franka::Gripper>(robot_ip);
-        std::printf("[hand] read session connected to %s\n", robot_ip);
-        warned = false;
-      } catch (const franka::Exception& e) {
-        if (!warned) {
-          warned = true;
-          std::printf("[hand] read session: no Hand at %s (%s) — retrying\n",
-                      robot_ip, e.what());
-        }
-        next_connect = mono_s() + 2.0;
-      }
-    }
-
     pollfd pfd{fd, POLLIN, 0};
     const int ready = poll(&pfd, 1, 50);
     if (ready < 0) return;
@@ -189,23 +207,19 @@ void serve(int fd, const char* robot_ip) {
         *nl = '\0';
         double w = 0, s = 0;
         if (std::sscanf(line, "MOVE %lf %lf", &w, &s) == 2) {
-          post(1, w, s);
-        } else if (!std::strcmp(line, "HOME")) {
-          post(2);
-        } else if (!std::strcmp(line, "GSTOP")) {
-          gstop_pending();  // sticky: kills a drained-but-unexecuted action too
-          if (hand) {
-            try {
-              // Cross-session stop: aborts the actor's in-flight move (the
-              // actor logs the resulting CommandException and moves on).
-              hand->stop();
-            } catch (const franka::Exception& e) {
-              std::printf("[hand] stop failed (%s) — resetting read session\n",
-                          e.what());
-              hand.reset();
-              next_connect = mono_s() + 2.0;
-            }
+          {
+            std::lock_guard<std::mutex> lk(mx);
+            pending = {1, w, s};
           }
+          cv.notify_one();
+        } else if (!std::strcmp(line, "HOME")) {
+          {
+            std::lock_guard<std::mutex> lk(mx);
+            pending = {2, 0, 0};
+          }
+          cv.notify_one();
+        } else if (!std::strcmp(line, "GSTOP")) {
+          gstop_pending();
         }
       }
       have = std::strlen(line);
@@ -219,18 +233,31 @@ void serve(int fd, const char* robot_ip) {
       }
     }
 
-    if (hand && mono_s() - last_state >= 0.1) {
+    if (mono_s() - last_state >= 0.1) {
       last_state = mono_s();
-      try {
-        const franka::GripperState st = hand->readOnce();
+      double w;
+      bool grasped, valid;
+      {
+        std::lock_guard<std::mutex> lk(mx);
+        valid = have_real;
+        grasped = real_grasped;
+        if (acting && act_speed > 0.0) {
+          // Mid-move: the Hand travels at the commanded speed — integrate
+          // toward the goal. Corrected by the first real post-move sample.
+          const double travelled = act_speed * (mono_s() - act_t0);
+          const double dist = std::fabs(act_goal - act_from);
+          const double frac = dist > 1e-9 ? std::fmin(travelled / dist, 1.0) : 1.0;
+          w = act_from + (act_goal - act_from) * frac;
+          valid = true;
+        } else {
+          w = real_w;
+        }
+      }
+      if (valid) {
         char out[64];
-        const int n = std::snprintf(out, sizeof(out), "STATE %.5f %d\n",
-                                    st.width, st.is_grasped ? 1 : 0);
+        const int n = std::snprintf(out, sizeof(out), "STATE %.5f %d\n", w,
+                                    grasped ? 1 : 0);
         if (send(fd, out, size_t(n), MSG_NOSIGNAL) != n) return;
-      } catch (const franka::Exception& e) {
-        std::printf("[hand] read failed (%s) — reconnecting\n", e.what());
-        hand.reset();
-        next_connect = mono_s() + 2.0;
       }
     }
   }
@@ -277,7 +304,7 @@ int main(int argc, char** argv) {
     const int nd = 1;
     setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
     std::printf("[hand] client connected\n");
-    serve(client, robot_ip);
+    serve(client);
     close(client);
     std::printf("[hand] client disconnected\n");
   }
