@@ -7,17 +7,22 @@
 Description=arm_rt_server — 1 kHz torque servo (RT link)
 After=network-online.target
 Wants=network-online.target
+# in [Unit], not [Service] — the box's systemd ignores it there and the default
+# 5-starts/10s limit races our 2s retry cycle
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# Adjust the path and backend for the box (franka on the bench RT machine).
+User=ok
+# arm_rt_server_frk = the WITH_FRANKA dynamic build (libs resolve via $ORIGIN
+# rpath to ~/arm_rt/lib); the static arm_rt_server has no franka backend.
 # --rt-cpu pins ONLY the servo thread to an isolcpus core; do NOT add a
 # CPUAffinity= line — pinning the whole process would put the SCHED_OTHER
 # comms threads on the servo core, where a preempted seqlock writer competes
 # with the FIFO reader for the same cycles.
-# --bind: answer ONLY on the PC direct link — the box is dual-NIC and the
+# --bind: answer ONLY on the router/PC link — the box is dual-homed and the
 # default INADDR_ANY would take commands from the robot LAN too.
-ExecStart=/opt/arm_rt/arm_rt_server --backend franka --franka-ip 172.16.0.3 --rt-cpu 3 --bind 172.16.1.2
+ExecStart=/home/ok/arm_rt/arm_rt_server_frk --backend franka --franka-ip 172.16.0.3 --rt-cpu 3 --bind 172.16.1.2
 # always, not on-failure: an appliance must come back from EVERY exit —
 # including the deliberate clean exit the server now makes after 5 s of
 # unreachable plant (franka::Robot is built once; a control-box power cycle
@@ -25,7 +30,6 @@ ExecStart=/opt/arm_rt/arm_rt_server --backend franka --franka-ip 172.16.0.3 --rt
 # is down rather than giving up after 5 attempts.
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=0
 # RT scheduling + locked memory; pair with a PREEMPT_RT kernel and the
 # limits documented in rt/README.md.
 LimitMEMLOCK=infinity

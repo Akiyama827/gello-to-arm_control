@@ -55,10 +55,11 @@ gripper_range_m: [0.0, 0.04]
 
 # --- libfranka / FCI --------------------------------------------------------
 franka:
-  # Desk/FCI address of the control box. MEASURED on this bench 2026-07-26: the
-  # `franka` NetworkManager profile puts this PC at 172.16.0.1/24 on enp6s0 and
-  # the control box answers on .3 (not the .2 in Franka's docs). Confirm with
-  # `ip neigh show dev enp6s0` if the arm ever stops answering.
+  # Desk/FCI address of the control box, which hangs off the RT box's second
+  # NIC on a dedicated wire (hybrid topology 2026-07-29: PC + RT box on an
+  # offline router, FCI point-to-point). This PC reaches .3 THROUGH the RT
+  # box (route via 172.16.1.2 + NAT there) — if the arm stops answering,
+  # check arm-rt-nat / ip_forward on the box before blaming this address.
   ip: 172.16.0.3
   # kEnforce refuses to run without RT scheduling. This host only READS state
   # and drives the gripper (the position path was removed 2026-07-26 — torque
@@ -89,9 +90,10 @@ franka:
 # timer to stop. The FR3 enforces its own limits for everything else.
 
 # --- RT link (nodes/rt_interface.py -> arm_rt_server on the RT box) ---------
-# PLACEHOLDER address: the RT machine's IP on its direct link to this PC
-# (second NIC; the FCI wire to the control box stays separate). Staleness/
-# fault thresholds live SERVER-side (launch flags); this is only addressing.
+# The RT box sits on the offline router with this PC; the control box hangs
+# off the box's second NIC (dedicated FCI wire, hybrid topology 2026-07-29).
+# Staleness/fault thresholds live SERVER-side (launch flags); this is only
+# addressing.
 rt:
   host: 172.16.1.2           # the RT box (rung-1 bring-up, 2026-07-27)
   udp_port: 47800
