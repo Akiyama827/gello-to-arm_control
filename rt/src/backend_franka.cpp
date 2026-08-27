@@ -33,6 +33,11 @@
 //  - stop() is NOT zero torque: a loaded arm drops on zero. It re-sends the
 //    last accepted torque with motion_finished, which libfranka takes as a
 //    controlled stop.
+//  - loadModel() runs ONCE, in the constructor: it downloads the model
+//    library from the control box (seconds of blocking network work). read()
+//    then fills PlantState's Jacobian and external-wrench estimate from it —
+//    the Cartesian sensing the impedance law and contact detection need.
+#include <array>
 #include <cstdio>
 #include <string>
 
@@ -42,6 +47,7 @@
 
 #include <franka/active_control.h>
 #include <franka/exception.h>
+#include <franka/model.h>
 #include <franka/robot.h>
 
 namespace arm_rt {
@@ -52,9 +58,38 @@ constexpr double FR3_TAU_LIMIT[MAX_JOINTS] = {87, 87, 87, 87, 12, 12, 12};
 
 class FrankaBackend final : public Backend {
 public:
-  explicit FrankaBackend(const std::string& ip)
-      : robot_(ip, franka::RealtimeConfig::kEnforce) {
+  // model_ is initialised from robot_ — DECLARATION ORDER matters (robot_ is
+  // declared first). loadModel() DOWNLOADS the model library from the control
+  // box, which is seconds of blocking network work: it must happen here, in
+  // the constructor, and never inside a control loop.
+  FrankaBackend(const std::string& ip, double ee_mass, const double ee_com[3])
+      : robot_(ip, franka::RealtimeConfig::kEnforce), model_(robot_.loadModel()) {
     fault_.reserve(256);  // latch path must not allocate on the RT thread
+    // Payload declaration. setLoad writes m_load, which is ADDITIVE to the
+    // Desk-configured end effector (the Hand's m_ee) — pass the camera+mount
+    // or module mass alone, never hand+camera. It is a non-realtime command:
+    // legal here in the constructor, illegal once a control session is open,
+    // which is why it happens once at startup and never on the arm path.
+    // The inertia tensor may NOT be zero: the control box rejects a nonzero
+    // mass with a zero tensor outright ("Set Load command rejected: invalid
+    // argument!" — probed against this FR3 on 2026-08-06; diag(2e-4) for the
+    // same 0.2 kg is accepted). Approximate the payload as a solid sphere of
+    // radius R about its CoM, I = 2/5 m R^2, which is diagonal and therefore
+    // trivially valid. Gravity compensation — the only thing float and hold
+    // depend on — does not use it; give the real tensor here if a payload
+    // ever gets heavy enough for its dynamics to matter.
+    constexpr double R = 0.05;  // m, camera/module scale
+    const double i = 0.4 * ee_mass * R * R;
+    if (ee_mass > 0.0) {
+      robot_.setLoad(ee_mass, {{ee_com[0], ee_com[1], ee_com[2]}},
+                     {{i, 0, 0, 0, i, 0, 0, 0, i}});
+      std::printf("[rt] franka payload declared: %.3f kg at flange "
+                  "[%.3f %.3f %.3f] m\n",
+                  ee_mass, ee_com[0], ee_com[1], ee_com[2]);
+    } else {
+      std::printf("[rt] franka payload: none declared (--ee-mass 0) — Desk's "
+                  "end-effector config is the whole model\n");
+    }
     // Bring-up-friendly collision thresholds: firm hand contact is fine,
     // a hard shove trips the reflex — which is the safe outcome; the
     // operator clears it with a DISARM->ARM cycle.
@@ -81,6 +116,26 @@ public:
         out.tau_ref[j] = state.tau_J_d[j];
         last_tau_ref_[j] = state.tau_J_d[j];
       }
+      // O_F_ext_hat_K, NOT K_F_ext_hat_K. Both are the same estimate; the
+      // choice is which frame it arrives in. Base frame wins because it is
+      // the frame EVERYTHING else here already lives in: zeroJacobian is
+      // base-frame, the servo's Cartesian task frame is fixed in the base
+      // (a dock's insertion axis does not move with the wrist), and the PC
+      // reads the wrench off the wire without a pose to rotate it by. The
+      // stiffness frame K would need the live EE orientation applied at
+      // every consumer — one more place to get a convention wrong, for no
+      // information gained. Sign is libfranka's: POSITIVE = the robot
+      // pushing on the world, so an insertion push reads positive along the
+      // approach axis.
+      for (int i = 0; i < 6; ++i) out.wrench[i] = state.O_F_ext_hat_K[i];
+      out.wrench_valid = true;
+      // zeroJacobian is COLUMN-major 6x7; PlantState wants ROW-major packed
+      // at stride n. Transpose here — the one place the conversion lives.
+      const std::array<double, 42> jac =
+          model_.zeroJacobian(franka::Frame::kEndEffector, state);
+      for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < FR3_N; ++c) out.jacobian[r * FR3_N + c] = jac[c * 6 + r];
+      out.jacobian_valid = true;
       return true;
     } catch (const franka::Exception& exc) {
       fail(exc);
@@ -147,6 +202,7 @@ private:
   }
 
   franka::Robot robot_;
+  franka::Model model_;  // MUST stay declared after robot_ (see the ctor)
   std::unique_ptr<franka::ActiveControlBase> control_;
   bool active_ = false;
   bool need_recovery_ = false;
@@ -156,9 +212,10 @@ private:
 
 } // namespace
 
-std::unique_ptr<Backend> make_franka_backend(const std::string& ip) {
+std::unique_ptr<Backend> make_franka_backend(const std::string& ip, double ee_mass,
+                                             const double ee_com[3]) {
   try {
-    return std::make_unique<FrankaBackend>(ip);
+    return std::make_unique<FrankaBackend>(ip, ee_mass, ee_com);
   } catch (const franka::Exception& exc) {
     // FCI off, robot unreachable, no RT permission — report, exit nonzero,
     // and let systemd's Restart=on-failure keep knocking until it's there.
@@ -172,7 +229,8 @@ std::unique_ptr<Backend> make_franka_backend(const std::string& ip) {
 #else // !ARM_RT_WITH_FRANKA
 
 namespace arm_rt {
-std::unique_ptr<Backend> make_franka_backend(const std::string&) {
+std::unique_ptr<Backend> make_franka_backend(const std::string&, double,
+                                             const double[3]) {
   std::fprintf(stderr, "[rt] built without libfranka (-DWITH_FRANKA=ON)\n");
   return nullptr;
 }

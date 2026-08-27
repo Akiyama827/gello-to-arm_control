@@ -124,6 +124,14 @@ review-caught, all in the stale-authority class):
      gravity compensation; push the arm around by hand.
    - `--hold-kp 30 --hold-kd 2` → the arm springs back around the pose
      captured at ARM.
+
+   **Declare anything bolted past the flange** (`--ee-mass KG [--ee-com
+   X,Y,Z]`, the CoM in the flange frame). The value is ADDED to Desk's
+   end-effector config — pass the camera+mount or module mass alone, not
+   hand+camera. Float has nothing but the robot's own gravity model holding
+   it up: 0.2 kg undeclared is ~1 N·m of permanent elbow torque, and the arm
+   creeps into its joint-4 limit and trips `joint_velocity_violation`
+   (2026-08-06, twice, before the flag existed).
    A hard shove trips the collision reflex — the safe outcome; recover
    DISARM→ARM (the backend runs `automaticErrorRecovery` on re-arm).
 3. **FR3 tracking**: slow sine from the PC graph via `rt_interface`;

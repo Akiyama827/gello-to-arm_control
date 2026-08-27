@@ -18,8 +18,13 @@
 # world — get it wrong and the FR3 picks where the assembler thinks the module
 # is, not where it actually is.
 arm:
-  world_origin: [0.0, 0.0, 0.0]
-  world_rpy:    [0.0, 0.0, 0.0]
+  # CAD NOMINAL, not measured: taken from the SolidWorks bench export (link0
+  # chamfer-registered against bench_setup.STL, yaw -90 deg = facing the table
+  # front). It is here so the static scene renders in the right place for the
+  # geometry check; `calibrate_hand_eye.py wrist` OVERWRITES it with the solved
+  # mount, and the two agreeing is the calibration's cross-check.
+  world_origin: [-0.3975, 0.31393, 0.012]
+  world_rpy:    [0.0, 0.0, -1.5707963]
 
   # --- Gain table (SIM-facing since the position path was removed) -----------
   # No process on this host closes a loop over the real FR3 (torque control

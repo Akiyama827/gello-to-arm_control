@@ -26,6 +26,32 @@ import numpy as np
 from arm_control.planning.mujoco_collision import _rpy_to_quat
 from arm_control.simulation.convex_decomp import replace_with_decomposition
 
+# THE law, compiled once (rt/include/arm_rt/servo_law.hpp via rt/bindings).
+# Optional by construction — a plain `pip install -e .` of arm_control does not
+# build it — but its absence is a real divergence between the twin and the RT
+# thread (the Python fallback below has NO torque clamp and NO slew limiter),
+# so it warns once and loudly rather than silently.
+try:  # pragma: no cover - presence depends on whether rt/bindings was built
+    import arm_rt_servo as _servo
+except ImportError:  # pragma: no cover
+    _servo = None
+
+_pd_fallback_warned = [False]
+
+
+def _warn_python_pd_once() -> None:
+    if _pd_fallback_warned[0]:
+        return
+    _pd_fallback_warned[0] = True
+    print(
+        "[mujoco_backend] WARNING: arm_rt_servo is not importable — the twin is "
+        "closing a PYTHON PD instead of the compiled RT law. It has no torque "
+        "clamp, no slew limiter and no Cartesian impedance, so sim results do "
+        "NOT predict the RT loop. Build it: pip install -e "
+        "libs/arm_control/rt/bindings",
+        flush=True,
+    )
+
 
 class MuJoCoUnavailableError(RuntimeError):
     """Raised when the scene cannot be built (missing assets, bad config)."""
@@ -51,6 +77,13 @@ class MuJoCoSceneSpec:
 def _load_model_spec(path: str | Path) -> mujoco.MjSpec:
     path = Path(path)
     if path.suffix.lower() == ".urdf":
+        # Same shims as single-model mode: URDF needs the <mujoco> compiler
+        # extension (meshdir, balanceinertia, undecodable-visual fallback) —
+        # the FR3's raw URDF fails on all three. keep_visual: this model feeds
+        # the viewer/Rerun mirror too.
+        from arm_control.planning.mujoco_collision import build_planning_model
+
+        path = build_planning_model(path, path.parent / ".mj_cache", keep_visual=True)
         return mujoco.MjSpec.from_string(path.read_text())
     if path.suffix.lower() in (".xml", ".mjcf"):
         return mujoco.MjSpec.from_file(str(path))
@@ -176,6 +209,10 @@ class MuJoCoBackend:
     # they get fine CoACD decomposition, module-only contact bits, and pad-force
     # readout. Empty = a scene with no grip fingers.
     finger_body_match: tuple = ()
+    # Servo slew budget, N·m per plant tick. Same default as the RT server's
+    # ServerConfig::slew (rt/src/server.hpp) — the sim has no better source,
+    # and a twin that ramps faster than the robot flatters every transient.
+    slew_per_tick: float = 1.0
     model_revision: int = 0
 
     model: Any = field(default=None, init=False, repr=False)
@@ -333,13 +370,37 @@ class MuJoCoBackend:
                     self.model.dof_frictionloss[joint.dofadr[0]] = max(
                         5.0, float(self.model.dof_frictionloss[joint.dofadr[0]])
                     )
+        if self.finger_body_match:
+            # condim 3 (the URDF-import default) has NO torsional term, so spin
+            # about the contact normal — exactly the in-hand roll axis the dock
+            # aim fights — was frictionless regardless of grip force, while the
+            # bench holds roll firmly at 40 N. condim 4 turns the term on for
+            # every contact involving a pad (contact condim/friction take the
+            # per-pair max).
+            # ponytail: 0.02 m is a POC-firm guess, not a bench measurement
+            # (2026-08-04 user call: sim is POC-only) — retune if a rung needs
+            # sim/bench roll parity.
+            for gid in range(self.model.ngeom):
+                body = self.model.body(self.model.geom_bodyid[gid]).name
+                if any(tok in body for tok in self.finger_body_match):
+                    self.model.geom_condim[gid] = max(
+                        4, int(self.model.geom_condim[gid])
+                    )
+                    self.model.geom_friction[gid, 1] = max(
+                        0.02, float(self.model.geom_friction[gid, 1])
+                    )
         if not self.enable_self_collision:
             self._contacts_ground_only()
         self.data = mujoco.MjData(self.model)
+        mujoco.mj_resetData(self.model, self.data)
+        # Spawn pose via data.qpos, NEVER model.qpos0: MuJoCo poses a hinge at
+        # (qpos - qpos0), so writing spawn angles into qpos0 silently shifts
+        # those joints' zero — the plant then lives in a coordinate frame
+        # offset by the spawn pose while IK/RNEA speak URDF coordinates.
+        # (Latent since the restoration: the DM scene's defaults were all 0.)
         for name, value in (self.default_joint_positions or {}).items():
             joint = self.model.joint(str(name))
-            self.model.qpos0[joint.qposadr[0]] = float(value)
-        mujoco.mj_resetData(self.model, self.data)
+            self.data.qpos[joint.qposadr[0]] = float(value)
         self._qadr = np.array(
             [self.model.joint(n).qposadr[0] for n in self.joint_names], dtype=int
         )
@@ -349,6 +410,42 @@ class MuJoCoBackend:
         self._act_id = np.array(
             [self.model.actuator(f"{n}_motor").id for n in self.joint_names], dtype=int
         )
+        # Per-joint torque limit for the servo law. The MJCF's
+        # ``actuatorfrcrange`` is the authority (module docstring): MuJoCo
+        # already clamps the applied force there, so mirroring it into the law
+        # keeps the twin's torque identical to the RT loop's instead of merely
+        # similar. A joint with no range declared gets inf — i.e. exactly the
+        # unclamped behaviour it has today, not a guessed number.
+        # (Ranges here are symmetric; the law takes one magnitude, so an
+        # asymmetric range would be read as ±upper. None of ours are.)
+        self._tau_limit = np.array(
+            [
+                float(self.model.jnt_actfrcrange[self.model.joint(n).id][1])
+                if self.model.jnt_actfrclimited[self.model.joint(n).id]
+                else np.inf
+                for n in self.joint_names
+            ]
+        )
+        self._ee_bid = (
+            int(self.model.body(self.ee_body).id) if self.ee_body else -1
+        )
+        # Bodies whose external forces count as "acting on the arm" — every
+        # body sharing the EE's kinematic-tree root. NOT the EE body's own
+        # subtree: a TCP frame is typically a childless leaf hung off the hand
+        # (the FR3's asm_fr3_hand_tcp is a SIBLING of the fingers), so its own
+        # cfrc_ext is zero forever and the grip reaction would never show up.
+        # Derived from body_rootid — a model fact, so no robot names here. It
+        # is also the right definition: this is what O_F_ext_hat_K estimates,
+        # the total external wrench on the robot, and the real estimate cannot
+        # localise a touch either. All bodies in one tree share the same
+        # cfrc_ext reference point, so they sum without any transform.
+        self._ee_tree = (
+            np.flatnonzero(self.model.body_rootid == self.model.body_rootid[self._ee_bid])
+            if self._ee_bid > 0
+            else np.empty(0, dtype=int)
+        )
+        self._jacp = np.zeros((3, self.model.nv))
+        self._jacr = np.zeros((3, self.model.nv))
         self._gripper_act = [
             self.model.actuator(f"{n}_servo").id for n in gripper_present
         ]
@@ -371,11 +468,18 @@ class MuJoCoBackend:
             )
             for n in gripper_present
         ]
-        # Servo targets start at the OPEN rest (ctrl defaults to 0 = closed).
+        # Servo targets start at the spawn rest (ctrl defaults to 0, which for
+        # an open-at-nonzero gripper like the FR3 would slam the fingers shut).
         for act, name in zip(self._gripper_act, gripper_present):
-            self.data.ctrl[act] = self.model.qpos0[
+            self.data.ctrl[act] = self.data.qpos[
                 self.model.joint(name).qposadr[0]
             ]
+        # The spawn rest IS this gripper's OPEN: the release trigger compares
+        # commanded ctrl against it (a literal `<= 0.004` assumed the DM's
+        # open-at-zero and never fired for the FR3's open-at-0.04).
+        self._gripper_open_ctrl = [
+            float(self.data.ctrl[a]) for a in self._gripper_act
+        ]
         mujoco.mj_forward(self.model, self.data)
         if self.scene is not None:
             self._activate_body_weld("fixture_weld", "world", self.module_body)
@@ -492,19 +596,119 @@ class MuJoCoBackend:
             .copy()
             for key in ("position", "velocity", "torque", "kp", "kd")
         }
+        # Optional Cartesian-impedance block (messages.unpack_motor_command).
+        # None = every graph that does not send one behaves exactly as before.
+        self._last_command["cartesian"] = command.get("cartesian")
+
+    def _cartesian_tau_ff(self, tau_ff: np.ndarray, cart: dict) -> np.ndarray:
+        """Fold the task-frame Cartesian impedance into tau_ff.
+
+        The twin computes J and the EE pose ITSELF, from MuJoCo, exactly as
+        the RT loop computes them from libfranka — the PC only ever sends the
+        target and the stiffness. Keeping that split honest here is the point:
+        a sim that took a PC-computed Jacobian would not be testing the thing
+        the robot actually runs.
+        """
+        if self._ee_bid < 0 or _servo is None:
+            return tau_ff  # no EE configured, or no compiled law to call
+        mujoco.mj_jacBody(self.model, self.data, self._jacp, self._jacr, self._ee_bid)
+        # 6 x n row-major, ACTUATED columns only — the layout servo_law.hpp
+        # documents. Rows the arm cannot drive would just be noise in J^T f.
+        jac = np.vstack((self._jacp[:, self._vadr], self._jacr[:, self._vadr]))
+        body = self.data.body(self._ee_bid)
+        return _servo.cartesian_torque(
+            tau_ff=tau_ff,
+            J=jac,
+            R_task=cart["task_R"],
+            x=body.xpos,
+            quat=body.xquat,  # MuJoCo quats are [w,x,y,z], like the law's
+            x_des=cart["pose"][:3],
+            quat_des=cart["pose"][3:7],
+            # Twist from the SAME J, so the damping term can never disagree
+            # with the stiffness term about what the EE is doing.
+            twist=jac @ self.data.qvel[self._vadr],
+            # ponytail: desired twist is zero — the dock target crawls
+            # (speed_scale 0.3 over 65 mm), so D_c * v_des is well under a
+            # newton. Send a real one if fast Cartesian legs ever appear.
+            twist_des=np.zeros(6),
+            kc=cart["kc"],
+            dc=cart["dc"],
+        )
 
     def _apply_pd(self) -> None:
+        """One servo tick: THE compiled RT law, or a warned Python fallback.
+
+        Calling ``arm_rt_servo.servo_torque`` is the whole point of the pybind
+        module — the twin then closes the byte-identical law the RT thread
+        runs, INCLUDING the per-joint torque clamp and the slew limiter that
+        the old Python PD here silently omitted.
+        """
         if self._last_command is None:
             return
         cmd = self._last_command
         q = self.data.qpos[self._qadr]
         v = self.data.qvel[self._vadr]
-        tau = (
-            cmd["torque"]
-            + cmd["kp"] * (cmd["position"] - q)
-            + cmd["kd"] * (cmd["velocity"] - v)
+        tau_ff = cmd["torque"]
+        cart = cmd.get("cartesian")
+        if cart is not None:
+            tau_ff = self._cartesian_tau_ff(tau_ff, cart)
+        if _servo is None:
+            _warn_python_pd_once()
+            self.data.ctrl[self._act_id] = (
+                tau_ff
+                + cmd["kp"] * (cmd["position"] - q)
+                + cmd["kd"] * (cmd["velocity"] - v)
+            )
+            return
+        # tau_ref is the plant's echo of the last ACCEPTED torque. On the FR3
+        # that is state.tau_J_d; here it is the previous tick's applied ctrl
+        # for these actuators — same meaning, and the fancy index hands back a
+        # copy, so it cannot alias the assignment below.
+        tau_ref = self.data.ctrl[self._act_id].copy()
+        self.data.ctrl[self._act_id] = _servo.servo_torque(
+            q=q,
+            dq=v,
+            q_des=cmd["position"],
+            qd_des=cmd["velocity"],
+            tau_ff=tau_ff,
+            kp=cmd["kp"],
+            kd=cmd["kd"],
+            tau_ref=tau_ref,
+            tau_limit=self._tau_limit,
+            slew_per_tick=float(self.slew_per_tick),
         )
-        self.data.ctrl[self._act_id] = tau
+
+    def ee_wrench(self) -> np.ndarray:
+        """External wrench on the EE body, WORLD frame, ``[fx,fy,fz,tx,ty,tz]``.
+
+        The sim's analogue of the FR3's ``O_F_ext_hat_K`` — same frame (base /
+        world), same sign (POSITIVE = the robot pushing on the world), so a
+        consumer cannot tell the two plants apart.
+
+        Source is ``mj_rnePostConstraint`` -> ``cfrc_ext``, NOT a sum over
+        ``mj_contactForce``. Two reasons: cfrc_ext includes EQUALITY-constraint
+        reactions, and in this scene the grasp fixture and the keyed dock mate
+        ARE equalities while module<->dock contact pairs are masked off by the
+        ground-only contact policy — a contact sum would read ~0 through the
+        entire insertion. And cfrc_ext is a whole-body external total, which is
+        structurally the quantity the FR3 estimates, rather than the per-pad
+        normal that ``_pad_forces`` already answers.
+
+        cfrc_ext is [torque; force] about the subtree CoM, so this reorders to
+        force-first and shifts the moment to the EE body origin.
+        """
+        if self.data is None or self._ee_bid < 0 or not self._ee_tree.size:
+            return np.zeros(6)
+        # cfrc_ext is only meaningful after this call — mj_step leaves it stale
+        # unless a sensor happened to need it.
+        mujoco.mj_rnePostConstraint(self.model, self.data)
+        cfrc = self.data.cfrc_ext[self._ee_tree].sum(axis=0)
+        force = -cfrc[3:6]  # negate: cfrc_ext is world-ON-robot, libfranka is
+        torque = -cfrc[0:3]  # robot-ON-world
+        ref = self.data.subtree_com[self.model.body_rootid[self._ee_bid]]
+        # Move the moment from `ref` to the EE origin: t_B = t_A + (A - B) x f
+        torque = torque + np.cross(ref - self.data.body(self._ee_bid).xpos, force)
+        return np.concatenate((force, torque))
 
     def step(self, command: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
         self.load()
@@ -567,7 +771,8 @@ class MuJoCoBackend:
             # (module gone while still commanded closed) for topology truth.
             elif self._grasped_modules and (
                 all(
-                    float(self.data.ctrl[a]) <= 0.004 for a in self._gripper_act
+                    abs(float(self.data.ctrl[a]) - o) <= 0.004
+                    for a, o in zip(self._gripper_act, self._gripper_open_ctrl)
                 )
                 or float(
                     np.linalg.norm(
@@ -614,9 +819,12 @@ class MuJoCoBackend:
                 # release `elif` and silently disabled it (live-caught).
                 self._grip_log_steps = getattr(self, "_grip_log_steps", 0) + 1
                 if self._grip_log_steps % 100 == 0:
+                    w = self.ee_wrench()
                     print(
                         f"[mujoco_backend] carry: conn-in-EE "
-                        f"{self._conn_in_ee_mm()} mm grip {grip_n:.1f} N",
+                        f"{self._conn_in_ee_mm()} mm grip {grip_n:.1f} N "
+                        f"ee-wrench |f| {np.linalg.norm(w[:3]):.1f} N "
+                        f"|t| {np.linalg.norm(w[3:]):.2f} N.m",
                         flush=True,
                     )
         if self.viewer is not None:
@@ -694,6 +902,23 @@ class MuJoCoBackend:
         data[10] = 20.0
         self._set_weld_active(name, True)
 
+    def inhand_pose(self) -> list | None:
+        """Module pose in the EE-body frame, [x,y,z,qw,qx,qy,qz] (twin truth).
+
+        The sim source for the in-hand monitor: on the bench the wrist
+        camera's end-cap tag re-read supplies the same measurement. None in
+        single-model mode (no module in the world).
+        """
+        if self.scene is None or self.data is None:
+            return None
+        p_ee, R_ee = self._body_T(self.ee_body)
+        p_mod, R_mod = self._body_T(self.module_body)
+        rel_R = R_ee.T @ R_mod
+        rel_p = R_ee.T @ (p_mod - p_ee)
+        quat = np.empty(4)
+        mujoco.mju_mat2Quat(quat, rel_R.ravel())
+        return [float(v) for v in (*rel_p, *quat)]
+
     def _conn_in_ee_mm(self) -> list:
         """Carried connector position in the EE frame (mm) — pad-slip probe.
 
@@ -763,3 +988,124 @@ class MuJoCoBackend:
             "docks": dict(self._docked_modules),
             "grasped_modules": dict(self._grasped_modules),
         }
+
+
+def _demo() -> None:
+    """Self-check for the compiled servo law this plant closes.
+
+    Run: ``python -m arm_control.simulation.mujoco_backend --demo``.
+    The smallest thing that fails if the Cartesian math breaks — no scene, no
+    physics, just the law.
+    """
+    if _servo is None:
+        raise SystemExit(
+            "arm_rt_servo is not importable — build it first:\n"
+            "  pip install -e libs/arm_control/rt/bindings"
+        )
+    rng = np.random.default_rng(7)
+    n = 6
+    eye = np.eye(6)  # J = I: tau IS the EE wrench, so the checks read directly
+    x = np.array([0.30, 0.10, 0.20])
+    quat = np.array([1.0, 0.0, 0.0, 0.0])
+    twist = np.zeros(6)
+    zeros6 = np.zeros(6)
+    # Task frame: X = the insertion axis, deliberately NOT a world axis, so a
+    # law that quietly ignored R_task cannot pass.
+    axis = np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0)
+    R = np.column_stack((axis, np.array([-axis[1], axis[0], 0.0]), [0.0, 0.0, 1.0]))
+    k_axial, k_lat = 2000.0, 200.0
+    kc = np.array([k_axial, k_lat, k_lat, 20.0, 5.0, 5.0])
+    dc = np.zeros(6)
+
+    # (1) COMPATIBILITY: all-zero K_c/D_c must reduce EXACTLY to the plain
+    # joint-space law. Random everything, so it is not passing by symmetry.
+    for _ in range(50):
+        args = {
+            "q": rng.normal(size=n),
+            "dq": rng.normal(size=n),
+            "q_des": rng.normal(size=n),
+            "qd_des": rng.normal(size=n),
+            "kp": rng.uniform(0, 500, n),
+            "kd": rng.uniform(0, 40, n),
+            "tau_ref": rng.normal(size=n),
+            "tau_limit": rng.uniform(5, 90, n),
+            "slew_per_tick": 1.0,
+        }
+        tau_ff = rng.normal(size=n)
+        folded = _servo.cartesian_torque(
+            tau_ff=tau_ff, J=rng.normal(size=(6, n)), R_task=R, x=x, quat=quat,
+            x_des=rng.normal(size=3), quat_des=quat, twist=rng.normal(size=6),
+            twist_des=zeros6, kc=zeros6, dc=zeros6,
+        )
+        assert np.array_equal(folded, tau_ff), "zero K_c/D_c perturbed tau_ff"
+        plain = _servo.servo_torque(tau_ff=tau_ff, **args)
+        with_cart = _servo.servo_torque(tau_ff=folded, **args)
+        assert np.array_equal(plain, with_cart), "zero K_c/D_c changed the output"
+
+    # (2) DIRECTION: displace the EE 1 mm LATERALLY (task Y) and the restoring
+    # wrench must come back mostly along task Y, at the LATERAL stiffness.
+    d = 1e-3
+    lat = _servo.cartesian_torque(
+        tau_ff=np.zeros(n), J=eye, R_task=R, x=x + d * R[:, 1], quat=quat,
+        x_des=x, quat_des=quat, twist=twist, twist_des=zeros6, kc=kc, dc=dc,
+    )
+    f_task = R.T @ lat[:3]
+    assert abs(f_task[1] + k_lat * d) < 1e-9, f"lateral gain wrong: {f_task}"
+    assert abs(f_task[0]) < 1e-12 and abs(f_task[2]) < 1e-12, (
+        f"lateral push leaked onto other axes: {f_task}"
+    )
+    assert np.linalg.norm(lat[3:]) < 1e-12, "pure translation produced a moment"
+
+    # ...and the SAME displacement along the stiff insertion axis must cost the
+    # full stiffness ratio more force. That ratio is the whole design.
+    ax = _servo.cartesian_torque(
+        tau_ff=np.zeros(n), J=eye, R_task=R, x=x + d * R[:, 0], quat=quat,
+        x_des=x, quat_des=quat, twist=twist, twist_des=zeros6, kc=kc, dc=dc,
+    )
+    ratio = np.linalg.norm(ax[:3]) / np.linalg.norm(lat[:3])
+    assert abs(ratio - k_axial / k_lat) < 1e-9, f"stiffness ratio {ratio}"
+    assert np.dot(ax[:3], R[:, 0]) < 0.0, "axial restoring force points outward"
+
+    # (3) ORIENTATION error: a small rotation about task X must produce a
+    # moment opposing it, and the SHORTEST-ARC sign must hold past 180 deg —
+    # q and -q are the same rotation, so a naive difference springs the long
+    # way round exactly there.
+    ang = 0.02
+    s, c = np.sin(ang / 2), np.cos(ang / 2)
+    q_off = np.array([c, *(s * axis)])
+    rot = _servo.cartesian_torque(
+        tau_ff=np.zeros(n), J=eye, R_task=R, x=x, quat=q_off, x_des=x,
+        quat_des=quat, twist=twist, twist_des=zeros6, kc=kc, dc=dc,
+    )
+    assert np.dot(rot[3:], axis) < 0.0, "rotational spring pushes the wrong way"
+    assert abs(np.linalg.norm(rot[3:]) - kc[3] * ang) < 1e-5, f"rot gain {rot[3:]}"
+    flipped = _servo.cartesian_torque(
+        tau_ff=np.zeros(n), J=eye, R_task=R, x=x, quat=q_off, x_des=x,
+        quat_des=-quat, twist=twist, twist_des=zeros6, kc=kc, dc=dc,
+    )
+    assert np.allclose(rot, flipped), "negating q_des changed the spring (arc sign)"
+
+    # (4) DAMPING opposes motion, in the task frame like the stiffness does.
+    v = 0.05
+    damp = _servo.cartesian_torque(
+        tau_ff=np.zeros(n), J=eye, R_task=R, x=x, quat=quat, x_des=x,
+        quat_des=quat, twist=np.concatenate((v * R[:, 1], np.zeros(3))),
+        twist_des=zeros6, kc=zeros6, dc=np.array([130.0, 40.0, 40.0, 0, 0, 0]),
+    )
+    assert abs((R.T @ damp[:3])[1] + 40.0 * v) < 1e-9, f"damping wrong: {damp[:3]}"
+
+    print(
+        f"mujoco_backend: servo law ok — zero K_c/D_c is bit-identical over 50 "
+        f"random cases; lateral {np.linalg.norm(lat[:3]):.3f} N vs axial "
+        f"{np.linalg.norm(ax[:3]):.3f} N for the same {d*1e3:.0f} mm "
+        f"(ratio {ratio:.0f}x)"
+    )
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--demo" in sys.argv:
+        _demo()
+    else:
+        print(__doc__)

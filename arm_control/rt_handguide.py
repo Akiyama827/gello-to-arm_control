@@ -20,6 +20,13 @@ catch a commander that died — there is none here, and letting it latch
 would make a real fault (collision reflex) indistinguishable in the flags.
 The TCP-session deadman and the physical stop stay live.
 
+Also the INSERTION-FORCE bench tool: float the arm with the module in the
+gripper, push it into the dock by hand, and read the logged external wrench
+(``fx..tz``, robot base frame) for the axial seating force and the lateral
+force at a given misalignment — the two numbers that size the Cartesian
+impedance stiffness. Needs a backend that estimates a wrench (franka does;
+fake/DM log zeros with ``wrench_valid`` 0).
+
     python -m arm_control.rt_handguide --host 172.16.1.2 --log guide.csv
 """
 from __future__ import annotations
@@ -39,9 +46,13 @@ def _log_loop(backend: RtBackend, path: str, stop: threading.Event) -> None:
     n = backend.n
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
+        # wrench_valid is logged alongside the six numbers on purpose: an
+        # all-zero wrench is otherwise ambiguous between "no external force"
+        # and "this backend does not estimate one" (fake/DM report zeros).
         w.writerow(
             ["t_mono", "flags", "fault"]
             + [f"{k}{j}" for k in ("q", "dq", "tau", "tau_cmd") for j in range(n)]
+            + ["wrench_valid", "fx", "fy", "fz", "tx", "ty", "tz"]
         )
         last_console = 0.0
         last_fault = ""
@@ -49,10 +60,13 @@ def _log_loop(backend: RtBackend, path: str, stop: threading.Event) -> None:
             state, rx_t = backend.latest_state()
             now = time.monotonic()
             if state is not None:
+                wrench = list(state.wrench) or [0.0] * 6
                 w.writerow(
                     [f"{rx_t:.4f}", state.flags, ""]
                     + [f"{v:.5f}" for v in (*state.q, *state.dq,
                                             *state.tau, *state.tau_cmd)]
+                    + [int(state.wrench_valid)]
+                    + [f"{v:.5f}" for v in wrench]
                 )
                 if now - last_console >= CONSOLE_EVERY_S:
                     last_console = now
@@ -61,8 +75,13 @@ def _log_loop(backend: RtBackend, path: str, stop: threading.Event) -> None:
                     mode = ("FAULTED" if state.faulted else
                             "holding" if state.holding else
                             "armed" if state.armed else "disarmed")
+                    # Live force readout is the point of the insertion test:
+                    # you need to see what you are pushing WHILE you push.
+                    force = (f"F [{wrench[0]:+6.1f} {wrench[1]:+6.1f} "
+                             f"{wrench[2]:+6.1f}] N" if state.wrench_valid
+                             else "F (none)")
                     print(f"[guide] {mode:9s} max|dq| {dq:6.3f} rad/s   "
-                          f"max|tau_cmd| {tc:6.2f} N.m", flush=True)
+                          f"max|tau_cmd| {tc:6.2f} N.m   {force}", flush=True)
                 fault = backend.motor_health()["latched_fault"]
                 if fault and fault != last_fault:
                     last_fault = fault

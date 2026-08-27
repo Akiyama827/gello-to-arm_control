@@ -726,6 +726,32 @@ def _optional_str(value: Any) -> str | None:
     return str(value)
 
 
+def dm_spec_from_config(cfg: Any, iface: str | None = None) -> str:
+    """Build ``arm_rt_server --backend dm``'s ``--dm-spec`` from a hardware config.
+
+    The RT server takes its motor list as a CLI string (``iface;id:type[:mst]``)
+    while the same facts live in ``hardware.yaml``'s ``motors:`` block. Deriving
+    the string here keeps the two from drifting: a motor reflashed to a new
+    Master ID is a config edit, not a systemd-unit edit.
+
+    ``master_id`` matters more than it looks — the RT backend installs a KERNEL
+    CAN FILTER on it (``rt/src/backend_dm.cpp:240``), so a wrong value drops
+    every reply before the backend sees it and surfaces as "motor N never
+    replied". ``None`` means the DM factory default 0x00 and is emitted as a
+    bare ``id:type`` pair, matching the server's own default.
+    """
+    motors = _parse_motor_configs(cfg)
+    if iface is None:
+        iface = str((getattr(cfg, "raw", {}) or {}).get("bus", {}).get("interface", "can0"))
+    parts = []
+    for m in motors:
+        item = f"0x{m.can_id:02X}:{m.motor_type}"
+        if m.master_id is not None:
+            item += f":0x{m.master_id:02X}"
+        parts.append(item)
+    return f"{iface};" + ",".join(parts)
+
+
 __all__ = [
     "DM_DISABLE_FRAME",
     "DM_ENABLE_FRAME",
@@ -735,5 +761,6 @@ __all__ = [
     "DmHardwareBackend",
     "DmMotorConfig",
     "DmMotorLimits",
+    "dm_spec_from_config",
     "pack_mit_control_frame",
 ]

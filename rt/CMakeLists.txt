@@ -53,3 +53,8 @@ endif()
 
 add_executable(protocol_selfcheck src/selfcheck.cpp)
 target_include_directories(protocol_selfcheck PRIVATE include)
+
+# Dock latch/sensor TCP re-export (src/dock_bridge.cpp). Pure SocketCAN +
+# libc — builds in every config, shares can0 with the dm backend via
+# disjoint kernel CAN filters.
+add_executable(dock_bridge src/dock_bridge.cpp)

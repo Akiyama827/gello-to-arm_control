@@ -99,6 +99,16 @@ class State:
     def holding(self) -> bool:
         return bool(self.flags & FLAG_HOLDING)
 
+    @property
+    def wrench_valid(self) -> bool:
+        """True when ``wrench`` is a real estimate, not the reserved zeros.
+
+        The field and the flag have existed since v1; the franka backend
+        started filling them in 2026-08-02 (the fake backend never will — it
+        has no geometry). NOT a wire change: same layout, same VERSION.
+        """
+        return bool(self.flags & FLAG_WRENCH_VALID)
+
 
 def unpack_state(data: bytes) -> State:
     if len(data) != STATE_SIZE:

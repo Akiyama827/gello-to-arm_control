@@ -1,0 +1,27 @@
+# Brings up the gs_usb FDCAN link the base server and dock bridge share.
+# The dmcan USB2FDCAN adapter enumerates as candleLight/gs_usb (1d50:606f);
+# the kernel owns it as can0 but the link starts DOWN and unconfigured —
+# somebody root must set the bus timing before either service can bind.
+# Timing is the dock/motor bus contract (firmware MX_FDCAN1_Init):
+# 1 Mbps nominal / 4 Mbps data, FD on. Install:
+#   sudo cp can0-up.service /etc/systemd/system/
+#   sudo systemctl enable --now can0-up
+# After a REPLUG of the adapter the link comes back DOWN — run
+#   sudo systemctl restart can0-up
+# (or add a udev rule later if replugging becomes routine).
+[Unit]
+Description=can0 — gs_usb FDCAN link up (1M/4M, fd on) for base + dock
+# Wait for the interface to exist (gs_usb probe) before configuring it.
+After=sys-subsystem-net-devices-can0.device
+Wants=sys-subsystem-net-devices-can0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# restart-ms 100: auto-recover from bus-off (hot-mate transients live on
+# this bus) — without it a bus-off can0 stays dead until a manual down/up.
+ExecStart=/usr/sbin/ip link set can0 up type can bitrate 1000000 dbitrate 4000000 fd on restart-ms 100
+ExecStop=/usr/sbin/ip link set can0 down
+
+[Install]
+WantedBy=multi-user.target

@@ -46,6 +46,17 @@ public:
       out.tau[j] = tau_[j];
       out.tau_ref[j] = tau_[j];  // self-echo: last applied torque
     }
+    // Cartesian sensing: EXPLICIT zeros, both flags false. This plant has no
+    // geometry at all (independent per-joint integrators — there is no EE to
+    // put a wrench on and no chain to build a Jacobian from), so the honest
+    // answer is "not available", and the false flags keep FLAG_WRENCH_VALID
+    // clear on the wire. Faking a Jacobian here would let a Cartesian bug
+    // pass the loopback tests and surface first on the robot. PlantState
+    // zero-initialises both arrays; the assignments below are here so that
+    // stays a DECISION, not a default nobody revisited.
+    for (int i = 0; i < 6; ++i) out.wrench[i] = 0.0;
+    out.wrench_valid = false;
+    out.jacobian_valid = false;
     return true;
   }
 

@@ -1,0 +1,105 @@
+# Modular base (2-DOF dock stand) — HARDWARE IDENTITY.
+#
+# Lifetime: changes when the BASE ITSELF changes (a motor swapped or reflashed,
+# the CAN adapter replaced). Nothing here is a bench session knob and nothing
+# here is written by a calibration script.
+#
+# This plant is NOT driven from the PC. It runs on the RT box as a SECOND
+# arm_rt_server instance (`--backend dm`, ports 47810/47811) alongside the FR3's
+# instance on 47800/47801 — see rt/systemd/arm-base-server.service. The
+# `motors:` block below is the single source of truth for that server's
+# --dm-spec string; build it with `dm_spec_from_config()` rather than retyping
+# it (arm_control/hardware/dm_backend.py).
+#
+# Bus: the base motors SHARE can0 with the dock MCUs. The bus contract is
+# 1 M nominal / 4 M data FD+BRS (can0-up.service on the box). The motors always
+# reply FD/BRS — a classic-frame reader sees silence, not errors.
+
+real_backend: rt
+listen_mode: false
+
+arm:
+  joints: [base_yaw, base_pitch]
+  urdf: modules/modular_base_2dof.urdf
+
+num_motors: 2
+motor_ids: [1, 2]
+motor_names: [base_yaw, base_pitch]
+joint_names: [base_yaw, base_pitch]
+render_joint_names: [base_yaw, base_pitch]
+
+bus:
+  interface: can0
+  canfd: true
+  can_baudrate: 1000000      # nominal
+  canfd_baudrate: 4000000    # data (BRS) — motors are FIXED at 4 M
+  brs: true
+  extended_id: false
+
+# master_id = the CAN id the motor's firmware REPLIES on. NOT the factory
+# default 0x00: these two are flashed to 0x010 + can_id, MEASURED 2026-08-27
+# (feedback observed on 0x011 / 0x012). The RT backend installs a kernel CAN
+# filter on this value (backend_dm.cpp:240) — get it wrong and every reply is
+# dropped before the backend sees it, reported as "motor N never replied".
+motors:
+  - name: base_yaw
+    joint: base_yaw
+    can_id: 0x01
+    motor_type: "4340"
+    master_id: 0x11
+    module: base
+    bank: null
+    enabled_on_open: false
+  - name: base_pitch
+    joint: base_pitch
+    can_id: 0x02
+    motor_type: "4340p"
+    master_id: 0x12
+    module: base
+    bank: null
+    enabled_on_open: false
+
+banks: []
+modules:
+  - name: base
+    bank: null
+    motor_names: [base_yaw, base_pitch]
+
+# --- Measured plant facts (2026-08-27 bench) --------------------------------
+# Gear ratio is 1:1 in the REPORTED angle — a 45 deg hand move read 40.5 deg at
+# the motor, so motor angle IS joint angle (the 40:1 internal reduction does
+# not appear in the MIT feedback).
+#
+# Zero convention VERIFIED against modules/modular_base_2dof.urdf — no sign
+# inversions, no offsets to bake in:
+#   base_yaw   +ve = CCW viewed from above (URDF +z). Range +/-3.14.
+#   base_pitch  0  = dock face HORIZONTAL, aimed at the arm
+#              -pi/2 = dock face STRAIGHT UP;  -pi = horizontal, other way.
+#              Measured 0 -> -86.70 deg for a hand move to vertical (URDF -90).
+#   The mechanism travels PAST 0; the URDF's upper="0.0" is a deliberate
+#   user-chosen buffer, not a hard stop. Keep it.
+measured:
+  # Static friction in the drive, from the settled residual under a known
+  # restoring torque. ~2x the 0.21 N.m peak gravity load, which is why the base
+  # never droops undisturbed — but it DID fall 83 deg once while yaw was being
+  # swung, because vibration breaks stiction loose.
+  stiction_nm: {base_yaw: 0.49, base_pitch: 0.36}
+  # Hold deadband = stiction / hold_kp. At kp 15 this measured 1.8 deg / 1.4 deg,
+  # which eats 50-60% of scenario.yaml's dock_seat_ang_tol_deg: 3.0. kp 50 puts
+  # it near 0.55 deg. Raise kp for docking; the two joints differ, so per-joint
+  # gains eventually.
+  gravity_peak_nm: 0.21
+
+# --- RT link (PC -> arm_rt_server --backend dm on the box) ------------------
+# Its own port pair. NOTE 47802 is NOT free: hand_bridge holds TCP 47802 on the
+# same box for the Franka Hand (franka/hardware.yaml: hand_port).
+rt:
+  host: 172.16.1.2
+  udp_port: 47810
+  tcp_port: 47811
+  state_timeout_s: 0.2
+  # Refuse a server whose command deadman is slower than this — a handguide
+  # server (--fault-ms 3600000) has NO staleness reflex.
+  max_fault_ms: 5000
+
+urdf_path: modules/modular_base_2dof.urdf

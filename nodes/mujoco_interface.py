@@ -131,7 +131,17 @@ def main() -> None:
     install_signal_handlers(shutdown)
 
     command = {
-        "position": _zeros(n),
+        # The SPAWN POSE, read back from the plant — not zeros. The comment
+        # below has always said "hold at the spawn pose"; the code held at
+        # q=0, which for any arm whose spawn pose is not the origin is not a
+        # hold at all but a full-authority move to the origin. Measured on the
+        # FR3 scene: the arm slams off its ready pose at up to 30 rad/s during
+        # the pre-arm window, and whether it has wrecked the scene by the time
+        # the operator arms is a race against sim_bridge's park taking over.
+        # That is the "start pose is in collision per the plan world" the
+        # planner intermittently refused on. Pre-existing, law-independent
+        # (the old Python PD does it too) — found while A/B-ing the servo law.
+        "position": backend.motor_state()["position"].copy(),
         "velocity": _zeros(n),
         "torque": _zeros(n),
         # Gentle hold at the spawn pose until real commands arrive: with zero
@@ -139,11 +149,16 @@ def main() -> None:
         # tangle downstream planners then refuse to start from.
         "kp": _zeros(n) + 60.0,
         "kd": _zeros(n) + 2.0,
+        # Optional Cartesian-impedance target + task-frame K_c/D_c. None until
+        # a command carries one; None = joint-space PD only, i.e. today.
+        "cartesian": None,
     }
     last_cmd_time: dict[str, float] = {arm: 0.0 for arm in arm_slices}
     last_step = 0.0
     last_qpos_pub = 0.0
     last_grip_pub = 0.0
+    last_inhand_pub = 0.0
+    last_wrench_pub = 0.0
     _slow_warned_at = [0.0]
     _slow_debt = [0.0]   # debt at last warning (warn only on NEW drift)
     _sim_steps = [0]
@@ -156,6 +171,10 @@ def main() -> None:
         command["torque"][s : s + m] = 0.0
         command["kp"][s : s + m] = 0.0
         command["kd"][s : s + m] = 0.0
+        # The Cartesian spring decays WITH the joint gains. Leaving it live
+        # while kp/kd go to zero is the worst of both: a limp arm still being
+        # pulled toward a target nobody is refreshing.
+        command["cartesian"] = None
 
     try:
         while not shutdown.stop_requested:
@@ -179,6 +198,11 @@ def main() -> None:
                         last_cmd_time[arm] = time.monotonic()
                         for key in ("position", "velocity", "torque", "kp", "kd"):
                             command[key][s : s + m] = sub[key]
+                        # Cartesian impedance is an EE-level term, so it has no
+                        # slice — the arm that owns the configured EE body owns
+                        # it. Last writer wins; in every scene we run, exactly
+                        # one arm ever sends one.
+                        command["cartesian"] = sub["cartesian"]
                 elif etype == "INPUT" and not arm_slices and eid == "motor_command":
                     command = unpack_motor_command(event["value"], n)
                     _warn_undamped(command)
@@ -275,6 +299,40 @@ def main() -> None:
                         "sim_qpos",
                         pack_json_message(
                             "sim_qpos", {"qpos": backend.data.qpos.tolist()}
+                        ),
+                    )
+                except Exception:
+                    pass  # graphs without the output declared still run
+            # In-hand truth at 10 Hz: module pose in the EE frame, the sim
+            # source for the orchestrator's slip monitor (bench source = the
+            # wrist camera's end-cap tag re-read, same message).
+            if scene_cfg and now - last_inhand_pub > 0.1:
+                last_inhand_pub = now
+                pose = backend.inhand_pose()
+                if pose is not None:
+                    try:
+                        node.send_output(
+                            "inhand_pose",
+                            pack_json_message(
+                                "inhand_pose", {"pose_xyzquat": pose}
+                            ),
+                        )
+                    except Exception:
+                        pass  # graphs without the output declared still run
+            # Measured EE wrench at 20 Hz — the sim's stand-in for the FR3's
+            # O_F_ext_hat_K (same frame, same sign). Published so contact
+            # detection has a signal to grow into; nothing acts on it yet.
+            if scene_cfg and now - last_wrench_pub > 0.05:
+                last_wrench_pub = now
+                try:
+                    node.send_output(
+                        "ee_wrench",
+                        pack_json_message(
+                            "ee_wrench",
+                            {
+                                "frame": "world",
+                                "wrench": backend.ee_wrench().tolist(),
+                            },
                         ),
                     )
                 except Exception:

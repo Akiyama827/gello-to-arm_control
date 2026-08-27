@@ -19,7 +19,11 @@ from typing import Sequence
 import numpy as np
 import pyarrow as pa
 
-from arm_control.messages import pack_motor_command, unpack_motor_state
+from arm_control.messages import (
+    pack_cartesian_block,
+    pack_motor_command,
+    unpack_motor_state,
+)
 
 
 def _endpoints(mimic_cfg: dict) -> tuple[float, float, float, float]:
@@ -66,6 +70,7 @@ def pack_arm_gripper_command(
     gripper_finger_m: float,
     gripper_gains: Sequence[float],
     mimic_cfg: dict | None,
+    cartesian: dict | None = None,
 ) -> pa.Array:
     """Pack the 7-motor command: 6 arm joints 1:1 + 1 gripper motor.
 
@@ -77,7 +82,18 @@ def pack_arm_gripper_command(
     ``mimic_cfg=None`` means this arm's gripper is NOT a motor on the same bus
     (the FR3's Franka Hand is its own device, driven by grasp requests): the
     command is then arm joints only, with no gripper slot appended.
+
+    ``cartesian`` is the optional EE-level impedance block (target pose +
+    task-frame K_c/D_c dict, see ``messages.pack_cartesian_block``). It has no
+    per-motor structure, so the gripper mapping above does not touch it.
     """
+    tail = (
+        None
+        if cartesian is None
+        else pack_cartesian_block(
+            cartesian["pose"], cartesian["task_R"], cartesian["kc"], cartesian["dc"]
+        )
+    )
     if mimic_cfg is None:
         return pack_motor_command(
             np.asarray(arm_q, dtype=float),
@@ -85,6 +101,7 @@ def pack_arm_gripper_command(
             np.asarray(arm_tau, dtype=float),
             np.asarray(arm_kp, dtype=float),
             np.asarray(arm_kd, dtype=float),
+            tail,
         )
     motor_rad = gripper_finger_to_motor(float(gripper_finger_m), mimic_cfg)
     g_kp, g_kd = float(gripper_gains[0]), float(gripper_gains[1])
@@ -93,7 +110,7 @@ def pack_arm_gripper_command(
     tor = np.concatenate([np.asarray(arm_tau, dtype=float), [0.0]])
     kp = np.concatenate([np.asarray(arm_kp, dtype=float), [g_kp]])
     kd = np.concatenate([np.asarray(arm_kd, dtype=float), [g_kd]])
-    return pack_motor_command(pos, vel, tor, kp, kd)
+    return pack_motor_command(pos, vel, tor, kp, kd, tail)
 
 
 def unpack_motor_state_to_joint(

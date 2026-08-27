@@ -330,3 +330,158 @@ class PreviewScene:
             f"preview/{name}",
             rr.Points3D(pts, colors=[_rgba8(rgba)], radii=[float(point_size)]),
         )
+
+
+def static_scene_geoms(cfg) -> list:
+    """[(body, mesh_name, mesh_path, arm_T_geom)] for every non-arm scene body.
+
+    Reads the SAME `scene:` block the sim composes its MuJoCo model from, so the
+    Rerun recordings, the teleop page and the sim can never disagree about where
+    the dock stands. Poses come back in the ARM BASE frame — the frame the robot
+    meshes and preview ghosts already live in (pinocchio FK, URDF root = arm
+    base) — so callers can use them without another transform.
+
+    Returns [] (never raises) when there is no scene, no mujoco, or a missing
+    mesh: a viewer that cannot draw the table must still draw the robot.
+    """
+    scene = {k: v for k, v in dict(cfg.get("scene") or {}).items() if k != "arm"}
+    if not scene:
+        return []
+    try:
+        import xml.etree.ElementTree as ET
+
+        import mujoco
+
+        from arm_control import CONTROL_ROOT, frames
+
+        arm_T_world = frames.invert(frames.world_T_arm(cfg))
+    except Exception as exc:  # mujoco is optional on a viewer-only host
+        print(f"[scene] static scene skipped: {exc}", flush=True)
+        return []
+
+    out = []
+    for name, spec in scene.items():
+        spec = dict(spec or {})
+        model_path = spec.get("model_path")
+        if not model_path:
+            continue
+        xml_path = Path(str(model_path))
+        if not xml_path.is_absolute():
+            xml_path = CONTROL_ROOT / xml_path
+        try:
+            model = mujoco.MjModel.from_xml_path(str(xml_path))
+            data = mujoco.MjData(model)
+            # Pose the body's own joints exactly as the sim holds them, so a
+            # rotated dock socket renders rotated here too.
+            hold = spec.get("hold_q") or cfg.get("sim_base_hold_q") or []
+            for j, value in enumerate(hold[: model.nq]):
+                data.qpos[j] = float(value)
+            mujoco.mj_forward(model, data)
+            # meshdir + file names live in the XML, not the compiled model.
+            root = ET.parse(xml_path).getroot()
+            compiler = root.find("compiler")
+            meshdir = (compiler.get("meshdir") if compiler is not None else "") or ""
+            files = {
+                m.get("name"): m.get("file")
+                for m in root.iter("mesh")
+                if m.get("name") and m.get("file")
+            }
+            world_T_body = frames.T_from_spec(
+                {
+                    "origin": spec.get("world_pos", [0, 0, 0]),
+                    "rpy": spec.get("world_rpy", [0, 0, 0]),
+                }
+            )
+            for gid in range(model.ngeom):
+                # group 2 is this model family's VISUAL group (group 3 is the
+                # collision copy — drawing both doubles every mesh).
+                if model.geom_group[gid] != 2 or model.geom_dataid[gid] < 0:
+                    continue
+                mesh_name = mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_MESH, model.geom_dataid[gid]
+                )
+                mesh_file = files.get(mesh_name)
+                if not mesh_file:
+                    continue
+                mesh_path = xml_path.parent / meshdir / mesh_file
+                if not mesh_path.is_file():
+                    print(f"[scene] mesh missing: {mesh_path}", flush=True)
+                    continue
+                T_body_geom = np.eye(4)
+                T_body_geom[:3, :3] = np.asarray(data.geom_xmat[gid]).reshape(3, 3)
+                T_body_geom[:3, 3] = np.asarray(data.geom_xpos[gid])
+                # MuJoCo RECENTERS and REORIENTS every mesh asset at compile
+                # time; mesh_pos/mesh_quat record what it applied, mapping the
+                # stored vertices back to the file's own frame (verified on
+                # this model: v_file = R_m v_stored + p_m, residual 2e-4 m).
+                # geom_xpos/xmat therefore place the PROCESSED mesh — hand them
+                # the raw STL, as Rerun and the teleop page do, and the parts
+                # scatter and tumble (bench 2026-08-06). Undo it.
+                mesh_id = int(model.geom_dataid[gid])
+                R_m = np.zeros(9)
+                mujoco.mju_quat2Mat(R_m, model.mesh_quat[mesh_id])
+                T_mesh = np.eye(4)
+                T_mesh[:3, :3] = R_m.reshape(3, 3)
+                T_mesh[:3, 3] = np.asarray(model.mesh_pos[mesh_id])
+                out.append(
+                    (name, f"{mesh_name}_{gid}", mesh_path,
+                     arm_T_world @ world_T_body @ T_body_geom @ frames.invert(T_mesh))
+                )
+        except Exception as exc:
+            print(f"[scene] body {name!r} failed: {exc}", flush=True)
+    return out
+
+
+def log_static_scene(cfg) -> None:
+    """Draw the non-arm scene bodies into the current Rerun recording, static."""
+    geoms = static_scene_geoms(cfg)
+    for body, mesh_name, mesh_path, T in geoms:
+        entity = f"scene/{body}/{mesh_name}"
+        rr.log(entity, rr.Asset3D(path=mesh_path), static=True)
+        rr.log(
+            entity,
+            rr.Transform3D(translation=T[:3, 3], mat3x3=T[:3, :3]),
+            static=True,
+        )
+    if geoms:
+        bodies = sorted({g[0] for g in geoms})
+        print(f"[scene] drew {len(geoms)} meshes for {bodies}", flush=True)
+
+
+def scene_obstacle_geoms(cfg) -> list[dict]:
+    """`environment`-style MESH obstacles for the static scene bodies.
+
+    The planner only ever knew about `environment:` boxes, so a dock drawn in
+    every viewer was still invisible to collision checking — the arm would
+    happily plan straight through it. These come from `static_scene_geoms`,
+    the SAME call the viewers draw with, so the obstacle and the picture can
+    never disagree (they did, by 36 mm, when this computed its own transform).
+
+    One entry per visual geom, pointing at the geom's own STL: MuJoCo collides
+    a mesh by its CONVEX HULL — far tighter than a bounding box while never
+    optimistic, since a hull contains its mesh. The dock's parts are close to
+    convex, so this is nearly exact.
+
+    Marked `toggleable` so `enable_scene_obstacles` can drop them for the
+    insertion leg, where the dock stops being an obstacle and becomes the
+    target. Poses place the RAW FILE; MuJoCo's own asset recentering is the
+    collision world's problem to undo (see MuJoCoCollisionWorld._build).
+    """
+    try:
+        import pinocchio as pin
+    except Exception as exc:
+        print(f"[scene] obstacles skipped: {exc}", flush=True)
+        return []
+    out = [
+        {
+            "name": f"scene_{body}_{mesh_name}",
+            "mesh": str(mesh_path),
+            "pose": [float(v) for v in T[:3, 3]]
+            + [float(v) for v in pin.rpy.matrixToRpy(T[:3, :3])],
+            "toggleable": True,
+        }
+        for body, mesh_name, mesh_path, T in static_scene_geoms(cfg)
+    ]
+    if out:
+        print(f"[scene] {len(out)} mesh obstacles from scene", flush=True)
+    return out

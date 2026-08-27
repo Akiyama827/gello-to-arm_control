@@ -33,6 +33,17 @@ constexpr uint32_t FAULT_PLANT = 3;     // backend read/write failed
 struct ServerConfig {
   std::string backend = "fake";
   std::string franka_ip = "172.16.0.3";
+  // Extra payload bolted past the flange (wrist camera + its mount, a carried
+  // module), declared to the robot with Robot::setLoad so its own gravity
+  // compensation accounts for it. ADDITIVE to Desk's end-effector config: the
+  // Franka Hand's 0.73 kg is m_ee and stays there, this is m_load. Leave at 0
+  // and an undeclared 0.2 kg at the flange is ~1 N.m of permanent elbow torque
+  // that a kp=0 float has nothing to hold against — the arm creeps into its
+  // joint-4 limit (2026-08-06, cost a joint_velocity_violation reflex).
+  double ee_mass = 0.0;          // kg
+  double ee_com[3] = {0, 0, 0};  // load CoM in the FLANGE frame (m)
+  // dm backend spec: "IF;ID:TYPE[:MST],..." (--dm-spec / --can-if). A bare
+  // interface name has no motors and is refused by make_dm_backend.
   std::string can_if = "can0";
   int n = 7;                // joints (fake); franka fixes 7 itself
   uint16_t udp_port = 47800;

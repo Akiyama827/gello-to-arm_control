@@ -119,7 +119,31 @@ class VisualFK:
             for i, g in enumerate(self.visual.geometryObjects)
             if Path(g.meshPath).is_file()
         ]
+        # Static scene bodies (the modular base / dock) appended AFTER the arm's
+        # geoms, so `mesh/<k>` keys stay stable for the robot itself. Same
+        # source as the Rerun recordings — the page and the viewer cannot
+        # disagree about where the dock stands.
+        self._static: list[tuple[Path, dict]] = []
         self._lock = threading.Lock()
+
+    def add_static_scene(self, cfg) -> None:
+        """Append the config's non-arm scene bodies as fixed page geometry."""
+        from arm_control.planning.preview_rerun import static_scene_geoms
+
+        for _body, _name, mesh_path, T in static_scene_geoms(cfg):
+            quat = self._pin.Quaternion(T[:3, :3].copy()).coeffs()  # x,y,z,w
+            self._static.append(
+                (
+                    Path(mesh_path),
+                    {
+                        "p": [round(float(v), 5) for v in T[:3, 3]],
+                        "q": [round(float(v), 6) for v in quat],
+                    },
+                )
+            )
+        if self._static:
+            print(f"[teleop] page scene: {len(self._static)} static meshes",
+                  flush=True)
 
     def scene_json(self) -> list[dict]:
         """Geometry list for the page: one cache-busted mesh URL per visual geom.
@@ -152,9 +176,39 @@ class VisualFK:
             )
         return out
 
+    def static_json(self) -> list[dict]:
+        """Fixed scene geometry (the dock/modular base): mesh + colour + POSE.
+
+        Deliberately NOT part of scene_json(): the page builds THREE robots
+        (measured, target, plan) from that list, so anything appended there is
+        drawn three times in three tints. These carry their own pose and are
+        drawn once.
+        """
+        out = []
+        for j, (path, pose) in enumerate(self._static):
+            try:
+                st = path.stat()
+                stamp = f"{int(st.st_mtime)}-{st.st_size}"
+            except OSError:
+                stamp = "0"
+            out.append(
+                {
+                    # Muted grey: a backdrop for judging geometry, never
+                    # mistakable for the live robot's own STL colours.
+                    "mesh": f"mesh/{len(self._geom_ids) + j}?v={stamp}",
+                    "color": [0.55, 0.57, 0.60],
+                    "scale": [1.0, 1.0, 1.0],
+                    **pose,
+                }
+            )
+        return out
+
     def mesh_path(self, k: int) -> Path | None:
         if 0 <= k < len(self._geom_ids):
             return Path(self.visual.geometryObjects[self._geom_ids[k]].meshPath)
+        j = k - len(self._geom_ids)
+        if 0 <= j < len(self._static):
+            return self._static[j][0]
         return None
 
     def poses(self, q_arm, finger_m: float) -> dict:
@@ -245,7 +299,12 @@ class ControlPanel:
                 elif route == "state":
                     self._json(panel._state())
                 elif route == "scene":
-                    self._json({"geoms": panel._vfk.scene_json()})
+                    self._json(
+                        {
+                            "geoms": panel._vfk.scene_json(),
+                            "static": panel._vfk.static_json(),
+                        }
+                    )
                 elif route == "plan":
                     self._json(panel.plan_json())
                 elif route.startswith("mesh/"):
@@ -492,6 +551,8 @@ def main() -> None:
         PreviewScene,
         RobotGhost,
         init_preview_stream,
+        log_static_scene,
+        scene_obstacle_geoms,
     )
 
     cfg = load_robot_config()
@@ -518,11 +579,19 @@ def main() -> None:
         planned,
         planner_cfg,
         cache_dir=CONTROL_ROOT / ".cache" / "planning",
-        environment=cfg.get("environment"),
+        # Scene bodies are obstacles, not scenery: the dock was drawn in every
+        # viewer and invisible to the planner, which would route straight
+        # through it.
+        environment=list(cfg.get("environment") or []) + scene_obstacle_geoms(cfg),
     )
     init_preview_stream(teleop_cfg.get("preview"))
     ee_link = ee_frame(cfg)
     vfk = VisualFK(cfg.urdf_path, planned, ee_link, gripper_joints(cfg))
+    # The dock/base on the teleop page AND in the preview recording — the
+    # planner's `environment:` boxes are invisible, so without this the operator
+    # judges reach against an empty table.
+    vfk.add_static_scene(cfg)
+    log_static_scene(cfg)
     # URDF-present finger joints (vfk already filtered them). The Rerun ghosts
     # carry them too: target fingers mirror the SLIDER, measured-ghost fingers
     # mirror the LIVE width — frozen URDF-default fingers on the live ghost

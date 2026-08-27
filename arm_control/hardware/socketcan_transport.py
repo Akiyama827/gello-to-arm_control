@@ -25,9 +25,13 @@ class canfd_frame(ctypes.Structure):
     ]
 
 
-CANFD_FDF = 0x01      # FD frame
-CANFD_BRS = 0x02      # bit-rate switch
-CANFD_ESI = 0x04      # error state indicator
+# Values from linux/can.h — the previous labels were permuted (FDF=0x01,
+# BRS=0x02, ESI=0x04), so TX flags went out as real BRS|ESI: bit-rate switch
+# by luck, ERROR STATE INDICATOR spuriously asserted, FDF absent (the kernel
+# inferred it from the 72-byte canfd_frame write, which is why it worked).
+CANFD_BRS = 0x01      # bit-rate switch
+CANFD_ESI = 0x02      # error state indicator
+CANFD_FDF = 0x04      # FD frame
 
 
 def _build_canfd_frame(can_id: int, payload: bytes, brs: bool = True) -> bytes:

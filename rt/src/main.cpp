@@ -17,6 +17,10 @@
 
 #include "server.hpp"
 
+namespace arm_rt {
+int dm_mit_selfcheck();  // backend_dm.cpp — MIT wire-format goldens
+}
+
 namespace {
 
 arm_rt::ServerCtx* g_ctx = nullptr;
@@ -30,7 +34,13 @@ void usage(const char* argv0) {
       "usage: %s [--backend fake|franka|dm] [--n N] [--udp-port P] [--tcp-port P]\n"
       "          [--state-hz HZ] [--hold-ms MS] [--fault-ms MS] [--slew NM]\n"
       "          [--hold-kp V] [--hold-kd V] [--franka-ip IP] [--can-if IF]\n"
-      "          [--rt-priority N] [--rt-cpu CPU] [--bind IP]\n",
+      "          [--ee-mass KG] [--ee-com X,Y,Z]\n"
+      "          [--dm-spec IF;ID:TYPE[:MST],...] [--rt-priority N]\n"
+      "          [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
+      "\n"
+      "  --ee-mass  payload past the flange (wrist camera + mount, carried\n"
+      "             module) in kg, ADDED to Desk's end-effector config.\n"
+      "  --ee-com   that payload's centre of mass in the FLANGE frame, metres.\n",
       argv0);
 }
 
@@ -46,6 +56,11 @@ uint16_t parse_port(const char* flag, const char* value) {
 } // namespace
 
 int main(int argc, char** argv) {
+  // MIT wire-format parity check (see backend_dm.cpp): golden frames the
+  // Python pack_mit_control_frame/decode_mit_reply must reproduce exactly.
+  if (argc > 1 && !std::strcmp(argv[1], "--mit-check"))
+    return arm_rt::dm_mit_selfcheck();
+
   arm_rt::ServerCtx ctx;
   auto& cfg = ctx.cfg;
   for (int i = 1; i < argc; ++i) {
@@ -75,7 +90,19 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--hold-kp")) cfg.hold_kp = std::atof(next("--hold-kp"));
     else if (!std::strcmp(argv[i], "--hold-kd")) cfg.hold_kd = std::atof(next("--hold-kd"));
     else if (!std::strcmp(argv[i], "--franka-ip")) cfg.franka_ip = next("--franka-ip");
+    else if (!std::strcmp(argv[i], "--ee-mass")) cfg.ee_mass = std::atof(next("--ee-mass"));
+    else if (!std::strcmp(argv[i], "--ee-com")) {
+      const char* v = next("--ee-com");
+      if (std::sscanf(v, "%lf,%lf,%lf", &cfg.ee_com[0], &cfg.ee_com[1],
+                      &cfg.ee_com[2]) != 3) {
+        std::fprintf(stderr, "--ee-com needs X,Y,Z in metres (got %s)\n", v);
+        return 2;
+      }
+    }
     else if (!std::strcmp(argv[i], "--can-if")) cfg.can_if = next("--can-if");
+    // dm backend: iface + motor list in one string ("can0;1:4340,2:4340").
+    // Same cfg field as --can-if — this is the full spelling of it.
+    else if (!std::strcmp(argv[i], "--dm-spec")) cfg.can_if = next("--dm-spec");
     else if (!std::strcmp(argv[i], "--rt-priority")) cfg.rt_priority = std::atoi(next("--rt-priority"));
     else if (!std::strcmp(argv[i], "--rt-cpu")) cfg.rt_cpu = std::atoi(next("--rt-cpu"));
     else {
@@ -98,6 +125,14 @@ int main(int argc, char** argv) {
   if (cfg.slew <= 0 || cfg.hold_kp < 0 || cfg.hold_kd < 0 ||
       cfg.state_hz < 1 || cfg.state_hz > 1000) {
     std::fprintf(stderr, "need --slew > 0, hold gains >= 0, --state-hz 1..1000\n");
+    return 2;
+  }
+  // FR3 rated payload is 3 kg. A value outside that is a unit slip (grams for
+  // kg is the easy one) and would put the robot's own gravity compensation
+  // further off than declaring nothing — refuse rather than fight it.
+  if (cfg.ee_mass < 0 || cfg.ee_mass > 3.0) {
+    std::fprintf(stderr, "--ee-mass must be 0..3 kg (got %.3f) — kg, not grams\n",
+                 cfg.ee_mass);
     return 2;
   }
 

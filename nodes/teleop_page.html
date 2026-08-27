@@ -111,6 +111,23 @@ async function buildRobot(geoms, tint, opacity){
  group.visible = false; scene.add(group);
  return {group, parts};
 }
+// Fixed scene bodies (dock / modular base): drawn ONCE at their own pose, not
+// as a fourth robot — they never move with a joint config.
+async function buildStatic(items){
+ const group = new THREE.Group();
+ for (const g of items){
+  const geo = await loadGeom(g.mesh);
+  const mat = new THREE.MeshPhongMaterial(
+   {color: new THREE.Color(g.color[0], g.color[1], g.color[2])});
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.scale.set(g.scale[0], g.scale[1], g.scale[2]);
+  mesh.position.set(g.p[0], g.p[1], g.p[2]);
+  mesh.quaternion.set(g.q[0], g.q[1], g.q[2], g.q[3]);
+  group.add(mesh);
+ }
+ scene.add(group);
+ return group;
+}
 function setPoses(robot, poses){
  if (!robot) return;              // poll() runs before build() finishes
  if (!poses){ robot.group.visible = false; return; }
@@ -204,6 +221,7 @@ async function build(s){
  measured = await buildRobot(sc.geoms, null, 1.0);          // real STL colors
  target   = await buildRobot(sc.geoms, 0xe08000, 0.45);     // orange = target
  planBot  = await buildRobot(sc.geoms, 0x2ca02c, 0.55);     // green = plan
+ if (sc.static && sc.static.length) await buildStatic(sc.static);  // dock/base
  joints = s.sliders.map(d => row(document.getElementById('debug'), d, 2, () => {
   const values = joints.map(([el]) => +el.value);
   fetch('sliders', {method: 'POST', body: JSON.stringify({values})});

@@ -320,10 +320,18 @@ class FrankaHardwareBackend:
         if self.robot is None:
             return
         com = np.asarray(com_m, dtype=float).ravel()[:3]
-        # Point-mass inertia: the module's own tensor is small next to the
-        # 3 kg-scale arm links, and libfranka only needs it to be non-crazy.
+        # NOT a point mass: the control box rejects a nonzero mass with a zero
+        # inertia tensor ("Set Load command rejected: invalid argument!",
+        # probed 2026-08-06), and the failure lands in the except below where
+        # it becomes a log line and an UNDECLARED payload. Solid sphere of
+        # radius R about the CoM, I = 2/5 m R^2 — diagonal, always valid, and
+        # irrelevant to the gravity compensation this call exists for.
+        inertia = 0.4 * float(mass_kg) * 0.05**2
         try:
-            self.robot.set_load(float(mass_kg), com.tolist(), [0.0] * 9)
+            self.robot.set_load(
+                float(mass_kg), com.tolist(),
+                [inertia, 0, 0, 0, inertia, 0, 0, 0, inertia],
+            )
         except Exception as exc:
             print(f"[franka] set_load failed: {exc}", flush=True)
 

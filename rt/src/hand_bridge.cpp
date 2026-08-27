@@ -11,7 +11,13 @@
 // TCP line protocol over the NAT-free direct link:
 //
 //   PC -> "MOVE <width_m> <speed_mps>\n" | "HOME\n" | "GSTOP\n"
+//      | "GRASP <width_m> <speed_mps> <force_n> <eps_in_m> <eps_out_m>\n"
 //   <-  "STATE <width_m> <0|1>\n"   (~10 Hz, streams DURING moves too)
+//   <-  "GDONE <0|1>\n"             (once per completed GRASP: the
+//                                    franka::Gripper::grasp verdict — object
+//                                    held within the epsilon band. A GRASP
+//                                    killed by GSTOP sends nothing; the PC
+//                                    client owns the timeout.)
 //
 // ONE franka::Gripper session, owned entirely by the actor thread (reads AND
 // actions). A dual-session design was tried and is IMPOSSIBLE: the Hand
@@ -58,13 +64,16 @@ double mono_s() {
 
 // Latest-wins action mailbox + shared Hand state, all under one mutex.
 struct Action {
-  int kind = 0;  // 0 = none, 1 = MOVE, 2 = HOME
+  int kind = 0;  // 0 = none, 1 = MOVE, 2 = HOME, 3 = GRASP
   double w = 0, s = 0;
+  double f = 0, ei = 0, eo = 0;  // GRASP only: force + epsilon band
 };
 std::mutex mx;
 std::condition_variable cv;
 Action pending;
 uint64_t stop_seq = 0;   // bumped by GSTOP: kills queued/carried actions
+uint64_t grasp_seq = 0;  // bumped per completed GRASP; serve() sends GDONE on change
+bool grasp_ok = false;   // verdict of the grasp behind grasp_seq
 bool have_real = false;  // last real sample valid
 double real_w = 0.0;
 bool real_grasped = false;
@@ -138,10 +147,12 @@ void actor(const char* robot_ip) {
         }
         acting = true;
         act_from = have_real ? real_w : a.w;
-        act_goal = a.kind == 1 ? a.w : act_from;  // homing: no width model
-        act_speed = a.kind == 1 ? a.s : 0.0;
+        act_goal = a.kind == 2 ? act_from : a.w;  // homing: no width model
+        act_speed = a.kind == 2 ? 0.0 : a.s;
         act_t0 = mono_s();
       }
+      const bool is_grasp = a.kind == 3;
+      bool ok = false;
       try {
         if (a.kind == 1) {
           std::printf("[hand] move -> %.4f m @ %.2f m/s\n", a.w, a.s);
@@ -149,6 +160,11 @@ void actor(const char* robot_ip) {
         } else if (a.kind == 2) {
           std::printf("[hand] homing\n");
           hand->homing();
+        } else if (a.kind == 3) {
+          std::printf("[hand] grasp -> %.4f m @ %.2f m/s, %.1f N, eps %.3f/%.3f\n",
+                      a.w, a.s, a.f, a.ei, a.eo);
+          ok = hand->grasp(a.w, a.s, a.f, a.ei, a.eo);
+          std::printf("[hand] grasp verdict: %s\n", ok ? "HELD" : "not held");
         }
       } catch (const franka::NetworkException& e) {
         std::printf("[hand] session lost (%s) — reconnecting\n", e.what());
@@ -166,6 +182,12 @@ void actor(const char* robot_ip) {
       a = {};
       std::lock_guard<std::mutex> lk(mx);
       acting = false;
+      if (is_grasp) {
+        // Every executed GRASP reports — including exception paths, where the
+        // verdict stays false: the PC client is blocked on this answer.
+        grasp_ok = ok;
+        ++grasp_seq;
+      }
       continue;  // loop straight into a real readOnce to truth the width
     }
     // Idle: refresh the real sample (same thread, same session — the ONLY
@@ -192,6 +214,12 @@ void serve(int fd) {
   double last_state = 0.0;
   char buf[256];
   size_t have = 0;
+  uint64_t seen_grasp;
+  {
+    // Results from before this client connected are nobody's to consume.
+    std::lock_guard<std::mutex> lk(mx);
+    seen_grasp = grasp_seq;
+  }
 
   for (;;) {
     pollfd pfd{fd, POLLIN, 0};
@@ -205,11 +233,18 @@ void serve(int fd) {
       char* line = buf;
       for (char* nl; (nl = std::strchr(line, '\n')) != nullptr; line = nl + 1) {
         *nl = '\0';
-        double w = 0, s = 0;
+        double w = 0, s = 0, f = 0, ei = 0, eo = 0;
         if (std::sscanf(line, "MOVE %lf %lf", &w, &s) == 2) {
           {
             std::lock_guard<std::mutex> lk(mx);
             pending = {1, w, s};
+          }
+          cv.notify_one();
+        } else if (std::sscanf(line, "GRASP %lf %lf %lf %lf %lf", &w, &s, &f,
+                               &ei, &eo) == 5) {
+          {
+            std::lock_guard<std::mutex> lk(mx);
+            pending = {3, w, s, f, ei, eo};
           }
           cv.notify_one();
         } else if (!std::strcmp(line, "HOME")) {
@@ -230,6 +265,23 @@ void serve(int fd) {
         // instead of dropping a healthy session over one garbage line.
         std::printf("[hand] oversized line — resyncing\n");
         have = 0;
+      }
+    }
+
+    {
+      // GRASP verdicts push promptly (poll granularity), not on the state tick.
+      uint64_t gs;
+      bool gok;
+      {
+        std::lock_guard<std::mutex> lk(mx);
+        gs = grasp_seq;
+        gok = grasp_ok;
+      }
+      if (gs != seen_grasp) {
+        seen_grasp = gs;
+        char out[32];
+        const int n = std::snprintf(out, sizeof(out), "GDONE %d\n", gok ? 1 : 0);
+        if (send(fd, out, size_t(n), MSG_NOSIGNAL) != n) return;
       }
     }
 

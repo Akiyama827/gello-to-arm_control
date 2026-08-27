@@ -32,6 +32,9 @@ from dora import Node
 
 from arm_control.config import load_robot_config_dict
 from arm_control.joint_motor_map import gripper_motor_to_finger
+# Same scene draw as the teleop preview — one implementation, so the two Rerun
+# recordings can never disagree about where the dock stands.
+from arm_control.planning.preview_rerun import log_static_scene
 from arm_control.messages import (
     unpack_motor_state,
     unpack_json_message,
@@ -302,7 +305,14 @@ def _setup_blueprint(motor_names: list[str], has_3d: bool, time_ranges=None) -> 
     right_col = rrb.Vertical(row1, row2, row3, row4)
 
     if has_3d:
-        spatial_view = rrb.Spatial3DView(name="3D (FK)", origin="/robot")
+        # origin="/" with explicit contents, NOT origin="/robot": the static
+        # scene bodies (the dock/modular base) are logged under /scene, which a
+        # view rooted at /robot cannot reach. They streamed in fine and were
+        # simply outside the viewport — invisible for the same reason an
+        # unplugged monitor is black (bench 2026-08-06).
+        spatial_view = rrb.Spatial3DView(
+            name="3D (FK)", origin="/", contents=["/robot/**", "/scene/**"]
+        )
         root = rrb.Horizontal(right_col, spatial_view, column_shares=[2, 1])
     else:
         root = right_col
@@ -483,6 +493,7 @@ def main() -> None:
     _setup_series_style(motor_names)
     if render_model is not None:
         _log_visual_assets(render_model[3])
+    log_static_scene(cfg)
     _setup_blueprint(motor_names, has_3d=(render_model is not None), time_ranges=time_ranges)
 
     print(f"[viz] Rerun '{app_id}' started — {n_motors} motors")

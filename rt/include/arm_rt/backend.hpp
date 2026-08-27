@@ -20,6 +20,19 @@ struct PlantState {
   double tau[MAX_JOINTS] = {};     // measured joint torque
   double tau_ref[MAX_JOINTS] = {}; // robot's echo of last ACCEPTED torque
                                    // (franka: tau_J_d) — the slew reference
+  // Cartesian sensing. INTERNAL struct — never on the wire (the StatePacket
+  // ships only the 6 wrench numbers, into a field that already exists), so
+  // the 96-double Jacobian costs nothing but stack.
+  double wrench[6] = {};  // external wrench on the EE, ROBOT BASE frame,
+                          // [fx,fy,fz,tx,ty,tz]. Sign follows libfranka:
+                          // POSITIVE = force the robot applies TO the world.
+  bool wrench_valid = false;  // gates StatePacket's FLAG_WRENCH_VALID
+  // EE Jacobian, base frame. Buffer is 6 x MAX_JOINTS so it fits any joint
+  // count, but the rows are PACKED AT STRIDE n (J[r*n + c]) — exactly the
+  // row-major layout arm_rt::cartesian_impedance documents, so this array can
+  // be handed to the law with no repack. Slots past 6*n are unused.
+  double jacobian[6 * MAX_JOINTS] = {};
+  bool jacobian_valid = false;
 };
 
 class Backend {

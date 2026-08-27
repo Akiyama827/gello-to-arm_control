@@ -151,75 +151,117 @@ class MuJoCoCollisionWorld:
         # from_string, not from_file: MjSpec's file decoder keys on extension
         # and refuses .urdf, while the parser itself handles URDF content fine
         # (meshdir in the injected <mujoco> extension is absolute).
-        spec = mujoco.MjSpec.from_string(self.plan_urdf.read_text())
-        for box in environment or []:
-            name = str(box["name"])
-            size = [float(v) for v in box["size"]]
-            pose = [float(v) for v in box["pose"]]
-            if len(size) != 3 or len(pose) != 6:
-                raise ValueError(f"environment box {name!r}: size needs 3 values, pose 6")
-            spec.worldbody.add_geom(
-                name=f"env_{name}",
-                type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=[s / 2.0 for s in size],  # MuJoCo box sizes are half-extents
-                pos=pose[:3],
-                quat=_rpy_to_quat(*pose[3:]),
-            )
-        robot_bodies = [b.name for b in spec.bodies if b.name not in ("world", "")]
-        for body_name in ignore_bodies or []:
-            # Bodies whose fat hulls phantom-collide at legitimate postures
-            # (the open gripper fingers graze the wrist hulls permanently).
-            # Robot-robot pairs are excluded; environment pairs stay checked —
-            # a finger really can hit the table.
-            if str(body_name) not in robot_bodies:
-                raise ValueError(f"ignore_bodies: unknown body {body_name!r}")
-            for other in robot_bodies:
-                if other != str(body_name):
-                    spec.add_exclude(
-                        bodyname1=str(body_name), bodyname2=other
-                    )
-        # Perception-cloud obstacle pool (P1): pre-allocated MOCAP bodies, not
-        # plain worldbody geoms. MuJoCo caches a worldbody-attached geom's
-        # broadphase bounding volume at COMPILE time — mutating geom_pos
-        # after compiling moves the geom for FK/rendering but mj_collision
-        # never sees it move, so it can never be repositioned live. Mocap
-        # bodies are MuJoCo's zero-DOF "kinematic prop" mechanism (position
-        # lives in data.mocap_pos, re-read every mj_kinematics) and collide
-        # correctly. Added AFTER robot_bodies/ignore_bodies above so the pool
-        # is never a candidate for an ignore_bodies exclude — it must behave
-        # like an environment box (collides with everything, ignored bodies
-        # included). Geoms compile at the contype/conaffinity DEFAULT (1, 1):
-        # this planning URDF sets discardvisual="true" and MuJoCo prunes any
-        # (0, 0) geom at compile time, so a pool created pre-disabled would
-        # compile to nothing — forced to (0, 0) AFTER compiling instead
-        # (below). Named ``env_cloud_NNN`` (not the "cloud_NNN" public name)
-        # so the env_-prefix contact scan below catches them for free.
-        cloud_geom_names: list[str] = []
-        cloud_body_names: list[str] = []
-        if cloud_obstacles is not None:
-            self._cloud_max = int(cloud_obstacles.get("max_voxels", 200))
-            self._cloud_voxel_m = float(cloud_obstacles.get("voxel_m", 0.03))
-            self._cloud_z_min = float(cloud_obstacles.get("z_min", 0.02))
-            margin_m = float(cloud_obstacles.get("margin_m", 0.005))
-            half = self._cloud_voxel_m / 2.0 + margin_m
-            width = max(3, len(str(self._cloud_max)))
-            for i in range(self._cloud_max):
-                body_name = f"mocap_cloud_{i:0{width}d}"
-                geom_name = f"env_cloud_{i:0{width}d}"
-                body = spec.worldbody.add_body(
-                    name=body_name, mocap=True, pos=[0.0, 0.0, -1.0]
-                )
-                body.add_geom(
-                    name=geom_name,
-                    type=mujoco.mjtGeom.mjGEOM_BOX,
-                    size=[half, half, half],
-                )
-                cloud_body_names.append(body_name)
-                cloud_geom_names.append(geom_name)
+        urdf_text = self.plan_urdf.read_text()
+
+        def _build():
+          spec = mujoco.MjSpec.from_string(urdf_text)
+          toggleable_geoms: list[str] = []
+          for box in environment or []:
+              name = str(box["name"])
+              pose = [float(v) for v in box["pose"]]
+              if len(pose) != 6:
+                  raise ValueError(f"environment {name!r}: pose needs 6 values")
+              if box.get("mesh"):
+                  # MESH obstacle (a scene body's real geometry). MuJoCo collides
+                  # the mesh's CONVEX HULL, so per-part meshes are far tighter
+                  # than one box per part without being optimistic: a hull always
+                  # contains its mesh.
+                  #
+                  # `pose` places the RAW FILE — the same transform the viewers
+                  # draw with, so the obstacle and the picture cannot drift
+                  # apart. MuJoCo recenters mesh assets (mesh_pos/mesh_quat) but
+                  # BAKES that into geom_pos at compile, so the raw transform is
+                  # exactly what belongs here. Composing it by hand first
+                  # double-applies the recentering and lands the hull ~28 mm off
+                  # with no error raised anywhere (2026-08-06 — caught only by
+                  # comparing mesh centroids against the source scene model).
+                  spec.add_mesh(name=f"envmesh_{name}", file=str(box["mesh"]))
+                  spec.worldbody.add_geom(
+                      name=f"env_{name}",
+                      type=mujoco.mjtGeom.mjGEOM_MESH,
+                      meshname=f"envmesh_{name}",
+                      pos=pose[:3],
+                      quat=_rpy_to_quat(*pose[3:]),
+                  )
+              else:
+                  size = [float(v) for v in box["size"]]
+                  if len(size) != 3:
+                      raise ValueError(f"environment box {name!r}: size needs 3 values")
+                  spec.worldbody.add_geom(
+                      name=f"env_{name}",
+                      type=mujoco.mjtGeom.mjGEOM_BOX,
+                      size=[s / 2.0 for s in size],  # MuJoCo sizes are half-extents
+                      pos=pose[:3],
+                      quat=_rpy_to_quat(*pose[3:]),
+                  )
+              # Phase-scoped obstacles (the dock the arm must eventually enter).
+              # The table is NOT toggleable and never should be.
+              if box.get("toggleable"):
+                  toggleable_geoms.append(f"env_{name}")
+          robot_bodies = [b.name for b in spec.bodies if b.name not in ("world", "")]
+          for body_name in ignore_bodies or []:
+              # Bodies whose fat hulls phantom-collide at legitimate postures
+              # (the open gripper fingers graze the wrist hulls permanently).
+              # Robot-robot pairs are excluded; environment pairs stay checked —
+              # a finger really can hit the table.
+              if str(body_name) not in robot_bodies:
+                  raise ValueError(f"ignore_bodies: unknown body {body_name!r}")
+              for other in robot_bodies:
+                  if other != str(body_name):
+                      spec.add_exclude(
+                          bodyname1=str(body_name), bodyname2=other
+                      )
+          # Perception-cloud obstacle pool (P1): pre-allocated MOCAP bodies, not
+          # plain worldbody geoms. MuJoCo caches a worldbody-attached geom's
+          # broadphase bounding volume at COMPILE time — mutating geom_pos
+          # after compiling moves the geom for FK/rendering but mj_collision
+          # never sees it move, so it can never be repositioned live. Mocap
+          # bodies are MuJoCo's zero-DOF "kinematic prop" mechanism (position
+          # lives in data.mocap_pos, re-read every mj_kinematics) and collide
+          # correctly. Added AFTER robot_bodies/ignore_bodies above so the pool
+          # is never a candidate for an ignore_bodies exclude — it must behave
+          # like an environment box (collides with everything, ignored bodies
+          # included). Geoms compile at the contype/conaffinity DEFAULT (1, 1):
+          # this planning URDF sets discardvisual="true" and MuJoCo prunes any
+          # (0, 0) geom at compile time, so a pool created pre-disabled would
+          # compile to nothing — forced to (0, 0) AFTER compiling instead
+          # (below). Named ``env_cloud_NNN`` (not the "cloud_NNN" public name)
+          # so the env_-prefix contact scan below catches them for free.
+          cloud_geom_names: list[str] = []
+          cloud_body_names: list[str] = []
+          if cloud_obstacles is not None:
+              self._cloud_max = int(cloud_obstacles.get("max_voxels", 200))
+              self._cloud_voxel_m = float(cloud_obstacles.get("voxel_m", 0.03))
+              self._cloud_z_min = float(cloud_obstacles.get("z_min", 0.02))
+              margin_m = float(cloud_obstacles.get("margin_m", 0.005))
+              half = self._cloud_voxel_m / 2.0 + margin_m
+              width = max(3, len(str(self._cloud_max)))
+              for i in range(self._cloud_max):
+                  body_name = f"mocap_cloud_{i:0{width}d}"
+                  geom_name = f"env_cloud_{i:0{width}d}"
+                  body = spec.worldbody.add_body(
+                      name=body_name, mocap=True, pos=[0.0, 0.0, -1.0]
+                  )
+                  body.add_geom(
+                      name=geom_name,
+                      type=mujoco.mjtGeom.mjGEOM_BOX,
+                      size=[half, half, half],
+                  )
+                  cloud_body_names.append(body_name)
+                  cloud_geom_names.append(geom_name)
+
+          return spec, toggleable_geoms, cloud_geom_names, cloud_body_names
+
+        spec, toggleable_geoms, cloud_geom_names, cloud_body_names = _build()
 
         self.model = spec.compile()
         self.data = mujoco.MjData(self.model)
 
+        self._scene_gids = (
+            np.array([self.model.geom(n).id for n in toggleable_geoms], dtype=int)
+            if toggleable_geoms
+            else None
+        )
         self._cloud_gids: np.ndarray | None = None
         self._cloud_mocap_ids: np.ndarray | None = None
         self._cloud_live_k = 0
@@ -335,6 +377,20 @@ class MuJoCoCollisionWorld:
         live = self._cloud_gids[: self._cloud_live_k]
         self.model.geom_contype[live] = val
         self.model.geom_conaffinity[live] = val
+
+    def enable_scene_obstacles(self, on: bool) -> None:
+        """Toggle the static scene bodies (dock/modular base) as obstacles.
+
+        Phase-scoped for the same reason the cloud is: the dock is an obstacle
+        for every transit leg and a TARGET for the insertion leg. Left on, the
+        final approach can never be planned — the goal pose is inside the
+        obstacle. No-op when the config declared no scene bodies.
+        """
+        if self._scene_gids is None:
+            return
+        val = 1 if on else 0
+        self.model.geom_contype[self._scene_gids] = val
+        self.model.geom_conaffinity[self._scene_gids] = val
 
     def preview(self, times: np.ndarray, positions: np.ndarray) -> None:
         """Transition stub (the old meshcat animation seam) — Rerun PreviewScene

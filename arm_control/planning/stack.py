@@ -24,6 +24,9 @@ from arm_control.config import CONTROL_ROOT, _arm_block, arm_joints, ee_frame, g
 from arm_control.dynamics import PinocchioDynamics
 from arm_control.execution.trajectory_executor import JointTrajectoryExecutor
 from arm_control.planning.high_level import ArmPlanner, build_collision_stack
+# Scene-derived obstacles; preview_rerun imports rerun/numpy only at module
+# level, so this stays importable on the executor hosts.
+from arm_control.planning.preview_rerun import scene_obstacle_geoms
 from arm_control.planning.ik import PinocchioIK
 
 __all__ = [
@@ -156,7 +159,10 @@ def build_planning_stack(cfg, *, arm_id: str = "arm") -> PlanningStack:
             joints,
             planner_cfg,
             cache_dir=CONTROL_ROOT / ".cache" / "planning",
-            environment=cfg.get("environment"),
+            # Same rule as the teleop node: whatever the viewers draw as scene
+            # bodies is also an obstacle to plan around.
+            environment=list(cfg.get("environment") or [])
+            + scene_obstacle_geoms(cfg),
         )
 
     preview, ghost = _build_preview(cfg, world, ik, urdf, joints, grip_joints)

@@ -179,12 +179,30 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--source", type=Path, help="franka_description checkout")
     ap.add_argument("--check", action="store_true", help="report status only")
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite a staged F/T-sensor model with the plain description",
+    )
     args = ap.parse_args(argv)
 
     if args.check:
         ok, message = status()
         print(("[fr3] " if ok else "[fr3] NOT READY — ") + message)
         return 0 if ok else 1
+
+    # The staged model may be the FR3 + F/T sensor variant (hand-staged from
+    # franka_ft_sensor_description; this script cannot regenerate it). Silently
+    # replacing it with the plain description would desync sim/planning from the
+    # real arm's mass and 37.5 mm TCP offset.
+    if not args.force and DEST_URDF.exists() and "fr3_ft_sensor" in DEST_URDF.read_text():
+        print(
+            f"[fr3] {DEST_URDF.relative_to(CONTROL_ROOT)} is the F/T-sensor "
+            "variant, which this script cannot restage. Refusing to overwrite "
+            "it with the plain FR3; pass --force if you really want that.",
+            file=sys.stderr,
+        )
+        return 1
 
     urdf = find_urdf(args.source)
     if urdf is None:

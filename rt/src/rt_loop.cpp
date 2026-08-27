@@ -33,7 +33,8 @@
 namespace arm_rt {
 
 std::unique_ptr<Backend> make_fake_backend(int n);
-std::unique_ptr<Backend> make_franka_backend(const std::string& ip);
+std::unique_ptr<Backend> make_franka_backend(const std::string& ip, double ee_mass,
+                                             const double ee_com[3]);
 std::unique_ptr<Backend> make_dm_backend(const std::string& can_if);
 
 namespace {
@@ -65,13 +66,15 @@ void rt_loop(ServerCtx& ctx) {
   if (ctx.cfg.backend == "fake") {
     backend = make_fake_backend(ctx.cfg.n);
   } else if (ctx.cfg.backend == "franka") {
-    backend = make_franka_backend(ctx.cfg.franka_ip);
+    backend = make_franka_backend(ctx.cfg.franka_ip, ctx.cfg.ee_mass, ctx.cfg.ee_com);
     if (!backend)
       std::fprintf(stderr, "[rt] franka backend failed to start "
                            "(reason above; RT perms? FCI on? robot reachable?)\n");
   } else if (ctx.cfg.backend == "dm") {
     backend = make_dm_backend(ctx.cfg.can_if);
-    if (!backend) std::fprintf(stderr, "[rt] dm backend not implemented yet\n");
+    if (!backend)
+      std::fprintf(stderr, "[rt] dm backend failed to start (reason above; "
+                           "--dm-spec? link up? fd on?)\n");
   } else {
     std::fprintf(stderr, "[rt] unknown backend %s\n", ctx.cfg.backend.c_str());
   }
@@ -244,13 +247,20 @@ void rt_loop(ServerCtx& ctx) {
     out.t_mono_ns = now;
     out.flags = (armed ? FLAG_ARMED : 0u) |
                 (ctx.fault.load(std::memory_order_acquire) ? FLAG_FAULTED : 0u) |
-                (holding ? FLAG_HOLDING : 0u);
+                (holding ? FLAG_HOLDING : 0u) |
+                (ps.wrench_valid ? FLAG_WRENCH_VALID : 0u);
     out.fault_code = ctx.fault_code.load(std::memory_order_acquire);
     std::memcpy(out.q, ps.q, sizeof(out.q));
     std::memcpy(out.dq, ps.dq, sizeof(out.dq));
     std::memcpy(out.tau, ps.tau, sizeof(out.tau));
     std::memcpy(out.tau_cmd, tau_out, sizeof(out.tau_cmd));
     std::memcpy(out.q_cmd, q_des, sizeof(double) * size_t(n));
+    // The wrench field has been reserved in StatePacket since v1 and
+    // FLAG_WRENCH_VALID has always gated it — filling it is NOT a wire
+    // change, so no VERSION bump. Copied unconditionally: a backend with no
+    // estimate leaves zeros AND clears the flag, so a client that ignores the
+    // flag still reads zeros rather than stale numbers.
+    std::memcpy(out.wrench, ps.wrench, sizeof(out.wrench));
     ctx.state_out.write(out);
   }
   backend->stop();
