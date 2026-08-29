@@ -108,15 +108,34 @@ def gripper_motor_to_fingers(motor: float, mimic: dict) -> np.ndarray:
     return np.full(2, value)
 
 
-def base_hold_command(q_hold: np.ndarray | None = None) -> tuple:
-    """Gentle PD hold for the 2-DOF dock base (default zeros).
+def base_hold_command(
+    q_hold: np.ndarray | None = None,
+    kp: np.ndarray | None = None,
+    kd: np.ndarray | None = None,
+) -> tuple:
+    """PD hold for the MODULAR ARM slice (2-DOF base, plus docked modules).
 
     ``sim_base_hold_q`` in the scenario config poses the socket — e.g. pitching
-    the dock port to face UP so the upright-carried module docks top-down.
+    the dock port to face UP so the upright-carried module docks top-down — and
+    its LENGTH sets the slice width, so an assembly scenario that reserves
+    module joints holds those too.
+
+    Gains come from ``sim_base_hold_kp`` / ``sim_base_hold_kd`` when the
+    scenario states them. They must: a docked module's joint is nothing like
+    the base's — its inertia is two orders smaller, and the base's 60/2 rings
+    it (measured). Absent keys keep the historical scenery hold.
     """
-    q = np.zeros(2) if q_hold is None else np.asarray(q_hold, dtype=float)[:2]
-    zeros = np.zeros(2)
-    return q, zeros, zeros, np.full(2, _BASE_KP), np.full(2, _BASE_KD)
+    q = np.zeros(2) if q_hold is None else np.asarray(q_hold, dtype=float)
+    n = q.size
+    zeros = np.zeros(n)
+    kp_v = np.full(n, _BASE_KP) if kp is None else np.asarray(kp, dtype=float)
+    kd_v = np.full(n, _BASE_KD) if kd is None else np.asarray(kd, dtype=float)
+    for name, vec in (("sim_base_hold_kp", kp_v), ("sim_base_hold_kd", kd_v)):
+        if vec.size != n:
+            raise ValueError(
+                f"{name} has {vec.size} values but sim_base_hold_q has {n}"
+            )
+    return q, zeros, zeros, kp_v, kd_v
 
 
 def park_command(q_arm, kp, kd) -> tuple:
@@ -306,6 +325,16 @@ def main() -> None:
         if cfg.get("sim_base_hold_q") is not None
         else None
     )
+    base_hold_kp = (
+        np.asarray(cfg.get("sim_base_hold_kp"), dtype=float)
+        if cfg.get("sim_base_hold_kp") is not None
+        else None
+    )
+    base_hold_kd = (
+        np.asarray(cfg.get("sim_base_hold_kd"), dtype=float)
+        if cfg.get("sim_base_hold_kd") is not None
+        else None
+    )
     arm_cfg = dict(cfg.get("arm") or {})
     park_kp = np.asarray(arm_cfg.get("kp", [_PARK_KP] * n_arm), float)[:n_arm]
     park_kd = np.asarray(arm_cfg.get("kd", [_PARK_KD] * n_arm), float)[:n_arm]
@@ -460,7 +489,9 @@ def main() -> None:
             if states_seen % _STREAM_EVERY == 0:
                 node.send_output(
                     "motor_command_base",
-                    pack_motor_command(*base_hold_command(base_hold_q)),
+                    pack_motor_command(
+                        *base_hold_command(base_hold_q, base_hold_kp, base_hold_kd)
+                    ),
                 )
                 if states_seen - last_cmd_state > _PARK_GAP_STATES:
                     if park_q is None:

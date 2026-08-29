@@ -25,6 +25,7 @@ import numpy as np
 
 from arm_control.planning.mujoco_collision import _rpy_to_quat
 from arm_control.simulation.convex_decomp import replace_with_decomposition
+from arm_control.topology import AssemblyChain
 
 # THE law, compiled once (rt/include/arm_rt/servo_law.hpp via rt/bindings).
 # Optional by construction — a plain `pip install -e .` of arm_control does not
@@ -67,11 +68,133 @@ class SceneModelSpec:
 
 
 @dataclass(frozen=True)
+class ModuleSlot:
+    """One inventory module: a model, a nest to sit in, and its port names.
+
+    ``slot`` is the instance id everywhere — the composed-model prefix, the
+    topology chain's instance, and the stem of the joint names the plant
+    publishes. Slots are unique and never reused, so every name derived from
+    one is stable across a dock (which is what lets ``MjSpec.recompile`` carry
+    state over by name).
+    """
+
+    slot: str
+    module_id: str                       # TYPE id; indexes module_grasps
+    spec: SceneModelSpec                 # model + nest pose
+    body: str                            # root body name INSIDE the model
+    joints: tuple[str, ...] = ()         # driven once docked, unprefixed
+    passive_site: str = "passive_connector"
+    active_site: str = "active_connector"
+    grasp_site: str = "grasp_frame"
+
+    @property
+    def prefix(self) -> str:
+        return self.spec.prefix
+
+    def _n(self, name: str) -> str:
+        return f"{self.prefix}{name}"
+
+    @property
+    def body_name(self) -> str:
+        return self._n(self.body)
+
+    @property
+    def passive_name(self) -> str:
+        return self._n(self.passive_site)
+
+    @property
+    def active_name(self) -> str:
+        return self._n(self.active_site)
+
+    @property
+    def grasp_name(self) -> str:
+        return self._n(self.grasp_site)
+
+    @property
+    def joint_names(self) -> list[str]:
+        return [self._n(j) for j in self.joints]
+
+    @property
+    def fixture_eq(self) -> str:
+        return f"fixture_weld_{self.slot}"
+
+
+@dataclass(frozen=True)
 class MuJoCoSceneSpec:
     arm: SceneModelSpec
     base: SceneModelSpec
-    module: SceneModelSpec
+    modules: tuple[ModuleSlot, ...]
     timestep: float = 0.001
+
+
+def _mat(quat) -> np.ndarray:
+    out = np.zeros(9)
+    mujoco.mju_quat2Mat(out, np.asarray(quat, dtype=float))
+    return out.reshape(3, 3)
+
+
+def _quat(rot: np.ndarray) -> np.ndarray:
+    out = np.zeros(4)
+    mujoco.mju_mat2Quat(out, np.ascontiguousarray(rot, dtype=float).ravel())
+    return out
+
+
+def _site_body(spec: mujoco.MjSpec, site_name: str) -> str:
+    """Name of the body a site hangs off — mjSpec has no back-pointer."""
+    for body in spec.bodies:
+        if any(site.name == site_name for site in body.sites):
+            return body.name
+    raise MuJoCoUnavailableError(f"no body carries site {site_name!r}")
+
+
+def _clocking_frame(site, clocking: int) -> tuple[list, list]:
+    """Mate frame in the port's parent body: the port, rolled by the key.
+
+    ``clocking`` counts quarter turns about the port's own z (the mating
+    axis), so the roll multiplies on the RIGHT of the site's orientation.
+    This is the only place the discrete key becomes geometry — everywhere
+    else it travels as the integer the dock's one-hot sensor reports.
+    """
+    angle = float(clocking) * np.pi / 2.0
+    cos, sin = np.cos(angle), np.sin(angle)
+    roll = np.array([[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]])
+    return [float(v) for v in site.pos], [
+        float(v) for v in _quat(_mat(site.quat) @ roll)
+    ]
+
+
+def _graft_module(
+    spec: mujoco.MjSpec,
+    slot: "ModuleSlot",
+    parent_body: str,
+    port_site: str,
+    clocking: int,
+) -> None:
+    """Attach ``slot``'s model into the chain, mated at ``port_site``.
+
+    The module's PASSIVE port is placed on the mate frame, which is what the
+    keyed connector does mechanically. Its freejoint is dropped: a docked
+    module is a LINK, not a loose body held by a constraint, and that is the
+    whole difference between a soft weld chain (which sags and drifts — the
+    failure mode BrickSim demonstrates) and a real kinematic chain.
+    """
+    pos, quat = _clocking_frame(spec.site(port_site), clocking)
+    frame = spec.body(parent_body).add_frame(pos=pos, quat=quat)
+    child = _load_model_spec(slot.spec.model_path)
+    root = child.body(slot.body)
+    for joint in list(root.joints):
+        if joint.type == mujoco.mjtJoint.mjJNT_FREE:
+            child.delete(joint)
+    # Root pose = inverse of the passive site's pose in the root body, so the
+    # site lands exactly on the mate frame.
+    site = child.site(slot.passive_site)
+    inv_q = np.zeros(4)
+    mujoco.mju_negQuat(inv_q, np.asarray(site.quat, dtype=float))
+    inv_p = np.zeros(3)
+    mujoco.mju_rotVecQuat(inv_p, -np.asarray(site.pos, dtype=float), inv_q)
+    root.pos = [float(v) for v in inv_p]
+    root.quat = [float(v) for v in inv_q]
+    spec.attach(child, prefix=slot.prefix, frame=frame)
 
 
 def _load_model_spec(path: str | Path) -> mujoco.MjSpec:
@@ -97,8 +220,16 @@ def compose_scene(
     spec_cfg: MuJoCoSceneSpec,
     ground_z: float | None = 0.0,
     static_boxes: list[dict] | None = None,
+    chain: AssemblyChain | None = None,
 ) -> mujoco.MjSpec:
-    """mjSpec world: ground plane + the three models attached with prefixes.
+    """mjSpec world: ground plane + arm + base + every inventory module.
+
+    The scene is a PURE FUNCTION of the config and ``chain``: a module the
+    chain lists is grafted into the base's kinematic chain at its keyed mate;
+    every other module free-floats at its nest. Re-docking therefore REBUILDS
+    rather than mutates — there is no incremental path that could disagree
+    with the topology, and MuJoCo forbids re-attaching a prefix anyway
+    (``repeated name '<prefix>_row_active' in mesh``, measured).
 
     Attached actuators are dropped (the backend adds plain ``motor`` actuators
     for the actively driven joints); two weld equalities are pre-declared
@@ -142,15 +273,81 @@ def compose_scene(
             pos=[float(v) for v in box["pos"]],
             rgba=[0.5, 0.42, 0.35, 1.0],
         )
-    for model in (spec_cfg.arm, spec_cfg.base, spec_cfg.module):
+    docked = {m.slot: m.clocking for m in (chain.modules if chain else ())}
+    for model in (spec_cfg.arm, spec_cfg.base):
         child = _load_model_spec(model.model_path)
         frame = spec.worldbody.add_frame(
             pos=list(model.world_pos), quat=list(_rpy_to_quat(*model.world_rpy))
         )
         spec.attach(child, prefix=f"{model.prefix}", frame=frame)
+    for slot in spec_cfg.modules:
+        if slot.slot in docked:
+            continue
+        child = _load_model_spec(slot.spec.model_path)
+        frame = spec.worldbody.add_frame(
+            pos=list(slot.spec.world_pos),
+            quat=list(_rpy_to_quat(*slot.spec.world_rpy)),
+        )
+        spec.attach(child, prefix=slot.prefix, frame=frame)
+    # Docked modules go on IN CHAIN ORDER: each mates onto a port that only
+    # exists once the module before it has been attached.
+    if chain is not None and chain.modules:
+        by_slot = {s.slot: s for s in spec_cfg.modules}
+        port = chain.root_port
+        for module in chain.modules:
+            slot = by_slot[module.slot]
+            _graft_module(spec, slot, _site_body(spec, port), port, module.clocking)
+            port = slot.active_name
     for actuator in list(spec.actuators):
         spec.delete(actuator)
     return spec
+
+_QPOS_WIDTH = {mujoco.mjtJoint.mjJNT_FREE: 7, mujoco.mjtJoint.mjJNT_BALL: 4}
+_DOF_WIDTH = {mujoco.mjtJoint.mjJNT_FREE: 6, mujoco.mjtJoint.mjJNT_BALL: 3}
+
+
+def _transfer_state(old_m, old_d, new_m, new_d) -> None:
+    """Carry live state across a recompile, BY NAME and explicitly.
+
+    ``MjSpec.recompile`` only maps state when handed the very spec object the
+    old model came from; given a freshly built spec it silently zeroes
+    everything (measured — the base went from 0.37 rad to 0.0 with no error).
+    Since the whole design rebuilds the spec from the topology, the transfer is
+    done here instead, which also makes what survives a dock a visible
+    decision rather than undocumented behaviour:
+
+    - every joint present in BOTH models keeps its qpos/qvel;
+    - a joint that vanished (the freejoint of a module that just docked) is
+      dropped — its 6 dofs have no meaning once the module is a link;
+    - a joint that appeared starts at its model rest;
+    - actuator ctrl carries by name, so the gripper does not fling open when
+      the fingers are mid-grip on the module being docked;
+    - equality activation carries by name (which fixtures have yielded).
+    """
+    for jid in range(new_m.njnt):
+        name = mujoco.mj_id2name(new_m, mujoco.mjtObj.mjOBJ_JOINT, jid)
+        old_id = mujoco.mj_name2id(old_m, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if old_id < 0 or old_m.jnt_type[old_id] != new_m.jnt_type[jid]:
+            continue
+        jtype = new_m.jnt_type[jid]
+        nq = _QPOS_WIDTH.get(jtype, 1)
+        nv = _DOF_WIDTH.get(jtype, 1)
+        src, dst = old_m.jnt_qposadr[old_id], new_m.jnt_qposadr[jid]
+        new_d.qpos[dst : dst + nq] = old_d.qpos[src : src + nq]
+        src, dst = old_m.jnt_dofadr[old_id], new_m.jnt_dofadr[jid]
+        new_d.qvel[dst : dst + nv] = old_d.qvel[src : src + nv]
+    for aid in range(new_m.nu):
+        name = mujoco.mj_id2name(new_m, mujoco.mjtObj.mjOBJ_ACTUATOR, aid)
+        old_id = mujoco.mj_name2id(old_m, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+        if old_id >= 0:
+            new_d.ctrl[aid] = old_d.ctrl[old_id]
+    for eid in range(new_m.neq):
+        name = mujoco.mj_id2name(new_m, mujoco.mjtObj.mjOBJ_EQUALITY, eid)
+        old_id = mujoco.mj_name2id(old_m, mujoco.mjtObj.mjOBJ_EQUALITY, name)
+        if old_id >= 0:
+            new_d.eq_active[eid] = old_d.eq_active[old_id]
+    new_d.time = old_d.time
+
 
 @dataclass
 class MuJoCoBackend:
@@ -180,9 +377,10 @@ class MuJoCoBackend:
     # mode. No robot-shaped defaults: these are model facts the scene config
     # states (scene.welds.*).
     ee_body: str | None = None
-    module_body: str | None = None
+    # The BASE's own port — the root of the assembly chain. The mate target
+    # for the next module is ``chain.tip_port``, which walks out to the tip as
+    # modules are added; this never moves.
     dock_site: str | None = None
-    module_site: str | None = None
     # Scene-mode gripper: the fingers are position-servoed (the bridge maps
     # the 7th motor slot onto them). Grip contact runs on the finger MESHES
     # as SDF geoms (2026-07-22 experiment): the true printed geometry —
@@ -223,8 +421,11 @@ class MuJoCoBackend:
     _vadr: np.ndarray | None = field(default=None, init=False, repr=False)
     _act_id: np.ndarray | None = field(default=None, init=False, repr=False)
     _last_command: dict[str, np.ndarray] | None = field(default=None, init=False, repr=False)
-    _grasped_modules: dict[str, str] = field(default_factory=dict, init=False, repr=False)
-    _docked_modules: dict[str, dict[str, str]] = field(default_factory=dict, init=False, repr=False)
+    chain: Any = field(default=None, init=False, repr=False)
+    _slots: dict = field(default_factory=dict, init=False, repr=False)
+    _joint_slot: dict = field(default_factory=dict, init=False, repr=False)
+    _held: Any = field(default=None, init=False, repr=False)
+    _driven: np.ndarray | None = field(default=None, init=False, repr=False)
 
     @property
     def loaded(self) -> bool:
@@ -235,6 +436,42 @@ class MuJoCoBackend:
         return len(self.joint_names)
 
     @property
+    def staged_slots(self) -> list:
+        """Inventory modules not yet docked, in plan order."""
+        if self.scene is None:
+            return []
+        docked = set(self.chain.slots) if self.chain is not None else set()
+        return [s for s in self.scene.modules if s.slot not in docked]
+
+    @property
+    def active_slot(self):
+        """The module the telemetry is ABOUT: the held one, else the next one.
+
+        Replaces the old single ``module_body``/``module_site`` config fields.
+        Falling back to the next staged module keeps the pre-grasp prints and
+        the in-hand probe pointed at something real before the first pick.
+        """
+        if self._held is not None:
+            return self._held
+        staged = self.staged_slots
+        return staged[0] if staged else None
+
+    @property
+    def module_body(self) -> str | None:
+        slot = self.active_slot
+        return slot.body_name if slot is not None else None
+
+    @property
+    def module_site(self) -> str | None:
+        slot = self.active_slot
+        return slot.passive_name if slot is not None else None
+
+    @property
+    def dock_target_site(self) -> str:
+        """Where the NEXT module mates — the base port, or the chain's tip."""
+        return self.chain.tip_port if self.chain is not None else str(self.dock_site)
+
+    @property
     def model_path(self) -> str:
         if self.scene is not None:
             return str(self.scene.arm.model_path)
@@ -243,7 +480,9 @@ class MuJoCoBackend:
     # -- lifecycle --------------------------------------------------------
     def _build_spec(self) -> mujoco.MjSpec:
         if self.scene is not None:
-            return compose_scene(self.scene, self.ground_z, self.static_boxes)
+            return compose_scene(
+                self.scene, self.ground_z, self.static_boxes, chain=self.chain
+            )
         if self.single_model_path is None:
             raise MuJoCoUnavailableError("need either a scene or single_model_path")
         path = Path(self.single_model_path)
@@ -267,18 +506,52 @@ class MuJoCoBackend:
         if self.loaded:
             return
         if self.scene is not None:
-            missing = [
-                k
-                for k in ("ee_body", "module_body", "dock_site", "module_site")
-                if not getattr(self, k)
-            ]
+            missing = [k for k in ("ee_body", "dock_site") if not getattr(self, k)]
             if missing:
                 raise ValueError(
                     f"scene mode requires {missing} (scene.welds.* in the "
                     "scenario config — model facts, no default robot)"
                 )
+            if not self.scene.modules:
+                raise ValueError(
+                    "scene mode needs at least one inventory module "
+                    "(scene.module or scene.inventory)"
+                )
+            # The topology graph is the ground truth this plant derives its
+            # model from; ``dock_site`` names the base's own port, the root.
+            self.chain = AssemblyChain(root_port=str(self.dock_site))
+            self._slots = {s.slot: s for s in self.scene.modules}
+            self._joint_slot = {
+                name: slot for slot in self.scene.modules for name in slot.joint_names
+            }
+        self._compile()
+        if self.scene is not None:
+            # Every un-picked module is HELD at its nest. Bench-fixture
+            # equivalent: contact-only emulation (pedestal, pocket walls) was
+            # tried and always drifts/leans — the module's collision hull has a
+            # rounded bottom; a real fixture's whole job is that the module does
+            # not move.
+            for slot in self.scene.modules:
+                self._activate_body_weld(slot.fixture_eq, "world", slot.body_name)
+        if self.launch_viewer:
+            try:
+                from mujoco import viewer as mj_viewer
+
+                self.viewer = mj_viewer.launch_passive(self.model, self.data)
+                print("[mujoco_backend] viewer launched", flush=True)
+            except Exception as exc:  # headless host — sim runs fine without it
+                print(f"[mujoco_backend] viewer unavailable: {exc}", flush=True)
+
+    def _compile(self) -> None:
+        """Build, compile and index the model for the CURRENT topology.
+
+        Runs at load AND after every dock, so the initial model and every
+        re-docked model come out of ONE code path — a post-dock model can
+        never quietly miss a contact-bit or friction policy the first one had.
+        Live state is carried across by ``_transfer_state``.
+        """
         spec = self._build_spec()
-        for name in self.joint_names:
+        for name in self._actuated_joints(spec):
             actuator = spec.add_actuator(
                 name=f"{name}_motor", target=str(name), trntype=mujoco.mjtTrn.mjTRN_JOINT
             )
@@ -287,9 +560,9 @@ class MuJoCoBackend:
         # otherwise a free prismatic pair — gravity slides a finger to its
         # stop, and gripper commands have no actuator to land on.
         gripper_present = []
-        joint_names = {spec_joint.name for spec_joint in spec.joints}
+        spec_joints = {spec_joint.name for spec_joint in spec.joints}
         for name in self.gripper_joints:
-            if name not in joint_names:
+            if name not in spec_joints:
                 continue
             servo = spec.add_actuator(
                 name=f"{name}_servo",
@@ -306,27 +579,21 @@ class MuJoCoBackend:
             servo.forcerange[1] = float(self.gripper_force_n)
             gripper_present.append(name)
         if self.scene is not None:
-            spec.add_equality(
-                name="dock_weld",
-                type=mujoco.mjtEq.mjEQ_WELD,
-                objtype=mujoco.mjtObj.mjOBJ_SITE,
-                name1=self.dock_site,
-                name2=self.module_site,
-                active=False,
-            )
-            # Bench-fixture equivalent: the module is HELD at its presentation
-            # pose until the grasp takes it. Contact-only emulation (pedestal,
-            # pocket walls) was tried and always drifts/leans — the module's
-            # collision hull has a rounded bottom; a real fixture's whole job
-            # is that the module does not move.
-            spec.add_equality(
-                name="fixture_weld",
-                type=mujoco.mjtEq.mjEQ_WELD,
-                objtype=mujoco.mjtObj.mjOBJ_BODY,
-                name1="world",
-                name2=self.module_body,
-                active=False,
-            )
+            # One fixture weld per UNDOCKED module. No dock weld any more: a
+            # seated module is re-grafted as a real link (see _graft), so there
+            # is no constraint left to hold the mate — which is the point, an
+            # equality-held chain sags and drifts under its own weight.
+            for slot in self.scene.modules:
+                if slot.slot in set(self.chain.slots):
+                    continue
+                spec.add_equality(
+                    name=slot.fixture_eq,
+                    type=mujoco.mjtEq.mjEQ_WELD,
+                    objtype=mujoco.mjtObj.mjOBJ_BODY,
+                    name1="world",
+                    name2=slot.body_name,
+                    active=False,
+                )
         if self.scene is not None and gripper_present:
             # Finger + module collide on their TRUE printed geometry via
             # cached convex decomposition (CoACD). Not hulls (bloat ~2 cm,
@@ -337,7 +604,11 @@ class MuJoCoBackend:
             cache = Path(__file__).resolve().parents[2] / ".cache" / "decomp"
             dirs = [
                 Path(mdl.model_path).parent / "meshes"
-                for mdl in (self.scene.arm, self.scene.base, self.scene.module)
+                for mdl in (
+                    self.scene.arm,
+                    self.scene.base,
+                    *(s.spec for s in self.scene.modules),
+                )
             ]
             # Fingers fine (0.02 — the grip slots ARE the contact feature);
             # module coarse (0.06 — at 0.02 CoACD chased rib fillets into
@@ -348,22 +619,32 @@ class MuJoCoBackend:
                     cache_dir=cache, mesh_search_dirs=dirs, threshold=0.02,
                 )
             replace_with_decomposition(
-                spec, bodies_containing=[self.scene.module.prefix],
+                spec, bodies_containing=[s.prefix for s in self.scene.modules],
                 cache_dir=cache, mesh_search_dirs=dirs, threshold=0.06,
             )
-        self.model = spec.compile()
+        model = spec.compile()
+        data = mujoco.MjData(model)
+        previous = (self.model, self.data)
+        self.model, self.data = model, data
         if self.scene is not None:
-            # The free module's INTERNAL joint (passive-to-motor) is unactuated
-            # in the MJCF, but 0.42 of the module's 0.49 kg hangs on it — free,
+            # A module's INTERNAL joint (passive-to-motor) is unactuated while
+            # the module is loose, but 0.42 of its 0.49 kg hangs on it — free,
             # it turns the standing module into a pendulum that topples itself.
             # Real modules hold that joint by gearing when unpowered; emulate
             # with static friction. 5.0, not 1.0: carry-swing transients
             # back-drove the joint ~55° at 1.0 (measured), visually dangling
             # the motor half of the carried module.
-            prefix = self.scene.module.prefix
+            #
+            # DOCKED modules are exempt: their joint is now driven by the
+            # modular arm's own servo, and 5 N·m of stiction there would fight
+            # every commanded motion of the assembled robot.
+            driven = set(self._actuated_joints(spec))
+            prefixes = tuple(s.prefix for s in self.scene.modules)
             for jid in range(self.model.njnt):
                 joint = self.model.joint(jid)
-                if joint.name.startswith(prefix) and self.model.jnt_type[jid] in (
+                if joint.name in driven:
+                    continue
+                if joint.name.startswith(prefixes) and self.model.jnt_type[jid] in (
                     mujoco.mjtJoint.mjJNT_HINGE,
                     mujoco.mjtJoint.mjJNT_SLIDE,
                 ):
@@ -391,24 +672,67 @@ class MuJoCoBackend:
                     )
         if not self.enable_self_collision:
             self._contacts_ground_only()
-        self.data = mujoco.MjData(self.model)
-        mujoco.mj_resetData(self.model, self.data)
-        # Spawn pose via data.qpos, NEVER model.qpos0: MuJoCo poses a hinge at
-        # (qpos - qpos0), so writing spawn angles into qpos0 silently shifts
-        # those joints' zero — the plant then lives in a coordinate frame
-        # offset by the spawn pose while IK/RNEA speak URDF coordinates.
-        # (Latent since the restoration: the DM scene's defaults were all 0.)
-        for name, value in (self.default_joint_positions or {}).items():
-            joint = self.model.joint(str(name))
-            self.data.qpos[joint.qposadr[0]] = float(value)
+        for name in gripper_present:
+            # The open stop is physical: without the limit, module contact
+            # shoves the fingers to negative travel (outside the mechanism).
+            self.model.jnt_limited[self.model.joint(name).id] = 1
+        if previous[0] is None:
+            mujoco.mj_resetData(self.model, self.data)
+            # Spawn pose via data.qpos, NEVER model.qpos0: MuJoCo poses a hinge
+            # at (qpos - qpos0), so writing spawn angles into qpos0 silently
+            # shifts those joints' zero — the plant then lives in a coordinate
+            # frame offset by the spawn pose while IK/RNEA speak URDF
+            # coordinates.
+            for name, value in (self.default_joint_positions or {}).items():
+                joint = self.model.joint(str(name))
+                self.data.qpos[joint.qposadr[0]] = float(value)
+        else:
+            _transfer_state(*previous, self.model, self.data)
+        self._cache_indices(gripper_present, first=previous[0] is None)
+        mujoco.mj_forward(self.model, self.data)
+
+    def _actuated_joints(self, spec: mujoco.MjSpec) -> list[str]:
+        """Planned joints this model can actually drive, in command order.
+
+        A module's joint is driven only once the module is DOCKED: while it
+        sits in its nest it is a loose part that must be free to spin. The
+        command vector keeps its full planned width regardless — see
+        ``_cache_indices``.
+        """
+        present = {joint.name for joint in spec.joints}
+        docked = set(self.chain.slots) if self.chain is not None else set()
+        out = []
+        for name in self.joint_names:
+            slot = self._joint_slot.get(name)
+            if slot is not None and slot.slot not in docked:
+                continue
+            if name in present:
+                out.append(name)
+        return out
+
+    def _cache_indices(self, gripper_present: list[str], *, first: bool) -> None:
+        """Re-derive every model-index cache. Invalid after any recompile."""
         self._qadr = np.array(
             [self.model.joint(n).qposadr[0] for n in self.joint_names], dtype=int
         )
         self._vadr = np.array(
             [self.model.joint(n).dofadr[0] for n in self.joint_names], dtype=int
         )
+        # Fixed-width command/state vectors, growing actuator set: a planned
+        # joint with no actuator yet (an undocked module's) is READ like any
+        # other but commands to it land nowhere. Keeping the width constant
+        # means the Dora contract — num_motors, arm_slices, message shapes —
+        # never has to be renegotiated mid-run.
+        driven = [
+            i
+            for i, n in enumerate(self.joint_names)
+            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{n}_motor")
+            >= 0
+        ]
+        self._driven = np.array(driven, dtype=int)
         self._act_id = np.array(
-            [self.model.actuator(f"{n}_motor").id for n in self.joint_names], dtype=int
+            [self.model.actuator(f"{self.joint_names[i]}_motor").id for i in driven],
+            dtype=int,
         )
         # Per-joint torque limit for the servo law. The MJCF's
         # ``actuatorfrcrange`` is the authority (module docstring): MuJoCo
@@ -416,8 +740,6 @@ class MuJoCoBackend:
         # keeps the twin's torque identical to the RT loop's instead of merely
         # similar. A joint with no range declared gets inf — i.e. exactly the
         # unclamped behaviour it has today, not a guessed number.
-        # (Ranges here are symmetric; the law takes one magnitude, so an
-        # asymmetric range would be read as ±upper. None of ours are.)
         self._tau_limit = np.array(
             [
                 float(self.model.jnt_actfrcrange[self.model.joint(n).id][1])
@@ -426,19 +748,12 @@ class MuJoCoBackend:
                 for n in self.joint_names
             ]
         )
-        self._ee_bid = (
-            int(self.model.body(self.ee_body).id) if self.ee_body else -1
-        )
+        self._ee_bid = int(self.model.body(self.ee_body).id) if self.ee_body else -1
         # Bodies whose external forces count as "acting on the arm" — every
         # body sharing the EE's kinematic-tree root. NOT the EE body's own
         # subtree: a TCP frame is typically a childless leaf hung off the hand
         # (the FR3's asm_fr3_hand_tcp is a SIBLING of the fingers), so its own
         # cfrc_ext is zero forever and the grip reaction would never show up.
-        # Derived from body_rootid — a model fact, so no robot names here. It
-        # is also the right definition: this is what O_F_ext_hat_K estimates,
-        # the total external wrench on the robot, and the real estimate cannot
-        # localise a touch either. All bodies in one tree share the same
-        # cfrc_ext reference point, so they sum without any transform.
         self._ee_tree = (
             np.flatnonzero(self.model.body_rootid == self.model.body_rootid[self._ee_bid])
             if self._ee_bid > 0
@@ -452,13 +767,8 @@ class MuJoCoBackend:
         # The joints that ACTUALLY exist in this model, not the ones configured:
         # ``gripper_joints`` is a superset covering every arm (the DM assembler's
         # Gripper_1/2 and the FR3's fr3_finger_joint1/2), and only one pair is
-        # present in any given model. Reading back through the configured names
-        # would look up a joint this model has never heard of.
+        # present in any given model.
         self._gripper_names = list(gripper_present)
-        for name in gripper_present:
-            # The open stop is physical: without the limit, module contact
-            # shoves the fingers to negative travel (outside the mechanism).
-            self.model.jnt_limited[self.model.joint(name).id] = 1
         # Finger travel from the MODEL, not a constant: the clamp in
         # _set_gripper_targets must match whatever gripper this scene has.
         self._gripper_range = [
@@ -468,29 +778,19 @@ class MuJoCoBackend:
             )
             for n in gripper_present
         ]
+        if not first:
+            return
         # Servo targets start at the spawn rest (ctrl defaults to 0, which for
         # an open-at-nonzero gripper like the FR3 would slam the fingers shut).
         for act, name in zip(self._gripper_act, gripper_present):
-            self.data.ctrl[act] = self.data.qpos[
-                self.model.joint(name).qposadr[0]
-            ]
+            self.data.ctrl[act] = self.data.qpos[self.model.joint(name).qposadr[0]]
         # The spawn rest IS this gripper's OPEN: the release trigger compares
         # commanded ctrl against it (a literal `<= 0.004` assumed the DM's
-        # open-at-zero and never fired for the FR3's open-at-0.04).
-        self._gripper_open_ctrl = [
-            float(self.data.ctrl[a]) for a in self._gripper_act
-        ]
-        mujoco.mj_forward(self.model, self.data)
-        if self.scene is not None:
-            self._activate_body_weld("fixture_weld", "world", self.module_body)
-        if self.launch_viewer:
-            try:
-                from mujoco import viewer as mj_viewer
+        # open-at-zero and never fired for the FR3's open-at-0.04). Latched
+        # ONCE, at spawn — re-deriving it after a dock would record whatever
+        # the fingers happen to be doing (mid-grip!) as "open".
+        self._gripper_open_ctrl = [float(self.data.ctrl[a]) for a in self._gripper_act]
 
-                self.viewer = mj_viewer.launch_passive(self.model, self.data)
-                print("[mujoco_backend] viewer launched", flush=True)
-            except Exception as exc:  # headless host — sim runs fine without it
-                print(f"[mujoco_backend] viewer unavailable: {exc}", flush=True)
 
     def close(self) -> None:
         if self.viewer is not None:
@@ -514,7 +814,11 @@ class MuJoCoBackend:
         1|4 — finger&module intersect (4 and 8); finger&finger,
         module&module and arm&module all stay OFF.
         """
-        module_prefix = self.scene.module.prefix if self.scene is not None else None
+        module_prefixes = (
+            tuple(s.prefix for s in self.scene.modules)
+            if self.scene is not None
+            else ()
+        )
         for i in range(self.model.ngeom):
             geom = self.model.geom(i)
             if geom.contype[0] == 0 and geom.conaffinity[0] == 0:
@@ -541,7 +845,7 @@ class MuJoCoBackend:
             if self.model.geom_bodyid[i] == 0:  # world body: ground + fixtures
                 geom.contype[:] = 1
                 geom.conaffinity[:] = 2
-            elif module_prefix and body.startswith(module_prefix):
+            elif module_prefixes and body.startswith(module_prefixes):
                 geom.contype[:] = 2 | 8
                 geom.conaffinity[:] = 1 | 4
             else:
@@ -652,19 +956,25 @@ class MuJoCoBackend:
         cart = cmd.get("cartesian")
         if cart is not None:
             tau_ff = self._cartesian_tau_ff(tau_ff, cart)
+        # Torque is computed at the FULL planned width and written only to the
+        # joints that currently have an actuator: a module still in its nest is
+        # commanded (the bridge does not know or care) and that command lands
+        # nowhere, which is exactly right — it is a loose part.
         if _servo is None:
             _warn_python_pd_once()
-            self.data.ctrl[self._act_id] = (
+            tau = (
                 tau_ff
                 + cmd["kp"] * (cmd["position"] - q)
                 + cmd["kd"] * (cmd["velocity"] - v)
             )
+            self.data.ctrl[self._act_id] = tau[self._driven]
             return
         # tau_ref is the plant's echo of the last ACCEPTED torque. On the FR3
         # that is state.tau_J_d; here it is the previous tick's applied ctrl
         # for these actuators — same meaning, and the fancy index hands back a
         # copy, so it cannot alias the assignment below.
-        tau_ref = self.data.ctrl[self._act_id].copy()
+        tau_ref = np.zeros(self.num_motors)
+        tau_ref[self._driven] = self.data.ctrl[self._act_id]
         self.data.ctrl[self._act_id] = _servo.servo_torque(
             q=q,
             dq=v,
@@ -676,7 +986,7 @@ class MuJoCoBackend:
             tau_ref=tau_ref,
             tau_limit=self._tau_limit,
             slew_per_tick=float(self.slew_per_tick),
-        )
+        )[self._driven]
 
     def ee_wrench(self) -> np.ndarray:
         """External wrench on the EE body, WORLD frame, ``[fx,fy,fz,tx,ty,tz]``.
@@ -723,44 +1033,48 @@ class MuJoCoBackend:
             self._apply_pd()
             mujoco.mj_step(self.model, self.data)
         if self.scene is not None and getattr(self, "_gripper_act", None):
-            # SENSOR-LOCAL weld physics — the plant senses and reacts to its
-            # own world; the grasp PROTOCOL (close sequencing, success, drop
-            # events) lives in the bridge's GraspGate:
-            # - the fixture YIELDS once the gripper truly squeezes the module
-            #   (a fixture's magnets give way to the hand's pull);
-            # - the keyed dock mate ENGAGES when the hand lets go with the
-            #   connector actually at the seat (mm lead-in, no magnets).
-            pads = self._pad_forces()
-            grip_n = float(sum(pads.values()))
-            # Yield at FIRST pad touch: the weld's only job is pre-grasp
-            # presentation (the rounded hull drifts if the module just
-            # stands). A real fixture seats the module magnetically —
-            # a lateral push slides it off almost immediately, and the
-            # freed module stands on the pedestal and SELF-CENTERS between
-            # the closing pads. Any force threshold loses this race: with
-            # the module rigidly anchored, the first (one-sided) contact
-            # twists the soft wrist away — 8 deg at the old 10 N gate,
-            # still 7 deg at a 3 N both-pad gate (measured live) — and the
-            # module is handed over tilted, carried 24 mm off-nominal, and
-            # the mm dock seat then rightly refuses the release.
-            if (
-                self.data.eq_active[self._eq_id("fixture_weld")]
-                and grip_n >= 0.5
-            ):
-                self._set_weld_active("fixture_weld", False)
-                self._grasped_modules[self._module_id()] = self.ee_body
-                ee_p = self._body_T(self.ee_body)[0]
-                mod_p = self._body_T(self.module_body)[0]
-                conn_p = self.data.site(self.module_site).xpos
-                print(
-                    f"[mujoco_backend] fixture yielded to the grip "
-                    f"({grip_n:.1f} N) — module rides the hand; "
-                    f"conn-in-EE {self._conn_in_ee_mm()} mm "
-                    f"EE {np.round(ee_p * 1e3, 1).tolist()} "
-                    f"mod {np.round(mod_p * 1e3, 1).tolist()} "
-                    f"conn {np.round(conn_p * 1e3, 1).tolist()}",
-                    flush=True,
-                )
+            # SENSOR-LOCAL topology physics — the plant senses and reacts to
+            # its own world; the grasp PROTOCOL (close sequencing, success,
+            # drop events) lives in the bridge's GraspGate:
+            # - a nest fixture YIELDS once the gripper truly squeezes that
+            #   module (a fixture's magnets give way to the hand's pull);
+            # - the keyed mate COMMITS when the hand lets go with the
+            #   connector actually at the seat (mm lead-in, no magnets), and
+            #   committing re-grafts the module as a driven link.
+            if self._held is None:
+                # Yield at FIRST pad touch: the weld's only job is pre-grasp
+                # presentation (the rounded hull drifts if the module just
+                # stands). A real fixture seats the module magnetically — a
+                # lateral push slides it off almost immediately, and the freed
+                # module stands on the pedestal and SELF-CENTERS between the
+                # closing pads. Any force threshold loses this race: with the
+                # module rigidly anchored, the first (one-sided) contact twists
+                # the soft wrist away — 8 deg at the old 10 N gate, still 7 deg
+                # at a 3 N both-pad gate (measured live) — and the module is
+                # handed over tilted, carried 24 mm off-nominal, and the mm
+                # dock seat then rightly refuses the release.
+                for slot in self.staged_slots:
+                    eq = self._eq_id(slot.fixture_eq)
+                    if eq < 0 or not self.data.eq_active[eq]:
+                        continue
+                    grip_n = float(sum(self._pad_forces(slot).values()))
+                    if grip_n < 0.5:
+                        continue
+                    self._set_weld_active(slot.fixture_eq, False)
+                    self._held = slot
+                    ee_p = self._body_T(self.ee_body)[0]
+                    mod_p = self._body_T(slot.body_name)[0]
+                    conn_p = self.data.site(slot.passive_name).xpos
+                    print(
+                        f"[mujoco_backend] fixture yielded to the grip "
+                        f"({grip_n:.1f} N) — {slot.slot} rides the hand; "
+                        f"conn-in-EE {self._conn_in_ee_mm()} mm "
+                        f"EE {np.round(ee_p * 1e3, 1).tolist()} "
+                        f"mod {np.round(mod_p * 1e3, 1).tolist()} "
+                        f"conn {np.round(conn_p * 1e3, 1).tolist()}",
+                        flush=True,
+                    )
+                    break
             # "The hand let go" is a COMMANDED fact, not residual contact: at
             # the dock orientation gravity runs parallel to the pad faces, so
             # a released module SLIDES down the opening fingers and WEDGES
@@ -769,7 +1083,7 @@ class MuJoCoBackend:
             # (user-observed). Commanded-open fires at the seat, before the
             # module can slide. The 0.25 m band covers true mid-carry drops
             # (module gone while still commanded closed) for topology truth.
-            elif self._grasped_modules and (
+            elif self._held is not None and (
                 all(
                     abs(float(self.data.ctrl[a]) - o) <= 0.004
                     for a, o in zip(self._gripper_act, self._gripper_open_ctrl)
@@ -777,49 +1091,34 @@ class MuJoCoBackend:
                 or float(
                     np.linalg.norm(
                         self._body_T(self.ee_body)[0]
-                        - self.data.site(
-                            f"{self.scene.module.prefix}grasp_frame"
-                        ).xpos
+                        - self.data.site(self._held.grasp_name).xpos
                     )
                 )
                 > 0.25
             ):
-                docked, why = self._dock_within_capture()
-                if docked:
-                    self._activate_dock_weld()
-                    for module_id in list(self._grasped_modules):
-                        self._grasped_modules.pop(module_id, None)
-                        self._docked_modules[module_id] = {
-                            "parent_body": self.dock_site,
-                            "child_body": self.module_body,
-                            "mode": "weld",
-                        }
-                    self.model_revision += 1
-                    print(
-                        "[mujoco_backend] released at the seat — dock mate "
-                        "engaged "
-                        f"({self._module_id()} -> {self.dock_site})",
-                        flush=True,
-                    )
+                slot = self._held
+                seated, why = self._dock_within_capture(slot)
+                if seated:
+                    self._commit_dock(slot)
                 else:
                     # Hand open with the connector NOT seated: no magnets to
                     # forgive it — the module leaves the pads under plain
                     # physics. Topology reflects the fact; the bridge's gate
                     # reports the LOST/MISSED event.
-                    for module_id in list(self._grasped_modules):
-                        self._grasped_modules.pop(module_id, None)
-                        print(
-                            f"[mujoco_backend] released unseated: "
-                            f"{module_id} free ({why})",
-                            flush=True,
-                        )
-            if self._grasped_modules:
+                    self._held = None
+                    print(
+                        f"[mujoco_backend] released unseated: "
+                        f"{slot.slot} free ({why})",
+                        flush=True,
+                    )
+            if self._held is not None:
                 # In-hand drift telemetry (~2 Hz). Standalone block: wedging
                 # an `if` into the yield/release chain above re-bound the
                 # release `elif` and silently disabled it (live-caught).
                 self._grip_log_steps = getattr(self, "_grip_log_steps", 0) + 1
                 if self._grip_log_steps % 100 == 0:
                     w = self.ee_wrench()
+                    grip_n = float(sum(self._pad_forces(self._held).values()))
                     print(
                         f"[mujoco_backend] carry: conn-in-EE "
                         f"{self._conn_in_ee_mm()} mm grip {grip_n:.1f} N "
@@ -864,18 +1163,48 @@ class MuJoCoBackend:
     def _set_weld_active(self, name: str, active: bool) -> None:
         self.data.eq_active[self._eq_id(name)] = 1 if active else 0
 
-    def _activate_dock_weld(self) -> None:
-        """Site weld: sites are pulled coincident — but only with a VALID
-        relpose quat in eq_data (all-zero quat silently disables the pull)."""
-        data = self.model.eq_data[self._eq_id("dock_weld")]
-        data[:] = 0.0
-        data[6] = 1.0  # identity relquat
-        # torquescale 20, same as the body welds: the keyed 90° dock is
-        # rotationally RIGID once seated — at 1.0 the docked
-        # module visibly tilted under its own 0.43 N·m gravity moment after
-        # release (user-observed).
-        data[10] = 20.0
-        self._set_weld_active("dock_weld", True)
+    def _commit_dock(self, slot) -> None:
+        """Commit the mate: record the edge, then rebuild the robot around it.
+
+        The clocking is READ from the seated pose rather than assumed — the
+        arm placed the module, so which of the four keys it actually landed on
+        is a measurement. Snapping to the nearest key is BrickSim's move: the
+        continuous pose is discarded the moment it has told us which discrete
+        mate it is, so nothing downstream can accumulate drift.
+        """
+        clocking = self._seated_clocking(slot)
+        port = self.dock_target_site
+        self.chain.attach(
+            slot=slot.slot,
+            module_id=slot.module_id,
+            clocking=clocking,
+            active_port=slot.active_name,
+        )
+        self._held = None
+        self.model_revision += 1
+        self._compile()
+        print(
+            f"[mujoco_backend] docked {slot.slot} ({slot.module_id}) onto "
+            f"{port} at clocking {clocking} ({clocking * 90}°) — chain is now "
+            f"{'+'.join(self.chain.slots)}, next port {self.dock_target_site}, "
+            f"rev {self.model_revision}",
+            flush=True,
+        )
+
+    def _seated_clocking(self, slot) -> int:
+        """Nearest keyed clocking of the module as currently presented.
+
+        Roll about the mate axis, port x-axis to module x-axis, quantized to
+        the four keys. On the bench this integer comes from the dock MCU's
+        one-hot sensor word instead (``topology.clocking_from_onehot``) — same
+        quantity, so sim and bench topology are directly comparable.
+        """
+        port = self.data.site(self.dock_target_site)
+        mod = self.data.site(slot.passive_name)
+        p_R = port.xmat.reshape(3, 3)
+        m_R = mod.xmat.reshape(3, 3)
+        angle = float(np.arctan2(m_R[:, 0] @ p_R[:, 1], m_R[:, 0] @ p_R[:, 0]))
+        return int(round(angle / (np.pi / 2))) % 4
 
     def _body_T(self, name: str) -> tuple[np.ndarray, np.ndarray]:
         body = self.data.body(name)
@@ -909,7 +1238,7 @@ class MuJoCoBackend:
         camera's end-cap tag re-read supplies the same measurement. None in
         single-model mode (no module in the world).
         """
-        if self.scene is None or self.data is None:
+        if self.scene is None or self.data is None or self.module_body is None:
             return None
         p_ee, R_ee = self._body_T(self.ee_body)
         p_mod, R_mod = self._body_T(self.module_body)
@@ -925,13 +1254,16 @@ class MuJoCoBackend:
         Nominal carry is ~[0, 45, 120]; the +y term is ALONG the module axis,
         the direction the pads cannot positively lock.
         """
+        if self.module_site is None:
+            return []
         p_ee, R_ee = self._body_T(self.ee_body)
         conn = self.data.site(self.module_site).xpos
         return np.round(R_ee.T @ (conn - p_ee) * 1e3, 1).tolist()
 
-    def _dock_within_capture(self) -> tuple[bool, str]:
-        dock = self.data.site(self.dock_site)
-        mod = self.data.site(self.module_site)
+    def _dock_within_capture(self, slot) -> tuple[bool, str]:
+        """Seat test against the chain's CURRENT open port, not a fixed dock."""
+        dock = self.data.site(self.dock_target_site)
+        mod = self.data.site(slot.passive_name)
         dist = float(np.linalg.norm(dock.xpos - mod.xpos))
         if dist > float(self.dock_capture_m):
             delta = (mod.xpos - dock.xpos) * 1e3
@@ -948,13 +1280,13 @@ class MuJoCoBackend:
             return False, f"dock axis off {angle:.0f}° > {self.dock_capture_deg:.0f}°"
         return True, ""
 
-    def _pad_forces(self) -> dict[str, float]:
-        """Per-pad normal force (N) against the module."""
+    def _pad_forces(self, slot) -> dict[str, float]:
+        """Per-pad normal force (N) against ONE module."""
         out: dict[str, float] = {}
         wrench = np.zeros(6)
-        if self.scene is None:
+        if self.scene is None or slot is None:
             return out  # pad forces are a composed-scene concept
-        prefix = self.scene.module.prefix
+        prefix = slot.prefix
         for c in range(self.data.ncon):
             g1 = int(self.data.contact.geom1[c])
             g2 = int(self.data.contact.geom2[c])
@@ -971,22 +1303,21 @@ class MuJoCoBackend:
             out[key] = out.get(key, 0.0) + abs(float(wrench[0]))
         return out
 
-    def _module_id(self) -> str:
-        """Module id derived from the scene body name (mod_row_module_body ->
-        row_module) — topology bookkeeping only; ids in EVENTS are bridge/
-        orchestrator concerns."""
-        name = str(self.module_body)
-        prefix = self.scene.module.prefix if self.scene is not None else ""
-        name = name.removeprefix(prefix)
-        return name.removesuffix("_body")
-
     def topology_state(self) -> dict[str, Any]:
+        """The assembly graph plus what the hand is holding.
+
+        ``chain`` is the authority on the robot's shape; ``next_port`` is what
+        the coordinator aims the next dock at, which is why the dock waypoints
+        no longer need to be constants in the scenario config.
+        """
+        state = self.chain.state() if self.chain is not None else {}
         return {
             "schema": "topology_state",
             "revision": self.model_revision,
-            "docked_modules": sorted(self._docked_modules),
-            "docks": dict(self._docked_modules),
-            "grasped_modules": dict(self._grasped_modules),
+            "chain": state,
+            "next_port": self.dock_target_site,
+            "staged_slots": [s.slot for s in self.staged_slots],
+            "held_slot": self._held.slot if self._held is not None else None,
         }
 
 
