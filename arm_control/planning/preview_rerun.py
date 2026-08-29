@@ -19,6 +19,8 @@ the bench topology), or spawns its own (``spawn: true``).
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from pathlib import Path
 
 import numpy as np
@@ -344,7 +346,24 @@ def static_scene_geoms(cfg) -> list:
     Returns [] (never raises) when there is no scene, no mujoco, or a missing
     mesh: a viewer that cannot draw the table must still draw the robot.
     """
-    scene = {k: v for k, v in dict(cfg.get("scene") or {}).items() if k != "arm"}
+    # "arm" is the robot itself (self-collision is the planner's own job) and
+    # "module" is the pick TARGET, not an obstacle: scene_off does not cover
+    # move_to_grasp, so registering it makes its own grasp descent unplannable
+    # (2026-08-26 decision). The nest fixture is the obstacle. Inventory
+    # modules are a list and are skipped by the Mapping guard below.
+    scene = {
+        k: v for k, v in dict(cfg.get("scene") or {}).items()
+        if k not in ("arm", "module")
+    }
+    # Inventory modules ARE obstacles — to each other. Only the one being
+    # picked is exempt, and that exemption is per-phase and per-module via
+    # MuJoCoCollisionWorld.enable_scene_obstacles(exclude=...), keyed on the
+    # slot id appearing in the geom name. Poses are the NEST poses: a module
+    # already docked is no longer there, so its obstacle is stale — acceptable
+    # only because the dock legs run with scene obstacles off anyway.
+    for entry in dict(cfg.get("scene") or {}).get("inventory") or []:
+        entry = dict(entry)
+        scene[str(entry.get("slot"))] = entry
     if not scene:
         return []
     try:
@@ -361,10 +380,23 @@ def static_scene_geoms(cfg) -> list:
 
     out = []
     for name, spec in scene.items():
-        spec = dict(spec or {})
+        # Only MODEL SLOTS describe a body to draw. The scene block also
+        # carries scalars (ground_z, timestep), lists (static_boxes, and the
+        # inventory of pickable modules) and plain sub-dicts (welds,
+        # arm_slices); `dict(spec)` on a list of dicts raises
+        # "dictionary update sequence element #0 has length N; 2 is required",
+        # which took out the whole planning stack for any scenario declaring
+        # static_boxes — i.e. the FR3 bench scenes since 2026-08-06.
+        if not isinstance(spec, Mapping):
+            continue
+        spec = dict(spec)
         model_path = spec.get("model_path")
         if not model_path:
             continue
+        # Inventory modules are deliberately NOT scene bodies: scene_off does
+        # not cover move_to_grasp, so a module registered as planner geometry
+        # makes its own grasp descent unplannable. The nest fixture is the
+        # obstacle; the module is the target.
         xml_path = Path(str(model_path))
         if not xml_path.is_absolute():
             xml_path = CONTROL_ROOT / xml_path
@@ -482,6 +514,33 @@ def scene_obstacle_geoms(cfg) -> list[dict]:
         }
         for body, mesh_name, mesh_path, T in static_scene_geoms(cfg)
     ]
+    # The plant's static fixtures (module nests, table) are obstacles for the
+    # PLANNER too. They live in scene.static_boxes, which only the plant read,
+    # so the arm had no reason to avoid the nests it reaches between — and the
+    # modules themselves are deliberately not obstacles, so nothing stood in
+    # for them. Derived here rather than duplicated into `environment:` so the
+    # two can never drift apart.
+    try:
+        from arm_control import frames
+
+        arm_T_world = frames.invert(frames.world_T_arm(cfg))
+        import pinocchio as pin
+
+        for box in (dict(cfg.get("scene") or {}).get("static_boxes") or []):
+            T = np.eye(4)
+            T[:3, 3] = [float(v) for v in box["pos"]]
+            T = arm_T_world @ T
+            out.append(
+                {
+                    "name": f"fixture_{box['name']}",
+                    "size": [float(v) for v in box["size"]],
+                    "pose": [float(v) for v in T[:3, 3]]
+                    + [float(v) for v in pin.rpy.matrixToRpy(T[:3, :3])],
+                    "toggleable": True,
+                }
+            )
+    except Exception as exc:  # never let a fixture stop the robot rendering
+        print(f"[scene] static fixtures skipped: {exc}", flush=True)
     if out:
-        print(f"[scene] {len(out)} mesh obstacles from scene", flush=True)
+        print(f"[scene] {len(out)} obstacles from scene", flush=True)
     return out

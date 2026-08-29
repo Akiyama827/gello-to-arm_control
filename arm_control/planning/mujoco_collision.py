@@ -253,6 +253,7 @@ class MuJoCoCollisionWorld:
           return spec, toggleable_geoms, cloud_geom_names, cloud_body_names
 
         spec, toggleable_geoms, cloud_geom_names, cloud_body_names = _build()
+        self._scene_names = list(toggleable_geoms)
 
         self.model = spec.compile()
         self.data = mujoco.MjData(self.model)
@@ -378,19 +379,28 @@ class MuJoCoCollisionWorld:
         self.model.geom_contype[live] = val
         self.model.geom_conaffinity[live] = val
 
-    def enable_scene_obstacles(self, on: bool) -> None:
-        """Toggle the static scene bodies (dock/modular base) as obstacles.
+    def enable_scene_obstacles(self, on: bool, exclude: tuple = ()) -> None:
+        """Toggle the static scene bodies (dock, nests, parked modules).
 
         Phase-scoped for the same reason the cloud is: the dock is an obstacle
         for every transit leg and a TARGET for the insertion leg. Left on, the
         final approach can never be planned — the goal pose is inside the
         obstacle. No-op when the config declared no scene bodies.
+
+        ``exclude`` names obstacles that stay OFF even when enabling — geoms
+        whose name contains any of the given substrings. That is how the module
+        being picked stops blocking its own approach while its NEIGHBOURS keep
+        blocking: with no inventory module an obstacle at all, a reach for one
+        module ploughs the hand through the next one along (measured — the
+        fingers ended up 11 mm inside s2 while reaching for s0).
         """
         if self._scene_gids is None:
             return
-        val = 1 if on else 0
-        self.model.geom_contype[self._scene_gids] = val
-        self.model.geom_conaffinity[self._scene_gids] = val
+        names = self._scene_names or []
+        for gid, name in zip(self._scene_gids, names):
+            val = 1 if (on and not any(x and x in name for x in exclude)) else 0
+            self.model.geom_contype[gid] = val
+            self.model.geom_conaffinity[gid] = val
 
     def preview(self, times: np.ndarray, positions: np.ndarray) -> None:
         """Transition stub (the old meshcat animation seam) — Rerun PreviewScene

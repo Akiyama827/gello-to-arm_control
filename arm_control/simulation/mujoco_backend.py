@@ -1041,7 +1041,18 @@ class MuJoCoBackend:
             # - the keyed mate COMMITS when the hand lets go with the
             #   connector actually at the seat (mm lead-in, no magnets), and
             #   committing re-grafts the module as a driven link.
-            if self._held is None:
+            # "The hand is closing" — commanded away from its open stop. The
+            # fixture-yield below is gated on it because a pad touch alone is
+            # not a grasp: with several modules in the scene the arm BRUSHES a
+            # neighbour in transit and the old first-touch rule handed that
+            # module over (measured: reaching for s0 picked up s2, which the
+            # open hand then immediately "released unseated"). Same test the
+            # release branch uses, so the two can never disagree.
+            hand_open = all(
+                abs(float(self.data.ctrl[a]) - o) <= 0.004
+                for a, o in zip(self._gripper_act, self._gripper_open_ctrl)
+            )
+            if self._held is None and not hand_open:
                 # Yield at FIRST pad touch: the weld's only job is pre-grasp
                 # presentation (the rounded hull drifts if the module just
                 # stands). A real fixture seats the module magnetically — a
@@ -1084,10 +1095,7 @@ class MuJoCoBackend:
             # module can slide. The 0.25 m band covers true mid-carry drops
             # (module gone while still commanded closed) for topology truth.
             elif self._held is not None and (
-                all(
-                    abs(float(self.data.ctrl[a]) - o) <= 0.004
-                    for a, o in zip(self._gripper_act, self._gripper_open_ctrl)
-                )
+                hand_open
                 or float(
                     np.linalg.norm(
                         self._body_T(self.ee_body)[0]
@@ -1247,6 +1255,70 @@ class MuJoCoBackend:
         quat = np.empty(4)
         mujoco.mju_mat2Quat(quat, rel_R.ravel())
         return [float(v) for v in (*rel_p, *quat)]
+
+    def connector_in_ee(self) -> list | None:
+        """Carried module's PASSIVE port pose in the EE frame, [xyz, wxyz].
+
+        The quantity that turns a dock port into an EE target: the arm must
+        put THIS frame on the port. Sim reads it from the twin; the bench
+        reads the same transform from the wrist camera's end-cap tag, so the
+        dock leg is derived identically on both.
+        """
+        if self.data is None or self._held is None:
+            return None
+        p_ee, R_ee = self._body_T(self.ee_body)
+        site = self.data.site(self._held.passive_name)
+        rel_R = R_ee.T @ site.xmat.reshape(3, 3)
+        rel_p = R_ee.T @ (site.xpos - p_ee)
+        quat = np.empty(4)
+        mujoco.mju_mat2Quat(quat, rel_R.ravel())
+        return [float(v) for v in (*rel_p, *quat)]
+
+    def dock_port_body(self) -> str | None:
+        """Body carrying the chain's open port — the dock request's parent.
+
+        Walks out to the tip with the chain, which is why it cannot stay the
+        scenario constant it used to be.
+        """
+        if self.model is None or self.chain is None:
+            return None
+        sid = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_SITE, self.dock_target_site
+        )
+        if sid < 0:
+            return None
+        return self.model.body(int(self.model.site_bodyid[sid])).name
+
+    def module_pose_world(self, slot: str) -> list | None:
+        """World pose of an inventory module's root body, [xyz, wxyz].
+
+        The pick derives from THIS, never from the config nest pose: a module
+        MJCF's root body carries its own offset (the row module's is
+        pos="0 0 0.05"), so the configured world_pos is where the attachment
+        FRAME goes, not where the body lands — 50 mm apart in the bench scene.
+        It is also the same quantity perception publishes, so the sim and
+        bench pick paths stay identical.
+        """
+        entry = self._slots.get(str(slot))
+        if entry is None or self.data is None:
+            return None
+        pos, rot = self._body_T(entry.body_name)
+        quat = np.empty(4)
+        mujoco.mju_mat2Quat(quat, rot.ravel())
+        return [float(v) for v in (*pos, *quat)]
+
+    def dock_port_world(self) -> list | None:
+        """World pose of the chain's OPEN port, [xyz, wxyz].
+
+        Where the next module mates. Walks out to the tip as the arm grows,
+        which is what replaces the scenario's fixed dock waypoints.
+        """
+        if self.data is None or self.chain is None:
+            return None
+        site = self.data.site(self.dock_target_site)
+        quat = np.empty(4)
+        mujoco.mju_mat2Quat(quat, site.xmat.reshape(3, 3).ravel())
+        return [float(v) for v in (*site.xpos, *quat)]
 
     def _conn_in_ee_mm(self) -> list:
         """Carried connector position in the EE frame (mm) — pad-slip probe.
