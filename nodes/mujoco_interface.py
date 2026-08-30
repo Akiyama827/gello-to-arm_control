@@ -32,7 +32,10 @@ from arm_control.config import gripper_joints, load_robot_config
 from arm_control.messages import (
     pack_json_message,
     pack_motor_state,
+    pack_scene_result,
+    pack_scene_state,
     unpack_motor_command,
+    unpack_scene_command,
 )
 from arm_control.node_utils import ShutdownFlag, _zeros, install_signal_handlers
 from arm_control.simulation.mujoco_backend import MuJoCoBackend
@@ -41,6 +44,7 @@ from arm_control.simulation.scene_backend import (
     build_scene_backend,
     build_workcell_backend,
 )
+from arm_control.scene import Attachment, SceneState
 
 
 def _without_schema(payload: dict) -> dict:
@@ -75,6 +79,34 @@ def _warn_undamped(command: dict) -> None:
             "controller owns damping still needs a damped value here.",
             flush=True,
         )
+
+
+def _scene_state_from_payload(current: SceneState, payload: dict) -> SceneState:
+    attachments = {
+        name: Attachment(**value) for name, value in dict(payload.get("attachments", {})).items()
+    }
+    return SceneState(
+        actor_q={name: list(values) for name, values in dict(payload.get("actor_q", current.actor_q)).items()},
+        attachments=attachments,
+        constraints={name: bool(value) for name, value in dict(payload.get("constraints", current.constraints)).items()},
+        revision=int(payload["revision"]),
+    )
+
+
+def _scene_state_payload(state: SceneState) -> dict:
+    return {
+        "revision": state.revision,
+        "actor_q": state.actor_q,
+        "attachments": {
+            name: {
+                "object_name": item.object_name, "body": item.body,
+                "parent_frame": item.parent_frame, "child_frame": item.child_frame,
+                "mate_pose": item.mate_pose,
+            }
+            for name, item in state.attachments.items()
+        },
+        "constraints": state.constraints,
+    }
 
 
 def main() -> None:
@@ -206,6 +238,30 @@ def main() -> None:
                     backend.apply_gripper_command(
                         unpack_motor_command(event["value"], 2)["position"]
                     )
+                elif etype == "INPUT" and eid == "scene_command" and backend.scene_state:
+                    request = unpack_scene_command(event["value"])
+                    try:
+                        if request["revision"] <= backend.scene_state.revision:
+                            raise ValueError("stale scene revision")
+                        next_state = _scene_state_from_payload(backend.scene_state, request["state"])
+                        backend.apply_scene_state(next_state)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        node.send_output(
+                            "scene_result",
+                            pack_scene_result(
+                                request_id=request["request_id"], revision=request["revision"],
+                                ok=False, reason=str(exc),
+                            ),
+                        )
+                    else:
+                        payload = _scene_state_payload(backend.scene_state)
+                        node.send_output(
+                            "scene_result",
+                            pack_scene_result(
+                                request_id=request["request_id"], revision=payload["revision"], ok=True,
+                            ),
+                        )
+                        node.send_output("scene_state", pack_scene_state(**payload))
                 elif etype == "INPUT" and eid.startswith("motor_command_"):
                     arm = eid.removeprefix("motor_command_")
                     if arm in arm_slices:
