@@ -212,6 +212,38 @@ def unpack_controller_settings(arrow: pa.Array) -> dict:
     return body
 
 
+def _scene_message(schema: str, body: dict) -> pa.Array:
+    request_id = body.get("request_id")
+    if schema != "scene_state" and (not isinstance(request_id, str) or not request_id):
+        raise ValueError(f"{schema}.request_id must be a non-empty string")
+    revision = body.get("revision")
+    if not isinstance(revision, int) or revision < 0:
+        raise ValueError(f"{schema}.revision must be a non-negative integer")
+    return pack_json_message(schema, body)
+
+
+def pack_scene_command(*, request_id: str, revision: int, state: dict) -> pa.Array:
+    if not isinstance(state, dict):
+        raise ValueError("scene_command.state must be a mapping")
+    return _scene_message("scene_command", {"request_id": request_id, "revision": revision, "state": state})
+
+
+def unpack_scene_command(payload: pa.Array) -> dict:
+    body = unpack_json_message(payload, expected_schema="scene_command")
+    _scene_message("scene_command", body)
+    if not isinstance(body.get("state"), dict):
+        raise ValueError("scene_command.state must be a mapping")
+    return body
+
+
+def pack_scene_result(*, request_id: str, revision: int, ok: bool, reason: str = "") -> pa.Array:
+    return _scene_message("scene_result", {"request_id": request_id, "revision": revision, "ok": bool(ok), "reason": str(reason)})
+
+
+def pack_scene_state(*, revision: int, actor_q: dict, attachments: dict, constraints: dict) -> pa.Array:
+    return _scene_message("scene_state", {"revision": revision, "actor_q": actor_q, "attachments": attachments, "constraints": constraints})
+
+
 def _check_length(name: str, values: np.ndarray, expected: int) -> None:
     if values.size != expected:
         raise ValueError(f"{name}: expected {expected} float64 values, got {values.size}")
