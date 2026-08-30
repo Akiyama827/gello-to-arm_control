@@ -22,6 +22,7 @@ from __future__ import annotations
 # ruff: noqa: E402
 
 import time
+import os
 
 import numpy as np
 from dora import Node
@@ -35,7 +36,11 @@ from arm_control.messages import (
 )
 from arm_control.node_utils import ShutdownFlag, _zeros, install_signal_handlers
 from arm_control.simulation.mujoco_backend import MuJoCoBackend
-from arm_control.simulation.scene_backend import build_scene_backend, _resolve
+from arm_control.simulation.scene_backend import (
+    _resolve,
+    build_scene_backend,
+    build_workcell_backend,
+)
 
 
 def _without_schema(payload: dict) -> dict:
@@ -78,8 +83,20 @@ def main() -> None:
     period = 1.0 / rate_hz
     idle_timeout = float(cfg.get("idle_timeout_sec", 0.1))
 
+    scene_path = os.environ.get("WORKCELL_SCENE")
     scene_cfg = cfg.get("scene")
-    if scene_cfg:
+    if scene_path:
+        backend, arm_slices, joint_names, n = build_workcell_backend(
+            scene_path,
+            control_period=period,
+            launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
+            enable_self_collision=bool(cfg.get("sim_self_collision", False)),
+        )
+        print(
+            f"[mujoco_interface] generic workcell: {n} actuators, slices={arm_slices}",
+            flush=True,
+        )
+    elif scene_cfg:
         backend, arm_slices, joint_names, n = build_scene_backend(
             scene_cfg,
             control_period=period,
