@@ -24,6 +24,7 @@ import mujoco
 import numpy as np
 
 from arm_control.planning.mujoco_collision import _rpy_to_quat
+from arm_control.scene import SceneSpec, SceneState
 from arm_control.simulation.convex_decomp import replace_with_decomposition
 from arm_control.topology import AssemblyChain
 
@@ -216,6 +217,76 @@ def _load_model_spec(path: str | Path) -> mujoco.MjSpec:
     )
 
 
+def _inverse_pose(pos, quat) -> tuple[np.ndarray, np.ndarray]:
+    inv_quat = np.empty(4)
+    mujoco.mju_negQuat(inv_quat, np.asarray(quat, dtype=float))
+    inv_pos = np.empty(3)
+    mujoco.mju_rotVecQuat(inv_pos, -np.asarray(pos, dtype=float), inv_quat)
+    return inv_pos, inv_quat
+
+
+def _prefixed(name: str, local: str) -> str:
+    return f"{name}__{local}"
+
+
+def compose_workcell_scene(
+    scene: SceneSpec,
+    state: SceneState,
+    *,
+    timestep: float = 0.001,
+    ground_z: float | None = 0.0,
+) -> mujoco.MjSpec:
+    """Compose arbitrary actors, separable objects, and box obstacles.
+
+    The caller supplies every attachment frame and mating pose.  This function
+    deliberately has no knowledge of application roles or attachment policy.
+    """
+    spec = mujoco.MjSpec()
+    spec.option.timestep = float(timestep)
+    if ground_z is not None:
+        spec.worldbody.add_geom(
+            name="ground", type=mujoco.mjtGeom.mjGEOM_PLANE,
+            size=[4.0, 4.0, 0.1], pos=[0.0, 0.0, float(ground_z)],
+        )
+    for obstacle in scene.obstacles:
+        spec.worldbody.add_geom(
+            name=f"obstacle__{obstacle.name}", type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=[value / 2.0 for value in obstacle.size], pos=list(obstacle.pos),
+            quat=list(_rpy_to_quat(*obstacle.rpy)),
+        )
+    for actor in scene.actors:
+        child = _load_model_spec(actor.path)
+        spec.attach(
+            child, prefix=f"{actor.name}__",
+            frame=spec.worldbody.add_frame(pos=list(actor.pos), quat=list(_rpy_to_quat(*actor.rpy))),
+        )
+    for obj in scene.objects:
+        child = _load_model_spec(obj.path)
+        attachment = state.attachments.get(obj.name)
+        if attachment is not None:
+            parent_site = spec.site(attachment.parent_frame)
+            parent_body = spec.body(_site_body(spec, attachment.parent_frame))
+            mate = parent_body.add_frame(
+                pos=list(parent_site.pos), quat=list(parent_site.quat)
+            ).add_frame(pos=list(attachment.mate_pose[:3]), quat=list(attachment.mate_pose[3:]))
+            body = child.body(attachment.body)
+            child_site = child.site(attachment.child_frame)
+            for joint in list(body.joints):
+                if joint.type == mujoco.mjtJoint.mjJNT_FREE:
+                    child.delete(joint)
+            body.pos, body.quat = _inverse_pose(child_site.pos, child_site.quat)
+            # ``child`` is attached below with this prefix.  Applying it here
+            # as well double-prefixes the detached body's sites.
+            mate.attach_body(body)
+        storage = spec.worldbody.add_frame(
+            pos=list(obj.pos), quat=list(_rpy_to_quat(*obj.rpy))
+        )
+        spec.attach(child, prefix=f"{obj.name}__", frame=storage)
+    for actuator in list(spec.actuators):
+        spec.delete(actuator)
+    return spec
+
+
 def compose_scene(
     spec_cfg: MuJoCoSceneSpec,
     ground_z: float | None = 0.0,
@@ -360,6 +431,8 @@ class MuJoCoBackend:
 
     joint_names: list[str]  # actuated; PREFIXED in scene mode (<arm prefix>Joint1 …)
     scene: MuJoCoSceneSpec | None = None
+    workcell_scene: SceneSpec | None = None
+    scene_state: SceneState | None = None
     single_model_path: str | Path | None = None
     timestep: float = 0.001
     control_period: float | None = None
@@ -426,6 +499,28 @@ class MuJoCoBackend:
     _joint_slot: dict = field(default_factory=dict, init=False, repr=False)
     _held: Any = field(default=None, init=False, repr=False)
     _driven: np.ndarray | None = field(default=None, init=False, repr=False)
+    _applied_attachments: dict = field(default_factory=dict, init=False, repr=False)
+
+    @classmethod
+    def from_workcell_scene(
+        cls,
+        scene: SceneSpec,
+        state: SceneState | None = None,
+        **kwargs,
+    ) -> "MuJoCoBackend":
+        """Build a plant from the policy-free workcell representation."""
+        state = state or scene.state()
+        return cls(
+            joint_names=[_prefixed(actor.name, joint) for actor in scene.actors for joint in actor.joints],
+            workcell_scene=scene,
+            scene_state=state,
+            default_joint_positions={
+                _prefixed(actor.name, joint): value
+                for actor in scene.actors
+                for joint, value in zip(actor.joints, state.actor_q[actor.name])
+            },
+            **kwargs,
+        )
 
     @property
     def loaded(self) -> bool:
@@ -479,6 +574,13 @@ class MuJoCoBackend:
 
     # -- lifecycle --------------------------------------------------------
     def _build_spec(self) -> mujoco.MjSpec:
+        if self.workcell_scene is not None:
+            if self.scene_state is None:
+                raise MuJoCoUnavailableError("workcell scene requires scene state")
+            return compose_workcell_scene(
+                self.workcell_scene, self.scene_state, timestep=self.timestep,
+                ground_z=self.ground_z,
+            )
         if self.scene is not None:
             return compose_scene(
                 self.scene, self.ground_z, self.static_boxes, chain=self.chain
@@ -688,6 +790,16 @@ class MuJoCoBackend:
                 self.data.qpos[joint.qposadr[0]] = float(value)
         else:
             _transfer_state(*previous, self.model, self.data)
+        if self.workcell_scene is not None and self.scene_state is not None:
+            for actor in self.workcell_scene.actors:
+                for joint, value in zip(actor.joints, self.scene_state.actor_q[actor.name]):
+                    self.data.qpos[self.model.joint(_prefixed(actor.name, joint)).qposadr[0]] = value
+            for name, active in self.scene_state.constraints.items():
+                equality = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, name)
+                if equality < 0:
+                    raise ValueError(f"unknown scene constraint: {name}")
+                self.data.eq_active[equality] = int(active)
+            self._applied_attachments = dict(self.scene_state.attachments)
         self._cache_indices(gripper_present, first=previous[0] is None)
         mujoco.mj_forward(self.model, self.data)
 
@@ -1164,6 +1276,78 @@ class MuJoCoBackend:
             "position_cmd": position_cmd,
         }
 
+    def apply_scene_state(self, new_state: SceneState) -> None:
+        """Atomically rebuild the generic scene from a new runtime overlay."""
+        if self.workcell_scene is None:
+            raise RuntimeError("apply_scene_state requires a workcell scene")
+        self.load()
+        released: dict[str, tuple[Any, np.ndarray, np.ndarray, np.ndarray]] = {}
+        for name, attachment in self._applied_attachments.items():
+            if name not in new_state.attachments:
+                body = self.data.body(_prefixed(name, attachment.body))
+                released[name] = (
+                    attachment, body.xpos.copy(), body.xquat.copy(),
+                    self.data.cvel[body.id].copy(),
+                )
+        self.scene_state = new_state
+        self.model_revision += 1
+        self._compile()
+        for name, (attachment, pos, quat, cvel) in released.items():
+            # Object-local free-joint names are intentionally not prescribed;
+            # find the root free joint under the named detachable body.
+            for joint_id in range(self.model.njnt):
+                if self.model.jnt_type[joint_id] != mujoco.mjtJoint.mjJNT_FREE:
+                    continue
+                joint = self.model.joint(joint_id)
+                if joint.name.startswith(f"{name}__"):
+                    qadr, dadr = int(joint.qposadr[0]), int(joint.dofadr[0])
+                    self.data.qpos[qadr : qadr + 3] = pos
+                    self.data.qpos[qadr + 3 : qadr + 7] = quat
+                    self.data.qvel[dadr : dadr + 3] = cvel[3:]
+                    self.data.qvel[dadr + 3 : dadr + 6] = cvel[:3]
+                    break
+        mujoco.mj_forward(self.model, self.data)
+
+    def frame_pose(self, name: str) -> list[float]:
+        self.load()
+        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, name)
+        if site_id < 0:
+            raise KeyError(f"unknown scene frame: {name}")
+        site = self.data.site(site_id)
+        quat = np.empty(4)
+        mujoco.mju_mat2Quat(quat, site.xmat)
+        return [*map(float, site.xpos), *map(float, quat)]
+
+    def body_pose(self, name: str) -> list[float]:
+        self.load()
+        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if body_id < 0:
+            raise KeyError(f"unknown scene body: {name}")
+        body = self.data.body(body_id)
+        return [*map(float, body.xpos), *map(float, body.xquat)]
+
+    def set_constraint(self, name: str, active: bool) -> None:
+        if self.scene_state is None:
+            raise RuntimeError("set_constraint requires a workcell scene")
+        self.scene_state.set_constraint(name, active)
+        self.apply_scene_state(self.scene_state)
+
+    def aggregate_inertial(self, body_names: list[str]) -> dict[str, list[float] | float]:
+        self.load()
+        bodies = [self.data.body(name) for name in body_names]
+        masses = np.asarray([self.model.body_mass[body.id] for body in bodies])
+        mass = float(masses.sum())
+        if mass <= 0.0:
+            raise ValueError("aggregate bodies must have positive total mass")
+        com = sum((m * body.xipos for m, body in zip(masses, bodies)), np.zeros(3)) / mass
+        inertia = np.zeros((3, 3))
+        for m, body in zip(masses, bodies):
+            local = np.diag(self.model.body_inertia[body.id])
+            rot = body.ximat.reshape(3, 3)
+            delta = body.xipos - com
+            inertia += rot @ local @ rot.T + m * (delta @ delta * np.eye(3) - np.outer(delta, delta))
+        return {"mass": mass, "com": com.tolist(), "inertia": inertia.tolist()}
+
     # -- weld topology ----------------------------------------------------
     def _eq_id(self, name: str) -> int:
         return mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, name)
@@ -1505,10 +1689,51 @@ def _demo() -> None:
     )
 
 
+def _scene_demo() -> None:
+    """Smallest proof that an arbitrary separable object composes correctly."""
+    import tempfile
+
+    from arm_control.scene import Attachment, load_scene
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "actor.xml").write_text(
+            "<mujoco><worldbody><body name='root'><joint name='j' type='hinge'/>"
+            "<geom type='sphere' size='.01'/><site name='tip'/></body></worldbody></mujoco>"
+        )
+        (root / "object.xml").write_text(
+            "<mujoco><worldbody><body name='fixture'><geom type='sphere' size='.01'/>"
+            "</body><body name='part'><freejoint name='free'/><geom type='sphere' "
+            "size='.01'/><site name='inward'/></body></worldbody></mujoco>"
+        )
+        (root / "scene.yaml").write_text(
+            "version: 1\nscene:\n  actors:\n"
+            "    welder: {path: actor.xml, joints: [j], pos: [0, 0, 0], rpy: [0, 0, 0]}\n"
+            "  objects:\n"
+            "    item: {path: object.xml, pos: [1, 0, 0], rpy: [0, 0, 0]}\n"
+        )
+        scene = load_scene(root / "scene.yaml")
+        state = scene.state()
+        state.attach(
+            scene,
+            Attachment("item", "part", "welder__tip", "inward", (0, 0, 0, 1, 0, 0, 0)),
+        )
+        backend = MuJoCoBackend.from_workcell_scene(scene, state)
+        backend.load()
+        assert backend.body_pose("item__fixture")[0] == 1.0
+        assert backend.frame_pose("item__inward")[:3] == [0.0, 0.0, 0.0]
+        state.detach(scene, "item")
+        backend.apply_scene_state(state)
+        assert backend.body_pose("item__part")[0] == 0.0
+    print("mujoco_backend: scene composition OK")
+
+
 if __name__ == "__main__":
     import sys
 
     if "--demo" in sys.argv:
         _demo()
+    elif "--scene-demo" in sys.argv:
+        _scene_demo()
     else:
         print(__doc__)
