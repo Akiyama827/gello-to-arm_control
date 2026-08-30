@@ -306,6 +306,47 @@ class MuJoCoCollisionWorld:
             dtype=bool,
         )
 
+    @classmethod
+    def from_scene(
+        cls,
+        scene,
+        state,
+        planned_actor: str,
+        *,
+        self_collision_padding_m: float = -0.002,
+    ) -> "MuJoCoCollisionWorld":
+        """Build collision truth from the same generic composed workcell."""
+        if self_collision_padding_m > 0.0:
+            raise ValueError("positive self_collision_padding_m is unsupported")
+        actor = next((item for item in scene.actors if item.name == planned_actor), None)
+        if actor is None:
+            raise KeyError(f"unknown planned actor: {planned_actor}")
+        # Local import avoids the composer/collision helper import cycle.
+        from arm_control.simulation.mujoco_backend import compose_workcell_scene
+
+        self = cls.__new__(cls)
+        self.model = compose_workcell_scene(scene, state).compile()
+        self.data = mujoco.MjData(self.model)
+        for item in scene.actors:
+            for joint, value in zip(item.joints, state.actor_q[item.name]):
+                self.data.qpos[self.model.joint(f"{item.name}__{joint}").qposadr[0]] = value
+        mujoco.mj_forward(self.model, self.data)
+        self.joint_names = [f"{actor.name}__{name}" for name in actor.joints]
+        self._qadr = np.asarray(
+            [int(self.model.joint(name).qposadr[0]) for name in self.joint_names], dtype=int
+        )
+        self.lower = np.asarray([self.model.jnt_range[self.model.joint(name).id][0] for name in self.joint_names])
+        self.upper = np.asarray([self.model.jnt_range[self.model.joint(name).id][1] for name in self.joint_names])
+        self._pad = float(self_collision_padding_m)
+        self._env_geom = np.asarray(
+            [(self.model.geom(i).name or "").startswith(("ground", "obstacle__"))
+             for i in range(self.model.ngeom)], dtype=bool,
+        )
+        self._scene_names = []
+        self._cloud_gids = self._cloud_mocap_ids = None
+        self._cloud_live_k = 0
+        return self
+
     def _full_q(self, q: np.ndarray) -> np.ndarray:
         out = self.model.qpos0.copy()
         out[self._qadr] = np.asarray(q, dtype=float)

@@ -140,7 +140,9 @@ class PlanningStack:
         return len(self.joints)
 
 
-def build_planning_stack(cfg, *, arm_id: str = "arm") -> PlanningStack:
+def build_planning_stack(
+    cfg, *, arm_id: str = "arm", collision_world=None
+) -> PlanningStack:
     """IK + collision world + OMPL + planner + executor (+ preview) from config."""
     urdf = arm_urdf(cfg)
     joints = arm_joints(cfg)
@@ -153,7 +155,18 @@ def build_planning_stack(cfg, *, arm_id: str = "arm") -> PlanningStack:
     # block keeps the historical straight-line behaviour (sim graphs unchanged).
     planner_cfg = dict(cfg.get("planner") or {})
     world = ompl = None
-    if planner_cfg.get("use_ompl", bool(planner_cfg)):
+    if collision_world is not None:
+        world = collision_world
+        if planner_cfg.get("use_ompl", bool(planner_cfg)):
+            from arm_control.planning.ompl_planner import OMPLPlanner
+
+            ompl = OMPLPlanner(
+                list(zip(world.lower, world.upper)), world.in_collision,
+                solve_time_sec=float(planner_cfg.get("solve_time_sec", 2.0)),
+                simplify_time_sec=float(planner_cfg.get("simplify_time_sec", 0.5)),
+                resolution_frac=float(planner_cfg.get("resolution_frac", 0.005)),
+            )
+    elif planner_cfg.get("use_ompl", bool(planner_cfg)):
         world, ompl = build_collision_stack(
             urdf,
             joints,
