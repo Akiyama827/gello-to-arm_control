@@ -1,23 +1,17 @@
 """Dora node: Tier-1 SIM bridge for the shadow run (pick-and-dock).
 
-Lets the HARDWARE orchestrator run unmodified against the MuJoCo composed
-scene: it speaks the real bridge's 7-motor contract (motor_state/motor_command,
-arm -> motor_health ACK) while the plant speaks per-arm slices of the composed
-scene (assembler: 6, base: 2, plus the finger servos). This node HOSTS the
-grasp policy — the same arm_control.bridge GraspGate/GraspController the bench
-bridge runs: grasp_request comes in here, the gate ramps the close and
-thresholds the grip through the plant's gripper_state effort stream, and
-grasp_result goes back out (GRASPED/MISSED, LOST on a drop).
+One configured actor bridge adapts the real bridge contract to one actor slice
+of a MuJoCo scene. ``SIM_ACTOR_ID`` selects the slice (legacy default:
+``assembler``). This node hosts only optional gripper behavior; scene policy
+belongs to the caller.
 
 Translation:
-- motor_command (7: 6 arm + gripper motor) -> motor_command_assembler (6):
-  arm slots pass through (armed only); the gripper MOTOR slot is mapped onto
+- motor_command (7: 6 arm + gripper motor) -> motor_command_<actor> (6):
+  actor slots pass through (armed only); the gripper MOTOR slot is mapped onto
   the scene's two finger servos via the joint_mimics calibration and sent as
   motor_command_gripper — the fingers physically close (and stop on the
   module via the pad<->module contact pair).
-- motor_command_base (2): gentle PD hold at the configured socket pose so the
-  dock base stays put.
-- motor_state_assembler (6) -> motor_state (7): arm slots pass through; the
+- motor_state_<actor> (6) -> motor_state (7): actor slots pass through; the
   gripper slot echoes the sim's TRUE finger position (gripper_state input,
   finger metres -> motor via the mimic) so a contact-jammed finger reaches
   the operator mirror; synthesized open only until the first echo arrives.
@@ -35,6 +29,7 @@ from __future__ import annotations
 
 
 import time
+import os
 
 import numpy as np
 from dora import Node
@@ -57,9 +52,6 @@ from arm_control.messages import (
     unpack_motor_state,
 )
 
-# ponytail: fixed gentle holds (base scenery + disarmed park); config knobs if
-# a scenario ever needs different scene dynamics.
-_BASE_KP, _BASE_KD = 60.0, 2.0
 _PARK_KP, _PARK_KD = 60.0, 2.0
 # Engage park almost immediately: the arm spawns at a clean, gravity-holdable
 # q=0, but 0.2 s of free-fall is enough to drop the weak wrist into a
@@ -106,36 +98,6 @@ def gripper_motor_to_fingers(motor: float, mimic: dict) -> np.ndarray:
     lo, hi = min(lower, upper), max(lower, upper)
     value = float(np.clip(gripper_motor_to_finger(float(motor), mimic), lo, hi))
     return np.full(2, value)
-
-
-def base_hold_command(
-    q_hold: np.ndarray | None = None,
-    kp: np.ndarray | None = None,
-    kd: np.ndarray | None = None,
-) -> tuple:
-    """PD hold for the MODULAR ARM slice (2-DOF base, plus docked modules).
-
-    ``sim_base_hold_q`` in the scenario config poses the socket — e.g. pitching
-    the dock port to face UP so the upright-carried module docks top-down — and
-    its LENGTH sets the slice width, so an assembly scenario that reserves
-    module joints holds those too.
-
-    Gains come from ``sim_base_hold_kp`` / ``sim_base_hold_kd`` when the
-    scenario states them. They must: a docked module's joint is nothing like
-    the base's — its inertia is two orders smaller, and the base's 60/2 rings
-    it (measured). Absent keys keep the historical scenery hold.
-    """
-    q = np.zeros(2) if q_hold is None else np.asarray(q_hold, dtype=float)
-    n = q.size
-    zeros = np.zeros(n)
-    kp_v = np.full(n, _BASE_KP) if kp is None else np.asarray(kp, dtype=float)
-    kd_v = np.full(n, _BASE_KD) if kd is None else np.asarray(kd, dtype=float)
-    for name, vec in (("sim_base_hold_kp", kp_v), ("sim_base_hold_kd", kd_v)):
-        if vec.size != n:
-            raise ValueError(
-                f"{name} has {vec.size} values but sim_base_hold_q has {n}"
-            )
-    return q, zeros, zeros, kp_v, kd_v
 
 
 def park_command(q_arm, kp, kd) -> tuple:
@@ -287,6 +249,7 @@ class SimHand:
 
 def main() -> None:
     cfg = load_robot_config()
+    actor_id = os.environ.get("SIM_ACTOR_ID", "assembler")
     n_arm = len(arm_joints(cfg))
     mimic = next(
         (m for m in (cfg.get("joint_mimics") or {}).values() if isinstance(m, dict)),
@@ -320,21 +283,6 @@ def main() -> None:
         n_bridge = n_arm
         gcfg = dict((cfg.get("franka") or {}).get("gripper") or {})
         hand = SimHand(HandGraspFsm(gcfg))
-    base_hold_q = (
-        np.asarray(cfg.get("sim_base_hold_q"), dtype=float)
-        if cfg.get("sim_base_hold_q") is not None
-        else None
-    )
-    base_hold_kp = (
-        np.asarray(cfg.get("sim_base_hold_kp"), dtype=float)
-        if cfg.get("sim_base_hold_kp") is not None
-        else None
-    )
-    base_hold_kd = (
-        np.asarray(cfg.get("sim_base_hold_kd"), dtype=float)
-        if cfg.get("sim_base_hold_kd") is not None
-        else None
-    )
     arm_cfg = dict(cfg.get("arm") or {})
     park_kp = np.asarray(arm_cfg.get("kp", [_PARK_KP] * n_arm), float)[:n_arm]
     park_kd = np.asarray(arm_cfg.get("kd", [_PARK_KD] * n_arm), float)[:n_arm]
@@ -372,7 +320,7 @@ def main() -> None:
             cmd = unpack_motor_command(event["value"], n_bridge)
             if armed:
                 node.send_output(
-                    "motor_command_assembler",
+                    f"motor_command_{actor_id}",
                     pack_motor_command(*command_arm_slice(cmd, n_arm)),
                 )
                 if grasp is not None and not grasp.active:
@@ -471,7 +419,7 @@ def main() -> None:
                         flush=True,
                     )
                     node.send_output("grasp_result", pack_grasp_result(**result))
-        elif topic == "motor_state_assembler":
+        elif topic == f"motor_state_{actor_id}":
             state = unpack_motor_state(event["value"], n_arm)
             states_seen += 1
             if states_seen % _PUBLISH_EVERY == 0:
@@ -487,19 +435,13 @@ def main() -> None:
                     pack_motor_state(pos, vel, tau, zeros, zeros, zeros, zeros, zeros),
                 )
             if states_seen % _STREAM_EVERY == 0:
-                node.send_output(
-                    "motor_command_base",
-                    pack_motor_command(
-                        *base_hold_command(base_hold_q, base_hold_kp, base_hold_kd)
-                    ),
-                )
                 if states_seen - last_cmd_state > _PARK_GAP_STATES:
                     if park_q is None:
                         park_q = np.asarray(
                             state["position"], dtype=float
                         )[:n_arm].copy()
                     node.send_output(
-                        "motor_command_assembler",
+                        f"motor_command_{actor_id}",
                         pack_motor_command(*park_command(park_q, park_kp, park_kd)),
                     )
             if states_seen - published_health >= 500:  # ~2 Hz at 1 kHz plant
