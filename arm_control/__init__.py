@@ -24,3 +24,5 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: resolving. Before the split this was ``Path(__file__).parents[N]`` computed
 #: independently in seven modules — the env var is the one seam.
 CONTROL_ROOT = Path(os.environ.get("ARM_CONTROL_ROOT") or REPO_ROOT)
+
+# Scene types live in a separate module so package import remains dependency-light.
