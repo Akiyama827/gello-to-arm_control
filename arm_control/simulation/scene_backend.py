@@ -18,6 +18,7 @@ from arm_control.simulation.mujoco_backend import (
     MuJoCoSceneSpec,
     SceneModelSpec,
 )
+from arm_control.scene import load_scene
 
 from arm_control import CONTROL_ROOT  # deployment root (env-overridable seam)
 
@@ -183,3 +184,29 @@ def build_scene_backend(
         ),
     )
     return backend, arm_slices, joint_names, n_motors
+
+
+def build_workcell_backend(
+    scene_path: str | Path,
+    control_period: float,
+    *,
+    launch_viewer: bool = False,
+    enable_self_collision: bool = False,
+) -> tuple[MuJoCoBackend, dict[str, dict[str, int]], list[str], int]:
+    """Load a generic workcell file and derive actor ports from its schema."""
+    scene = load_scene(scene_path)
+    backend = MuJoCoBackend.from_workcell_scene(
+        scene,
+        control_period=control_period,
+        launch_viewer=launch_viewer,
+        enable_self_collision=enable_self_collision,
+    )
+    start = 0
+    slices = {}
+    joint_names = []
+    for actor in scene.actors:
+        width = len(actor.joints)
+        slices[actor.name] = {"start": start, "n": width}
+        joint_names.extend(f"{actor.name}__{joint}" for joint in actor.joints)
+        start += width
+    return backend, slices, joint_names, len(joint_names)
