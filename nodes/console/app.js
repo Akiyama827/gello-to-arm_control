@@ -119,6 +119,9 @@ scene.add(gizmo);
 let draggingGizmo = false;
 let lastGizmoSend = 0;
 let rotationDelta = 0;
+let editorMode = false;
+let editorReferenceMatrix = null;
+let editorRevision = "";
 const previousQuaternion = new THREE.Quaternion();
 gizmo.addEventListener("dragging-changed", (event) => {
   draggingGizmo = event.value;
@@ -129,6 +132,15 @@ gizmo.addEventListener("dragging-changed", (event) => {
   }
 });
 gizmo.addEventListener("objectChange", () => {
+  if (editorMode) {
+    const now = performance.now();
+    if (now - lastGizmoSend < 80) return;
+    lastGizmoSend = now;
+    sendEditorGrasp().catch((error) => {
+      $("grasp-status").textContent = error.message;
+    });
+    return;
+  }
   const axis = gizmo.axis;
   if (!["X", "Y", "Z"].includes(axis)) return;
   const index = { X: 0, Y: 1, Z: 2 }[axis];
@@ -244,8 +256,120 @@ let planFrames = [];
 let planIndex = 0;
 let planVersion = -1;
 
+const wxyzPoseMatrix = (pose) => new THREE.Matrix4().compose(
+  new THREE.Vector3(...pose.slice(0, 3)),
+  new THREE.Quaternion(pose[4], pose[5], pose[6], pose[3]),
+  new THREE.Vector3(1, 1, 1),
+);
+
+const csvVector = (id) => {
+  const values = $(id).value.split(",").map((value) => Number(value.trim()));
+  if (values.length !== 3 || values.some((value) => !Number.isFinite(value))) {
+    throw new Error(`${id} needs three finite comma-separated values`);
+  }
+  return values;
+};
+
+async function sendEditorGrasp() {
+  if (!editorReferenceMatrix) return;
+  gizmoTarget.updateMatrix();
+  const local = editorReferenceMatrix.clone().invert().multiply(gizmoTarget.matrix);
+  const position = new THREE.Vector3();
+  const quaternion = new THREE.Quaternion();
+  local.decompose(position, quaternion, new THREE.Vector3());
+  await post("/grasp", {
+    pos: position.toArray(),
+    quat: [quaternion.w, quaternion.x, quaternion.y, quaternion.z],
+    approach_offset_m: csvVector("grasp-approach"),
+    retreat_offset_m: csvVector("grasp-retreat"),
+  });
+  $("grasp-status").textContent = "Draft changed in memory — Save draft to persist";
+}
+
+const buildModuleEditor = async (state) => {
+  editorMode = true;
+  const geometry = await (await fetch("/scene")).json();
+  const moduleGroup = new THREE.Group();
+  scene.add(moduleGroup);
+  for (const item of geometry.module || []) {
+    const mesh = new THREE.Mesh(
+      await loadGeometry(item.mesh),
+      new THREE.MeshPhongMaterial({ color: new THREE.Color(...item.color) }),
+    );
+    mesh.scale.set(...item.scale);
+    mesh.position.set(...item.p);
+    mesh.quaternion.set(...item.q);
+    moduleGroup.add(mesh);
+  }
+  for (const [name, pose] of Object.entries(geometry.frames || {})) {
+    const axes = new THREE.AxesHelper(0.055);
+    axes.position.set(...pose.p);
+    axes.quaternion.set(...pose.q);
+    axes.name = name;
+    moduleGroup.add(axes);
+  }
+  const bounds = new THREE.Box3().setFromObject(moduleGroup);
+  const center = bounds.getCenter(new THREE.Vector3());
+  const size = Math.max(bounds.getSize(new THREE.Vector3()).length(), 0.08);
+  orbit.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(1, -1, 0.75).normalize().multiplyScalar(size * 2.2));
+  camera.near = Math.max(size / 100, 0.001);
+  camera.far = Math.max(size * 30, 2);
+  camera.updateProjectionMatrix();
+  orbit.update();
+  const hand = new THREE.Group();
+  const ghostMaterial = new THREE.MeshPhongMaterial({
+    color: 0xd99a24,
+    transparent: true,
+    opacity: 0.55,
+  });
+  hand.add(new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.075, 0.018), ghostMaterial));
+  for (const y of [-0.047, 0.047]) {
+    const finger = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.012, 0.016), ghostMaterial);
+    finger.position.set(0.045, y, 0);
+    hand.add(finger);
+  }
+  gizmoTarget.add(hand);
+  $("actor-select").innerHTML = `<option>${state.module.type} grasp</option>`;
+  deadmanButton.disabled = true;
+  deadmanButton.querySelector("span").textContent = "Visualization only";
+  deadmanButton.querySelector("small").textContent = "No motion output is open";
+  $("buttons").textContent = "Profile editing cannot command an actor.";
+  $("grip").textContent = "Hand ghost only";
+  $("edit-grasp").disabled = false;
+  $("save-grasp").disabled = false;
+  $("grasp-fields").hidden = false;
+  $("grasp-approach").value = state.module.approach_offset_m.join(", ");
+  $("grasp-retreat").value = state.module.retreat_offset_m.join(", ");
+  $("joint-summary").textContent = "Module fixed at q = 0";
+  $("wrench-summary").textContent = "Not connected in visualization mode";
+  $("plan-summary").textContent = "IK/collision preview pending";
+  editorReferenceMatrix = wxyzPoseMatrix(state.module.reference_pose);
+  const ee = wxyzPoseMatrix(state.module.ee_pose);
+  ee.decompose(gizmoTarget.position, gizmoTarget.quaternion, new THREE.Vector3());
+  editorRevision = state.module.revision;
+  $("grasp-status").textContent = `${state.module.status} / ${state.module.reference_link}`;
+  $("save-grasp").onclick = async () => {
+    if (!confirm("Save this draft grasp and create a dated backup?")) return;
+    await sendEditorGrasp();
+    const saved = await post("/grasp/save", {
+      confirm: true,
+      expected_revision: editorRevision,
+    });
+    editorRevision = saved.revision;
+    $("grasp-status").textContent = "Draft saved";
+  };
+  built = true;
+  building = false;
+  resize();
+};
+
 const build = async (state) => {
   building = true;
+  if (state.mode === "module_editor") {
+    await buildModuleEditor(state);
+    return;
+  }
   const geometry = await (await fetch("/scene")).json();
   measuredRobot = await buildRobot(geometry.geoms, null, 1);
   targetRobot = await buildRobot(geometry.geoms, new THREE.Color(0xd99a24), 0.45);
@@ -309,6 +433,14 @@ const poll = async () => {
       document.title = `${state.ident.includes("real") ? "REAL" : "SIM"} calibration console`;
     }
     if (!built && !building) await build(state);
+    if (state.mode === "module_editor") {
+      $("log").textContent = state.log.join("\n");
+      if (!draggingGizmo && editorMode) {
+        editorReferenceMatrix = wxyzPoseMatrix(state.module.reference_pose);
+        editorRevision = state.module.revision;
+      }
+      return;
+    }
     if (built && !sliderDrag) {
       syncSliders(jointSliders, state.sliders, 3);
       if (gripperSlider) syncSliders([gripperSlider], [state.gripper], 3);

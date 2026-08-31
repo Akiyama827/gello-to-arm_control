@@ -98,9 +98,15 @@
         </div>
         <p class="quiet">Persistent actions remain disabled until their device stream is valid.</p>
         <div class="cal-actions">
-          <button disabled title="Requires a valid wrench stream">Tare F/T</button>
-          <button disabled title="Requires a selected actor state">Capture pose</button>
-          <button disabled title="Requires a loaded module profile">Edit grasp</button>
+          <button id="tare-wrench" disabled title="Requires a valid wrench stream">Tare F/T</button>
+          <button id="capture-pose" disabled title="Requires a selected actor state">Capture pose</button>
+          <button id="edit-grasp" disabled title="Requires a loaded module profile">Edit grasp</button>
+          <button id="save-grasp" disabled>Save draft</button>
+        </div>
+        <div id="grasp-fields" class="grasp-fields" hidden>
+          <label>Approach xyz (m)<input id="grasp-approach" value="0, 0, 0"></label>
+          <label>Retreat xyz (m)<input id="grasp-retreat" value="0, 0, 0"></label>
+          <p id="grasp-status" class="quiet"></p>
         </div>
       </section>
     </aside>

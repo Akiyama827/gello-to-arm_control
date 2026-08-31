@@ -152,6 +152,22 @@ input[type="range"] { width: 100%; accent-color: var(--blue); }
 #log { min-height: 6rem; margin: .7rem 0 0; padding: .55rem; white-space: pre-wrap; background: #e7ebe8; color: #354246; font: .67rem/1.45 ui-monospace, monospace; }
 .quiet { color: var(--muted); font-size: .72rem; line-height: 1.45; }
 .cal-actions { display: grid; grid-template-columns: 1fr; gap: .35rem; }
+.grasp-fields { display: grid; gap: .6rem; margin-top: .8rem; }
+.grasp-fields label {
+  color: var(--muted);
+  display: grid;
+  font-size: .72rem;
+  gap: .25rem;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.grasp-fields input {
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--paper);
+  padding: .45rem;
+}
 
 .safety-spine {
   height: 3.8rem;
