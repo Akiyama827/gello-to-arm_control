@@ -71,9 +71,10 @@ class ObjectSpec:
 class ObstacleSpec:
     name: str
     shape: str
-    size: tuple[float, float, float]
+    size: tuple[float, float, float] | None
     pos: tuple[float, float, float]
     rpy: tuple[float, float, float]
+    path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -190,11 +191,17 @@ def load_scene(path: str | Path) -> SceneSpec:
     obstacles: list[ObstacleSpec] = []
     for name, value in obstacle_entries.items():
         obstacle = _mapping(value, f"scene.obstacles.{name}")
-        if obstacle.get("shape") != "box":
-            raise ValueError(f"scene.obstacles.{name}.shape must be 'box'")
-        obstacles.append(ObstacleSpec(name, "box", _vec(obstacle.get("size"), f"scene.obstacles.{name}.size", positive=True),
-                                      _vec(obstacle.get("pos", (0, 0, 0)), f"scene.obstacles.{name}.pos"),
-                                      _vec(obstacle.get("rpy", (0, 0, 0)), f"scene.obstacles.{name}.rpy")))
+        shape = obstacle.get("shape")
+        pos = _vec(obstacle.get("pos", (0, 0, 0)), f"scene.obstacles.{name}.pos")
+        rpy = _vec(obstacle.get("rpy", (0, 0, 0)), f"scene.obstacles.{name}.rpy")
+        if shape == "box":
+            size = _vec(obstacle.get("size"), f"scene.obstacles.{name}.size", positive=True)
+            obstacles.append(ObstacleSpec(name, shape, size, pos, rpy))
+        elif shape == "mesh":
+            path = _path(obstacle.get("path"), source, f"scene.obstacles.{name}")
+            obstacles.append(ObstacleSpec(name, shape, None, pos, rpy, path))
+        else:
+            raise ValueError(f"scene.obstacles.{name}.shape must be 'box' or 'mesh'")
     if not actors:
         raise ValueError("scene.actors must be non-empty")
     return SceneSpec(tuple(actors), objects, tuple(obstacles))

@@ -242,7 +242,7 @@ def compose_workcell_scene(
     timestep: float = 0.001,
     ground_z: float | None = 0.0,
 ) -> mujoco.MjSpec:
-    """Compose arbitrary actors, separable objects, and box obstacles.
+    """Compose arbitrary actors, separable objects, and static obstacles.
 
     The caller supplies every attachment frame and mating pose.  This function
     deliberately has no knowledge of application roles or attachment policy.
@@ -255,11 +255,21 @@ def compose_workcell_scene(
             size=[4.0, 4.0, 0.1], pos=[0.0, 0.0, float(ground_z)],
         )
     for obstacle in scene.obstacles:
-        spec.worldbody.add_geom(
-            name=f"obstacle__{obstacle.name}", type=mujoco.mjtGeom.mjGEOM_BOX,
-            size=[value / 2.0 for value in obstacle.size], pos=list(obstacle.pos),
-            quat=list(_rpy_to_quat(*obstacle.rpy)),
-        )
+        kwargs = {
+            "name": f"obstacle__{obstacle.name}",
+            "pos": list(obstacle.pos),
+            "quat": list(_rpy_to_quat(*obstacle.rpy)),
+        }
+        if obstacle.shape == "box":
+            kwargs.update(
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=[value / 2.0 for value in obstacle.size],
+            )
+        else:
+            mesh_name = f"obstacle__{obstacle.name}__mesh"
+            spec.add_mesh(name=mesh_name, file=str(obstacle.path))
+            kwargs.update(type=mujoco.mjtGeom.mjGEOM_MESH, meshname=mesh_name)
+        spec.worldbody.add_geom(**kwargs)
     for actor in scene.actors:
         child = _load_model_spec(actor.path)
         spec.attach(
