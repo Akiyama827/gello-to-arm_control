@@ -1335,8 +1335,66 @@ class MuJoCoBackend:
     def set_constraint(self, name: str, active: bool) -> None:
         if self.scene_state is None:
             raise RuntimeError("set_constraint requires a workcell scene")
+        self.load()
+        equality = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_EQUALITY, name
+        )
+        if equality < 0:
+            raise KeyError(f"unknown scene constraint: {name}")
         self.scene_state.set_constraint(name, active)
-        self.apply_scene_state(self.scene_state)
+        self.data.eq_active[equality] = int(active)
+        mujoco.mj_forward(self.model, self.data)
+
+    def constraint_active(self, name: str) -> bool:
+        """Return the current state of one named equality constraint."""
+        self.load()
+        equality = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_EQUALITY, name
+        )
+        if equality < 0:
+            raise KeyError(f"unknown scene constraint: {name}")
+        return bool(self.data.eq_active[equality])
+
+    def equality_reaction(self, name: str) -> np.ndarray:
+        """Return a named equality's translational then rotational reactions."""
+        self.load()
+        equality = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_EQUALITY, name
+        )
+        if equality < 0:
+            raise KeyError(f"unknown scene constraint: {name}")
+        if not self.data.eq_active[equality]:
+            return np.zeros(6)
+        rows = np.flatnonzero(
+            (self.data.efc_type == mujoco.mjtConstraint.mjCNSTR_EQUALITY)
+            & (self.data.efc_id == equality)
+        )
+        result = np.zeros(6)
+        count = min(6, len(rows))
+        result[:count] = self.data.efc_force[rows[:count]]
+        return result
+
+    def release_constraint_if_force_exceeds(
+        self,
+        name: str,
+        axis_world,
+        threshold_n: float,
+    ) -> bool:
+        """Disable a named equality once its axial reaction exceeds a threshold."""
+        axis = np.asarray(axis_world, dtype=float).ravel()
+        norm = float(np.linalg.norm(axis))
+        threshold = float(threshold_n)
+        if axis.shape != (3,) or not np.isfinite(axis).all() or norm <= 0.0:
+            raise ValueError("axis_world must be a finite non-zero 3-vector")
+        if not np.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError("threshold_n must be positive and finite")
+        if not self.constraint_active(name):
+            return False
+        axial = abs(float(self.equality_reaction(name)[:3] @ (axis / norm)))
+        if axial <= threshold:
+            return False
+        self.set_constraint(name, False)
+        return True
 
     def aggregate_inertial(self, body_names: list[str]) -> dict[str, list[float] | float]:
         self.load()
