@@ -219,6 +219,10 @@ class GraspProfile:
     module_type: str
     calibration_status: str
     reference_link: str
+    ee_frame: str
+    tool_root_link: str
+    tool_source_sha256: str
+    finger_width_m: float
     link_T_ee: np.ndarray
     approach_offset_m: np.ndarray
     retreat_offset_m: np.ndarray
@@ -235,26 +239,80 @@ def validate_grasp_profile(
     raw: Mapping[str, object],
     *,
     module_urdf: str | Path,
+    tool_urdf: str | Path,
+    finger_joints: tuple[str, ...],
 ) -> GraspProfile:
     """Validate and normalize one module-local, asset-bound grasp profile."""
-    urdf = Path(module_urdf).resolve(strict=True)
-    if raw.get("version") != 1:
-        raise ValueError("grasp profile version must be 1")
+    module = Path(module_urdf).resolve(strict=True)
+    tool = Path(tool_urdf).resolve(strict=True)
+    if raw.get("version") != 2:
+        raise ValueError("grasp profile version must be 2")
     module_type = raw.get("module_type")
     if not isinstance(module_type, str) or not module_type:
         raise ValueError("module_type is required")
     status = raw.get("calibration_status")
     if status not in {"draft", "approved"}:
         raise ValueError("calibration_status must be draft or approved")
-    if raw.get("source_sha256") != asset_fingerprint(urdf):
+    if raw.get("source_sha256") != asset_fingerprint(module):
         raise ValueError("source fingerprint does not match module asset")
     grasp = raw.get("grasp")
     if not isinstance(grasp, Mapping):
         raise ValueError("grasp must be a mapping")
     reference = grasp.get("reference_link")
-    links = {link.get("name") for link in ET.parse(urdf).getroot().findall("link")}
-    if not isinstance(reference, str) or reference not in links:
+    module_links = {
+        link.get("name") for link in ET.parse(module).getroot().findall("link")
+    }
+    if not isinstance(reference, str) or reference not in module_links:
         raise ValueError("grasp.reference_link is not a module link")
+
+    tool_root = ET.parse(tool).getroot()
+    tool_links = {link.get("name") for link in tool_root.findall("link")}
+    ee_frame = grasp.get("ee_frame")
+    if not isinstance(ee_frame, str) or ee_frame not in tool_links:
+        raise ValueError("grasp.ee_frame is not a tool link")
+    tool_root_link = grasp.get("tool_root_link")
+    if not isinstance(tool_root_link, str) or tool_root_link not in tool_links:
+        raise ValueError("grasp.tool_root_link is not a tool link")
+    parents = {
+        child.get("link"): parent.get("link")
+        for joint in tool_root.findall("joint")
+        if (parent := joint.find("parent")) is not None
+        and (child := joint.find("child")) is not None
+    }
+    ancestor = ee_frame
+    while ancestor != tool_root_link and ancestor in parents:
+        ancestor = parents[ancestor]
+    if ancestor != tool_root_link:
+        raise ValueError("grasp.tool_root_link must be an ancestor of ee_frame")
+    tool_source_sha256 = grasp.get("tool_source_sha256")
+    if tool_source_sha256 != asset_fingerprint(tool):
+        raise ValueError("tool fingerprint does not match tool asset")
+
+    if not finger_joints or len(set(finger_joints)) != len(finger_joints):
+        raise ValueError("finger_joints must be non-empty and unique")
+    joints = {joint.get("name"): joint for joint in tool_root.findall("joint")}
+    try:
+        finger_width_m = float(grasp.get("finger_width_m"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("grasp.finger_width_m must be finite") from exc
+    if not np.isfinite(finger_width_m):
+        raise ValueError("grasp.finger_width_m must be finite")
+    per_joint = finger_width_m / len(finger_joints)
+    for name in finger_joints:
+        joint = joints.get(name)
+        if joint is None or joint.get("type") != "prismatic":
+            raise ValueError(f"finger joint {name!r} must be prismatic")
+        limit = joint.find("limit")
+        if limit is None:
+            raise ValueError(f"finger joint {name!r} requires limits")
+        try:
+            lower = float(limit.get("lower", ""))
+            upper = float(limit.get("upper", ""))
+        except ValueError as exc:
+            raise ValueError(f"finger joint {name!r} has invalid limits") from exc
+        if not lower <= per_joint <= upper:
+            raise ValueError("grasp.finger_width_m exceeds finger joint limits")
+
     pose = grasp.get("link_T_ee")
     if not isinstance(pose, Mapping):
         raise ValueError("grasp.link_T_ee must be a mapping")
@@ -268,6 +326,10 @@ def validate_grasp_profile(
         module_type,
         str(status),
         reference,
+        ee_frame,
+        tool_root_link,
+        str(tool_source_sha256),
+        finger_width_m,
         link_T_ee,
         _vector(grasp.get("approach_offset_m"), 3, "grasp.approach_offset_m"),
         _vector(grasp.get("retreat_offset_m"), 3, "grasp.retreat_offset_m"),

@@ -121,26 +121,116 @@ def test_console_page_is_offline_and_has_functional_sections():
     assert console_asset("static/vendor/three.module.js")[0] == "text/javascript"
 
 
-def test_grasp_profile_is_normalized_and_asset_bound(tmp_path):
-    urdf = tmp_path / "part.urdf"
-    urdf.write_text("<robot name='part'><link name='Passive'/></robot>")
+def _grasp_profile_assets(tmp_path):
+    module_urdf = tmp_path / "part.urdf"
+    module_urdf.write_text("<robot name='part'><link name='Passive'/></robot>")
+    tool_urdf = tmp_path / "tool.urdf"
+    tool_urdf.write_text(
+        """<robot name="tool">
+  <link name="upstream"/>
+  <link name="tool_root"/>
+  <link name="tcp"/>
+  <link name="left_finger"/>
+  <link name="right_finger"/>
+  <link name="other"/>
+  <joint name="mount" type="fixed">
+    <parent link="upstream"/><child link="tool_root"/>
+  </joint>
+  <joint name="tcp_fixed" type="fixed">
+    <parent link="tool_root"/><child link="tcp"/>
+  </joint>
+  <joint name="left_joint" type="prismatic">
+    <parent link="tool_root"/><child link="left_finger"/>
+    <axis xyz="0 1 0"/><limit lower="0" upper="0.04" effort="1" velocity="1"/>
+  </joint>
+  <joint name="right_joint" type="prismatic">
+    <parent link="tool_root"/><child link="right_finger"/>
+    <axis xyz="0 -1 0"/><limit lower="0" upper="0.04" effort="1" velocity="1"/>
+  </joint>
+</robot>"""
+    )
     raw = {
-        "version": 1,
+        "version": 2,
         "module_type": "Part",
         "calibration_status": "draft",
-        "source_sha256": asset_fingerprint(urdf),
+        "source_sha256": asset_fingerprint(module_urdf),
         "grasp": {
             "reference_link": "Passive",
+            "ee_frame": "tcp",
+            "tool_root_link": "tool_root",
+            "tool_source_sha256": asset_fingerprint(tool_urdf),
+            "finger_width_m": 0.04,
             "link_T_ee": {"pos": [0, 0, 0], "quat": [2, 0, 0, 0]},
             "approach_offset_m": [0, 0, 0.1],
             "retreat_offset_m": [0, 0, -0.1],
         },
     }
+    return module_urdf, tool_urdf, raw
 
-    grasp = validate_grasp_profile(raw, module_urdf=urdf)
+
+def _validate_grasp(raw, module_urdf, tool_urdf):
+    return validate_grasp_profile(
+        raw,
+        module_urdf=module_urdf,
+        tool_urdf=tool_urdf,
+        finger_joints=("left_joint", "right_joint"),
+    )
+
+
+def test_grasp_profile_is_normalized_and_bound_to_both_assets(tmp_path):
+    module_urdf, tool_urdf, raw = _grasp_profile_assets(tmp_path)
+
+    grasp = _validate_grasp(raw, module_urdf, tool_urdf)
 
     assert grasp.reference_link == "Passive"
+    assert grasp.ee_frame == "tcp"
+    assert grasp.tool_root_link == "tool_root"
+    assert grasp.finger_width_m == 0.04
     np.testing.assert_allclose(grasp.link_T_ee, np.eye(4))
+
+
+def test_grasp_profile_rejects_stale_tool_asset(tmp_path):
+    module_urdf, tool_urdf, raw = _grasp_profile_assets(tmp_path)
+    raw["grasp"]["tool_source_sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match="tool fingerprint"):
+        _validate_grasp(raw, module_urdf, tool_urdf)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("ee_frame", "missing", "ee_frame"),
+        ("tool_root_link", "missing", "tool_root_link"),
+        ("tool_root_link", "other", "ancestor"),
+    ],
+)
+def test_grasp_profile_rejects_invalid_tool_frames(
+    tmp_path, field, value, message
+):
+    module_urdf, tool_urdf, raw = _grasp_profile_assets(tmp_path)
+    raw["grasp"][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        _validate_grasp(raw, module_urdf, tool_urdf)
+
+
+def test_grasp_profile_rejects_width_beyond_joint_limits(tmp_path):
+    module_urdf, tool_urdf, raw = _grasp_profile_assets(tmp_path)
+    raw["grasp"]["finger_width_m"] = 0.081
+
+    with pytest.raises(ValueError, match="finger_width_m"):
+        _validate_grasp(raw, module_urdf, tool_urdf)
+
+
+def test_grasp_profile_rejects_version_one_and_stale_module_asset(tmp_path):
+    module_urdf, tool_urdf, raw = _grasp_profile_assets(tmp_path)
+    raw["version"] = 1
+
+    with pytest.raises(ValueError, match="version must be 2"):
+        _validate_grasp(raw, module_urdf, tool_urdf)
+
+    raw["version"] = 2
     raw["source_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="fingerprint"):
-        validate_grasp_profile(raw, module_urdf=urdf)
+        _validate_grasp(raw, module_urdf, tool_urdf)
