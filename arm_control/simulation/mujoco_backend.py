@@ -198,7 +198,9 @@ def _graft_module(
     spec.attach(child, prefix=slot.prefix, frame=frame)
 
 
-def _load_model_spec(path: str | Path) -> mujoco.MjSpec:
+def _load_model_spec(
+    path: str | Path, *, cache_dir: str | Path | None = None
+) -> mujoco.MjSpec:
     path = Path(path)
     if path.suffix.lower() == ".urdf":
         # Same shims as single-model mode: URDF needs the <mujoco> compiler
@@ -207,7 +209,11 @@ def _load_model_spec(path: str | Path) -> mujoco.MjSpec:
         # the viewer/Rerun mirror too.
         from arm_control.planning.mujoco_collision import build_planning_model
 
-        path = build_planning_model(path, path.parent / ".mj_cache", keep_visual=True)
+        path = build_planning_model(
+            path,
+            path.parent / ".mj_cache" if cache_dir is None else cache_dir,
+            keep_visual=True,
+        )
         return mujoco.MjSpec.from_string(path.read_text())
     if path.suffix.lower() in (".xml", ".mjcf"):
         return mujoco.MjSpec.from_file(str(path))

@@ -68,7 +68,10 @@ def build_planning_model(
         path = (
             (package_root / rel) if ref.startswith("package://") else (urdf_path.parent / rel)
         )
-        mesh_dirs.add(path.resolve().parent)
+        # Keep the package path here instead of resolving symlinks. Modular
+        # packages intentionally symlink common dock plates from one shared
+        # directory; MuJoCo can open those links from the package meshdir.
+        mesh_dirs.add(path.absolute().parent)
     keep_paths = False
     if len(mesh_dirs) > 1:
         if any(ref.startswith("package://") for ref in mesh_refs):
