@@ -11,8 +11,13 @@ import re
 import shutil
 import tempfile
 from typing import Mapping
+from xml.etree import ElementTree as ET
 
+import numpy as np
 import yaml
+
+from arm_control import frames
+from arm_control.assets import asset_fingerprint
 
 
 _ACTOR_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
@@ -207,3 +212,63 @@ class CalibrationStore:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         return self.revision(target)
+
+
+@dataclass(frozen=True)
+class GraspProfile:
+    module_type: str
+    calibration_status: str
+    reference_link: str
+    link_T_ee: np.ndarray
+    approach_offset_m: np.ndarray
+    retreat_offset_m: np.ndarray
+
+
+def _vector(raw: object, size: int, label: str) -> np.ndarray:
+    value = np.asarray(raw, dtype=float)
+    if value.shape != (size,) or not np.isfinite(value).all():
+        raise ValueError(f"{label} must contain {size} finite values")
+    return value
+
+
+def validate_grasp_profile(
+    raw: Mapping[str, object],
+    *,
+    module_urdf: str | Path,
+) -> GraspProfile:
+    """Validate and normalize one module-local, asset-bound grasp profile."""
+    urdf = Path(module_urdf).resolve(strict=True)
+    if raw.get("version") != 1:
+        raise ValueError("grasp profile version must be 1")
+    module_type = raw.get("module_type")
+    if not isinstance(module_type, str) or not module_type:
+        raise ValueError("module_type is required")
+    status = raw.get("calibration_status")
+    if status not in {"draft", "approved"}:
+        raise ValueError("calibration_status must be draft or approved")
+    if raw.get("source_sha256") != asset_fingerprint(urdf):
+        raise ValueError("source fingerprint does not match module asset")
+    grasp = raw.get("grasp")
+    if not isinstance(grasp, Mapping):
+        raise ValueError("grasp must be a mapping")
+    reference = grasp.get("reference_link")
+    links = {link.get("name") for link in ET.parse(urdf).getroot().findall("link")}
+    if not isinstance(reference, str) or reference not in links:
+        raise ValueError("grasp.reference_link is not a module link")
+    pose = grasp.get("link_T_ee")
+    if not isinstance(pose, Mapping):
+        raise ValueError("grasp.link_T_ee must be a mapping")
+    position = _vector(pose.get("pos"), 3, "grasp.link_T_ee.pos")
+    quaternion = _vector(pose.get("quat"), 4, "grasp.link_T_ee.quat")
+    norm = float(np.linalg.norm(quaternion))
+    if norm <= 1e-12:
+        raise ValueError("grasp.link_T_ee.quat must be non-zero")
+    link_T_ee = frames.T_from_spec({"pos": position, "quat": quaternion / norm})
+    return GraspProfile(
+        module_type,
+        str(status),
+        reference,
+        link_T_ee,
+        _vector(grasp.get("approach_offset_m"), 3, "grasp.approach_offset_m"),
+        _vector(grasp.get("retreat_offset_m"), 3, "grasp.retreat_offset_m"),
+    )

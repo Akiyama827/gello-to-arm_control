@@ -1,12 +1,15 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from arm_control.calibration_console import (
     ActorCatalog,
     CalibrationStore,
     ConsoleAuthority,
+    validate_grasp_profile,
 )
+from arm_control.assets import asset_fingerprint
 from nodes.motion_teleop import console_asset
 
 
@@ -116,3 +119,28 @@ def test_console_page_is_offline_and_has_functional_sections():
     ):
         assert f'id="{ident}"' in html
     assert console_asset("static/vendor/three.module.js")[0] == "text/javascript"
+
+
+def test_grasp_profile_is_normalized_and_asset_bound(tmp_path):
+    urdf = tmp_path / "part.urdf"
+    urdf.write_text("<robot name='part'><link name='Passive'/></robot>")
+    raw = {
+        "version": 1,
+        "module_type": "Part",
+        "calibration_status": "draft",
+        "source_sha256": asset_fingerprint(urdf),
+        "grasp": {
+            "reference_link": "Passive",
+            "link_T_ee": {"pos": [0, 0, 0], "quat": [2, 0, 0, 0]},
+            "approach_offset_m": [0, 0, 0.1],
+            "retreat_offset_m": [0, 0, -0.1],
+        },
+    }
+
+    grasp = validate_grasp_profile(raw, module_urdf=urdf)
+
+    assert grasp.reference_link == "Passive"
+    np.testing.assert_allclose(grasp.link_T_ee, np.eye(4))
+    raw["source_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="fingerprint"):
+        validate_grasp_profile(raw, module_urdf=urdf)
