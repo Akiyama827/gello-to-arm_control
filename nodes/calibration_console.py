@@ -2,101 +2,55 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 from pathlib import Path
 import threading
-import time
 
 import numpy as np
 import yaml
 
 from arm_control import frames
 from arm_control.calibration_console import CalibrationStore, validate_grasp_profile
-from motion_teleop import console_asset, main as motion_main
+from arm_control.grasp_visual import GraspVisual
+try:
+    from nodes.motion_teleop import console_asset, main as motion_main
+except ModuleNotFoundError:
+    from motion_teleop import console_asset, main as motion_main
 
 
-def _pose_json(pin, transform) -> dict[str, list[float]]:
-    quat = pin.Quaternion(transform.rotation).coeffs()
+def _pose_json(transform: np.ndarray) -> dict[str, list[float]]:
+    pose = frames.T_to_pose_xyzquat(transform)
     return {
-        "p": [float(value) for value in transform.translation],
-        "q": [float(value) for value in quat],
+        "p": [float(value) for value in pose[:3]],
+        "q": [float(pose[4]), float(pose[5]), float(pose[6]), float(pose[3])],
     }
-
-
-class ModuleVisual:
-    def __init__(self, urdf: Path) -> None:
-        import pinocchio as pin
-
-        from arm_control.planning.preview_rerun import _mesh_package_dirs
-
-        self.pin = pin
-        self.model, self.visual = pin.buildModelsFromUrdf(
-            str(urdf),
-            package_dirs=_mesh_package_dirs(urdf) or None,
-            geometry_types=[pin.GeometryType.VISUAL],
-        )
-        self.data = self.model.createData()
-        self.vdata = self.visual.createData()
-        q = pin.neutral(self.model)
-        pin.forwardKinematics(self.model, self.data, q)
-        pin.updateFramePlacements(self.model, self.data)
-        pin.updateGeometryPlacements(self.model, self.data, self.visual, self.vdata, q)
-        self.geom_ids = [
-            index
-            for index, geom in enumerate(self.visual.geometryObjects)
-            if Path(geom.meshPath).is_file()
-        ]
-
-    def mesh_path(self, index: int) -> Path | None:
-        if not 0 <= index < len(self.geom_ids):
-            return None
-        return Path(self.visual.geometryObjects[self.geom_ids[index]].meshPath)
-
-    def scene(self) -> dict[str, object]:
-        geoms = []
-        for index, geom_id in enumerate(self.geom_ids):
-            geom = self.visual.geometryObjects[geom_id]
-            path = self.mesh_path(index)
-            stat = path.stat()
-            geoms.append({
-                "mesh": f"mesh/{index}?v={int(stat.st_mtime)}-{stat.st_size}",
-                "color": [float(value) for value in geom.meshColor],
-                "scale": [float(value) for value in geom.meshScale],
-                **_pose_json(self.pin, self.vdata.oMg[geom_id]),
-            })
-        frames_json = {}
-        for name in ("Passive_Side", "Active_Side"):
-            frame_id = self.model.getFrameId(name)
-            if frame_id < len(self.model.frames):
-                frames_json[name] = _pose_json(self.pin, self.data.oMf[frame_id])
-        return {"module": geoms, "frames": frames_json}
-
-    def frame_T(self, name: str) -> np.ndarray:
-        frame_id = self.model.getFrameId(name)
-        if frame_id >= len(self.model.frames):
-            raise ValueError(f"unknown module link: {name}")
-        return np.asarray(self.data.oMf[frame_id].homogeneous).copy()
 
 
 class GraspEditorPanel:
     def __init__(
         self,
         profile_path: Path,
-        module_urdf: Path,
+        visual: GraspVisual,
         *,
         bind: str,
         port: int,
     ) -> None:
+        try:
+            loopback = ipaddress.ip_address(bind).is_loopback
+        except ValueError as exc:
+            raise ValueError("grasp editor bind must be a loopback address") from exc
+        if not loopback:
+            raise ValueError("grasp editor bind must be a loopback address")
         self.profile_path = profile_path.resolve(strict=True)
-        self.module_urdf = module_urdf.resolve(strict=True)
+        self.visual = visual
         self.store = CalibrationStore((self.profile_path.parent,))
         self.revision = self.store.revision(self.profile_path)
         self.raw = yaml.safe_load(self.profile_path.read_text())
-        self.grasp = validate_grasp_profile(self.raw, module_urdf=self.module_urdf)
-        self.visual = ModuleVisual(self.module_urdf)
+        self.grasp = self._validate(self.raw)
+        self.visual.set_finger_width(self.grasp.finger_width_m)
         self.log = ["Visualization only — editing cannot command hardware"]
         self._lock = threading.Lock()
         panel = self
@@ -133,12 +87,12 @@ class GraspEditorPanel:
                 elif route == "state":
                     self.json(panel.state())
                 elif route == "scene":
-                    self.json(panel.visual.scene())
+                    self.json(panel.scene())
                 elif route == "plan":
                     self.json({"version": 0, "times": [], "frames": []})
                 elif route.startswith("mesh/"):
                     try:
-                        path = panel.visual.mesh_path(int(route.split("/", 1)[1]))
+                        path = panel.mesh_path(int(route.split("/", 1)[1]))
                     except ValueError:
                         path = None
                     if path is None:
@@ -166,62 +120,113 @@ class GraspEditorPanel:
                 try:
                     payload = json.loads(self.rfile.read(length) or b"{}")
                     if self.path.endswith("/grasp"):
-                        panel.update(payload)
+                        editor = panel.update(payload)
                     elif self.path.endswith("/grasp/save"):
                         panel.save(payload)
+                        editor = panel.state()["module"]
                     else:
                         self.json({"error": "not found"}, 404)
                         return
                 except (KeyError, TypeError, ValueError) as exc:
                     self.json({"error": str(exc)}, 400)
                     return
-                self.json({"ok": True, "revision": panel.revision})
+                self.json(
+                    {"ok": True, "revision": panel.revision, "editor": editor}
+                )
 
         self.server = ThreadingHTTPServer((bind, int(port)), Handler)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
+    def _validate(self, raw) -> object:
+        return validate_grasp_profile(
+            raw,
+            module_urdf=self.visual.module_urdf,
+            tool_urdf=self.visual.tool_urdf,
+            finger_joints=self.visual.finger_joints,
+        )
+
+    @staticmethod
+    def _offset(vector: np.ndarray) -> np.ndarray:
+        transform = np.eye(4)
+        transform[:3, 3] = vector
+        return transform
+
+    def _editor_state(self) -> dict[str, object]:
+        reference_T = self.visual.frame_T("module", self.grasp.reference_link)
+        poses = {
+            "pregrasp": reference_T
+            @ self._offset(self.grasp.approach_offset_m)
+            @ self.grasp.link_T_ee,
+            "grasp": reference_T @ self.grasp.link_T_ee,
+            "retreat": reference_T
+            @ self._offset(self.grasp.retreat_offset_m)
+            @ self.grasp.link_T_ee,
+        }
+        return {
+            "type": self.grasp.module_type,
+            "status": self.grasp.calibration_status,
+            "reference_link": self.grasp.reference_link,
+            "ee_frame": self.grasp.ee_frame,
+            "reference_pose": frames.T_to_pose_xyzquat(reference_T),
+            "ee_pose": frames.T_to_pose_xyzquat(poses["grasp"]),
+            "pregrasp_pose": frames.T_to_pose_xyzquat(poses["pregrasp"]),
+            "retreat_pose": frames.T_to_pose_xyzquat(poses["retreat"]),
+            "link_T_ee": frames.T_to_pose_xyzquat(self.grasp.link_T_ee),
+            "approach_offset_m": self.grasp.approach_offset_m.tolist(),
+            "retreat_offset_m": self.grasp.retreat_offset_m.tolist(),
+            "finger_opening": {
+                "name": "Finger opening",
+                "min": self.visual.finger_width_limits[0],
+                "max": self.visual.finger_width_limits[1],
+                "step": 0.001,
+                "value": self.grasp.finger_width_m,
+            },
+            "contacts": {
+                name: self.visual.contacts(transform)
+                for name, transform in poses.items()
+            },
+            "revision": self.revision,
+        }
+
     def state(self) -> dict[str, object]:
         with self._lock:
-            reference_T = self.visual.frame_T(self.grasp.reference_link)
-            ee_T = reference_T @ self.grasp.link_T_ee
             return {
                 "mode": "module_editor",
                 "ident": f"{self.grasp.module_type} / draft grasp",
                 "log": list(self.log[-8:]),
-                "module": {
-                    "type": self.grasp.module_type,
-                    "status": self.grasp.calibration_status,
-                    "reference_link": self.grasp.reference_link,
-                    "reference_pose": frames.T_to_pose_xyzquat(reference_T),
-                    "ee_pose": frames.T_to_pose_xyzquat(ee_T),
-                    "link_T_ee": frames.T_to_pose_xyzquat(self.grasp.link_T_ee),
-                    "approach_offset_m": self.grasp.approach_offset_m.tolist(),
-                    "retreat_offset_m": self.grasp.retreat_offset_m.tolist(),
-                    "revision": self.revision,
-                },
+                "module": self._editor_state(),
             }
 
-    def update(self, payload: dict[str, object]) -> None:
+    def update(self, payload: dict[str, object]) -> dict[str, object]:
         with self._lock:
             raw = yaml.safe_load(yaml.safe_dump(self.raw, sort_keys=False))
-            raw["grasp"] = {
-                "reference_link": self.grasp.reference_link,
-                "link_T_ee": {"pos": payload["pos"], "quat": payload["quat"]},
-                "approach_offset_m": payload.get(
-                    "approach_offset_m", self.grasp.approach_offset_m.tolist()
-                ),
-                "retreat_offset_m": payload.get(
-                    "retreat_offset_m", self.grasp.retreat_offset_m.tolist()
-                ),
-            }
-            grasp = validate_grasp_profile(raw, module_urdf=self.module_urdf)
+            raw["grasp"].update(
+                {
+                    "link_T_ee": {
+                        "pos": payload["pos"],
+                        "quat": payload["quat"],
+                    },
+                    "finger_width_m": payload.get(
+                        "finger_width_m", self.grasp.finger_width_m
+                    ),
+                    "approach_offset_m": payload.get(
+                        "approach_offset_m", self.grasp.approach_offset_m.tolist()
+                    ),
+                    "retreat_offset_m": payload.get(
+                        "retreat_offset_m", self.grasp.retreat_offset_m.tolist()
+                    ),
+                }
+            )
+            grasp = self._validate(raw)
             normalized = frames.T_to_pose_xyzquat(grasp.link_T_ee)
             raw["grasp"]["link_T_ee"] = {
                 "pos": normalized[:3],
                 "quat": normalized[3:],
             }
             self.raw, self.grasp = raw, grasp
+            self.visual.set_finger_width(grasp.finger_width_m)
+            return self._editor_state()
 
     def save(self, payload: dict[str, object]) -> None:
         if payload.get("confirm") is not True:
@@ -239,37 +244,46 @@ class GraspEditorPanel:
 
     def close(self) -> None:
         self.server.shutdown()
+        self.server.server_close()
+
+    def mesh_path(self, index: int) -> Path | None:
+        visuals = self.visual.visuals()
+        if not 0 <= index < len(visuals):
+            return None
+        return visuals[index].mesh
+
+    def scene(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "fixture": [],
+            "module": [],
+            "tool": [],
+            "frames": {
+                self.grasp.reference_link: _pose_json(
+                    self.visual.frame_T("module", self.grasp.reference_link)
+                ),
+                self.grasp.ee_frame: _pose_json(
+                    self.visual.frame_T("tool", self.grasp.ee_frame)
+                ),
+            },
+        }
+        for index, item in enumerate(self.visual.visuals()):
+            stat = item.mesh.stat()
+            result[item.group].append(
+                {
+                    "mesh": (
+                        f"mesh/{index}?v={int(stat.st_mtime)}-{stat.st_size}"
+                    ),
+                    "link": item.link,
+                    "color": list(item.color),
+                    "scale": list(item.scale),
+                    **_pose_json(item.T),
+                }
+            )
+        return result
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--module-profile")
-    parser.add_argument("--module-urdf")
-    parser.add_argument("--visualization-only", action="store_true")
-    parser.add_argument("--http-bind", default="127.0.0.1")
-    parser.add_argument("--http-port", type=int, default=7500)
-    args, unknown = parser.parse_known_args()
-    if args.module_profile is None and args.module_urdf is None:
-        if unknown:
-            raise SystemExit(f"unknown arguments: {' '.join(unknown)}")
-        motion_main()
-        return
-    if not args.visualization_only:
-        raise SystemExit("module grasp editing requires --visualization-only")
-    if not args.module_profile or not args.module_urdf:
-        raise SystemExit("--module-profile and --module-urdf are both required")
-    panel = GraspEditorPanel(
-        Path(args.module_profile),
-        Path(args.module_urdf),
-        bind=args.http_bind,
-        port=args.http_port,
-    )
-    print(f"http://{args.http_bind}:{panel.port}", flush=True)
-    try:
-        while True:
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        panel.close()
+    motion_main()
 
 
 if __name__ == "__main__":

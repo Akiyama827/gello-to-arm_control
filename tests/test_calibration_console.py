@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from arm_control.calibration_console import (
     ActorCatalog,
@@ -10,6 +11,9 @@ from arm_control.calibration_console import (
     validate_grasp_profile,
 )
 from arm_control.assets import asset_fingerprint
+from arm_control.grasp_visual import VisualGeometry
+import nodes.calibration_console as calibration_console_node
+from nodes.calibration_console import GraspEditorPanel
 from nodes.motion_teleop import console_asset
 
 
@@ -119,6 +123,15 @@ def test_console_page_is_offline_and_has_functional_sections():
     ):
         assert f'id="{ident}"' in html
     assert console_asset("static/vendor/three.module.js")[0] == "text/javascript"
+
+
+def test_grasp_page_uses_real_geometry_and_finger_control():
+    app = console_asset("static/app.js")[1].decode()
+    html = console_asset("")[1].decode()
+
+    assert "new THREE.BoxGeometry" not in app
+    assert 'id="finger-opening"' in html
+    assert "forbidden_tool_links" in app
 
 
 def _grasp_profile_assets(tmp_path):
@@ -234,3 +247,101 @@ def test_grasp_profile_rejects_version_one_and_stale_module_asset(tmp_path):
     raw["source_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="fingerprint"):
         _validate_grasp(raw, module_urdf, tool_urdf)
+
+
+class _FakeGraspVisual:
+    def __init__(self, module_urdf, tool_urdf, mesh):
+        self.module_urdf = module_urdf
+        self.tool_urdf = tool_urdf
+        self.finger_joints = ("left_joint", "right_joint")
+        self.finger_width_limits = (0.0, 0.08)
+        self.finger_width_m = 0.04
+        self.mesh = mesh
+
+    def visuals(self):
+        return tuple(
+            VisualGeometry(
+                group,
+                "Passive" if group == "module" else "part",
+                self.mesh,
+                (0.5, 0.5, 0.5, 1.0),
+                (1.0, 1.0, 1.0),
+                np.eye(4),
+            )
+            for group in ("fixture", "module", "tool")
+        )
+
+    def frame_T(self, group, frame):
+        assert (group, frame) in {("module", "Passive"), ("tool", "tcp")}
+        return np.eye(4)
+
+    def set_finger_width(self, width_m):
+        self.finger_width_m = float(width_m)
+
+    def contacts(self, _world_T_tcp):
+        return {
+            "intended_tool_links": [],
+            "forbidden_tool_links": [],
+            "ok": True,
+        }
+
+
+class _FakeServer:
+    def __init__(self, address, _handler):
+        self.server_address = (address[0], 12345)
+
+    def serve_forever(self):
+        return None
+
+    def shutdown(self):
+        return None
+
+    def server_close(self):
+        return None
+
+
+def test_grasp_panel_exposes_context_and_three_pose_reports(tmp_path, monkeypatch):
+    module_urdf, tool_urdf, raw = _grasp_profile_assets(tmp_path)
+    profile = tmp_path / "Part.yaml"
+    profile.write_text(yaml.safe_dump(raw, sort_keys=False))
+    mesh = tmp_path / "part.stl"
+    mesh.write_bytes(b"solid part\nendsolid part\n")
+    visual = _FakeGraspVisual(module_urdf, tool_urdf, mesh)
+    monkeypatch.setattr(calibration_console_node, "ThreadingHTTPServer", _FakeServer)
+    panel = GraspEditorPanel(profile, visual, bind="127.0.0.1", port=0)
+    try:
+        scene = panel.scene()
+        assert set(scene) >= {"fixture", "module", "tool", "frames"}
+        editor = panel.update(
+            {
+                "pos": [0.01, 0.02, 0.03],
+                "quat": [1, 0, 0, 0],
+                "finger_width_m": 0.03,
+                "approach_offset_m": [0, 0, 0.1],
+                "retreat_offset_m": [0, 0, -0.1],
+            }
+        )
+        assert set(editor["contacts"]) == {
+            "pregrasp",
+            "grasp",
+            "retreat",
+        }
+        assert visual.finger_width_m == 0.03
+    finally:
+        panel.close()
+
+
+def test_grasp_panel_rejects_non_loopback_bind(tmp_path):
+    module_urdf, tool_urdf, raw = _grasp_profile_assets(tmp_path)
+    profile = tmp_path / "Part.yaml"
+    profile.write_text(yaml.safe_dump(raw, sort_keys=False))
+    mesh = tmp_path / "part.stl"
+    mesh.write_bytes(b"solid part\nendsolid part\n")
+
+    with pytest.raises(ValueError, match="loopback"):
+        GraspEditorPanel(
+            profile,
+            _FakeGraspVisual(module_urdf, tool_urdf, mesh),
+            bind="0.0.0.0",
+            port=0,
+        )

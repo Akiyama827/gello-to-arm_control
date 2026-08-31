@@ -168,6 +168,9 @@ input[type="range"] { width: 100%; accent-color: var(--blue); }
   color: var(--paper);
   padding: .45rem;
 }
+.contact-status { margin: 0; font: .68rem/1.45 ui-monospace, monospace; }
+.contact-status .ok { color: var(--teal); }
+.contact-status .blocked { color: var(--red); font-weight: 700; }
 
 .safety-spine {
   height: 3.8rem;

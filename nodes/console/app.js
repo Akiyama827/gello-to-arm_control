@@ -122,6 +122,10 @@ let rotationDelta = 0;
 let editorMode = false;
 let editorReferenceMatrix = null;
 let editorRevision = "";
+let editorFingerSlider = null;
+let editorCurrentTool = null;
+let editorPregraspTool = null;
+let editorRetreatTool = null;
 const previousQuaternion = new THREE.Quaternion();
 gizmo.addEventListener("dragging-changed", (event) => {
   draggingGizmo = event.value;
@@ -277,21 +281,89 @@ async function sendEditorGrasp() {
   const position = new THREE.Vector3();
   const quaternion = new THREE.Quaternion();
   local.decompose(position, quaternion, new THREE.Vector3());
-  await post("/grasp", {
+  const response = await post("/grasp", {
     pos: position.toArray(),
     quat: [quaternion.w, quaternion.x, quaternion.y, quaternion.z],
+    finger_width_m: editorFingerSlider ? Number(editorFingerSlider[0].value) : 0,
     approach_offset_m: csvVector("grasp-approach"),
     retreat_offset_m: csvVector("grasp-retreat"),
   });
+  updateEditorState(response.editor);
   $("grasp-status").textContent = "Draft changed in memory — Save draft to persist";
+  return response.editor;
 }
+
+const buildEditorTool = async (items, opacity, tint = null) => {
+  const group = new THREE.Group();
+  const parts = [];
+  for (const item of items) {
+    const baseColor = new THREE.Color(...item.color);
+    const mesh = new THREE.Mesh(
+      await loadGeometry(item.mesh),
+      new THREE.MeshPhongMaterial({
+        color: tint || baseColor,
+        transparent: opacity < 1,
+        opacity,
+        depthWrite: opacity >= 1,
+      }),
+    );
+    mesh.scale.set(...item.scale);
+    mesh.position.set(...item.p);
+    mesh.quaternion.set(...item.q);
+    group.add(mesh);
+    parts.push({ mesh, link: item.link, baseColor });
+  }
+  return { group, parts };
+};
+
+const updateToolParts = (tool, items) => items.forEach((item, index) => {
+  const part = tool.parts[index];
+  if (!part) return;
+  part.mesh.position.set(...item.p);
+  part.mesh.quaternion.set(...item.q);
+});
+
+const setToolPose = (tool, pose) => {
+  const matrix = wxyzPoseMatrix(pose);
+  matrix.decompose(tool.group.position, tool.group.quaternion, new THREE.Vector3());
+};
+
+const updateEditorState = (editor) => {
+  if (!editor) return;
+  setToolPose(editorPregraspTool, editor.pregrasp_pose);
+  setToolPose(editorRetreatTool, editor.retreat_pose);
+  const report = editor.contacts.grasp;
+  const forbidden = new Set(report.forbidden_tool_links);
+  const intended = new Set(report.intended_tool_links);
+  for (const part of editorCurrentTool.parts) {
+    const color = forbidden.has(part.link)
+      ? new THREE.Color(0xaf3932)
+      : intended.has(part.link) ? new THREE.Color(0xd99a24) : part.baseColor;
+    part.mesh.material.color.copy(color);
+  }
+  const label = (name) => {
+    const ok = editor.contacts[name].ok;
+    return `<span class="${ok ? "ok" : "blocked"}">${name}: ${ok ? "clear" : "blocked"}</span>`;
+  };
+  $("contact-status").innerHTML = ["pregrasp", "grasp", "retreat"].map(label).join(" · ");
+  $("plan-summary").textContent = report.ok
+    ? "Editor collision preview clear"
+    : `Forbidden contact: ${report.forbidden_tool_links.join(", ")}`;
+};
+
+const refreshEditorTool = async () => {
+  const geometry = await (await fetch("/scene", { cache: "no-store" })).json();
+  updateToolParts(editorCurrentTool, geometry.tool || []);
+  updateToolParts(editorPregraspTool, geometry.tool || []);
+  updateToolParts(editorRetreatTool, geometry.tool || []);
+};
 
 const buildModuleEditor = async (state) => {
   editorMode = true;
   const geometry = await (await fetch("/scene")).json();
   const moduleGroup = new THREE.Group();
   scene.add(moduleGroup);
-  for (const item of geometry.module || []) {
+  for (const item of [...(geometry.fixture || []), ...(geometry.module || [])]) {
     const mesh = new THREE.Mesh(
       await loadGeometry(item.mesh),
       new THREE.MeshPhongMaterial({ color: new THREE.Color(...item.color) }),
@@ -306,9 +378,19 @@ const buildModuleEditor = async (state) => {
     axes.position.set(...pose.p);
     axes.quaternion.set(...pose.q);
     axes.name = name;
-    moduleGroup.add(axes);
+    if (name === state.module.ee_frame) gizmoTarget.add(axes);
+    else moduleGroup.add(axes);
   }
-  const bounds = new THREE.Box3().setFromObject(moduleGroup);
+  editorCurrentTool = await buildEditorTool(geometry.tool || [], 1);
+  editorPregraspTool = await buildEditorTool(geometry.tool || [], 0.28, new THREE.Color(0x55aa7a));
+  editorRetreatTool = await buildEditorTool(geometry.tool || [], 0.24, new THREE.Color(0x6d9fc0));
+  gizmoTarget.add(editorCurrentTool.group);
+  scene.add(editorPregraspTool.group, editorRetreatTool.group);
+  editorReferenceMatrix = wxyzPoseMatrix(state.module.reference_pose);
+  const ee = wxyzPoseMatrix(state.module.ee_pose);
+  ee.decompose(gizmoTarget.position, gizmoTarget.quaternion, new THREE.Vector3());
+  updateEditorState(state.module);
+  const bounds = new THREE.Box3().setFromObject(moduleGroup).expandByObject(gizmoTarget);
   const center = bounds.getCenter(new THREE.Vector3());
   const size = Math.max(bounds.getSize(new THREE.Vector3()).length(), 0.08);
   orbit.target.copy(center);
@@ -317,25 +399,26 @@ const buildModuleEditor = async (state) => {
   camera.far = Math.max(size * 30, 2);
   camera.updateProjectionMatrix();
   orbit.update();
-  const hand = new THREE.Group();
-  const ghostMaterial = new THREE.MeshPhongMaterial({
-    color: 0xd99a24,
-    transparent: true,
-    opacity: 0.55,
-  });
-  hand.add(new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.075, 0.018), ghostMaterial));
-  for (const y of [-0.047, 0.047]) {
-    const finger = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.012, 0.016), ghostMaterial);
-    finger.position.set(0.045, y, 0);
-    hand.add(finger);
-  }
-  gizmoTarget.add(hand);
   $("actor-select").innerHTML = `<option>${state.module.type} grasp</option>`;
   deadmanButton.disabled = true;
   deadmanButton.querySelector("span").textContent = "Visualization only";
   deadmanButton.querySelector("small").textContent = "No motion output is open";
   $("buttons").textContent = "Profile editing cannot command an actor.";
-  $("grip").textContent = "Hand ghost only";
+  $("finger-opening").replaceChildren();
+  editorFingerSlider = addSlider(
+    $("finger-opening"),
+    state.module.finger_opening,
+    3,
+    async () => {
+      try {
+        await sendEditorGrasp();
+        await refreshEditorTool();
+      } catch (error) {
+        $("grasp-status").textContent = error.message;
+      }
+    },
+  );
+  $("grip-readout").value = `${state.module.finger_opening.value.toFixed(3)} m`;
   $("edit-grasp").disabled = false;
   $("save-grasp").disabled = false;
   $("grasp-fields").hidden = false;
@@ -343,10 +426,7 @@ const buildModuleEditor = async (state) => {
   $("grasp-retreat").value = state.module.retreat_offset_m.join(", ");
   $("joint-summary").textContent = "Module fixed at q = 0";
   $("wrench-summary").textContent = "Not connected in visualization mode";
-  $("plan-summary").textContent = "IK/collision preview pending";
-  editorReferenceMatrix = wxyzPoseMatrix(state.module.reference_pose);
-  const ee = wxyzPoseMatrix(state.module.ee_pose);
-  ee.decompose(gizmoTarget.position, gizmoTarget.quaternion, new THREE.Vector3());
+  $("plan-summary").textContent = "Editor collision preview only";
   editorRevision = state.module.revision;
   $("grasp-status").textContent = `${state.module.status} / ${state.module.reference_link}`;
   $("save-grasp").onclick = async () => {
