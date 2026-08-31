@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from arm_control.grasp_visual import FixedUrdf, GraspVisual
+from arm_control.planning.preview_rerun import _mesh_package_dirs
 
 
 _STL = """solid triangle
@@ -149,3 +150,12 @@ def test_contacts_distinguish_fingers_from_forbidden_tool_parts(tmp_path):
     fixture_contact = scene.contacts(_translation(0.97))
     assert fixture_contact["ok"] is False
     assert fixture_contact["forbidden_tool_links"]
+
+
+def test_package_search_includes_parent_without_package_manifest(tmp_path):
+    urdf_dir = tmp_path / "Storage" / "urdf"
+    urdf_dir.mkdir(parents=True)
+    urdf = urdf_dir / "Storage.urdf"
+    urdf.write_text('<robot name="storage"><link name="root"/></robot>')
+
+    assert str(tmp_path) in _mesh_package_dirs(urdf)

@@ -90,10 +90,8 @@ def log_frame_transform(entity_root: str, T: np.ndarray | None) -> None:
 
 def _mesh_package_dirs(urdf_path: str | Path) -> list[str]:
     urdf_dir = Path(urdf_path).resolve().parent
-    package_root = (
-        urdf_dir.parent if (urdf_dir.parent / "package.xml").is_file() else urdf_dir
-    )
-    candidates = [urdf_dir, urdf_dir.parent, package_root, package_root.parent]
+    package_root = urdf_dir.parent
+    candidates = [urdf_dir, package_root, package_root.parent]
     return [str(path) for path in candidates if path.is_dir()]
 
 
