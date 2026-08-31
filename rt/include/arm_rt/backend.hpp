@@ -43,6 +43,16 @@ public:
   virtual double tick_s() const = 0;                 // nominal servo period
   virtual const double* tau_limit() const = 0;       // per-joint, length n
 
+  // Fixed slots are configured once. A backend may report a subset online
+  // and activate a subset for torque; conventional arms keep all slots live.
+  virtual uint32_t online_mask() const {
+    return n() >= 16 ? 0xFFFFu : ((1u << n()) - 1u);
+  }
+  virtual uint32_t active_mask() const { return online_mask(); }
+  virtual bool set_active_mask(uint32_t mask) {
+    return mask == active_mask();
+  }
+
   // Block until the next tick's state is available. False = plant fault
   // (reason via fault_text()). Errors surface HERE, on the read side.
   virtual bool read(PlantState& out) = 0;

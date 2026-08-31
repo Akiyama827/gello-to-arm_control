@@ -49,7 +49,7 @@ uint32_t flags_snapshot(const ServerCtx& ctx) {
   uint32_t f = 0;
   if (ctx.armed.load()) f |= FLAG_ARMED;
   if (ctx.fault.load()) f |= FLAG_FAULTED;
-  return f;
+  return with_online_mask(f, ctx.online_mask.load());
 }
 
 void serve_client(ServerCtx& ctx, int fd) {
@@ -72,8 +72,10 @@ void serve_client(ServerCtx& ctx, int fd) {
   // configured for hand-guiding (--fault-ms 3600000) — a commander graph
   // against that server has no staleness reflex at all (audit 2026-07-29).
   char hello[96];
-  std::snprintf(hello, sizeof(hello), "%s hold_ms=%.0f fault_ms=%.0f",
-                ctx.backend_name, ctx.cfg.hold_ms, ctx.cfg.fault_ms);
+  std::snprintf(hello, sizeof(hello),
+                "%s hold_ms=%.0f fault_ms=%.0f active=0x%X",
+                ctx.backend_name, ctx.cfg.hold_ms, ctx.cfg.fault_ms,
+                ctx.active_mask.load());
   send_frame(fd, make(CTL_HELLO, uint32_t(ctx.backend_n.load()), hello));
 
   // Session deadman: the client answers CTL_PING with CTL_PONG, so a healthy
@@ -160,6 +162,32 @@ void serve_client(ServerCtx& ctx, int fd) {
         ctx.fault_claim.store(false);
         send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "disarmed"));
         break;
+      case CTL_SET_ACTIVE: {
+        const int n = ctx.backend_n.load();
+        const uint32_t configured = n >= 16 ? 0xFFFFu : ((1u << n) - 1u);
+        const uint32_t desired = rx.arg;
+        const uint32_t current = ctx.active_mask.load();
+        if ((desired & ~configured) || (desired & ~ctx.online_mask.load())) {
+          send_frame(fd, make(CTL_STATUS, current,
+                              "active mask refused: slot offline or unconfigured"));
+          break;
+        }
+        if (ctx.armed.load() && (current & ~desired)) {
+          send_frame(fd, make(CTL_STATUS, current,
+                              "active mask refused: disarm before removal"));
+          break;
+        }
+        ctx.requested_active_mask.store(desired);
+        for (int i = 0; i < 500 && ctx.active_mask.load() != desired; ++i) {
+          timespec wait{0, 1'000'000};
+          nanosleep(&wait, nullptr);
+        }
+        const uint32_t applied = ctx.active_mask.load();
+        send_frame(fd, make(CTL_STATUS, applied,
+                            applied == desired ? "active mask applied"
+                                               : "active mask refused by backend"));
+        break;
+      }
       case CTL_PING:
         send_frame(fd, make(CTL_PONG, 0, nullptr));
         break;

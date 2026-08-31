@@ -47,7 +47,7 @@ int main() {
   st.state_seq = 1000;
   st.last_cmd_seq = 42;
   st.t_mono_ns = T;
-  st.flags = FLAG_ARMED;
+  st.flags = with_online_mask(FLAG_ARMED, 0b101);
   st.fault_code = 0;
   for (int j = 0; j < 7; ++j) {
     st.q[j] = 0.1 * j + 0.01;

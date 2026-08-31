@@ -23,6 +23,8 @@ FLAG_ARMED = 1 << 0
 FLAG_FAULTED = 1 << 1
 FLAG_HOLDING = 1 << 2
 FLAG_WRENCH_VALID = 1 << 3
+ONLINE_MASK_SHIFT = 16
+ONLINE_MASK_BITS = 0xFFFF << ONLINE_MASK_SHIFT
 
 CTL_HELLO = 1
 CTL_ARM = 2
@@ -31,6 +33,7 @@ CTL_PING = 4
 CTL_PONG = 5
 CTL_STATUS = 6
 CTL_FAULT = 7
+CTL_SET_ACTIVE = 8
 
 FAULT_CMD_LOST = 1
 FAULT_CTL_LOST = 2
@@ -44,6 +47,16 @@ CMD_SIZE = struct.calcsize(_CMD_FMT)
 STATE_SIZE = struct.calcsize(_STATE_FMT)
 CTL_SIZE = struct.calcsize(_CTL_FMT)
 assert (CMD_SIZE, STATE_SIZE, CTL_SIZE) == (664, 736, 128)
+
+
+def with_online_mask(flags: int, mask: int) -> int:
+    if not 0 <= int(mask) <= 0xFFFF:
+        raise ValueError("online mask must fit 16 slots")
+    return (int(flags) & ~ONLINE_MASK_BITS) | (int(mask) << ONLINE_MASK_SHIFT)
+
+
+def online_mask(flags: int) -> int:
+    return (int(flags) & ONLINE_MASK_BITS) >> ONLINE_MASK_SHIFT
 
 
 def _padded(values, n_total: int = MAX_JOINTS) -> list[float]:
@@ -108,6 +121,10 @@ class State:
         has no geometry). NOT a wire change: same layout, same VERSION.
         """
         return bool(self.flags & FLAG_WRENCH_VALID)
+
+    @property
+    def online_mask(self) -> int:
+        return online_mask(self.flags)
 
 
 def unpack_state(data: bytes) -> State:
@@ -186,7 +203,7 @@ def golden_lines() -> list[str]:
         1000,
         42,
         _GOLDEN_T,
-        FLAG_ARMED,
+        with_online_mask(FLAG_ARMED, 0b101),
         0,
         *_padded([0.1 * j + 0.01 for j in range(n)]),
         *_padded([0.02 * j for j in range(n)]),
@@ -208,6 +225,7 @@ def _demo() -> None:
     # Round trips.
     st = unpack_state(bytes.fromhex(golden_lines()[1].split()[1]))
     assert st.n == 7 and st.armed and not st.faulted and st.last_cmd_seq == 42
+    assert st.online_mask == 0b101
     assert abs(st.q[3] - 0.31) < 1e-12 and abs(st.tau_cmd[4] - 1.0) < 1e-12
     ctl = unpack_control(bytes.fromhex(golden_lines()[2].split()[1]))
     assert ctl.ctl_type == CTL_STATUS and ctl.arg == 1 and ctl.text == "ok"

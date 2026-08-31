@@ -89,6 +89,7 @@ class RtBackend:
         self._last_send_err = 0.0
         self._link_rx_t = 0.0  # ANY state arrival (vs _state_rx_t = new content)
         self._send_lock = threading.Lock()  # node thread + _ctl_loop PONG
+        self._active_mask = 0
 
     @classmethod
     def from_config(cls, cfg) -> "RtBackend":
@@ -127,6 +128,7 @@ class RtBackend:
         flags = dict(
             p.split("=", 1) for p in parts[1:] if "=" in p
         )
+        self._active_mask = int(flags.get("active", (1 << self.n) - 1), 0)
         fault_ms = float(flags.get("fault_ms", 0) or 0)
         if self.config.max_fault_ms > 0 and fault_ms > self.config.max_fault_ms:
             raise RtLinkError(
@@ -197,6 +199,20 @@ class RtBackend:
             time.sleep(0.01)
         print("[rt_link] disarm not yet reflected in the state stream", flush=True)
         return False
+
+    def set_active_mask(self, mask: int) -> None:
+        """Activate fixed slots; removal is allowed only while disarmed."""
+        mask = int(mask)
+        configured = (1 << self.n) - 1
+        if mask < 0 or mask & ~configured:
+            raise ValueError(f"active mask must fit {self.n} configured slots")
+        state, _ = self.latest_state()
+        if state is not None and state.armed and self._active_mask & ~mask:
+            raise RuntimeError("cannot remove an active slot while armed")
+        status = self._control_roundtrip(rtp.CTL_SET_ACTIVE, arg=mask)
+        if status.arg != mask:
+            raise RtLinkError(status.text or "active mask refused")
+        self._active_mask = mask
 
     def close(self) -> None:
         try:
@@ -311,6 +327,8 @@ class RtBackend:
             "state_age_s": age if rx_t > 0 else -1.0,
             "last_cmd_seq": state.last_cmd_seq if state else 0,
             "sent_cmd_seq": self._cmd_seq,
+            "online_mask": state.online_mask if state else 0,
+            "active_mask": self._active_mask,
         }
 
     # -- internals ------------------------------------------------------------
@@ -376,9 +394,13 @@ class RtBackend:
                     )
                     return
 
-    def _send_control(self, ctl_type: int, text: str = "") -> None:
+    def _send_control(self, ctl_type: int, text: str = "", arg: int = 0) -> None:
         pkt = rtp.pack_control(
-            ctl_type=ctl_type, seq=0, arg=0, t_mono_ns=time.monotonic_ns(), text=text
+            ctl_type=ctl_type,
+            seq=0,
+            arg=arg,
+            t_mono_ns=time.monotonic_ns(),
+            text=text,
         )
         try:
             # Two writers share this socket (node thread + the PONG reply in
@@ -392,10 +414,10 @@ class RtBackend:
             # 2026-07-29). One guard here fixes every caller.
             raise RtLinkError(f"control link down: {exc}") from exc
 
-    def _control_roundtrip(self, ctl_type: int) -> rtp.Control:
+    def _control_roundtrip(self, ctl_type: int, *, arg: int = 0) -> rtp.Control:
         while not self._status_q.empty():  # drop stale acks
             self._status_q.get_nowait()
-        self._send_control(ctl_type)
+        self._send_control(ctl_type, arg=arg)
         try:
             return self._status_q.get(timeout=self.config.ack_timeout_s)
         except queue.Empty as exc:
@@ -469,7 +491,16 @@ def _demo() -> None:
         time.sleep(0.3)
         backend.open()
         assert backend.backend_name == "fake"
+        backend.set_active_mask(0b011)
         backend.enable_all()
+        backend.set_active_mask(0b111)
+        try:
+            backend.set_active_mask(0b011)
+            raise AssertionError("active slots must not be removed while armed")
+        except RuntimeError:
+            pass
+        time.sleep(0.05)
+        assert backend.motor_health()["online_mask"] == 0b111
 
         # Track a step target; the fake integrator must actually converge.
         target = np.array([0.5, -0.3, 0.2])

@@ -28,6 +28,13 @@ public:
   int n() const override { return n_; }
   double tick_s() const override { return TICK_S; }
   const double* tau_limit() const override { return tau_limit_; }
+  uint32_t active_mask() const override { return active_mask_; }
+  bool set_active_mask(uint32_t mask) override {
+    const uint32_t configured = n_ >= 16 ? 0xFFFFu : ((1u << n_) - 1u);
+    if (mask & ~configured) return false;
+    active_mask_ = mask;
+    return true;
+  }
 
   bool read(PlantState& out) override {
     // Absolute deadline keeps the tick rate drift-free regardless of how
@@ -62,6 +69,10 @@ public:
 
   bool write(const double* tau, int n) override {
     for (int j = 0; j < n; ++j) {
+      if (!(active_mask_ & (1u << j))) {
+        tau_[j] = 0.0;
+        continue;
+      }
       tau_[j] = tau[j];
       const double qdd = (tau[j] - DAMPING * dq_[j]) / INERTIA;
       dq_[j] += qdd * TICK_S;
@@ -84,6 +95,7 @@ private:
   double tau_[MAX_JOINTS] = {};
   timespec next_ = {};
   std::string fault_;
+  uint32_t active_mask_ = n_ >= 16 ? 0xFFFFu : ((1u << n_) - 1u);
 };
 
 } // namespace

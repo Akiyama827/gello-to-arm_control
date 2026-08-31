@@ -35,7 +35,8 @@ namespace arm_rt {
 std::unique_ptr<Backend> make_fake_backend(int n);
 std::unique_ptr<Backend> make_franka_backend(const std::string& ip, double ee_mass,
                                              const double ee_com[3]);
-std::unique_ptr<Backend> make_dm_backend(const std::string& can_if);
+std::unique_ptr<Backend> make_dm_backend(const std::string& can_if,
+                                         uint32_t active_mask);
 
 namespace {
 
@@ -71,7 +72,7 @@ void rt_loop(ServerCtx& ctx) {
       std::fprintf(stderr, "[rt] franka backend failed to start "
                            "(reason above; RT perms? FCI on? robot reachable?)\n");
   } else if (ctx.cfg.backend == "dm") {
-    backend = make_dm_backend(ctx.cfg.can_if);
+    backend = make_dm_backend(ctx.cfg.can_if, ctx.cfg.initial_active_mask);
     if (!backend)
       std::fprintf(stderr, "[rt] dm backend failed to start (reason above; "
                            "--dm-spec? link up? fd on?)\n");
@@ -85,6 +86,9 @@ void rt_loop(ServerCtx& ctx) {
   }
   const int n = backend->n();
   ctx.backend_n.store(n);
+  ctx.online_mask.store(backend->online_mask());
+  ctx.active_mask.store(backend->active_mask());
+  ctx.requested_active_mask.store(backend->active_mask());
   std::snprintf(ctx.backend_name, sizeof(ctx.backend_name), "%s", backend->name());
   ctx.backend_ready.store(true);
   elevate(ctx.cfg);
@@ -116,6 +120,7 @@ void rt_loop(ServerCtx& ctx) {
   }
   uint32_t state_seq = 0;
   uint32_t last_cmd_seq = 0;
+  uint32_t last_active_mask = backend->active_mask();
 
   bool plant_ok = true;  // false after any backend failure; reset only by ARM
   uint64_t seen_gen = ctx.arm_gen.load(std::memory_order_acquire);
@@ -156,6 +161,16 @@ void rt_loop(ServerCtx& ctx) {
       continue;
     }
     read_fail_streak = 0;
+    ctx.online_mask.store(backend->online_mask(), std::memory_order_release);
+    const uint32_t requested =
+        ctx.requested_active_mask.load(std::memory_order_acquire);
+    if (requested != backend->active_mask() && backend->set_active_mask(requested)) {
+      const uint32_t added = requested & ~last_active_mask;
+      for (int j = 0; j < n; ++j)
+        if (added & (1u << j)) q_hold[j] = ps.q[j];
+      last_active_mask = requested;
+      ctx.active_mask.store(requested, std::memory_order_release);
+    }
     const uint64_t now = mono_ns();
     const bool armed = ctx.armed.load(std::memory_order_acquire);
     bool faulted = ctx.fault.load(std::memory_order_acquire);
@@ -245,10 +260,12 @@ void rt_loop(ServerCtx& ctx) {
     out.state_seq = ++state_seq;
     out.last_cmd_seq = last_cmd_seq;
     out.t_mono_ns = now;
-    out.flags = (armed ? FLAG_ARMED : 0u) |
-                (ctx.fault.load(std::memory_order_acquire) ? FLAG_FAULTED : 0u) |
-                (holding ? FLAG_HOLDING : 0u) |
-                (ps.wrench_valid ? FLAG_WRENCH_VALID : 0u);
+    out.flags = with_online_mask(
+        (armed ? FLAG_ARMED : 0u) |
+            (ctx.fault.load(std::memory_order_acquire) ? FLAG_FAULTED : 0u) |
+            (holding ? FLAG_HOLDING : 0u) |
+            (ps.wrench_valid ? FLAG_WRENCH_VALID : 0u),
+        ctx.online_mask.load(std::memory_order_acquire));
     out.fault_code = ctx.fault_code.load(std::memory_order_acquire);
     std::memcpy(out.q, ps.q, sizeof(out.q));
     std::memcpy(out.dq, ps.dq, sizeof(out.dq));

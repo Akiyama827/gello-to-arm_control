@@ -35,6 +35,15 @@ constexpr uint32_t FLAG_ARMED = 1u << 0;
 constexpr uint32_t FLAG_FAULTED = 1u << 1;
 constexpr uint32_t FLAG_HOLDING = 1u << 2;      // staleness hold active
 constexpr uint32_t FLAG_WRENCH_VALID = 1u << 3; // reserved FT-sensor fields live
+constexpr uint32_t ONLINE_MASK_SHIFT = 16;
+constexpr uint32_t ONLINE_MASK_BITS = 0xFFFFu << ONLINE_MASK_SHIFT;
+
+constexpr uint32_t with_online_mask(uint32_t flags, uint32_t mask) {
+  return (flags & ~ONLINE_MASK_BITS) | ((mask & 0xFFFFu) << ONLINE_MASK_SHIFT);
+}
+constexpr uint32_t online_mask(uint32_t flags) {
+  return (flags & ONLINE_MASK_BITS) >> ONLINE_MASK_SHIFT;
+}
 
 // ControlPacket.type
 enum CtlType : uint16_t {
@@ -46,6 +55,7 @@ enum CtlType : uint16_t {
   CTL_PONG = 5,
   CTL_STATUS = 6, // server -> client: arg = flags snapshot, text = note
   CTL_FAULT = 7,  // server -> client event: arg = fault code, text = reason
+  CTL_SET_ACTIVE = 8, // client -> server: arg = desired fixed-slot mask
 };
 
 #pragma pack(push, 1)

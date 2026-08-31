@@ -134,6 +134,18 @@ def main() -> None:
                                 "still be armed; do not approach the arm",
                                 flush=True,
                             )
+                elif etype == "INPUT" and eid == "active_mask":
+                    try:
+                        backend.set_active_mask(
+                            int(unpack_json_message(event["value"])["mask"])
+                        )
+                        print(
+                            f"[rt_interface] active slots 0x"
+                            f"{backend.motor_health()['active_mask']:04X}",
+                            flush=True,
+                        )
+                    except (KeyError, TypeError, ValueError, RuntimeError, RtLinkError) as exc:
+                        print(f"[rt_interface] active-mask refused: {exc}", flush=True)
 
             now = time.perf_counter()
             if now - last_step < period:

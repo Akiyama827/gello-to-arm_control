@@ -36,7 +36,7 @@ void usage(const char* argv0) {
       "          [--hold-kp V] [--hold-kd V] [--franka-ip IP] [--can-if IF]\n"
       "          [--ee-mass KG] [--ee-com X,Y,Z]\n"
       "          [--dm-spec IF;ID:TYPE[:MST],...] [--rt-priority N]\n"
-      "          [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
+      "          [--active-mask MASK] [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
       "\n"
       "  --ee-mass  payload past the flange (wrist camera + mount, carried\n"
       "             module) in kg, ADDED to Desk's end-effector config.\n"
@@ -103,6 +103,16 @@ int main(int argc, char** argv) {
     // dm backend: iface + motor list in one string ("can0;1:4340,2:4340").
     // Same cfg field as --can-if — this is the full spelling of it.
     else if (!std::strcmp(argv[i], "--dm-spec")) cfg.can_if = next("--dm-spec");
+    else if (!std::strcmp(argv[i], "--active-mask")) {
+      char* end = nullptr;
+      const char* value = next("--active-mask");
+      const unsigned long mask = std::strtoul(value, &end, 0);
+      if (!end || *end || mask > 0xFFFFu) {
+        std::fprintf(stderr, "--active-mask must fit 16 bits (got %s)\n", value);
+        return 2;
+      }
+      cfg.initial_active_mask = uint32_t(mask);
+    }
     else if (!std::strcmp(argv[i], "--rt-priority")) cfg.rt_priority = std::atoi(next("--rt-priority"));
     else if (!std::strcmp(argv[i], "--rt-cpu")) cfg.rt_cpu = std::atoi(next("--rt-cpu"));
     else {

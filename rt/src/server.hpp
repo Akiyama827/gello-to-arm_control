@@ -54,6 +54,7 @@ struct ServerConfig {
   double slew = 1.0;        // N.m per tick, the servo slew budget
   double hold_kp = 50.0;    // hold gains when no command was ever received
   double hold_kd = 5.0;
+  uint32_t initial_active_mask = 0xFFFFu;
   int rt_priority = 80;     // SCHED_FIFO; failure to set is a warning, not fatal
   int rt_cpu = -1;          // pin the SERVO thread here (an isolcpus core);
                             // comms threads float on the housekeeping cores
@@ -107,6 +108,9 @@ struct ServerCtx {
                                      // (a port race must not look like success)
   std::atomic<bool> backend_ready{false};
   std::atomic<int> backend_n{0};
+  std::atomic<uint32_t> online_mask{0};
+  std::atomic<uint32_t> active_mask{0};
+  std::atomic<uint32_t> requested_active_mask{0};
   char backend_name[32] = {};
 
   // Latched fault reason. latch() copies into the fixed buffer then flips the

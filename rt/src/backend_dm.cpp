@@ -214,11 +214,16 @@ bool parse_spec(const std::string& spec, std::string& iface,
 
 class DmBackend final : public Backend {
 public:
-  DmBackend(const std::string& iface, std::vector<Motor> motors)
+  DmBackend(const std::string& iface, std::vector<Motor> motors,
+            uint32_t active_mask)
       : iface_(iface), motors_(std::move(motors)) {
     fault_.reserve(256);  // latch path must not allocate on the RT thread
     for (size_t j = 0; j < motors_.size(); ++j)
       tau_limit_[j] = motors_[j].lim.t_hi;
+    const uint32_t configured = motors_.size() >= 16
+                                    ? 0xFFFFu
+                                    : ((1u << motors_.size()) - 1u);
+    active_mask_ = active_mask & configured;
 
     fd_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (fd_ < 0) {
@@ -272,6 +277,39 @@ public:
   int n() const override { return int(motors_.size()); }
   double tick_s() const override { return TICK_S; }
   const double* tau_limit() const override { return tau_limit_; }
+  uint32_t online_mask() const override {
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const uint64_t stamp = ts_ns(now);
+    uint32_t mask = 0;
+    for (size_t j = 0; j < motors_.size(); ++j)
+      if (motors_[j].seen && stamp - motors_[j].last_rx_ns <= uint64_t(SILENCE_NS))
+        mask |= 1u << j;
+    return mask;
+  }
+  uint32_t active_mask() const override { return active_mask_; }
+  bool set_active_mask(uint32_t mask) override {
+    const uint32_t configured = motors_.size() >= 16
+                                    ? 0xFFFFu
+                                    : ((1u << motors_.size()) - 1u);
+    if (mask & ~configured || mask & ~online_mask()) return false;
+    const uint32_t added = mask & ~active_mask_;
+    const uint32_t removed = active_mask_ & ~mask;
+    uint8_t zero[8];
+    for (size_t j = 0; j < motors_.size(); ++j) {
+      if (removed & (1u << j)) {
+        pack_mit(0, 0, 0, 0, 0, motors_[j].lim, zero);
+        if (!send8(motors_[j].id, zero) ||
+            !send8(motors_[j].id, DM_DISABLE_FRAME))
+          return false;
+        last_tau_[j] = 0.0;
+      } else if (enabled_ && (added & (1u << j))) {
+        if (!send8(motors_[j].id, DM_ENABLE_FRAME)) return false;
+      }
+    }
+    active_mask_ = mask;
+    return true;
+  }
 
   bool read(PlantState& out) override {
     timespec now;
@@ -283,7 +321,6 @@ public:
 
     if (!started_) {
       started_ = true;
-      if (!enable_all()) return false;
       const uint64_t t0 = ts_ns(now);
       for (Motor& m : motors_) m.last_rx_ns = t0;  // silence grace from here
     }
@@ -308,10 +345,10 @@ public:
     while (!all_seen_) {
       all_seen_ = true;
       const Motor* quiet = nullptr;
-      for (const Motor& m : motors_)
-        if (!m.seen) {
+      for (size_t j = 0; j < motors_.size(); ++j)
+        if ((active_mask_ & (1u << j)) && !motors_[j].seen) {
           all_seen_ = false;
-          quiet = &m;
+          quiet = &motors_[j];
         }
       if (all_seen_) break;
       clock_gettime(CLOCK_MONOTONIC, &now);
@@ -328,13 +365,16 @@ public:
     }
 
     const uint64_t now_ns = ts_ns(now);
-    for (const Motor& m : motors_)
-      if (int64_t(now_ns - m.last_rx_ns) > SILENCE_NS) {
+    for (size_t j = 0; j < motors_.size(); ++j) {
+      const Motor& m = motors_[j];
+      if ((active_mask_ & (1u << j)) &&
+          int64_t(now_ns - m.last_rx_ns) > SILENCE_NS) {
         fail("motor %d (%s) silent %lld ms on %s", m.id, m.type.c_str(),
              (long long)((now_ns - m.last_rx_ns) / 1'000'000ull),
              iface_.c_str());
         return false;
       }
+    }
 
     out.n = int(motors_.size());
     for (size_t j = 0; j < motors_.size(); ++j) {
@@ -355,6 +395,7 @@ public:
     if (!enabled_ && !enable_all()) return false;  // lazy re-arm after stop()
     uint8_t buf[8];
     for (int j = 0; j < n && j < int(motors_.size()); ++j) {
+      if (!(active_mask_ & (1u << j))) continue;
       const DmLimits& L = motors_[j].lim;
       double t = tau[j];
       if (t < L.t_lo) t = L.t_lo;
@@ -401,8 +442,10 @@ private:
   }
 
   bool enable_all() {
-    for (const Motor& m : motors_)
-      if (!send8(m.id, DM_ENABLE_FRAME)) return false;
+    for (size_t j = 0; j < motors_.size(); ++j)
+      if ((active_mask_ & (1u << j)) &&
+          !send8(motors_[j].id, DM_ENABLE_FRAME))
+        return false;
     enabled_ = true;
     return true;
   }
@@ -467,13 +510,15 @@ private:
   bool enabled_ = false;   // motors enabled since the last stop()
   bool wrote_ = false;     // a write() happened since the last read()
   bool all_seen_ = false;  // every motor has replied at least once
+  uint32_t active_mask_ = 0;
   timespec next_ = {};
   std::string fault_;
 };
 
 } // namespace
 
-std::unique_ptr<Backend> make_dm_backend(const std::string& spec) {
+std::unique_ptr<Backend> make_dm_backend(const std::string& spec,
+                                         uint32_t active_mask) {
   std::string iface, err;
   std::vector<Motor> motors;
   if (!parse_spec(spec, iface, motors, err)) {
@@ -481,7 +526,8 @@ std::unique_ptr<Backend> make_dm_backend(const std::string& spec) {
                  spec.c_str());
     return nullptr;
   }
-  auto backend = std::make_unique<DmBackend>(iface, std::move(motors));
+  auto backend =
+      std::make_unique<DmBackend>(iface, std::move(motors), active_mask);
   if (!backend->ok()) {
     // fault_text already carries the "dm: " prefix (it feeds rt_loop's latch).
     std::fprintf(stderr, "[rt] %s\n", backend->fault_text().c_str());
