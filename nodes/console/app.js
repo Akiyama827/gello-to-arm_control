@@ -409,7 +409,8 @@ const buildModuleEditor = async (state) => {
     $("finger-opening"),
     state.module.finger_opening,
     3,
-    async () => {
+    async (value) => {
+      $("grip-readout").value = `${value.toFixed(3)} m`;
       try {
         await sendEditorGrasp();
         await refreshEditorTool();

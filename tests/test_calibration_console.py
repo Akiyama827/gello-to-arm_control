@@ -132,6 +132,7 @@ def test_grasp_page_uses_real_geometry_and_finger_control():
     assert "new THREE.BoxGeometry" not in app
     assert 'id="finger-opening"' in html
     assert "forbidden_tool_links" in app
+    assert app.count('$("grip-readout").value = `${value.toFixed(3)} m`') == 2
 
 
 def _grasp_profile_assets(tmp_path):
