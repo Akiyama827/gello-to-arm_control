@@ -7,11 +7,94 @@ from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 from typing import Mapping
 
 import yaml
+
+
+_ACTOR_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
+_CAPABILITIES = frozenset({"joint", "cartesian", "gripper", "wrench"})
+
+
+@dataclass(frozen=True)
+class ActorSpec:
+    name: str
+    joints: tuple[str, ...]
+    capabilities: frozenset[str]
+    urdf: str | None = None
+    ee_frame: str | None = None
+
+    @property
+    def command_port(self) -> str:
+        return f"{self.name}_command"
+
+    @property
+    def arm_port(self) -> str:
+        return f"{self.name}_arm"
+
+    def supports(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+
+class ActorCatalog:
+    def __init__(self, actors: tuple[ActorSpec, ...]):
+        self._actors = {actor.name: actor for actor in actors}
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> "ActorCatalog":
+        actors = []
+        for name, value in raw.items():
+            if not isinstance(name, str) or _ACTOR_NAME.fullmatch(name) is None:
+                raise ValueError(f"invalid actor name: {name!r}")
+            if not isinstance(value, Mapping):
+                raise ValueError(f"actor {name!r} must be a mapping")
+            joints_raw = value.get("joints")
+            if (
+                not isinstance(joints_raw, list)
+                or not joints_raw
+                or any(not isinstance(joint, str) or not joint for joint in joints_raw)
+                or len(set(joints_raw)) != len(joints_raw)
+            ):
+                raise ValueError(f"actor {name!r} joints must be non-empty and unique")
+            capabilities_raw = value.get("capabilities", ["joint"])
+            if (
+                not isinstance(capabilities_raw, list)
+                or not capabilities_raw
+                or any(capability not in _CAPABILITIES for capability in capabilities_raw)
+            ):
+                raise ValueError(f"actor {name!r} has unsupported capabilities")
+            capabilities = frozenset(capabilities_raw)
+            urdf = value.get("urdf")
+            ee = value.get("ee_frame")
+            if "cartesian" in capabilities and (
+                not isinstance(urdf, str) or not isinstance(ee, str)
+            ):
+                raise ValueError(f"Cartesian actor {name!r} requires urdf and ee_frame")
+            actors.append(
+                ActorSpec(
+                    name,
+                    tuple(joints_raw),
+                    capabilities,
+                    urdf if isinstance(urdf, str) else None,
+                    ee if isinstance(ee, str) else None,
+                )
+            )
+        if not actors:
+            raise ValueError("actor catalog must be non-empty")
+        return cls(tuple(actors))
+
+    def __getitem__(self, name: str) -> ActorSpec:
+        return self._actors[name]
+
+    def __iter__(self):
+        return iter(self._actors.values())
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._actors)
 
 
 @dataclass

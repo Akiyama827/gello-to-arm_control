@@ -29,6 +29,7 @@ from __future__ import annotations
 # ruff: noqa: E402
 
 import json
+import hashlib
 import os
 import threading
 import time
@@ -41,7 +42,7 @@ from dora import Node
 
 from arm_control import CONTROL_ROOT
 
-
+from arm_control.calibration_console import ConsoleAuthority
 from arm_control.config import arm_joints, ee_frame, gripper_joints, load_robot_config
 from arm_control.joint_motor_map import gripper_motor_to_finger
 from arm_control.messages import (
@@ -69,7 +70,42 @@ _GATE_BUTTONS = ("ARM", "DISARM")
 
 _CART_NAMES = ("x", "y", "z", "roll", "pitch", "yaw")
 
-_PAGE = (Path(__file__).resolve().parent / "teleop_page.html").read_text()
+_CONSOLE_DIR = Path(__file__).resolve().parent / "console"
+_CONSOLE_ASSETS = {
+    "": ("text/html; charset=utf-8", "index.html", "no-store"),
+    "index.html": ("text/html; charset=utf-8", "index.html", "no-store"),
+    "static/style.css": ("text/css; charset=utf-8", "style.css", "no-store"),
+    "static/app.js": ("text/javascript", "app.js", "no-store"),
+    "static/vendor/three.module.js": (
+        "text/javascript",
+        "vendor/three.module.js",
+        "public, max-age=31536000, immutable",
+    ),
+    "static/vendor/OrbitControls.js": (
+        "text/javascript",
+        "vendor/OrbitControls.js",
+        "public, max-age=31536000, immutable",
+    ),
+    "static/vendor/TransformControls.js": (
+        "text/javascript",
+        "vendor/TransformControls.js",
+        "public, max-age=31536000, immutable",
+    ),
+    "static/vendor/STLLoader.js": (
+        "text/javascript",
+        "vendor/STLLoader.js",
+        "public, max-age=31536000, immutable",
+    ),
+}
+
+
+def console_asset(route: str) -> tuple[str, bytes, str]:
+    """Return one allowlisted offline console asset."""
+    try:
+        content_type, relative, cache = _CONSOLE_ASSETS[route.strip("/")]
+    except KeyError as exc:
+        raise KeyError(f"unknown console asset: {route}") from exc
+    return content_type, (_CONSOLE_DIR / relative).read_bytes(), cache
 
 
 def _pose_json(pin, M) -> dict:
@@ -269,6 +305,8 @@ class ControlPanel:
         self._log: deque[str] = deque(maxlen=200)  # page shows [-8:]; a stuck
         # gizmo drag logged at loop rate once grew this without bound
         self._ident = ident
+        self._authority = ConsoleAuthority(("robot",), deadman_timeout_s=0.3)
+        self._authority.select("robot", now=time.monotonic())
         panel = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -285,15 +323,18 @@ class ControlPanel:
 
             def do_GET(self) -> None:
                 route = self.path.split("?")[0].strip("/")
-                if route in ("", "index.html"):
-                    body = _PAGE.encode()
+                if route in _CONSOLE_ASSETS:
+                    content_type, body, cache = console_asset(route)
+                    etag = hashlib.sha256(body).hexdigest()
+                    if self.headers.get("If-None-Match") == etag:
+                        self.send_response(304)
+                        self.end_headers()
+                        return
                     self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Type", content_type)
                     self.send_header("Content-Length", str(len(body)))
-                    # A cached page runs LAST session's JS against this
-                    # session's node — an operator saw a stale badge ignore a
-                    # live fault. The page is tiny; never cache it.
-                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Cache-Control", cache)
+                    self.send_header("ETag", etag)
                     self.end_headers()
                     self.wfile.write(body)
                 elif route == "state":
@@ -358,8 +399,13 @@ class ControlPanel:
                     )
                 elif self.path.endswith("gripper"):
                     panel.set_gripper(payload.get("value"), dirty=True)
+                elif self.path.endswith("deadman"):
+                    panel.set_deadman(bool(payload.get("held")))
                 elif self.path.endswith("click"):
                     panel._click(str(payload.get("button", "")))
+                else:
+                    self._json({"error": "not found"}, 404)
+                    return
                 self._json({"ok": True})
 
         # Loopback by default: every mutating endpoint on this server can
@@ -370,6 +416,7 @@ class ControlPanel:
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     def _state(self) -> dict:
+        self.expire_deadman()
         with self._lock:
             values = list(self._values)
             measured = None if self._measured is None else list(self._measured)
@@ -395,6 +442,9 @@ class ControlPanel:
                 "log": list(self._log)[-8:],  # deque: copy THEN slice
                 "plan_version": self._plan["version"],
                 "ident": self._ident,
+                "deadman": self._authority.may_move(
+                    "robot", now=time.monotonic()
+                ),
             }
         target_fk = self._vfk.poses(values, grip)   # vfk has its own lock
         payload["target_geoms"] = target_fk["geoms"]
@@ -406,8 +456,29 @@ class ControlPanel:
 
     def _click(self, button: str) -> None:
         with self._lock:
+            if button == "Execute" and not self._authority.may_move(
+                "robot", now=time.monotonic()
+            ):
+                self._log.append("REFUSED: hold the deadman before Execute")
+                return
             if button in self._clicks:
                 self._clicks[button] += 1
+
+    def _authority_actions(self, actions: list[tuple[str, str]]) -> None:
+        for action, _actor in actions:
+            button = "Stop (hold)" if action == "hold" else "DISARM"
+            self._clicks[button] += 1
+
+    def set_deadman(self, held: bool) -> None:
+        with self._lock:
+            actions = self._authority.set_deadman(held, now=time.monotonic())
+            self._authority_actions(actions)
+
+    def expire_deadman(self) -> None:
+        with self._lock:
+            self._authority_actions(
+                self._authority.expire(now=time.monotonic())
+            )
 
     def set_sliders(self, values) -> None:
         with self._lock:
@@ -484,6 +555,11 @@ class ControlPanel:
         except (TypeError, ValueError):
             return
         with self._lock:
+            if dirty and not self._authority.may_move(
+                "robot", now=time.monotonic()
+            ):
+                self._log.append("REFUSED: hold the deadman to move the Hand")
+                return
             self._grip = float(np.clip(value, self._grip_lo, self._grip_hi))
             self._grip_dirty = self._grip_dirty or dirty
 
@@ -679,6 +755,7 @@ def main() -> None:
     while True:
         event = node.next(timeout=0.05)
         now = time.monotonic()
+        panel.expire_deadman()
         if event is not None:
             if event["type"] == "INPUT" and event["id"] == "motor_state":
                 pos = unpack_motor_state(event["value"], n)["position"]

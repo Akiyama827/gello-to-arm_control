@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from arm_control.calibration_console import CalibrationStore, ConsoleAuthority
+from arm_control.calibration_console import (
+    ActorCatalog,
+    CalibrationStore,
+    ConsoleAuthority,
+)
+from nodes.motion_teleop import console_asset
 
 
 def test_deadman_expiry_requests_hold_then_disarm():
@@ -64,3 +69,50 @@ def test_stale_revision_does_not_change_file(tmp_path):
 
     assert target.read_bytes() == before
     assert list(tmp_path.glob("*.bak")) == []
+
+
+def test_actor_catalog_routes_without_robot_name_branches():
+    catalog = ActorCatalog.from_mapping(
+        {
+            "assembler": {
+                "joints": ["j1", "j2"],
+                "capabilities": ["cartesian", "gripper", "wrench"],
+                "urdf": "robot.urdf",
+                "ee_frame": "tool",
+            },
+            "base": {
+                "joints": ["b1", "b2"],
+                "capabilities": ["joint"],
+            },
+        }
+    )
+
+    assert catalog["assembler"].command_port == "assembler_command"
+    assert catalog["base"].arm_port == "base_arm"
+    assert catalog["base"].supports("joint")
+    assert not catalog["base"].supports("cartesian")
+
+
+def test_cartesian_actor_requires_kinematic_model():
+    with pytest.raises(ValueError, match="urdf and ee_frame"):
+        ActorCatalog.from_mapping(
+            {"arm": {"joints": ["j1"], "capabilities": ["cartesian"]}}
+        )
+
+
+def test_console_page_is_offline_and_has_functional_sections():
+    content_type, body, _cache = console_asset("")
+    html = body.decode()
+
+    assert content_type == "text/html; charset=utf-8"
+    assert "http://" not in html and "https://" not in html
+    assert "/static/vendor/three.module.js" in html
+    for ident in (
+        "control-panel",
+        "telemetry-panel",
+        "calibration-panel",
+        "scene-panel",
+        "deadman",
+    ):
+        assert f'id="{ident}"' in html
+    assert console_asset("static/vendor/three.module.js")[0] == "text/javascript"

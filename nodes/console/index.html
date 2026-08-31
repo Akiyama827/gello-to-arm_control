@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workcell calibration console</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="importmap">
+  {"imports": {
+    "three": "/static/vendor/three.module.js",
+    "three/addons/": "/static/vendor/"
+  }}
+  </script>
+</head>
+<body>
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">Local workcell / calibration authority</p>
+      <h1>Control desk</h1>
+    </div>
+    <div class="session">
+      <span id="ident">Waiting for configuration</span>
+      <span id="connection" class="status neutral">Connecting</span>
+    </div>
+  </header>
+
+  <main class="console-grid">
+    <section id="control-panel" class="rack control-rack" aria-labelledby="control-title">
+      <div class="rack-title">
+        <span>Control</span><strong id="control-title">Selected actor</strong>
+      </div>
+      <label class="field">Actor
+        <select id="actor-select" aria-label="Selected actor">
+          <option value="robot">Current robot</option>
+        </select>
+      </label>
+
+      <div id="gate" class="authority" hidden>
+        <span id="gatebadge" class="status neutral">Unknown</span>
+        <div class="button-pair">
+          <button id="arm-btn" class="arm">Arm</button>
+          <button id="disarm-btn" class="danger">Disarm</button>
+        </div>
+      </div>
+
+      <button id="deadman" class="deadman" type="button">
+        <span>Hold to move</span>
+        <small>Space bar or pointer</small>
+      </button>
+
+      <div class="mode-row" role="group" aria-label="Cartesian gizmo mode">
+        <button id="mode-t" class="selected">Translate</button>
+        <button id="mode-r">Rotate</button>
+      </div>
+      <div id="buttons" class="command-stack"></div>
+
+      <div class="subsection">
+        <div class="subhead"><span>Hand</span><output id="grip-readout">—</output></div>
+        <div id="grip"></div>
+      </div>
+
+      <details class="subsection">
+        <summary>Joint target editor</summary>
+        <div id="debug"></div>
+      </details>
+    </section>
+
+    <section id="scene-panel" class="viewport" aria-label="Workcell scene and grasp editor">
+      <div id="view"></div>
+      <div class="view-labels" aria-hidden="true">
+        <span><i class="live-key"></i>Measured</span>
+        <span><i class="target-key"></i>Target</span>
+        <span><i class="plan-key"></i>Plan</span>
+      </div>
+      <div class="crosshair" aria-hidden="true"></div>
+      <div class="view-tools">
+        <strong>Scene / grasp</strong>
+        <span>Orbit to inspect. Drag one gizmo axis at a time.</span>
+      </div>
+    </section>
+
+    <aside class="right-rail">
+      <section id="telemetry-panel" class="rack" aria-labelledby="telemetry-title">
+        <div class="rack-title">
+          <span>Telemetry</span><strong id="telemetry-title">Live state</strong>
+        </div>
+        <dl class="telemetry-list">
+          <div><dt>Joint state</dt><dd id="joint-summary">No samples</dd></div>
+          <div><dt>F/T sensor</dt><dd id="wrench-summary">No wrench stream</dd></div>
+          <div><dt>Plan</dt><dd id="plan-summary">None</dd></div>
+        </dl>
+        <pre id="log" aria-live="polite"></pre>
+      </section>
+
+      <section id="calibration-panel" class="rack" aria-labelledby="calibration-title">
+        <div class="rack-title">
+          <span>Calibration</span><strong id="calibration-title">Measured values</strong>
+        </div>
+        <p class="quiet">Persistent actions remain disabled until their device stream is valid.</p>
+        <div class="cal-actions">
+          <button disabled title="Requires a valid wrench stream">Tare F/T</button>
+          <button disabled title="Requires a selected actor state">Capture pose</button>
+          <button disabled title="Requires a loaded module profile">Edit grasp</button>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="safety-spine">
+    <div><strong>Command authority</strong><span id="authority-text">Deadman released</span></div>
+    <button id="hold-disarm" class="hard-stop">Hold + disarm</button>
+  </footer>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
