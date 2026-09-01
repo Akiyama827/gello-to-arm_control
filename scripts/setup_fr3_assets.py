@@ -15,6 +15,7 @@ is self-contained and does not depend on ROS package resolution.
 
     python scripts/setup_fr3_assets.py                 # auto-detect
     python scripts/setup_fr3_assets.py --source ~/franka_description
+    python scripts/setup_fr3_assets.py --source-urdf model.urdf --dest output
     python scripts/setup_fr3_assets.py --check         # report status, change nothing
 """
 from __future__ import annotations
@@ -92,7 +93,8 @@ def stage_meshes(urdf_text: str, source: Path) -> tuple[int, list[str]]:
     copied, unresolved = 0, []
     for ref in mesh_references(urdf_text):
         want = Path(ref)
-        candidates = by_name.get(want.name.lower(), [])
+        exact = source / want
+        candidates = [exact] if exact.is_file() else by_name.get(want.name.lower(), [])
         if not candidates:
             unresolved.append(ref)
             continue
@@ -165,19 +167,30 @@ def rewrite_mesh_paths(text: str) -> str:
 
 def status() -> tuple[bool, str]:
     if not DEST_URDF.exists():
-        return False, f"missing URDF: {DEST_URDF.relative_to(CONTROL_ROOT)}"
+        return False, f"missing URDF: {_display(DEST_URDF)}"
     meshes = [
         m for m in DEST_MESHES.rglob("*")
         if m.suffix.lower() in (".stl", ".obj", ".dae") and m.is_file()
     ]
     if not meshes:
-        return False, f"missing meshes: {DEST_MESHES.relative_to(CONTROL_ROOT)} is empty"
+        return False, f"missing meshes: {_display(DEST_MESHES)} is empty"
     return True, f"fr3 assets ready ({len(meshes)} meshes)"
 
 
+def _display(path: Path) -> Path:
+    try:
+        return path.relative_to(CONTROL_ROOT)
+    except ValueError:
+        return path
+
+
 def main(argv: list[str] | None = None) -> int:
+    global DEST, DEST_URDF, DEST_MESHES
+
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--source", type=Path, help="franka_description checkout")
+    ap.add_argument("--source-urdf", type=Path, help="exact standalone URDF")
+    ap.add_argument("--dest", type=Path, default=DEST, help="output package root")
     ap.add_argument("--check", action="store_true", help="report status only")
     ap.add_argument(
         "--force",
@@ -185,6 +198,9 @@ def main(argv: list[str] | None = None) -> int:
         help="overwrite a staged F/T-sensor model with the plain description",
     )
     args = ap.parse_args(argv)
+    DEST = args.dest.resolve()
+    DEST_URDF = DEST / "urdf" / "fr3.urdf"
+    DEST_MESHES = DEST / "meshes"
 
     if args.check:
         ok, message = status()
@@ -197,14 +213,16 @@ def main(argv: list[str] | None = None) -> int:
     # real arm's mass and 37.5 mm TCP offset.
     if not args.force and DEST_URDF.exists() and "fr3_ft_sensor" in DEST_URDF.read_text():
         print(
-            f"[fr3] {DEST_URDF.relative_to(CONTROL_ROOT)} is the F/T-sensor "
+            f"[fr3] {_display(DEST_URDF)} is the F/T-sensor "
             "variant, which this script cannot restage. Refusing to overwrite "
             "it with the plain FR3; pass --force if you really want that.",
             file=sys.stderr,
         )
         return 1
 
-    urdf = find_urdf(args.source)
+    urdf = args.source_urdf.resolve() if args.source_urdf else find_urdf(args.source)
+    if urdf is not None and not urdf.is_file():
+        urdf = None
     if urdf is None:
         print(
             "[fr3] no fr3 URDF found. Clone the description and retry:\n"
@@ -218,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     DEST_URDF.parent.mkdir(parents=True, exist_ok=True)
     urdf_text = rewrite_mesh_paths(urdf.read_text())
     DEST_URDF.write_text(urdf_text)
-    print(f"[fr3] wrote {DEST_URDF.relative_to(CONTROL_ROOT)}")
+    print(f"[fr3] wrote {_display(DEST_URDF)}")
 
     # Search the explicit source first, then the URDF's own neighbourhood (the
     # Isaac export keeps its meshes beside it when it has any).
@@ -229,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     for src in sources:
         copied, unresolved = stage_meshes(urdf_text, src)
         if not unresolved:
-            print(f"[fr3] meshes from {src} -> {DEST_MESHES.relative_to(CONTROL_ROOT)}")
+            print(f"[fr3] meshes from {src} -> {_display(DEST_MESHES)}")
             break
     if unresolved:
         print(
