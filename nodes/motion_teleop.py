@@ -122,13 +122,23 @@ class VisualFK:
     Thread-safe (own lock): the HTTP handler poses the measured/target robots
     per poll while the node loop builds plan-playback frames."""
 
-    def __init__(self, urdf_path, joint_names: list[str], ee_frame: str,
-                 finger_joints: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        urdf_path,
+        joint_names: list[str],
+        ee_frame: str,
+        finger_joints: list[str] | None = None,
+        world_T_root: np.ndarray | None = None,
+    ) -> None:
         import pinocchio as pin
 
         from arm_control.planning.preview_rerun import _mesh_package_dirs
 
         self._pin = pin
+        root = np.eye(4) if world_T_root is None else np.asarray(world_T_root, dtype=float)
+        if root.shape != (4, 4) or not np.isfinite(root).all():
+            raise ValueError("world_T_root must be a finite 4x4")
+        self._world_T_root = pin.SE3(root[:3, :3], root[:3, 3])
         self.model, self.visual = pin.buildModelsFromUrdf(
             str(urdf_path),
             package_dirs=_mesh_package_dirs(urdf_path) or None,
@@ -181,7 +191,7 @@ class VisualFK:
             print(f"[teleop] page scene: {len(self._static)} static meshes",
                   flush=True)
 
-    def scene_json(self) -> list[dict]:
+    def scene_json(self, mesh_prefix: str = "mesh") -> list[dict]:
         """Geometry list for the page: one cache-busted mesh URL per visual geom.
 
         The ``?v=`` stamp is load-bearing. ``mesh/<k>`` is a stable, OPAQUE key
@@ -205,7 +215,7 @@ class VisualFK:
                 stamp = "0"
             out.append(
                 {
-                    "mesh": f"mesh/{k}?v={stamp}",
+                    "mesh": f"{mesh_prefix}/{k}?v={stamp}",
                     "color": [float(v) for v in g.meshColor],
                     "scale": [float(v) for v in g.meshScale],
                 }
@@ -261,8 +271,14 @@ class VisualFK:
             pin.updateGeometryPlacements(
                 self.model, self.data, self.visual, self.vdata, q
             )
-            geoms = [_pose_json(pin, self.vdata.oMg[gid]) for gid in self._geom_ids]
-            return {"geoms": geoms, "ee": _pose_json(pin, self.data.oMf[self._ee_id])}
+            geoms = [
+                _pose_json(pin, self._world_T_root * self.vdata.oMg[gid])
+                for gid in self._geom_ids
+            ]
+            return {
+                "geoms": geoms,
+                "ee": _pose_json(pin, self._world_T_root * self.data.oMf[self._ee_id]),
+            }
 
 
 class ControlPanel:

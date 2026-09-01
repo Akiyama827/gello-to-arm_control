@@ -279,11 +279,6 @@ class MuJoCoCollisionWorld:
             self.model.geom_contype[self._cloud_gids] = 0
             self.model.geom_conaffinity[self._cloud_gids] = 0
 
-        self._held_qpos = self.model.qpos0.copy()
-        for name, value in (held_positions or {}).items():
-            joint = self.model.joint(str(name))
-            self._held_qpos[joint.qposadr[0]] = float(value)
-
         self._qadr = []
         lower, upper = [], []
         for name in planned_joints:
@@ -301,6 +296,8 @@ class MuJoCoCollisionWorld:
         self.joint_names = list(planned_joints)
         self.lower = np.asarray(lower)
         self.upper = np.asarray(upper)
+        self._held_qpos = self.model.qpos0.copy()
+        self.set_held_positions(held_positions or {})
         self._pad = float(self_collision_padding_m)
         self._env_geom = np.array(
             [
@@ -340,17 +337,15 @@ class MuJoCoCollisionWorld:
         for item in scene.actors:
             for joint, value in zip(item.joints, state.actor_q[item.name]):
                 self.data.qpos[self.model.joint(f"{item.name}__{joint}").qposadr[0]] = value
-        self._held_qpos = self.model.qpos0.copy()
-        for name, value in (held_positions or {}).items():
-            joint = self.model.joint(str(name))
-            self._held_qpos[joint.qposadr[0]] = float(value)
-        mujoco.mj_forward(self.model, self.data)
         self.joint_names = [f"{actor.name}__{name}" for name in actor.joints]
         self._qadr = np.asarray(
             [int(self.model.joint(name).qposadr[0]) for name in self.joint_names], dtype=int
         )
         self.lower = np.asarray([self.model.jnt_range[self.model.joint(name).id][0] for name in self.joint_names])
         self.upper = np.asarray([self.model.jnt_range[self.model.joint(name).id][1] for name in self.joint_names])
+        self._held_qpos = self.data.qpos.copy()
+        self.set_held_positions(held_positions or {})
+        mujoco.mj_forward(self.model, self.data)
         self._pad = float(self_collision_padding_m)
         fixture_names = tuple(fixture.name for fixture in scene.fixtures)
         fixture_prefixes = tuple(f"{name}__" for name in fixture_names)
@@ -395,6 +390,16 @@ class MuJoCoCollisionWorld:
         self._cloud_gids = self._cloud_mocap_ids = None
         self._cloud_live_k = 0
         return self
+
+    def set_held_positions(self, positions: dict[str, float]) -> None:
+        for name, value in positions.items():
+            joint = self.model.joint(str(name))
+            if joint.qposadr.size != 1 or not np.isfinite(float(value)):
+                raise ValueError(f"held joint {name!r} needs one finite position")
+            address = int(joint.qposadr[0])
+            if address in self._qadr:
+                raise ValueError(f"planned joint {name!r} cannot be held")
+            self._held_qpos[address] = float(value)
 
     def _full_q(self, q: np.ndarray) -> np.ndarray:
         out = self._held_qpos.copy()

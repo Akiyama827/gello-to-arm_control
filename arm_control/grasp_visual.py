@@ -17,6 +17,18 @@ class FixedUrdf:
     name: str
     urdf: Path
     world_T_root: np.ndarray
+    joints: tuple[tuple[str, float], ...] = ()
+    emphasized: bool = False
+
+
+@dataclass(frozen=True)
+class FixedMesh:
+    name: str
+    mesh: Path
+    world_T_mesh: np.ndarray
+    color: tuple[float, float, float, float] = (0.55, 0.60, 0.60, 1.0)
+    scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    emphasized: bool = False
 
 
 @dataclass(frozen=True)
@@ -34,6 +46,7 @@ class VisualGeometry:
     color: tuple[float, float, float, float]
     scale: tuple[float, float, float]
     T: np.ndarray
+    emphasized: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +92,18 @@ class _UrdfGeometry:
             self.q,
         )
 
+    def set_joints(self, joints: tuple[tuple[str, float], ...]) -> None:
+        for name, value in joints:
+            joint_id = self.model.getJointId(str(name))
+            if joint_id == 0:
+                raise ValueError(f"unknown fixed joint: {name}")
+            joint = self.model.joints[joint_id]
+            value = float(value)
+            if joint.nq != 1 or not np.isfinite(value):
+                raise ValueError(f"fixed joint {name!r} needs one finite position")
+            self.q[joint.idx_q] = value
+        self.update()
+
     def frame_T(self, name: str) -> np.ndarray:
         frame_id = self.model.getFrameId(name)
         if frame_id >= len(self.model.frames):
@@ -90,6 +115,7 @@ class _UrdfGeometry:
         group: str,
         selected_links: frozenset[str],
         origin_T_root: np.ndarray,
+        emphasized: bool = False,
     ) -> tuple[list[VisualGeometry], list[_CollisionGeometry], dict[str, np.ndarray]]:
         visuals = []
         for geom_id, geom in enumerate(self.visual.geometryObjects):
@@ -106,6 +132,7 @@ class _UrdfGeometry:
                     tuple(float(value) for value in geom.meshScale),
                     origin_T_root
                     @ np.asarray(self.visual_data.oMg[geom_id].homogeneous),
+                    emphasized,
                 )
             )
         collisions = []
@@ -160,6 +187,13 @@ def _subtree_links(urdf: Path, root_link: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _finite_transform(transform: np.ndarray, label: str) -> np.ndarray:
+    out = np.asarray(transform, dtype=float)
+    if out.shape != (4, 4) or not np.isfinite(out).all():
+        raise ValueError(f"{label} must be a finite 4x4")
+    return out
+
+
 class GraspVisual:
     """Render fixed context and a movable tool, and classify its contacts."""
 
@@ -174,6 +208,8 @@ class GraspVisual:
         finger_joints: tuple[str, ...],
         intended_tool_links: frozenset[str],
         halfspaces: tuple[FixedHalfspace, ...] = (),
+        context: tuple[FixedUrdf, ...] = (),
+        meshes: tuple[FixedMesh, ...] = (),
     ) -> None:
         self.module_urdf = Path(module.urdf).resolve(strict=True)
         self.fixture_urdf = Path(fixture.urdf).resolve(strict=True)
@@ -212,18 +248,43 @@ class GraspVisual:
         self._fixed_collisions: list[_CollisionGeometry] = []
         self._tool_collisions: list[_CollisionGeometry] = []
 
-        for asset, model in ((module, self._module), (fixture, self._fixture)):
-            world_T_root = np.asarray(asset.world_T_root, dtype=float)
-            if world_T_root.shape != (4, 4) or not np.isfinite(world_T_root).all():
-                raise ValueError(f"{asset.name}.world_T_root must be a finite 4x4")
+        fixed_models = [(module, self._module), (fixture, self._fixture)]
+        fixed_models.extend((item, _UrdfGeometry(item.urdf)) for item in context)
+        for asset, model in fixed_models:
+            world_T_root = _finite_transform(
+                asset.world_T_root, f"{asset.name}.world_T_root"
+            )
+            model.set_joints(asset.joints)
             visual, collision, fixed_frames = model.geometry(
                 asset.name,
                 _links(model.urdf),
                 world_T_root,
+                asset.emphasized,
             )
             self._visuals.extend(visual)
             self._fixed_collisions.extend(collision)
             self._frames[asset.name] = fixed_frames
+        for mesh in meshes:
+            path = Path(mesh.mesh).resolve(strict=True)
+            color = tuple(float(value) for value in mesh.color)
+            scale = tuple(float(value) for value in mesh.scale)
+            if len(color) != 4 or not np.isfinite(color).all():
+                raise ValueError(f"{mesh.name}.color must have four finite values")
+            if len(scale) != 3 or not np.isfinite(scale).all() or min(scale) <= 0.0:
+                raise ValueError(
+                    f"{mesh.name}.scale must have three finite positive values"
+                )
+            self._visuals.append(
+                VisualGeometry(
+                    mesh.name,
+                    mesh.name,
+                    path,
+                    color,
+                    scale,
+                    _finite_transform(mesh.world_T_mesh, f"{mesh.name}.world_T_mesh"),
+                    mesh.emphasized,
+                )
+            )
 
         if not self.finger_joints or len(set(self.finger_joints)) != len(
             self.finger_joints
@@ -337,4 +398,10 @@ class GraspVisual:
         }
 
 
-__all__ = ["FixedHalfspace", "FixedUrdf", "GraspVisual", "VisualGeometry"]
+__all__ = [
+    "FixedHalfspace",
+    "FixedMesh",
+    "FixedUrdf",
+    "GraspVisual",
+    "VisualGeometry",
+]

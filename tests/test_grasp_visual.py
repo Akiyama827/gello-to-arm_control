@@ -1,9 +1,13 @@
 from pathlib import Path
+import sys
 
 import numpy as np
 
-from arm_control.grasp_visual import FixedHalfspace, FixedUrdf, GraspVisual
+from arm_control.grasp_visual import FixedHalfspace, FixedMesh, FixedUrdf, GraspVisual
 from arm_control.planning.preview_rerun import _mesh_package_dirs
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "nodes"))
+from motion_teleop import VisualFK  # noqa: E402
 
 
 _STL = """solid triangle
@@ -163,6 +167,52 @@ def test_contacts_include_fixed_halfspace(tmp_path):
 
     assert report["ok"] is False
     assert "hand" in report["forbidden_tool_links"]
+
+
+def test_context_models_and_meshes_keep_world_pose_and_emphasis(tmp_path):
+    module, fixture, tool = _assets(tmp_path)
+    mesh = tmp_path / "triangle.stl"
+    scene = GraspVisual(
+        module=FixedUrdf("module", module, _translation(0.03), emphasized=True),
+        fixture=FixedUrdf("fixture", fixture, _translation(1.0), emphasized=True),
+        tool_urdf=tool,
+        tool_root_link="tool_root",
+        ee_frame="tcp",
+        finger_joints=("left_joint", "right_joint"),
+        intended_tool_links=frozenset({"left_finger", "right_finger"}),
+        context=(FixedUrdf("storage_2", fixture, _translation(0.5)),),
+        meshes=(FixedMesh("bench", mesh, _translation(z=-0.02)),),
+    )
+
+    groups = {item.group for item in scene.visuals()}
+    assert {"module", "fixture", "storage_2", "bench", "tool"} <= groups
+    assert all(
+        item.emphasized
+        for item in scene.visuals()
+        if item.group in {"module", "fixture"}
+    )
+    assert all(
+        not item.emphasized
+        for item in scene.visuals()
+        if item.group in {"storage_2", "bench"}
+    )
+
+
+def test_visual_fk_applies_declared_world_mount(tmp_path):
+    _module, _fixture, tool = _assets(tmp_path)
+    visual = VisualFK(
+        tool,
+        ["left_joint"],
+        "tcp",
+        ["right_joint"],
+        world_T_root=_translation(1.0, 2.0, 3.0),
+    )
+
+    result = visual.poses([0.0], 0.0)
+
+    assert result["geoms"]
+    np.testing.assert_allclose(result["geoms"][0]["p"], [1.0, 2.0, 3.0])
+    assert visual.scene_json("arm-mesh")[0]["mesh"].startswith("arm-mesh/")
 
 
 def test_package_search_includes_parent_without_package_manifest(tmp_path):
