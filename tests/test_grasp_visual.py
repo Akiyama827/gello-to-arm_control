@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 from arm_control.grasp_visual import FixedHalfspace, FixedMesh, FixedUrdf, GraspVisual
 from arm_control.planning.preview_rerun import _mesh_package_dirs
@@ -196,6 +197,26 @@ def test_context_models_and_meshes_keep_world_pose_and_emphasis(tmp_path):
         for item in scene.visuals()
         if item.group in {"storage_2", "bench"}
     )
+
+
+def test_fixed_urdf_rejects_unknown_declared_joint(tmp_path):
+    module, fixture, tool = _assets(tmp_path)
+
+    with pytest.raises(ValueError, match="unknown fixed joint: missing"):
+        GraspVisual(
+            module=FixedUrdf(
+                "module",
+                module,
+                _translation(0.03),
+                joints=(("missing", 0.0),),
+            ),
+            fixture=FixedUrdf("fixture", fixture, _translation(1.0)),
+            tool_urdf=tool,
+            tool_root_link="tool_root",
+            ee_frame="tcp",
+            finger_joints=("left_joint", "right_joint"),
+            intended_tool_links=frozenset({"left_finger", "right_finger"}),
+        )
 
 
 def test_visual_fk_applies_declared_world_mount(tmp_path):

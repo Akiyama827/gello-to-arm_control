@@ -94,9 +94,9 @@ class _UrdfGeometry:
 
     def set_joints(self, joints: tuple[tuple[str, float], ...]) -> None:
         for name, value in joints:
-            joint_id = self.model.getJointId(str(name))
-            if joint_id == 0:
+            if not self.model.existJointName(str(name)):
                 raise ValueError(f"unknown fixed joint: {name}")
+            joint_id = self.model.getJointId(str(name))
             joint = self.model.joints[joint_id]
             value = float(value)
             if joint.nq != 1 or not np.isfinite(value):
