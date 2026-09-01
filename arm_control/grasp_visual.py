@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -405,5 +406,179 @@ __all__ = [
     "FixedMesh",
     "FixedUrdf",
     "GraspVisual",
+    "VisualFK",
     "VisualGeometry",
 ]
+
+
+def _pose_json(pin, M) -> dict:
+    quat = pin.Quaternion(M.rotation).coeffs()  # x, y, z, w
+    return {
+        "p": [round(float(v), 5) for v in M.translation],
+        "q": [round(float(v), 6) for v in quat],
+    }
+
+
+class VisualFK:
+    """Visual-geom FK feeding the web page: mesh list once, poses per config.
+
+    Thread-safe (own lock): the HTTP handler poses the measured/target robots
+    per poll while the node loop builds plan-playback frames."""
+
+    def __init__(
+        self,
+        urdf_path,
+        joint_names: list[str],
+        ee_frame: str,
+        finger_joints: list[str] | None = None,
+        world_T_root: np.ndarray | None = None,
+    ) -> None:
+        import pinocchio as pin
+
+        from arm_control.planning.preview_rerun import _mesh_package_dirs
+
+        self._pin = pin
+        root = np.eye(4) if world_T_root is None else np.asarray(world_T_root, dtype=float)
+        if root.shape != (4, 4) or not np.isfinite(root).all():
+            raise ValueError("world_T_root must be a finite 4x4")
+        self._world_T_root = pin.SE3(root[:3, :3], root[:3, 3])
+        self.model, self.visual = pin.buildModelsFromUrdf(
+            str(urdf_path),
+            package_dirs=_mesh_package_dirs(urdf_path) or None,
+            geometry_types=[pin.GeometryType.VISUAL],
+        )
+        self.data = self.model.createData()
+        self.vdata = self.visual.createData()
+        self._q_idx = [
+            self.model.joints[self.model.getJointId(str(n))].idx_q for n in joint_names
+        ]
+        # Finger joints ride along so every ghost mirrors the gripper slider.
+        # Whichever finger joints THIS arm declares (arm.gripper_joints), kept
+        # only if the URDF really has them — no robot names baked in here.
+        self.finger_joints = [
+            n for n in (finger_joints or []) if self.model.existJointName(n)
+        ]
+        self._finger_idx = [
+            self.model.joints[self.model.getJointId(n)].idx_q
+            for n in self.finger_joints
+        ]
+        self._ee_id = self.model.getFrameId(str(ee_frame))
+        self._geom_ids = [
+            i
+            for i, g in enumerate(self.visual.geometryObjects)
+            if Path(g.meshPath).is_file()
+        ]
+        # Static scene bodies (the modular base / dock) appended AFTER the arm's
+        # geoms, so `mesh/<k>` keys stay stable for the robot itself. Same
+        # source as the Rerun recordings — the page and the viewer cannot
+        # disagree about where the dock stands.
+        self._static: list[tuple[Path, dict]] = []
+        self._lock = threading.Lock()
+
+    def add_static_scene(self, cfg) -> None:
+        """Append the config's non-arm scene bodies as fixed page geometry."""
+        from arm_control.planning.preview_rerun import static_scene_geoms
+
+        for _body, _name, mesh_path, T in static_scene_geoms(cfg):
+            quat = self._pin.Quaternion(T[:3, :3].copy()).coeffs()  # x,y,z,w
+            self._static.append(
+                (
+                    Path(mesh_path),
+                    {
+                        "p": [round(float(v), 5) for v in T[:3, 3]],
+                        "q": [round(float(v), 6) for v in quat],
+                    },
+                )
+            )
+        if self._static:
+            print(f"[teleop] page scene: {len(self._static)} static meshes",
+                  flush=True)
+
+    def scene_json(self, mesh_prefix: str = "mesh") -> list[dict]:
+        """Geometry list for the page: one cache-busted mesh URL per visual geom.
+
+        The ``?v=`` stamp is load-bearing. ``mesh/<k>`` is a stable, OPAQUE key
+        whose CONTENT changes whenever the arm changes or its meshes are
+        restaged, and the handler serves it with ``max-age=86400`` — so without a
+        content-dependent URL the browser happily renders yesterday's robot for a
+        day. Measured: after converting the FR3 visuals from .obj to .stl, Chrome
+        kept returning the cached OBJ body (5.1 MB, "# https://github.com/mikedh/
+        trimesh") with no network request at all, and the page silently showed
+        nothing. Stamping mtime+size keeps caching effective and makes staleness
+        impossible.
+        """
+        out = []
+        for k, gid in enumerate(self._geom_ids):
+            g = self.visual.geometryObjects[gid]
+            path = self.mesh_path(k)
+            try:
+                st = path.stat()
+                stamp = f"{int(st.st_mtime)}-{st.st_size}"
+            except OSError:
+                stamp = "0"
+            out.append(
+                {
+                    "mesh": f"{mesh_prefix}/{k}?v={stamp}",
+                    "color": [float(v) for v in g.meshColor],
+                    "scale": [float(v) for v in g.meshScale],
+                }
+            )
+        return out
+
+    def static_json(self) -> list[dict]:
+        """Fixed scene geometry (the dock/modular base): mesh + colour + POSE.
+
+        Deliberately NOT part of scene_json(): the page builds THREE robots
+        (measured, target, plan) from that list, so anything appended there is
+        drawn three times in three tints. These carry their own pose and are
+        drawn once.
+        """
+        out = []
+        for j, (path, pose) in enumerate(self._static):
+            try:
+                st = path.stat()
+                stamp = f"{int(st.st_mtime)}-{st.st_size}"
+            except OSError:
+                stamp = "0"
+            out.append(
+                {
+                    # Muted grey: a backdrop for judging geometry, never
+                    # mistakable for the live robot's own STL colours.
+                    "mesh": f"mesh/{len(self._geom_ids) + j}?v={stamp}",
+                    "color": [0.55, 0.57, 0.60],
+                    "scale": [1.0, 1.0, 1.0],
+                    **pose,
+                }
+            )
+        return out
+
+    def mesh_path(self, k: int) -> Path | None:
+        if 0 <= k < len(self._geom_ids):
+            return Path(self.visual.geometryObjects[self._geom_ids[k]].meshPath)
+        j = k - len(self._geom_ids)
+        if 0 <= j < len(self._static):
+            return self._static[j][0]
+        return None
+
+    def poses(self, q_arm, finger_m: float) -> dict:
+        """``{'geoms': [{p,q}...], 'ee': {p,q}}`` at arm config + finger opening."""
+        pin = self._pin
+        with self._lock:
+            q = pin.neutral(self.model)
+            for idx, value in zip(self._q_idx, np.asarray(q_arm, dtype=float)):
+                q[idx] = value
+            for idx in self._finger_idx:
+                q[idx] = float(finger_m)
+            pin.forwardKinematics(self.model, self.data, q)
+            pin.updateFramePlacements(self.model, self.data)
+            pin.updateGeometryPlacements(
+                self.model, self.data, self.visual, self.vdata, q
+            )
+            geoms = [
+                _pose_json(pin, self._world_T_root * self.vdata.oMg[gid])
+                for gid in self._geom_ids
+            ]
+            return {
+                "geoms": geoms,
+                "ee": _pose_json(pin, self._world_T_root * self.data.oMf[self._ee_id]),
+            }
