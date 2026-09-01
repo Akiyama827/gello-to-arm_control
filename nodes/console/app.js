@@ -328,10 +328,16 @@ const setToolPose = (tool, pose) => {
   matrix.decompose(tool.group.position, tool.group.quaternion, new THREE.Vector3());
 };
 
+const samePose = (left, right) => left.every(
+  (value, index) => Math.abs(value - right[index]) < 1e-9,
+);
+
 const updateEditorState = (editor) => {
   if (!editor) return;
   setToolPose(editorPregraspTool, editor.pregrasp_pose);
   setToolPose(editorRetreatTool, editor.retreat_pose);
+  editorPregraspTool.group.visible = !samePose(editor.pregrasp_pose, editor.ee_pose);
+  editorRetreatTool.group.visible = !samePose(editor.retreat_pose, editor.ee_pose);
   const report = editor.contacts.grasp;
   const forbidden = new Set(report.forbidden_tool_links);
   const intended = new Set(report.intended_tool_links);
@@ -427,7 +433,6 @@ const buildModuleEditor = async (state) => {
   $("grasp-retreat").value = state.module.retreat_offset_m.join(", ");
   $("joint-summary").textContent = "Module fixed at q = 0";
   $("wrench-summary").textContent = "Not connected in visualization mode";
-  $("plan-summary").textContent = "Editor collision preview only";
   editorRevision = state.module.revision;
   $("grasp-status").textContent = `${state.module.status} / ${state.module.reference_link}`;
   $("save-grasp").onclick = async () => {

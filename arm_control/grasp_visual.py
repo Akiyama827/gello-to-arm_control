@@ -20,6 +20,13 @@ class FixedUrdf:
 
 
 @dataclass(frozen=True)
+class FixedHalfspace:
+    name: str
+    normal: tuple[float, float, float]
+    offset: float
+
+
+@dataclass(frozen=True)
 class VisualGeometry:
     group: str
     link: str
@@ -166,6 +173,7 @@ class GraspVisual:
         ee_frame: str,
         finger_joints: tuple[str, ...],
         intended_tool_links: frozenset[str],
+        halfspaces: tuple[FixedHalfspace, ...] = (),
     ) -> None:
         self.module_urdf = Path(module.urdf).resolve(strict=True)
         self.fixture_urdf = Path(fixture.urdf).resolve(strict=True)
@@ -180,6 +188,21 @@ class GraspVisual:
         if not intended_tool_links <= tool_link_set:
             raise ValueError("intended contact links must belong to the tool subtree")
         self.intended_tool_links = frozenset(intended_tool_links)
+        self._halfspaces = []
+        for halfspace in halfspaces:
+            normal = np.asarray(halfspace.normal, dtype=float)
+            norm = float(np.linalg.norm(normal))
+            if (
+                not halfspace.name
+                or normal.shape != (3,)
+                or not np.isfinite(normal).all()
+                or not np.isfinite(halfspace.offset)
+                or norm == 0.0
+            ):
+                raise ValueError("halfspace needs a name, finite normal, and offset")
+            self._halfspaces.append(
+                (normal / norm, float(halfspace.offset) / norm)
+            )
 
         self._module = _UrdfGeometry(self.module_urdf)
         self._fixture = _UrdfGeometry(self.fixture_urdf)
@@ -295,6 +318,18 @@ class GraspVisual:
                     intended.add(tool.link)
                 else:
                     forbidden.add(tool.link)
+            for normal, offset in self._halfspaces:
+                result = coal.CollisionResult()
+                coal.collide(
+                    tool.geometry,
+                    tool_pose,
+                    coal.Halfspace(normal, offset),
+                    coal.Transform3s(),
+                    request,
+                    result,
+                )
+                if result.isCollision():
+                    forbidden.add(tool.link)
         return {
             "intended_tool_links": sorted(intended),
             "forbidden_tool_links": sorted(forbidden),
@@ -302,4 +337,4 @@ class GraspVisual:
         }
 
 
-__all__ = ["FixedUrdf", "GraspVisual", "VisualGeometry"]
+__all__ = ["FixedHalfspace", "FixedUrdf", "GraspVisual", "VisualGeometry"]

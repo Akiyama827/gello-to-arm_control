@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
-from arm_control.grasp_visual import FixedUrdf, GraspVisual
+from arm_control.grasp_visual import FixedHalfspace, FixedUrdf, GraspVisual
 from arm_control.planning.preview_rerun import _mesh_package_dirs
 
 
@@ -92,7 +92,7 @@ def _translation(x=0.0, y=0.0, z=0.0):
     return transform
 
 
-def _scene(tmp_path):
+def _scene(tmp_path, *, halfspaces=()):
     module, fixture, tool = _assets(tmp_path)
     return GraspVisual(
         module=FixedUrdf("module", module, _translation(0.03)),
@@ -102,6 +102,7 @@ def _scene(tmp_path):
         ee_frame="tcp",
         finger_joints=("left_joint", "right_joint"),
         intended_tool_links=frozenset({"left_finger", "right_finger"}),
+        halfspaces=halfspaces,
     )
 
 
@@ -150,6 +151,18 @@ def test_contacts_distinguish_fingers_from_forbidden_tool_parts(tmp_path):
     fixture_contact = scene.contacts(_translation(0.97))
     assert fixture_contact["ok"] is False
     assert fixture_contact["forbidden_tool_links"]
+
+
+def test_contacts_include_fixed_halfspace(tmp_path):
+    scene = _scene(
+        tmp_path,
+        halfspaces=(FixedHalfspace("bench", (0.0, 0.0, 1.0), 0.0),),
+    )
+
+    report = scene.contacts(_translation(z=-0.02))
+
+    assert report["ok"] is False
+    assert "hand" in report["forbidden_tool_links"]
 
 
 def test_package_search_includes_parent_without_package_manifest(tmp_path):
