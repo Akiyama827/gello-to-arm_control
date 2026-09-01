@@ -352,9 +352,24 @@ class MuJoCoCollisionWorld:
         self.lower = np.asarray([self.model.jnt_range[self.model.joint(name).id][0] for name in self.joint_names])
         self.upper = np.asarray([self.model.jnt_range[self.model.joint(name).id][1] for name in self.joint_names])
         self._pad = float(self_collision_padding_m)
+        fixture_names = tuple(fixture.name for fixture in scene.fixtures)
+        fixture_prefixes = tuple(f"{name}__" for name in fixture_names)
         self._env_geom = np.asarray(
-            [(self.model.geom(i).name or "").startswith(("ground", "obstacle__"))
-             for i in range(self.model.ngeom)], dtype=bool,
+            [
+                (self.model.geom(i).name or "").startswith(("ground", "obstacle__"))
+                or (
+                    bool(fixture_prefixes)
+                    and (
+                        body_name := self.model.body(self.model.geom_bodyid[i]).name or ""
+                    )
+                    and (
+                        body_name in fixture_names
+                        or body_name.startswith(fixture_prefixes)
+                    )
+                )
+                for i in range(self.model.ngeom)
+            ],
+            dtype=bool,
         )
         actor_prefix = f"{actor.name}__"
         self._planned_body = np.asarray(

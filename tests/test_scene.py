@@ -71,6 +71,7 @@ scene:
     ).compile()
 
     assert scene.fixtures[0].name == "storage_2"
+    assert model.body("storage_2").pos.tolist() == [1.0, 2.0, 3.0]
     assert model.body("storage_2__holder").jntnum == 0
     assert model.body("storage_2__holder").pos.tolist() == [0.0, 0.0, 0.02]
 
