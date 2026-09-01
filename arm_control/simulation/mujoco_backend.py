@@ -60,14 +60,13 @@ class MuJoCoUnavailableError(RuntimeError):
 
 
 # Reflected rotor inertia (kg.m^2) for a module joint's DM motor: Gr^2 *
-# J_rotor. DM datasheets do not publish J_rotor -- it is a runtime register --
-# so this uses the two base motors measured off the live bus on 2026-08-29
-# (J_rotor 1.8e-5, Gr 40 -> 0.0288).
-# ponytail: the MODULE motor type is UNCONFIRMED. Gr 40 (DM-J4340) is assumed
-# because the module URDFs declare effort="9", the 4340's rated torque; if it
-# is really a 4310 this is 16x too large. Read it with
-# libs/arm_control/scripts/dm_read_params.py once a module motor is on the bus.
-MODULE_ARMATURE = 0.0288
+# J_rotor. The Row Module is a DM-J4310, so Gr = 10 (user-confirmed
+# 2026-09-01; the URDFs' effort="9" is NOT evidence of a 4340 as once assumed).
+# ponytail: J_rotor is still the 4340 base motors' measured 1.8e-5 -- DM
+# datasheets do not publish it and no module motor has been on the bus yet.
+# A 4310's rotor is smaller, so this is an upper bound; read the real value
+# with libs/arm_control/scripts/dm_read_params.py when one is reachable.
+MODULE_ARMATURE = 10.0**2 * 1.8e-5  # 0.0018
 
 @dataclass(frozen=True)
 class SceneModelSpec:
