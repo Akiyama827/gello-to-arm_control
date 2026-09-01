@@ -82,11 +82,14 @@ h1 {
 .console-grid {
   height: calc(100% - 8.4rem);
   display: grid;
-  grid-template-columns: 17.5rem minmax(25rem, 1fr) 19rem;
+  grid-template-columns:
+    var(--left-w, 17.5rem) .35rem minmax(25rem, 1fr) .35rem var(--right-w, 19rem);
   gap: 1px;
   background: var(--rule);
 }
 .rack, .right-rail { background: var(--panel); min-width: 0; }
+.gutter { background: var(--rule); cursor: col-resize; touch-action: none; }
+.gutter:hover, .gutter.dragging { background: var(--blue); }
 .rack { padding: .9rem; overflow: auto; }
 .control-rack { border-top: 4px solid var(--blue); }
 .rack-title { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: .8rem; }
@@ -211,7 +214,7 @@ input[type="range"] { width: 100%; accent-color: var(--blue); }
 .hard-stop { min-width: 10rem; color: white; background: var(--red); border-color: #d56b64; font-weight: 800; }
 
 @media (max-width: 1180px) {
-  .console-grid { grid-template-columns: 16rem minmax(25rem, 1fr) 16rem; }
+  .console-grid { --left-w: 16rem; --right-w: 16rem; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }

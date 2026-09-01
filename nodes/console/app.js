@@ -32,6 +32,8 @@ const resize = () => {
   camera.updateProjectionMatrix();
 };
 addEventListener("resize", resize);
+// Panel drags change the viewport width without a window resize event.
+new ResizeObserver(resize).observe(view);
 
 scene.add(new THREE.HemisphereLight(0xf5fbfa, 0x33464d, 1.25));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.55);
@@ -781,3 +783,39 @@ const animate = () => {
 };
 resize();
 animate();
+
+// Draggable panel dividers. The grid tracks are the source of truth, so a drag
+// writes the two custom properties rather than resizing any element -- setting
+// an element width would fight the fixed track it sits in. Pointer capture is
+// load-bearing: without it the WebGL canvas swallows the moves for OrbitControls
+// the moment the cursor crosses the viewport.
+const MIN_PANEL_PX = 160;
+const MAX_PANEL_PX = 640;
+const consoleGrid = document.querySelector(".console-grid");
+for (const gutter of consoleGrid.querySelectorAll(".gutter")) {
+  gutter.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    const side = gutter.dataset.side;
+    const panel = side === "left" ? consoleGrid.firstElementChild : consoleGrid.lastElementChild;
+    const startX = event.clientX;
+    const startWidth = panel.getBoundingClientRect().width;
+    gutter.setPointerCapture(event.pointerId);
+    gutter.classList.add("dragging");
+
+    const onMove = (move) => {
+      const delta = side === "left" ? move.clientX - startX : startX - move.clientX;
+      const width = Math.min(MAX_PANEL_PX, Math.max(MIN_PANEL_PX, startWidth + delta));
+      consoleGrid.style.setProperty(`--${side}-w`, `${width}px`);
+    };
+    const onUp = () => {
+      gutter.classList.remove("dragging");
+      gutter.releasePointerCapture(event.pointerId);
+      gutter.removeEventListener("pointermove", onMove);
+      gutter.removeEventListener("pointerup", onUp);
+      gutter.removeEventListener("pointercancel", onUp);
+    };
+    gutter.addEventListener("pointermove", onMove);
+    gutter.addEventListener("pointerup", onUp);
+    gutter.addEventListener("pointercancel", onUp);
+  });
+}
