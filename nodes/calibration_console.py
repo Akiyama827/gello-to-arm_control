@@ -375,6 +375,16 @@ class GraspEditorPanel:
                 }
             )
             grasp = self._validate(raw)
+            changed = (
+                not np.allclose(grasp.link_T_ee, self.grasp.link_T_ee)
+                or not np.allclose(
+                    grasp.approach_offset_m, self.grasp.approach_offset_m
+                )
+                or not np.allclose(grasp.retreat_offset_m, self.grasp.retreat_offset_m)
+                or not np.isclose(grasp.finger_width_m, self.grasp.finger_width_m)
+            )
+            if not changed:
+                return self._editor_state()
             normalized = frames.T_to_pose_xyzquat(grasp.link_T_ee)
             raw["grasp"]["link_T_ee"] = {
                 "pos": normalized[:3],
@@ -395,6 +405,10 @@ class GraspEditorPanel:
         if not isinstance(expected, str):
             raise ValueError("expected_revision is required")
         with self._lock:
+            if not self.dirty:
+                if expected != self.revision:
+                    raise ValueError("stale revision")
+                return
             self.revision = self.store.save_yaml(
                 self.profile_path,
                 self.raw,
@@ -459,28 +473,33 @@ class GraspEditorPanel:
         self.server.server_close()
 
     def mesh_path(self, index: int) -> Path | None:
-        visuals = self.visual.visuals()
+        with self._lock:
+            visuals = self.visual.visuals()
         if not 0 <= index < len(visuals):
             return None
         return visuals[index].mesh
 
     def scene(self) -> dict[str, object]:
+        with self._lock:
+            visual = self.visual
+            grasp = self.grasp
+            arm = self.workspace.arm_visual
         result: dict[str, object] = {
             "fixture": [],
             "module": [],
             "tool": [],
             "fixed": [],
-            "arm": self.workspace.arm_visual.scene_json("arm-mesh"),
+            "arm": arm.scene_json("arm-mesh"),
             "frames": {
-                self.grasp.reference_link: _pose_json(
-                    self.visual.frame_T("module", self.grasp.reference_link)
+                grasp.reference_link: _pose_json(
+                    visual.frame_T("module", grasp.reference_link)
                 ),
-                self.grasp.ee_frame: _pose_json(
-                    self.visual.frame_T("tool", self.grasp.ee_frame)
+                grasp.ee_frame: _pose_json(
+                    visual.frame_T("tool", grasp.ee_frame)
                 ),
             },
         }
-        for index, item in enumerate(self.visual.visuals()):
+        for index, item in enumerate(visual.visuals()):
             stat = item.mesh.stat()
             entry = {
                 "mesh": f"mesh/{index}?v={int(stat.st_mtime)}-{stat.st_size}",

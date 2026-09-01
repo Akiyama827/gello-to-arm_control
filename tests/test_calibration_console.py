@@ -345,6 +345,33 @@ class _FakeArmVisual:
         }
 
 
+class _NamedGraspVisual(_FakeGraspVisual):
+    def __init__(self, name, module_urdf, tool_urdf, mesh):
+        super().__init__(module_urdf, tool_urdf, mesh)
+        self.name = name
+        self.trigger = None
+
+    def visuals(self):
+        return tuple(
+            VisualGeometry(
+                group,
+                self.name,
+                self.mesh,
+                (0.5, 0.5, 0.5, 1.0),
+                (1.0, 1.0, 1.0),
+                np.eye(4),
+            )
+            for group in ("fixture", "module", "tool")
+        )
+
+    def frame_T(self, group, frame):
+        if self.trigger is not None:
+            trigger = self.trigger
+            self.trigger = None
+            trigger()
+        return super().frame_T(group, frame)
+
+
 class _FakeServer:
     def __init__(self, address, _handler):
         self.server_address = (address[0], 12345)
@@ -469,6 +496,81 @@ def test_grasp_panel_workspace_selection_stale_checks_and_save(tmp_path, monkeyp
         assert len(list(tmp_path.glob("part_a.yaml.*.bak"))) == 1
         assert list(tmp_path.glob("part_b.yaml.*.bak")) == []
         assert built[-1] == ("part_a", "storage_2", "dock")
+    finally:
+        panel.close()
+
+
+def test_grasp_panel_noop_update_and_save_preserve_approved_profile(
+    tmp_path, monkeypatch
+):
+    module_urdf, tool_urdf, raw = _grasp_profile_assets(tmp_path)
+    raw["calibration_status"] = "approved"
+    profile = tmp_path / "part_a.yaml"
+    profile.write_text(yaml.safe_dump(raw, sort_keys=False))
+    mesh = tmp_path / "part.stl"
+    mesh.write_bytes(b"solid part\nendsolid part\n")
+    monkeypatch.setattr(calibration_console_node, "ThreadingHTTPServer", _FakeServer)
+    panel = GraspEditorPanel(
+        profile,
+        _FakeGraspVisual(module_urdf, tool_urdf, mesh),
+        bind="127.0.0.1",
+        port=0,
+    )
+    try:
+        state = panel.state()["module"]
+        panel.update(
+            {
+                "pos": [0, 0, 0],
+                "quat": [1, 0, 0, 0],
+                "finger_width_m": 0.04,
+                "approach_offset_m": [0, 0, 0.1],
+                "retreat_offset_m": [0, 0, -0.1],
+            }
+        )
+        assert panel.state()["module"]["status"] == "approved"
+        assert panel.state()["module"]["edit_revision"] == state["edit_revision"]
+        panel.save({"confirm": True, "expected_revision": state["revision"]})
+        assert yaml.safe_load(profile.read_text())["calibration_status"] == "approved"
+        assert list(tmp_path.glob("part_a.yaml.*.bak")) == []
+    finally:
+        panel.close()
+
+
+def test_grasp_panel_scene_uses_one_visual_snapshot(tmp_path, monkeypatch):
+    module_urdf, tool_urdf, raw_a = _grasp_profile_assets(tmp_path)
+    raw_b = yaml.safe_load(yaml.safe_dump(raw_a, sort_keys=False))
+    raw_b["module_type"] = "part_b"
+    profile_a = tmp_path / "part_a.yaml"
+    profile_b = tmp_path / "part_b.yaml"
+    profile_a.write_text(yaml.safe_dump(raw_a, sort_keys=False))
+    profile_b.write_text(yaml.safe_dump(raw_b, sort_keys=False))
+    mesh = tmp_path / "part.stl"
+    mesh.write_bytes(b"solid part\nendsolid part\n")
+    visuals = {
+        "part_a": _NamedGraspVisual("part_a", module_urdf, tool_urdf, mesh),
+        "part_b": _NamedGraspVisual("part_b", module_urdf, tool_urdf, mesh),
+    }
+    workspace = GraspEditorWorkspace(
+        targets={"part_a": profile_a, "part_b": profile_b},
+        default_placements={"part_a": "storage_1", "part_b": "storage_1"},
+        placements=("storage_1",),
+        contexts=("storage",),
+        build_visual=lambda target, _placement, _context: visuals[target],
+        evaluate=lambda _target, _placement, _grasp_raw: {
+            "storage": GraspCheck("checking")
+        },
+        arm_visual=_FakeArmVisual(mesh),
+    )
+    monkeypatch.setattr(calibration_console_node, "ThreadingHTTPServer", _FakeServer)
+    panel = GraspEditorPanel(workspace, bind="127.0.0.1", port=0)
+    visuals["part_a"].trigger = lambda: panel.select(
+        {"module": "part_b", "discard": True}
+    )
+    try:
+        scene = panel.scene()
+        assert {item["link"] for item in scene["fixed"]} == {"part_a"}
+        assert {item["link"] for item in scene["tool"]} == {"part_a"}
+        assert panel.state()["module"]["selection"]["module"] == "part_b"
     finally:
         panel.close()
 
