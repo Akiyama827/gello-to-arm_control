@@ -59,6 +59,16 @@ class MuJoCoUnavailableError(RuntimeError):
     """Raised when the scene cannot be built (missing assets, bad config)."""
 
 
+# Reflected rotor inertia (kg.m^2) for a module joint's DM motor: Gr^2 *
+# J_rotor. DM datasheets do not publish J_rotor -- it is a runtime register --
+# so this uses the two base motors measured off the live bus on 2026-08-29
+# (J_rotor 1.8e-5, Gr 40 -> 0.0288).
+# ponytail: the MODULE motor type is UNCONFIRMED. Gr 40 (DM-J4340) is assumed
+# because the module URDFs declare effort="9", the 4340's rated torque; if it
+# is really a 4310 this is 16x too large. Read it with
+# libs/arm_control/scripts/dm_read_params.py once a module motor is on the bus.
+MODULE_ARMATURE = 0.0288
+
 @dataclass(frozen=True)
 class SceneModelSpec:
     model_path: str
@@ -820,6 +830,32 @@ class MuJoCoBackend:
             servo.forcerange[0] = -float(self.gripper_force_n)
             servo.forcerange[1] = float(self.gripper_force_n)
             gripper_present.append(name)
+        if len(gripper_present) == 2:
+            # Both jaws run off ONE actuator on the real hardware -- the FR3's
+            # URDF says so (`<mimic joint="fr3_finger_joint1"/>` on finger 2),
+            # and the DM pair has its joint_mimics block. MuJoCo's URDF
+            # importer silently DROPS mimic tags, so without this the sim has
+            # two free jaws: each closes until it personally finds contact, and
+            # an off-centre part is simply held where it sits (measured: pads
+            # resting 2.2 mm apart in travel). Real jaws cannot do that -- they
+            # move together about the hand centre and shove an off-centre part
+            # into line -- so the sim would pass grasps the bench would not.
+            mimic = spec.add_equality(
+                name="gripper_mimic",
+                type=mujoco.mjtEq.mjEQ_JOINT,
+                objtype=mujoco.mjtObj.mjOBJ_JOINT,
+                name1=str(gripper_present[0]),
+                name2=str(gripper_present[1]),
+                # joint2 = 0 + 1.0 * joint1, higher powers zero.
+                data=[0.0, 1.0, 0.0, 0.0, 0.0] + [0.0] * 6,
+                active=True,
+            )
+            # A default equality is SOFT (20 ms) and a mechanical coupling is
+            # not: at the default the jaws still drifted 1.4 mm apart under an
+            # uneven pad load. Stiffen it toward rigid -- it is a gear train,
+            # not a spring.
+            mimic.solref = [2.0 * float(self.timestep), 1.0]
+            mimic.solimp = [0.999, 0.9999, 1e-4, 0.5, 2.0]
         if self.scene is not None:
             # One fixture weld per UNDOCKED module. No dock weld any more: a
             # seated module is re-grafted as a real link (see _graft), so there
@@ -942,8 +978,18 @@ class MuJoCoBackend:
             self._applied_attachments = dict(self.scene_state.attachments)
             driven = set(self._actuated_joints(spec))
             for name in self._joint_object:
+                dof = self.model.joint(name).dofadr[0]
+                # Every module joint carries its motor's ROTOR inertia, docked
+                # or not. Without it the joint has only its link inertia
+                # (1.25e-4 kg.m^2) and a docked one has nothing else at all --
+                # the stiction below exempts it precisely because it is now
+                # driven -- so the servo diverges: measured, kp 50 / kd 1 at a
+                # 100 Hz control period drove the seated module's joint to
+                # 430 rad/s with the actuator saturating sign-to-sign.
+                self.model.dof_armature[dof] = max(
+                    MODULE_ARMATURE, float(self.model.dof_armature[dof])
+                )
                 if name not in driven:
-                    dof = self.model.joint(name).dofadr[0]
                     self.model.dof_frictionloss[dof] = max(
                         5.0, float(self.model.dof_frictionloss[dof])
                     )
