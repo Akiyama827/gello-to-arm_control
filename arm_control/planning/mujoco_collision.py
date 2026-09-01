@@ -279,9 +279,10 @@ class MuJoCoCollisionWorld:
             self.model.geom_contype[self._cloud_gids] = 0
             self.model.geom_conaffinity[self._cloud_gids] = 0
 
+        self._held_qpos = self.model.qpos0.copy()
         for name, value in (held_positions or {}).items():
             joint = self.model.joint(str(name))
-            self.model.qpos0[joint.qposadr[0]] = float(value)
+            self._held_qpos[joint.qposadr[0]] = float(value)
 
         self._qadr = []
         lower, upper = [], []
@@ -317,6 +318,8 @@ class MuJoCoCollisionWorld:
         planned_actor: str,
         *,
         self_collision_padding_m: float = -0.002,
+        held_positions: dict[str, float] | None = None,
+        ground_z: float | None = 0.0,
     ) -> "MuJoCoCollisionWorld":
         """Build collision truth from the same generic composed workcell."""
         if self_collision_padding_m > 0.0:
@@ -328,11 +331,19 @@ class MuJoCoCollisionWorld:
         from arm_control.simulation.mujoco_backend import compose_workcell_scene
 
         self = cls.__new__(cls)
-        self.model = compose_workcell_scene(scene, state).compile()
+        self.model = compose_workcell_scene(
+            scene,
+            state,
+            ground_z=ground_z,
+        ).compile()
         self.data = mujoco.MjData(self.model)
         for item in scene.actors:
             for joint, value in zip(item.joints, state.actor_q[item.name]):
                 self.data.qpos[self.model.joint(f"{item.name}__{joint}").qposadr[0]] = value
+        self._held_qpos = self.model.qpos0.copy()
+        for name, value in (held_positions or {}).items():
+            joint = self.model.joint(str(name))
+            self._held_qpos[joint.qposadr[0]] = float(value)
         mujoco.mj_forward(self.model, self.data)
         self.joint_names = [f"{actor.name}__{name}" for name in actor.joints]
         self._qadr = np.asarray(
@@ -345,13 +356,33 @@ class MuJoCoCollisionWorld:
             [(self.model.geom(i).name or "").startswith(("ground", "obstacle__"))
              for i in range(self.model.ngeom)], dtype=bool,
         )
-        self._scene_names = []
+        actor_prefix = f"{actor.name}__"
+        self._planned_body = np.asarray(
+            [
+                (self.model.body(i).name or "").startswith(actor_prefix)
+                for i in range(self.model.nbody)
+            ],
+            dtype=bool,
+        )
+        self._scene_gids = np.asarray(
+            [
+                i
+                for i in range(self.model.ngeom)
+                if self.model.geom_bodyid[i] > 0
+                and not self._planned_body[self.model.geom_bodyid[i]]
+            ],
+            dtype=int,
+        )
+        self._scene_names = [
+            self.model.body(self.model.geom_bodyid[i]).name or ""
+            for i in self._scene_gids
+        ]
         self._cloud_gids = self._cloud_mocap_ids = None
         self._cloud_live_k = 0
         return self
 
     def _full_q(self, q: np.ndarray) -> np.ndarray:
-        out = self.model.qpos0.copy()
+        out = self._held_qpos.copy()
         out[self._qadr] = np.asarray(q, dtype=float)
         return out
 
@@ -365,6 +396,12 @@ class MuJoCoCollisionWorld:
         mujoco.mj_collision(self.model, self.data)
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
+            body1 = self.model.geom_bodyid[contact.geom1]
+            body2 = self.model.geom_bodyid[contact.geom2]
+            if hasattr(self, "_planned_body") and not (
+                self._planned_body[body1] or self._planned_body[body2]
+            ):
+                continue
             if self._env_geom[contact.geom1] or self._env_geom[contact.geom2]:
                 return True  # environment: zero padding, any contact counts
             if contact.dist <= self._pad:

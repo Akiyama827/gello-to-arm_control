@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import time
 import os
+import importlib
 
 import numpy as np
 from dora import Node
@@ -118,11 +119,17 @@ def main() -> None:
     scene_path = os.environ.get("WORKCELL_SCENE")
     scene_cfg = cfg.get("scene")
     if scene_path:
+        loader = None
+        loader_name = os.environ.get("WORKCELL_LOADER")
+        if loader_name:
+            module_name, function_name = loader_name.split(":", 1)
+            loader = getattr(importlib.import_module(module_name), function_name)
         backend, arm_slices, joint_names, n = build_workcell_backend(
             scene_path,
             control_period=period,
             launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
             enable_self_collision=bool(cfg.get("sim_self_collision", False)),
+            loader=loader,
         )
         print(
             f"[mujoco_interface] generic workcell: {n} actuators, slices={arm_slices}",

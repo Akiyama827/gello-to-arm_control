@@ -11,12 +11,14 @@ slot is config data (``model_path`` + ``prefix``), never a name in this code.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from arm_control.simulation.mujoco_backend import (
     ModuleSlot,
     MuJoCoBackend,
     MuJoCoSceneSpec,
     SceneModelSpec,
+    _prefixed,
 )
 from arm_control.scene import load_scene
 
@@ -192,21 +194,41 @@ def build_workcell_backend(
     *,
     launch_viewer: bool = False,
     enable_self_collision: bool = False,
+    loader: Callable | None = None,
 ) -> tuple[MuJoCoBackend, dict[str, dict[str, int]], list[str], int]:
     """Load a generic workcell file and derive actor ports from its schema."""
-    scene = load_scene(scene_path)
+    loaded = loader(scene_path) if loader is not None else load_scene(scene_path)
+    scene = getattr(loaded, "scene", loaded)
+    state = getattr(loaded, "state", None)
+    object_joint_owner = getattr(loaded, "docking_base", None)
+    editor = getattr(loaded, "grasp_editor", None)
+    assembler = getattr(loaded, "assembler", None)
     backend = MuJoCoBackend.from_workcell_scene(
         scene,
+        state,
+        object_joint_owner=object_joint_owner,
         control_period=control_period,
         launch_viewer=launch_viewer,
         enable_self_collision=enable_self_collision,
+        gripper_joints=tuple(
+            _prefixed(assembler, name) for name in getattr(editor, "finger_joints", ())
+        ),
+        finger_body_match=tuple(
+            _prefixed(assembler, name)
+            for name in getattr(editor, "intended_contact_links", ())
+        ),
+        ee_body=(
+            _prefixed(assembler, editor.ee_frame)
+            if assembler is not None and editor is not None
+            else None
+        ),
     )
     start = 0
     slices = {}
-    joint_names = []
     for actor in scene.actors:
         width = len(actor.joints)
+        if actor.name == object_joint_owner:
+            width += len(backend._joint_object)
         slices[actor.name] = {"start": start, "n": width}
-        joint_names.extend(f"{actor.name}__{joint}" for joint in actor.joints)
         start += width
-    return backend, slices, joint_names, len(joint_names)
+    return backend, slices, list(backend.joint_names), len(backend.joint_names)

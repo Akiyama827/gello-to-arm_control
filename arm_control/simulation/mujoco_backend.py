@@ -235,6 +235,40 @@ def _prefixed(name: str, local: str) -> str:
     return f"{name}__{local}"
 
 
+def _prune_unused_meshes(spec: mujoco.MjSpec) -> None:
+    used = {
+        geom.meshname
+        for geom in spec.geoms
+        if geom.type == mujoco.mjtGeom.mjGEOM_MESH
+    }
+    for mesh in list(spec.meshes):
+        if mesh.name not in used:
+            spec.delete(mesh)
+
+
+def _object_scalar_joints(scene: SceneSpec) -> dict[str, str]:
+    """Return fixed command slots for hinge/slide joints in scene objects."""
+    result = {}
+    for obj in scene.objects:
+        child = _load_model_spec(obj.path)
+        for joint in child.joints:
+            if joint.type in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
+                result[_prefixed(obj.name, joint.name)] = obj.name
+    return result
+
+
+def _object_free_bodies(scene: SceneSpec) -> tuple[str, ...]:
+    result = []
+    for obj in scene.objects:
+        child = _load_model_spec(obj.path)
+        result.extend(
+            _prefixed(obj.name, body.name)
+            for body in child.bodies
+            if any(joint.type == mujoco.mjtJoint.mjJNT_FREE for joint in body.joints)
+        )
+    return tuple(result)
+
+
 def compose_workcell_scene(
     scene: SceneSpec,
     state: SceneState,
@@ -279,25 +313,73 @@ def compose_workcell_scene(
     for obj in scene.objects:
         child = _load_model_spec(obj.path)
         attachment = state.attachments.get(obj.name)
-        if attachment is not None:
-            parent_site = spec.site(attachment.parent_frame)
-            parent_body = spec.body(_site_body(spec, attachment.parent_frame))
-            mate = parent_body.add_frame(
-                pos=list(parent_site.pos), quat=list(parent_site.quat)
-            ).add_frame(pos=list(attachment.mate_pose[:3]), quat=list(attachment.mate_pose[3:]))
-            body = child.body(attachment.body)
-            child_site = child.site(attachment.child_frame)
-            for joint in list(body.joints):
-                if joint.type == mujoco.mjtJoint.mjJNT_FREE:
-                    child.delete(joint)
-            body.pos, body.quat = _inverse_pose(child_site.pos, child_site.quat)
-            # ``child`` is attached below with this prefix.  Applying it here
-            # as well double-prefixes the detached body's sites.
-            mate.attach_body(body)
         storage = spec.worldbody.add_frame(
             pos=list(obj.pos), quat=list(_rpy_to_quat(*obj.rpy))
         )
-        spec.attach(child, prefix=f"{obj.name}__", frame=storage)
+        if attachment is None:
+            spec.attach(child, prefix=f"{obj.name}__", frame=storage)
+            continue
+
+        # A separable object can leave its fixture behind.  mjSpec cannot
+        # reparent a body after attaching its source spec, so split two fresh
+        # copies first, prune their disjoint mesh assets, then attach them.
+        equalities = [
+            {
+                "name": equality.name,
+                "type": equality.type,
+                "data": list(equality.data),
+                "active": equality.active,
+                "name1": equality.name1,
+                "name2": equality.name2,
+                "objtype": equality.objtype,
+                "solref": list(equality.solref),
+                "solimp": list(equality.solimp),
+            }
+            for equality in child.equalities
+        ]
+        for equality in list(child.equalities):
+            child.delete(equality)
+        body = child.body(attachment.body)
+        for root in list(child.worldbody.bodies):
+            if root.name != attachment.body:
+                child.delete(root)
+        _prune_unused_meshes(child)
+        child_site = child.site(attachment.child_frame)
+        for joint in list(body.joints):
+            if joint.type == mujoco.mjtJoint.mjJNT_FREE:
+                child.delete(joint)
+        body.pos, body.quat = _inverse_pose(child_site.pos, child_site.quat)
+        parent_site = spec.site(attachment.parent_frame)
+        parent_body = spec.body(_site_body(spec, attachment.parent_frame))
+        mate = parent_body.add_frame(
+            pos=list(parent_site.pos), quat=list(parent_site.quat)
+        ).add_frame(
+            pos=list(attachment.mate_pose[:3]),
+            quat=list(attachment.mate_pose[3:]),
+        )
+        mate.attach_body(body, prefix=f"{obj.name}__")
+
+        fixture = _load_model_spec(obj.path)
+        fixture.delete(fixture.body(attachment.body))
+        for equality in list(fixture.equalities):
+            fixture.delete(equality)
+        _prune_unused_meshes(fixture)
+        spec.attach(fixture, prefix=f"{obj.name}__", frame=storage)
+        for equality in equalities:
+            equality.update(
+                name=_prefixed(obj.name, equality["name"]),
+                name1=(
+                    _prefixed(obj.name, equality["name1"])
+                    if equality["name1"]
+                    else ""
+                ),
+                name2=(
+                    _prefixed(obj.name, equality["name2"])
+                    if equality["name2"]
+                    else ""
+                ),
+            )
+            spec.add_equality(**equality)
     for actuator in list(spec.actuators):
         spec.delete(actuator)
     return spec
@@ -513,6 +595,8 @@ class MuJoCoBackend:
     chain: Any = field(default=None, init=False, repr=False)
     _slots: dict = field(default_factory=dict, init=False, repr=False)
     _joint_slot: dict = field(default_factory=dict, init=False, repr=False)
+    _joint_object: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _object_free_roots: tuple[str, ...] = field(default=(), init=False, repr=False)
     _held: Any = field(default=None, init=False, repr=False)
     _driven: np.ndarray | None = field(default=None, init=False, repr=False)
     _applied_attachments: dict = field(default_factory=dict, init=False, repr=False)
@@ -522,12 +606,24 @@ class MuJoCoBackend:
         cls,
         scene: SceneSpec,
         state: SceneState | None = None,
+        *,
+        object_joint_owner: str | None = None,
         **kwargs,
     ) -> "MuJoCoBackend":
         """Build a plant from the policy-free workcell representation."""
         state = state or scene.state()
-        return cls(
-            joint_names=[_prefixed(actor.name, joint) for actor in scene.actors for joint in actor.joints],
+        object_joints = _object_scalar_joints(scene)
+        if object_joint_owner is not None and object_joint_owner not in scene.actor_names:
+            raise KeyError(f"unknown object joint owner: {object_joint_owner}")
+        joint_names = []
+        for actor in scene.actors:
+            joint_names.extend(_prefixed(actor.name, joint) for joint in actor.joints)
+            if actor.name == object_joint_owner:
+                joint_names.extend(object_joints)
+        if object_joint_owner is None:
+            joint_names.extend(object_joints)
+        backend = cls(
+            joint_names=joint_names,
             workcell_scene=scene,
             scene_state=state,
             default_joint_positions={
@@ -537,6 +633,9 @@ class MuJoCoBackend:
             },
             **kwargs,
         )
+        backend._joint_object = object_joints
+        backend._object_free_roots = _object_free_bodies(scene)
+        return backend
 
     @property
     def loaded(self) -> bool:
@@ -816,6 +915,13 @@ class MuJoCoBackend:
                     raise ValueError(f"unknown scene constraint: {name}")
                 self.data.eq_active[equality] = int(active)
             self._applied_attachments = dict(self.scene_state.attachments)
+            driven = set(self._actuated_joints(spec))
+            for name in self._joint_object:
+                if name not in driven:
+                    dof = self.model.joint(name).dofadr[0]
+                    self.model.dof_frictionloss[dof] = max(
+                        5.0, float(self.model.dof_frictionloss[dof])
+                    )
         self._cache_indices(gripper_present, first=previous[0] is None)
         mujoco.mj_forward(self.model, self.data)
 
@@ -829,10 +935,18 @@ class MuJoCoBackend:
         """
         present = {joint.name for joint in spec.joints}
         docked = set(self.chain.slots) if self.chain is not None else set()
+        attached = (
+            set(self.scene_state.attachments)
+            if self.workcell_scene is not None and self.scene_state is not None
+            else set()
+        )
         out = []
         for name in self.joint_names:
             slot = self._joint_slot.get(name)
             if slot is not None and slot.slot not in docked:
+                continue
+            object_name = self._joint_object.get(name)
+            if object_name is not None and object_name not in attached:
                 continue
             if name in present:
                 out.append(name)
@@ -947,6 +1061,11 @@ class MuJoCoBackend:
             if self.scene is not None
             else ()
         )
+        module_roots = {
+            self.model.body(name).id
+            for name in self._object_free_roots
+            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name) >= 0
+        }
         for i in range(self.model.ngeom):
             geom = self.model.geom(i)
             if geom.contype[0] == 0 and geom.conaffinity[0] == 0:
@@ -973,7 +1092,10 @@ class MuJoCoBackend:
             if self.model.geom_bodyid[i] == 0:  # world body: ground + fixtures
                 geom.contype[:] = 1
                 geom.conaffinity[:] = 2
-            elif module_prefixes and body.startswith(module_prefixes):
+            elif (
+                (module_prefixes and body.startswith(module_prefixes))
+                or self.model.body_rootid[self.model.geom_bodyid[i]] in module_roots
+            ):
                 geom.contype[:] = 2 | 8
                 geom.conaffinity[:] = 1 | 4
             else:
