@@ -6,8 +6,10 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+from dataclasses import dataclass
 from pathlib import Path
 import threading
+from typing import Callable, Mapping
 
 import numpy as np
 import yaml
@@ -16,9 +18,9 @@ from arm_control import frames
 from arm_control.calibration_console import CalibrationStore, validate_grasp_profile
 from arm_control.grasp_visual import GraspVisual
 try:
-    from nodes.motion_teleop import console_asset, main as motion_main
+    from nodes.motion_teleop import VisualFK, console_asset, main as motion_main
 except ModuleNotFoundError:
-    from motion_teleop import console_asset, main as motion_main
+    from motion_teleop import VisualFK, console_asset, main as motion_main
 
 
 def _pose_json(transform: np.ndarray) -> dict[str, list[float]]:
@@ -29,14 +31,62 @@ def _pose_json(transform: np.ndarray) -> dict[str, list[float]]:
     }
 
 
+@dataclass(frozen=True)
+class GraspCheck:
+    status: str
+    detail: str = ""
+    q: tuple[float, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {
+            "checking",
+            "valid",
+            "unreachable",
+            "collision",
+            "error",
+        }:
+            raise ValueError(f"unknown grasp check status: {self.status}")
+        if self.q is not None and (
+            self.status not in {"valid", "collision"}
+            or not self.q
+            or not np.isfinite(np.asarray(self.q, dtype=float)).all()
+        ):
+            raise ValueError("only valid or colliding checks may carry finite q")
+
+
+@dataclass(frozen=True)
+class GraspEditorWorkspace:
+    targets: Mapping[str, Path]
+    default_placements: Mapping[str, str]
+    placements: tuple[str, ...]
+    contexts: tuple[str, ...]
+    build_visual: Callable[[str, str, str], GraspVisual]
+    evaluate: Callable[[str, str, Mapping[str, object]], Mapping[str, GraspCheck]]
+    arm_visual: VisualFK
+
+
+class _NoArmVisual:
+    def scene_json(self, _mesh_prefix: str = "arm-mesh") -> list[dict]:
+        return []
+
+    def mesh_path(self, _index: int) -> Path | None:
+        return None
+
+    def poses(self, _q, _finger_m: float) -> dict:
+        return {"geoms": []}
+
+
 class GraspEditorPanel:
     def __init__(
         self,
-        profile_path: Path,
-        visual: GraspVisual,
+        workspace: GraspEditorWorkspace | Path,
+        visual: GraspVisual | None = None,
         *,
         bind: str,
         port: int,
+        target: str | None = None,
+        placement: str | None = None,
+        context: str | None = None,
     ) -> None:
         try:
             loopback = ipaddress.ip_address(bind).is_loopback
@@ -44,15 +94,45 @@ class GraspEditorPanel:
             raise ValueError("grasp editor bind must be a loopback address") from exc
         if not loopback:
             raise ValueError("grasp editor bind must be a loopback address")
-        self.profile_path = profile_path.resolve(strict=True)
-        self.visual = visual
-        self.store = CalibrationStore((self.profile_path.parent,))
-        self.revision = self.store.revision(self.profile_path)
-        self.raw = yaml.safe_load(self.profile_path.read_text())
-        self.grasp = self._validate(self.raw)
-        self.visual.set_finger_width(self.grasp.finger_width_m)
+        if isinstance(workspace, GraspEditorWorkspace):
+            self.workspace = workspace
+        else:
+            if visual is None:
+                raise ValueError("visual is required for a single grasp profile")
+            profile_path = Path(workspace).resolve(strict=True)
+            name = profile_path.stem
+            self.workspace = GraspEditorWorkspace(
+                targets={name: profile_path},
+                default_placements={name: "default"},
+                placements=("default",),
+                contexts=("default",),
+                build_visual=lambda _target, _placement, _context: visual,
+                evaluate=lambda _target, _placement, _raw: {
+                    "default": GraspCheck("checking")
+                },
+                arm_visual=_NoArmVisual(),
+            )
+            target = target or name
+            placement = placement or "default"
+            context = context or "default"
+        self._validate_workspace()
+        self.store = CalibrationStore(
+            tuple(path.parent for path in self.workspace.targets.values())
+        )
         self.log = ["Visualization only — editing cannot command hardware"]
         self._lock = threading.Lock()
+        self._check_lock = threading.Lock()
+        self.dirty = False
+        self.edit_revision = 0
+        self.target = target or next(iter(self.workspace.targets))
+        self.placement = placement or self.workspace.default_placements[self.target]
+        self.context = context or self.workspace.contexts[0]
+        self.profile_path: Path
+        self.visual: GraspVisual
+        self.revision: str
+        self.raw: Mapping[str, object]
+        self.grasp: object
+        self._activate(self.target, self.placement, self.context)
         panel = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -104,6 +184,22 @@ class GraspEditorPanel:
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                elif route.startswith("arm-mesh/"):
+                    try:
+                        path = panel.workspace.arm_visual.mesh_path(
+                            int(route.split("/", 1)[1])
+                        )
+                    except ValueError:
+                        path = None
+                    if path is None:
+                        self.json({"error": "not found"}, 404)
+                        return
+                    body = path.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 else:
                     self.json({"error": "not found"}, 404)
 
@@ -124,6 +220,11 @@ class GraspEditorPanel:
                     elif self.path.endswith("/grasp/save"):
                         panel.save(payload)
                         editor = panel.state()["module"]
+                    elif self.path.endswith("/selection"):
+                        editor = panel.select(payload)
+                    elif self.path.endswith("/grasp/check"):
+                        self.json(panel.check(payload))
+                        return
                     else:
                         self.json({"error": "not found"}, 404)
                         return
@@ -137,6 +238,44 @@ class GraspEditorPanel:
         self.server = ThreadingHTTPServer((bind, int(port)), Handler)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def _validate_workspace(self) -> None:
+        if not self.workspace.targets:
+            raise ValueError("workspace targets must be non-empty")
+        if (
+            not self.workspace.placements
+            or len(set(self.workspace.placements)) != len(self.workspace.placements)
+            or not self.workspace.contexts
+            or len(set(self.workspace.contexts)) != len(self.workspace.contexts)
+        ):
+            raise ValueError("workspace choices must be non-empty and unique")
+        for name, path in self.workspace.targets.items():
+            if not name:
+                raise ValueError("workspace target names must be non-empty")
+            Path(path).resolve(strict=True)
+            placement = self.workspace.default_placements.get(name)
+            if placement not in self.workspace.placements:
+                raise ValueError(f"missing default storage for module: {name}")
+
+    def _activate(self, target: str, placement: str, context: str) -> None:
+        if target not in self.workspace.targets:
+            raise ValueError(f"unknown module: {target}")
+        if placement not in self.workspace.placements:
+            raise ValueError(f"unknown storage: {placement}")
+        if context not in self.workspace.contexts:
+            raise ValueError(f"unknown context: {context}")
+        load = not hasattr(self, "profile_path") or target != self.target
+        self.target = target
+        self.placement = placement
+        self.context = context
+        self.profile_path = Path(self.workspace.targets[target]).resolve(strict=True)
+        self.visual = self.workspace.build_visual(target, placement, context)
+        if load:
+            self.revision = self.store.revision(self.profile_path)
+            self.raw = yaml.safe_load(self.profile_path.read_text())
+            self.grasp = self._validate(self.raw)
+            self.dirty = False
+        self.visual.set_finger_width(self.grasp.finger_width_m)
 
     def _validate(self, raw) -> object:
         return validate_grasp_profile(
@@ -187,6 +326,17 @@ class GraspEditorPanel:
                 for name, transform in poses.items()
             },
             "revision": self.revision,
+            "edit_revision": self.edit_revision,
+            "choices": {
+                "modules": list(self.workspace.targets),
+                "storages": list(self.workspace.placements),
+                "contexts": list(self.workspace.contexts),
+            },
+            "selection": {
+                "module": self.target,
+                "storage": self.placement,
+                "context": self.context,
+            },
         }
 
     def state(self) -> dict[str, object]:
@@ -226,6 +376,10 @@ class GraspEditorPanel:
             }
             self.raw, self.grasp = raw, grasp
             self.visual.set_finger_width(grasp.finger_width_m)
+            self.raw["calibration_status"] = "draft"
+            self.grasp = self._validate(self.raw)
+            self.dirty = True
+            self.edit_revision += 1
             return self._editor_state()
 
     def save(self, payload: dict[str, object]) -> None:
@@ -240,7 +394,59 @@ class GraspEditorPanel:
                 self.raw,
                 expected_revision=expected,
             )
+            self.dirty = False
             self.log.append("Draft grasp saved with dated backup")
+
+    def select(self, payload: Mapping[str, object]) -> dict[str, object]:
+        with self._lock:
+            target = str(payload.get("module", self.target))
+            placement = str(payload.get("storage", self.placement))
+            context = str(payload.get("context", self.context))
+            if target not in self.workspace.targets:
+                raise ValueError(f"unknown module: {target}")
+            if placement not in self.workspace.placements:
+                raise ValueError(f"unknown storage: {placement}")
+            if context not in self.workspace.contexts:
+                raise ValueError(f"unknown context: {context}")
+            if (
+                target != self.target
+                and self.dirty
+                and payload.get("discard") is not True
+            ):
+                raise ValueError(
+                    "unsaved grasp; save or discard before switching module"
+                )
+            self._activate(target, placement, context)
+            self.edit_revision += 1
+            return self._editor_state()
+
+    def check(self, payload: Mapping[str, object]) -> dict[str, object]:
+        requested = int(payload.get("edit_revision", -1))
+        with self._lock:
+            if requested != self.edit_revision:
+                return {"stale": True, "edit_revision": self.edit_revision}
+            target = self.target
+            placement = self.placement
+            grasp_raw = dict(self.raw["grasp"])
+            finger_width = self.grasp.finger_width_m
+        with self._check_lock:
+            checks = self.workspace.evaluate(target, placement, grasp_raw)
+        with self._lock:
+            if requested != self.edit_revision:
+                return {"stale": True, "edit_revision": self.edit_revision}
+        result = {}
+        for name in self.workspace.contexts:
+            check = checks[name]
+            arm = None
+            if check.q is not None:
+                finger = finger_width / len(self.visual.finger_joints)
+                arm = self.workspace.arm_visual.poses(check.q, finger)["geoms"]
+            result[name] = {
+                "status": check.status,
+                "detail": check.detail,
+                "arm_geoms": arm,
+            }
+        return {"stale": False, "edit_revision": requested, "checks": result}
 
     def close(self) -> None:
         self.server.shutdown()
@@ -257,6 +463,8 @@ class GraspEditorPanel:
             "fixture": [],
             "module": [],
             "tool": [],
+            "fixed": [],
+            "arm": self.workspace.arm_visual.scene_json("arm-mesh"),
             "frames": {
                 self.grasp.reference_link: _pose_json(
                     self.visual.frame_T("module", self.grasp.reference_link)
@@ -268,17 +476,17 @@ class GraspEditorPanel:
         }
         for index, item in enumerate(self.visual.visuals()):
             stat = item.mesh.stat()
-            result[item.group].append(
-                {
-                    "mesh": (
-                        f"mesh/{index}?v={int(stat.st_mtime)}-{stat.st_size}"
-                    ),
-                    "link": item.link,
-                    "color": list(item.color),
-                    "scale": list(item.scale),
-                    **_pose_json(item.T),
-                }
-            )
+            entry = {
+                "mesh": f"mesh/{index}?v={int(stat.st_mtime)}-{stat.st_size}",
+                "link": item.link,
+                "color": list(item.color),
+                "scale": list(item.scale),
+                "emphasized": bool(getattr(item, "emphasized", False)),
+                **_pose_json(item.T),
+            }
+            result.setdefault(item.group, []).append(entry)
+            if item.group != "tool":
+                result["fixed"].append(entry)
         return result
 
 

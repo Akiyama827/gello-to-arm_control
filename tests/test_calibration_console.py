@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
@@ -12,8 +13,15 @@ from arm_control.calibration_console import (
 )
 from arm_control.assets import asset_fingerprint
 from arm_control.grasp_visual import VisualGeometry
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import nodes.calibration_console as calibration_console_node
-from nodes.calibration_console import GraspEditorPanel
+from nodes.calibration_console import (
+    GraspCheck,
+    GraspEditorPanel,
+    GraspEditorWorkspace,
+)
 from nodes.motion_teleop import console_asset
 
 
@@ -136,6 +144,24 @@ def test_grasp_page_uses_real_geometry_and_finger_control():
     assert "editorPregraspTool.group.visible = !samePose" in app
     assert "editorRetreatTool.group.visible = !samePose" in app
     assert app.count('$("grip-readout").value = `${value.toFixed(3)} m`') == 2
+    for ident in (
+        "module-select",
+        "storage-select",
+        "context-select",
+        "show-arm",
+        "pose-x",
+        "pose-y",
+        "pose-z",
+        "pose-roll",
+        "pose-pitch",
+        "pose-yaw",
+        "storage-ik",
+        "dock-ik",
+    ):
+        assert f'id="{ident}"' in html
+    assert "setTimeout(runEditorChecks, 150)" in app
+    assert "result.edit_revision !== editorEditRevision" in app
+    assert 'new THREE.Euler(roll, pitch, yaw, "ZYX")' in app
 
 
 def _grasp_profile_assets(tmp_path):
@@ -290,6 +316,33 @@ class _FakeGraspVisual:
         }
 
 
+class _FakeArmVisual:
+    def __init__(self, mesh):
+        self.mesh = mesh
+
+    def scene_json(self, mesh_prefix="mesh"):
+        return [
+            {
+                "mesh": f"{mesh_prefix}/0",
+                "color": [0.2, 0.3, 0.4, 1.0],
+                "scale": [1.0, 1.0, 1.0],
+            }
+        ]
+
+    def mesh_path(self, index):
+        return self.mesh if index == 0 else None
+
+    def poses(self, q, finger_m):
+        return {
+            "geoms": [
+                {
+                    "p": [float(q[0]), finger_m, 0.0],
+                    "q": [0.0, 0.0, 0.0, 1.0],
+                }
+            ]
+        }
+
+
 class _FakeServer:
     def __init__(self, address, _handler):
         self.server_address = (address[0], 12345)
@@ -331,6 +384,89 @@ def test_grasp_panel_exposes_context_and_three_pose_reports(tmp_path, monkeypatc
             "retreat",
         }
         assert visual.finger_width_m == 0.03
+    finally:
+        panel.close()
+
+
+def test_grasp_panel_workspace_selection_stale_checks_and_save(tmp_path, monkeypatch):
+    module_urdf, tool_urdf, raw_a = _grasp_profile_assets(tmp_path)
+    raw_b = yaml.safe_load(yaml.safe_dump(raw_a, sort_keys=False))
+    raw_a["module_type"] = "part_a"
+    raw_a["calibration_status"] = "approved"
+    raw_b["module_type"] = "part_b"
+    profile_a = tmp_path / "part_a.yaml"
+    profile_b = tmp_path / "part_b.yaml"
+    profile_a.write_text(yaml.safe_dump(raw_a, sort_keys=False))
+    profile_b.write_text(yaml.safe_dump(raw_b, sort_keys=False))
+    mesh = tmp_path / "part.stl"
+    mesh.write_bytes(b"solid part\nendsolid part\n")
+    built = []
+
+    def build_visual(target, placement, context):
+        built.append((target, placement, context))
+        return _FakeGraspVisual(module_urdf, tool_urdf, mesh)
+
+    workspace = GraspEditorWorkspace(
+        targets={"part_a": profile_a, "part_b": profile_b},
+        default_placements={"part_a": "storage_1", "part_b": "storage_2"},
+        placements=("storage_1", "storage_2"),
+        contexts=("storage", "dock"),
+        build_visual=build_visual,
+        evaluate=lambda _target, _placement, _grasp_raw: {
+            "storage": GraspCheck("valid", "ok", (0.1,)),
+            "dock": GraspCheck("unreachable", "too far"),
+        },
+        arm_visual=_FakeArmVisual(mesh),
+    )
+    monkeypatch.setattr(calibration_console_node, "ThreadingHTTPServer", _FakeServer)
+    panel = GraspEditorPanel(workspace, bind="127.0.0.1", port=0)
+    try:
+        state = panel.state()["module"]
+        assert state["choices"] == {
+            "modules": ["part_a", "part_b"],
+            "storages": ["storage_1", "storage_2"],
+            "contexts": ["storage", "dock"],
+        }
+        assert state["selection"] == {
+            "module": "part_a",
+            "storage": "storage_1",
+            "context": "storage",
+        }
+
+        revision = state["edit_revision"]
+        panel.update(
+            {
+                "pos": [0.01, 0.02, 0.03],
+                "quat": [1, 0, 0, 0],
+                "finger_width_m": 0.03,
+                "approach_offset_m": [0, 0, 0.1],
+                "retreat_offset_m": [0, 0, -0.1],
+            }
+        )
+        assert panel.check({"edit_revision": revision}) == {
+            "stale": True,
+            "edit_revision": panel.state()["module"]["edit_revision"],
+        }
+        assert panel.state()["module"]["status"] == "draft"
+        assert yaml.safe_load(profile_a.read_text())["calibration_status"] == "approved"
+        with pytest.raises(
+            ValueError,
+            match="unsaved grasp; save or discard before switching module",
+        ):
+            panel.select({"module": "part_b"})
+        panel.select({"storage": "storage_2"})
+        panel.select({"context": "dock"})
+        assert yaml.safe_load(profile_a.read_text())["calibration_status"] == "approved"
+        current = panel.state()["module"]
+        before_b = profile_b.read_bytes()
+        panel.save({"confirm": True, "expected_revision": current["revision"]})
+        assert profile_b.read_bytes() == before_b
+        saved = yaml.safe_load(profile_a.read_text())
+        assert saved["calibration_status"] == "draft"
+        assert saved["grasp"]["link_T_ee"]["pos"] == [0.01, 0.02, 0.03]
+        assert len(list(tmp_path.glob("part_a.yaml.*.bak"))) == 1
+        assert list(tmp_path.glob("part_b.yaml.*.bak")) == []
+        assert built[-1] == ("part_a", "storage_2", "dock")
     finally:
         panel.close()
 

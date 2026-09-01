@@ -10,8 +10,9 @@ const post = async (route, payload) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!response.ok) throw new Error(`${route}: ${response.status}`);
-  return response.json();
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || `${route}: ${response.status}`);
+  return body;
 };
 
 const view = $("view");
@@ -126,6 +127,12 @@ let editorFingerSlider = null;
 let editorCurrentTool = null;
 let editorPregraspTool = null;
 let editorRetreatTool = null;
+let editorFixedGroup = null;
+let editorArm = null;
+let editorArmBaseColors = [];
+let editorCheckTimer = null;
+let editorEditRevision = 0;
+let editorChecks = null;
 const previousQuaternion = new THREE.Quaternion();
 gizmo.addEventListener("dragging-changed", (event) => {
   draggingGizmo = event.value;
@@ -140,6 +147,7 @@ gizmo.addEventListener("objectChange", () => {
     const now = performance.now();
     if (now - lastGizmoSend < 80) return;
     lastGizmoSend = now;
+    syncPoseFields();
     sendEditorGrasp().catch((error) => {
       $("grasp-status").textContent = error.message;
     });
@@ -274,6 +282,46 @@ const csvVector = (id) => {
   return values;
 };
 
+const syncPoseFields = () => {
+  if (!editorReferenceMatrix) return;
+  gizmoTarget.updateMatrix();
+  const local = editorReferenceMatrix.clone().invert().multiply(gizmoTarget.matrix);
+  const position = new THREE.Vector3();
+  const quaternion = new THREE.Quaternion();
+  local.decompose(position, quaternion, new THREE.Vector3());
+  const euler = new THREE.Euler().setFromQuaternion(quaternion, "ZYX");
+  $("pose-x").value = (position.x * 1000).toFixed(3);
+  $("pose-y").value = (position.y * 1000).toFixed(3);
+  $("pose-z").value = (position.z * 1000).toFixed(3);
+  $("pose-roll").value = THREE.MathUtils.radToDeg(euler.x).toFixed(3);
+  $("pose-pitch").value = THREE.MathUtils.radToDeg(euler.y).toFixed(3);
+  $("pose-yaw").value = THREE.MathUtils.radToDeg(euler.z).toFixed(3);
+};
+
+const applyPoseFields = async () => {
+  const mm = ["pose-x", "pose-y", "pose-z"].map((id) => Number($(id).value));
+  const degrees = ["pose-roll", "pose-pitch", "pose-yaw"].map(
+    (id) => Number($(id).value),
+  );
+  if ([...mm, ...degrees].some((value) => !Number.isFinite(value))) {
+    throw new Error("XYZ and RPY must be finite numbers");
+  }
+  const [roll, pitch, yaw] = degrees.map(THREE.MathUtils.degToRad);
+  const local = new THREE.Matrix4().compose(
+    new THREE.Vector3(...mm.map((value) => value / 1000)),
+    new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(roll, pitch, yaw, "ZYX"),
+    ),
+    new THREE.Vector3(1, 1, 1),
+  );
+  editorReferenceMatrix.clone().multiply(local).decompose(
+    gizmoTarget.position,
+    gizmoTarget.quaternion,
+    new THREE.Vector3(),
+  );
+  await sendEditorGrasp();
+};
+
 async function sendEditorGrasp() {
   if (!editorReferenceMatrix) return;
   gizmoTarget.updateMatrix();
@@ -290,6 +338,7 @@ async function sendEditorGrasp() {
   });
   updateEditorState(response.editor);
   $("grasp-status").textContent = "Draft changed in memory — Save draft to persist";
+  scheduleEditorChecks();
   return response.editor;
 }
 
@@ -332,8 +381,71 @@ const samePose = (left, right) => left.every(
   (value, index) => Math.abs(value - right[index]) < 1e-9,
 );
 
+const setCheckBadge = (name, status, detail) => {
+  const badge = $(`${name}-ik`);
+  if (!badge) return;
+  badge.className = "status";
+  badge.classList.add(
+    status === "valid" ? "live"
+      : status === "checking" ? "neutral"
+        : status === "collision" ? "warn" : "fault",
+  );
+  badge.textContent = `${name[0].toUpperCase()}${name.slice(1)}: ${status}`;
+  badge.title = detail || "";
+};
+
+const showSelectedArm = () => {
+  const check = editorChecks ? editorChecks[$("context-select").value] : null;
+  const visible = Boolean(
+    editorArm
+      && $("show-arm").checked
+      && check
+      && check.arm_geoms
+      && !["unreachable", "error"].includes(check.status),
+  );
+  setPoses(editorArm, visible ? check.arm_geoms : null);
+  if (editorArm) {
+    editorArm.parts.forEach((part, index) => {
+      part.material.color.copy(
+        check && check.status === "collision"
+          ? new THREE.Color(0xaf3932)
+          : editorArmBaseColors[index],
+      );
+    });
+  }
+  if (editorCurrentTool) editorCurrentTool.group.visible = !visible;
+};
+
+const scheduleEditorChecks = () => {
+  clearTimeout(editorCheckTimer);
+  editorChecks = null;
+  setCheckBadge("storage", "checking", "");
+  setCheckBadge("dock", "checking", "");
+  showSelectedArm();
+  editorCheckTimer = setTimeout(runEditorChecks, 150);
+};
+
+const runEditorChecks = async () => {
+  try {
+    const result = await post("/grasp/check", {
+      edit_revision: editorEditRevision,
+    });
+    if (result.stale || result.edit_revision !== editorEditRevision) return;
+    editorChecks = result.checks;
+    for (const name of ["storage", "dock"]) {
+      const check = editorChecks[name];
+      setCheckBadge(name, check.status, check.detail);
+    }
+    showSelectedArm();
+  } catch (error) {
+    setCheckBadge("storage", "error", error.message);
+    setCheckBadge("dock", "error", error.message);
+  }
+};
+
 const updateEditorState = (editor) => {
   if (!editor) return;
+  editorEditRevision = editor.edit_revision;
   setToolPose(editorPregraspTool, editor.pregrasp_pose);
   setToolPose(editorRetreatTool, editor.retreat_pose);
   editorPregraspTool.group.visible = !samePose(editor.pregrasp_pose, editor.ee_pose);
@@ -355,6 +467,7 @@ const updateEditorState = (editor) => {
   $("plan-summary").textContent = report.ok
     ? "Editor collision preview clear"
     : `Forbidden contact: ${report.forbidden_tool_links.join(", ")}`;
+  syncPoseFields();
 };
 
 const refreshEditorTool = async () => {
@@ -364,20 +477,46 @@ const refreshEditorTool = async () => {
   updateToolParts(editorRetreatTool, geometry.tool || []);
 };
 
-const buildModuleEditor = async (state) => {
-  editorMode = true;
+const setOptions = (select, values, selected) => {
+  select.replaceChildren();
+  select.dataset.current = selected;
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    option.selected = value === selected;
+    select.appendChild(option);
+  }
+};
+
+const syncSelectionControls = (editor) => {
+  setOptions($("module-select"), editor.choices.modules, editor.selection.module);
+  setOptions($("storage-select"), editor.choices.storages, editor.selection.storage);
+  setOptions($("context-select"), editor.choices.contexts, editor.selection.context);
+};
+
+const rebuildEditorScene = async (state, frameCamera) => {
   const geometry = await (await fetch("/scene")).json();
-  const moduleGroup = new THREE.Group();
-  scene.add(moduleGroup);
-  for (const item of [...(geometry.fixture || []), ...(geometry.module || [])]) {
+  if (editorFixedGroup) scene.remove(editorFixedGroup);
+  if (editorPregraspTool) scene.remove(editorPregraspTool.group);
+  if (editorRetreatTool) scene.remove(editorRetreatTool.group);
+  if (editorArm) scene.remove(editorArm.group);
+  gizmoTarget.clear();
+  editorFixedGroup = new THREE.Group();
+  scene.add(editorFixedGroup);
+  for (const item of geometry.fixed || [...(geometry.fixture || []), ...(geometry.module || [])]) {
     const mesh = new THREE.Mesh(
       await loadGeometry(item.mesh),
-      new THREE.MeshPhongMaterial({ color: new THREE.Color(...item.color) }),
+      new THREE.MeshPhongMaterial({
+        color: new THREE.Color(...item.color),
+        transparent: item.emphasized === false,
+        opacity: item.emphasized === false ? 0.34 : 1,
+      }),
     );
     mesh.scale.set(...item.scale);
     mesh.position.set(...item.p);
     mesh.quaternion.set(...item.q);
-    moduleGroup.add(mesh);
+    editorFixedGroup.add(mesh);
   }
   for (const [name, pose] of Object.entries(geometry.frames || {})) {
     const axes = new THREE.AxesHelper(0.055);
@@ -385,26 +524,37 @@ const buildModuleEditor = async (state) => {
     axes.quaternion.set(...pose.q);
     axes.name = name;
     if (name === state.module.ee_frame) gizmoTarget.add(axes);
-    else moduleGroup.add(axes);
+    else editorFixedGroup.add(axes);
   }
   editorCurrentTool = await buildEditorTool(geometry.tool || [], 1);
   editorPregraspTool = await buildEditorTool(geometry.tool || [], 0.28, new THREE.Color(0x55aa7a));
   editorRetreatTool = await buildEditorTool(geometry.tool || [], 0.24, new THREE.Color(0x6d9fc0));
+  editorArm = await buildRobot(geometry.arm || [], null, 1);
+  editorArmBaseColors = (geometry.arm || []).map((item) => new THREE.Color(...item.color));
   gizmoTarget.add(editorCurrentTool.group);
   scene.add(editorPregraspTool.group, editorRetreatTool.group);
   editorReferenceMatrix = wxyzPoseMatrix(state.module.reference_pose);
   const ee = wxyzPoseMatrix(state.module.ee_pose);
   ee.decompose(gizmoTarget.position, gizmoTarget.quaternion, new THREE.Vector3());
   updateEditorState(state.module);
-  const bounds = new THREE.Box3().setFromObject(moduleGroup).expandByObject(gizmoTarget);
-  const center = bounds.getCenter(new THREE.Vector3());
-  const size = Math.max(bounds.getSize(new THREE.Vector3()).length(), 0.08);
-  orbit.target.copy(center);
-  camera.position.copy(center).add(new THREE.Vector3(1, -1, 0.75).normalize().multiplyScalar(size * 2.2));
-  camera.near = Math.max(size / 100, 0.001);
-  camera.far = Math.max(size * 30, 2);
-  camera.updateProjectionMatrix();
-  orbit.update();
+  showSelectedArm();
+  if (frameCamera) {
+    const bounds = new THREE.Box3().setFromObject(editorFixedGroup).expandByObject(gizmoTarget);
+    const center = bounds.getCenter(new THREE.Vector3());
+    const size = Math.max(bounds.getSize(new THREE.Vector3()).length(), 0.08);
+    orbit.target.copy(center);
+    camera.position.copy(center).add(new THREE.Vector3(1, -1, 0.75).normalize().multiplyScalar(size * 2.2));
+    camera.near = Math.max(size / 100, 0.001);
+    camera.far = Math.max(size * 30, 2);
+    camera.updateProjectionMatrix();
+    orbit.update();
+  }
+};
+
+const buildModuleEditor = async (state) => {
+  editorMode = true;
+  await rebuildEditorScene(state, true);
+  syncSelectionControls(state.module);
   $("actor-select").innerHTML = `<option>${state.module.type} grasp</option>`;
   deadmanButton.disabled = true;
   deadmanButton.querySelector("span").textContent = "Visualization only";
@@ -435,6 +585,7 @@ const buildModuleEditor = async (state) => {
   $("wrench-summary").textContent = "Not connected in visualization mode";
   editorRevision = state.module.revision;
   $("grasp-status").textContent = `${state.module.status} / ${state.module.reference_link}`;
+  scheduleEditorChecks();
   $("save-grasp").onclick = async () => {
     if (!confirm("Save this draft grasp and create a dated backup?")) return;
     await sendEditorGrasp();
@@ -449,6 +600,56 @@ const buildModuleEditor = async (state) => {
   building = false;
   resize();
 };
+
+const changeSelection = async () => {
+  try {
+    const result = await post("/selection", {
+      module: $("module-select").value,
+      storage: $("storage-select").value,
+      context: $("context-select").value,
+    });
+    const state = { module: result.editor };
+    editorRevision = result.revision;
+    syncSelectionControls(result.editor);
+    $("grasp-approach").value = result.editor.approach_offset_m.join(", ");
+    $("grasp-retreat").value = result.editor.retreat_offset_m.join(", ");
+    await rebuildEditorScene(state, false);
+    scheduleEditorChecks();
+  } catch (error) {
+    $("grasp-status").textContent = error.message;
+    syncSelectionControls({
+      choices: {
+        modules: [...$("module-select").options].map((option) => option.value),
+        storages: [...$("storage-select").options].map((option) => option.value),
+        contexts: [...$("context-select").options].map((option) => option.value),
+      },
+      selection: {
+        module: $("module-select").dataset.current,
+        storage: $("storage-select").dataset.current,
+        context: $("context-select").dataset.current,
+      },
+    });
+  }
+};
+
+for (const id of ["module-select", "storage-select", "context-select"]) {
+  $(id).addEventListener("change", changeSelection);
+}
+$("show-arm").addEventListener("change", showSelectedArm);
+for (const id of ["pose-x", "pose-y", "pose-z", "pose-roll", "pose-pitch", "pose-yaw"]) {
+  $(id).addEventListener("blur", () => {
+    applyPoseFields().catch((error) => {
+      $("grasp-status").textContent = error.message;
+    });
+  });
+  $(id).addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    applyPoseFields().catch((error) => {
+      $("grasp-status").textContent = error.message;
+    });
+  });
+}
 
 const build = async (state) => {
   building = true;
