@@ -78,6 +78,14 @@ class ObstacleSpec:
 
 
 @dataclass(frozen=True)
+class FixedModelSpec:
+    name: str
+    path: Path
+    pos: tuple[float, float, float]
+    rpy: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
 class Attachment:
     object_name: str
     body: str
@@ -97,6 +105,7 @@ class SceneSpec:
     actors: tuple[ActorSpec, ...]
     objects: tuple[ObjectSpec, ...]
     obstacles: tuple[ObstacleSpec, ...]
+    fixtures: tuple[FixedModelSpec, ...] = ()
 
     def state(self) -> "SceneState":
         return SceneState(actor_q={actor.name: list(actor.q) for actor in self.actors})
@@ -166,7 +175,8 @@ def load_scene(path: str | Path) -> SceneSpec:
     actor_entries = _mapping(scene.get("actors"), "scene.actors")
     object_entries = _mapping(scene.get("objects", {}), "scene.objects")
     obstacle_entries = _mapping(scene.get("obstacles", {}), "scene.obstacles")
-    names = [*actor_entries, *object_entries, *obstacle_entries]
+    fixture_entries = _mapping(scene.get("fixtures", {}), "scene.fixtures")
+    names = [*actor_entries, *object_entries, *obstacle_entries, *fixture_entries]
     if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
         raise ValueError("scene names must be non-empty and unique")
 
@@ -202,9 +212,20 @@ def load_scene(path: str | Path) -> SceneSpec:
             obstacles.append(ObstacleSpec(name, shape, None, pos, rpy, path))
         else:
             raise ValueError(f"scene.obstacles.{name}.shape must be 'box' or 'mesh'")
+    fixtures: list[FixedModelSpec] = []
+    for name, value in fixture_entries.items():
+        fixture = _mapping(value, f"scene.fixtures.{name}")
+        fixtures.append(
+            FixedModelSpec(
+                name,
+                _path(fixture.get("path"), source, f"scene.fixtures.{name}"),
+                _vec(fixture.get("pos", (0, 0, 0)), f"scene.fixtures.{name}.pos"),
+                _vec(fixture.get("rpy", (0, 0, 0)), f"scene.fixtures.{name}.rpy"),
+            )
+        )
     if not actors:
         raise ValueError("scene.actors must be non-empty")
-    return SceneSpec(tuple(actors), objects, tuple(obstacles))
+    return SceneSpec(tuple(actors), objects, tuple(obstacles), tuple(fixtures))
 
 
 def _demo() -> None:

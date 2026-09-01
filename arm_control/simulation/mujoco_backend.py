@@ -304,6 +304,20 @@ def compose_workcell_scene(
             spec.add_mesh(name=mesh_name, file=str(obstacle.path))
             kwargs.update(type=mujoco.mjtGeom.mjGEOM_MESH, meshname=mesh_name)
         spec.worldbody.add_geom(**kwargs)
+    for fixture in scene.fixtures:
+        child = _load_model_spec(fixture.path)
+        if list(child.joints):
+            raise ValueError(f"fixed model {fixture.name} must have zero DoF")
+        body = spec.worldbody.add_body(
+            name=fixture.name,
+            pos=list(fixture.pos),
+            quat=list(_rpy_to_quat(*fixture.rpy)),
+        )
+        spec.attach(
+            child,
+            prefix=f"{fixture.name}__",
+            frame=body.add_frame(),
+        )
     for actor in scene.actors:
         child = _load_model_spec(actor.path)
         spec.attach(
