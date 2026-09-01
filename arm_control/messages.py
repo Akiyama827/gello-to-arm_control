@@ -296,6 +296,63 @@ def unpack_grasp_result(payload: pa.Array) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Base-tilt request/result — the orchestrator <-> base_driver wire contract.
+# Low-rate control-plane messages (one per TILT_BASE/RETURN_BASE phase), so
+# JSON via pack_json_message rather than a new binary layout, matching grasp.
+# --------------------------------------------------------------------------- #
+
+
+def pack_base_tilt_request(
+    *, request_id: str, module_id: str, tilt_rad: float | None,
+) -> pa.Array:
+    """``tilt_rad`` is the commanded angle for a KNOWN target (``RETURN_BASE``'s
+    0.0); ``None`` asks the driver to SOLVE the seat tilt itself against the
+    live scene (``TILT_BASE`` — the coordinator carries no static
+    ``dock_tilt_rad`` constant to hand it one; the seat pose moves with the
+    stack frontier)."""
+    return pack_json_message(
+        "base_tilt_request",
+        {
+            "request_id": request_id,
+            "module_id": module_id,
+            "tilt_rad": None if tilt_rad is None else float(tilt_rad),
+        },
+    )
+
+
+def unpack_base_tilt_request(payload: pa.Array) -> dict:
+    return unpack_json_message(payload, expected_schema="base_tilt_request")
+
+
+def pack_base_tilt_result(
+    *,
+    request_id: str,
+    ok: bool,
+    tilt_rad: float,
+    error_rad: float,
+    reason: str = "",
+    settle_s: float = 0.0,
+) -> pa.Array:
+    """Reports what was ASKED and what HAPPENED: the commanded/solved angle,
+    the settled error, and how long it took — never just a bare ok/fail."""
+    return pack_json_message(
+        "base_tilt_result",
+        {
+            "request_id": request_id,
+            "ok": bool(ok),
+            "tilt_rad": float(tilt_rad),
+            "error_rad": float(error_rad),
+            "settle_s": float(settle_s),
+            "reason": reason,
+        },
+    )
+
+
+def unpack_base_tilt_result(payload: pa.Array) -> dict:
+    return unpack_json_message(payload, expected_schema="base_tilt_result")
+
+
+# --------------------------------------------------------------------------- #
 # module_poses — the perception -> orchestrator contract. Hand-rolled on both
 # ends until 2026-07-26; once perception lives in its own repo this codec is
 # the ONLY place the schema exists, so drift between publisher and consumer
@@ -350,6 +407,10 @@ __all__ = [
     "unpack_grasp_request",
     "pack_grasp_result",
     "unpack_grasp_result",
+    "pack_base_tilt_request",
+    "unpack_base_tilt_request",
+    "pack_base_tilt_result",
+    "unpack_base_tilt_result",
     "pack_module_poses",
     "unpack_module_poses",
 ]
