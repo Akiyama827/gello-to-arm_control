@@ -394,12 +394,16 @@ class MuJoCoCollisionWorld:
     def set_held_positions(self, positions: dict[str, float]) -> None:
         for name, value in positions.items():
             joint = self.model.joint(str(name))
-            if joint.qposadr.size != 1 or not np.isfinite(float(value)):
+            value = float(value)
+            if joint.qposadr.size != 1 or self.model.jnt_type[joint.id] not in (
+                mujoco.mjtJoint.mjJNT_HINGE,
+                mujoco.mjtJoint.mjJNT_SLIDE,
+            ) or not np.isfinite(value):
                 raise ValueError(f"held joint {name!r} needs one finite position")
             address = int(joint.qposadr[0])
             if address in self._qadr:
                 raise ValueError(f"planned joint {name!r} cannot be held")
-            self._held_qpos[address] = float(value)
+            self._held_qpos[address] = value
 
     def _full_q(self, q: np.ndarray) -> np.ndarray:
         out = self._held_qpos.copy()

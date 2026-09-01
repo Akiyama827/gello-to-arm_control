@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import mujoco
 
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.scene import load_scene
@@ -63,6 +64,24 @@ def test_held_positions_update_only_non_planned_qpos(tmp_path):
     assert world._held_qpos[planned_addr] == 0.0
     with pytest.raises(ValueError, match="planned joint"):
         world.set_held_positions({"axis": 0.1})
+
+
+def test_held_positions_reject_multi_qpos_joint():
+    world = MuJoCoCollisionWorld.__new__(MuJoCoCollisionWorld)
+    world.model = mujoco.MjModel.from_xml_string(
+        "<mujoco><worldbody><body name='floating'>"
+        "<freejoint name='root'/>"
+        "<geom type='sphere' size='.01'/>"
+        "<body name='arm'>"
+        "<joint name='axis' type='slide' axis='1 0 0' range='-1 1'/>"
+        "<geom type='sphere' size='.01'/>"
+        "</body></body></worldbody></mujoco>"
+    )
+    world._qadr = np.array([int(world.model.joint("axis").qposadr[0])])
+    world._held_qpos = world.model.qpos0.copy()
+
+    with pytest.raises(ValueError, match="one finite position"):
+        world.set_held_positions({"root": 0.2})
 
 
 def test_scene_held_positions_preserve_non_planned_actor_q(tmp_path):
