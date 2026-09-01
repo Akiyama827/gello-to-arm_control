@@ -241,9 +241,15 @@ def main() -> None:
 
                 if etype == "INPUT" and eid == "motor_command_gripper":
                     # Finger servo targets (not an arm slice): drive the
-                    # scene's gripper joints so closing is physical.
+                    # scene's gripper joints so closing is physical. A nonzero
+                    # TORQUE slot means grasp(force) instead of move(width):
+                    # close under that force cap and let contact stop the
+                    # fingers. Reuses the motor_command torque field rather
+                    # than adding a second gripper message.
+                    gripper_cmd = unpack_motor_command(event["value"], 2)
                     backend.apply_gripper_command(
-                        unpack_motor_command(event["value"], 2)["position"]
+                        gripper_cmd["position"],
+                        force_n=float(max(abs(t) for t in gripper_cmd["torque"])),
                     )
                 elif etype == "INPUT" and eid == "scene_command" and backend.scene_state:
                     request = unpack_scene_command(event["value"])

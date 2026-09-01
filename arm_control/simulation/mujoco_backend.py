@@ -283,6 +283,17 @@ def compose_workcell_scene(
     """
     spec = mujoco.MjSpec()
     spec.option.timestep = float(timestep)
+    # Contact-solver settings for a CONTACT-physical grasp, identical to
+    # build_scene_backend's. They belong on the parent because mjSpec.attach
+    # discards the child models' own options. Without them this path ran on
+    # MuJoCo's defaults -- pyramidal cone, impratio 1, no noslip pass -- and a
+    # sustained grip CREEPS straight through the module: measured, the pads
+    # sank from a 57 mm pinch to the fingers' 0 mm stop (and 1.7 mm past the
+    # joint limit) over ~6 s of carry, at every grip force from 12 to 40 N.
+    spec.option.impratio = 10.0
+    spec.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+    spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    spec.option.noslip_iterations = 5
     if ground_z is not None:
         spec.worldbody.add_geom(
             name="ground", type=mujoco.mjtGeom.mjGEOM_PLANE,
@@ -1034,6 +1045,7 @@ class MuJoCoBackend:
             )
             for n in gripper_present
         ]
+        self._gripper_force_mode = getattr(self, "_gripper_force_mode", False)
         if not first:
             return
         # Servo targets start at the spawn rest (ctrl defaults to 0, which for
@@ -1116,12 +1128,35 @@ class MuJoCoBackend:
                 geom.contype[:] = 2
                 geom.conaffinity[:] = 1
 
-    def apply_gripper_command(self, positions) -> None:
+    def apply_gripper_command(self, positions, force_n: float = 0.0) -> None:
         """Servo the finger joints toward ``positions`` (clamped to travel).
+
+        ``force_n`` > 0 lowers the finger servos' force cap to it for this and
+        every later command, which with a full-close target is the plant's
+        analog of the Franka Hand's ``grasp(force)``: each finger drives inward
+        under that cap until contact stops it, so the object settles between
+        the pads. Which target is "closed" is the caller's to know -- the plant
+        only caps the force.
+
+        This matters because a POSITION command is symmetric about the hand
+        centre and so can only pinch a perfectly centred object. Measured on
+        the bench grasp: the module sits ~5 mm off centre, so one finger jammed
+        on it at 6 N while the other closed to target through free air -- a
+        one-sided shove the module slid out of. Under force both fingers load
+        equally (-10/-10 N, both in contact).
 
         The plant takes every command verbatim: gripper OWNERSHIP (grasp gate
         vs orchestrator open/hold) is bridge policy, not plant policy."""
+        self._gripper_force_mode = force_n > 0.0
+        self._set_gripper_force(force_n if force_n > 0.0 else self.gripper_force_n)
         self._set_gripper_targets(positions)
+
+    def _set_gripper_force(self, force_n: float) -> None:
+        """Cap every finger servo at ``force_n`` (N)."""
+        if not getattr(self, "_gripper_act", None):
+            return
+        for act in self._gripper_act:
+            self.model.actuator_forcerange[act] = (-float(force_n), float(force_n))
 
     def _set_gripper_targets(self, positions) -> None:
         if not getattr(self, "_gripper_act", None):
@@ -1312,7 +1347,10 @@ class MuJoCoBackend:
             # module over (measured: reaching for s0 picked up s2, which the
             # open hand then immediately "released unseated"). Same test the
             # release branch uses, so the two can never disagree.
-            hand_open = all(
+            # A force-limited grasp is never open, whatever the target reads:
+            # its full-close command can land ON the open sentinel (this FR3
+            # spawns with ctrl 0, and 0 is also the fingers' closed stop).
+            hand_open = not self._gripper_force_mode and all(
                 abs(float(self.data.ctrl[a]) - o) <= 0.004
                 for a, o in zip(self._gripper_act, self._gripper_open_ctrl)
             )

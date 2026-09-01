@@ -142,16 +142,20 @@ class SimHand:
     settle on a 57 mm module). (2) Verdict is width-only, like grasp():
     fingers BLOCKED short of the commanded width = object present (an empty
     close reaches the target exactly), plus the epsilon band. (3) On HELD,
-    a force phase drives the targets to full close against the jam so the
-    plant's per-finger force cap becomes the sustained grip (a position
-    servo AT the settle width holds ~zero force — the module would ratchet
-    out during the carry). Feeds the same HandGraspFsm the real node runs.
+    the hold hands the fingers to the plant's FORCE mode at the configured
+    grasp force, exactly like the real grasp(force). Neither width command
+    can hold: a servo AT the settle width holds ~zero force and the module
+    ratchets out during the carry, while a narrower one is symmetric about
+    the hand centre and so only pinches a CENTRED object -- measured on the
+    bench module, which sits ~5 mm off centre, one finger jammed on it at
+    6 N while the other closed through free air. Under force both fingers
+    load equally and the module settles between the pads.
+    Feeds the same HandGraspFsm the real node runs.
     """
 
     SETTLE_WINDOW_S = 0.2
     SETTLE_TOL_M = 0.0005
     CONTACT_TOL_M = 0.003  # blocked this far short of the command = contact
-    FORCE_CLOSE_EXTRA_M = 0.010  # hold-phase squeeze past the jam width
     EFFORT_FLOOR_N = 2.0  # held module keeps the servos loaded (5-12 N meas.)
 
     def __init__(self, fsm: HandGraspFsm) -> None:
@@ -161,6 +165,7 @@ class SimHand:
         self.gdone_ok = False
         self.state: dict | None = None
         self.finger_cmd: np.ndarray | None = None  # per-finger targets to send
+        self.finger_force = 0.0  # >0 = plant closes under this force cap
         self._cmd_w: float | None = None    # ramped width command
         self._target_w = 0.0
         self._last_t: float | None = None
@@ -171,6 +176,7 @@ class SimHand:
             self.fsm.grasp_width_m if action == "grasp" else self.fsm.open_width_m
         )
         self.mode = "closing" if action == "grasp" else "opening"
+        self.finger_force = 0.0
         self._last_t = now
         self._hist.clear()
         if action != "grasp":
@@ -225,14 +231,17 @@ class SimHand:
                     flush=True,
                 )
                 if self.gdone_ok:
-                    # BOUNDED force phase: close a further 10 mm against the
-                    # jam (~6 N/finger at the plant's servo kp). Full close
-                    # was tried and squeezes the curved hull out of the flat
-                    # pinch (width collapsed 48 -> 19 mm, module escaped);
-                    # the noslip post-pass carries the hold from there.
+                    # Hand the hold to the plant's force mode: both fingers
+                    # drive shut under fsm.force_n and contact decides where
+                    # they stop, so the module settles between the pads
+                    # instead of being shoved by whichever one reached it
+                    # first. (A full-close POSITION target was tried at the
+                    # 45 N servo cap and squeezed the curved hull out of the
+                    # flat pinch: width collapsed 48 -> 19 mm.)
                     self.mode = "holding"
-                    self._cmd_w = max(0.0, width - self.FORCE_CLOSE_EXTRA_M)
-                    self.finger_cmd = np.full(2, self._cmd_w / 2.0)
+                    self.finger_force = self.fsm.force_n
+                    self._cmd_w = 0.0
+                    self.finger_cmd = np.zeros(2)
                 else:
                     self.mode = "idle"
         # Holding truth: width band + servo LOAD. Width-blocked alone is
@@ -373,7 +382,10 @@ def main() -> None:
                     z2 = np.zeros(2)
                     node.send_output(
                         "motor_command_gripper",
-                        pack_motor_command(hand.finger_cmd, z2, z2, z2, z2),
+                        pack_motor_command(
+                            hand.finger_cmd, z2,
+                            np.full(2, hand.finger_force), z2, z2,
+                        ),
                     )
                 result = hand.fsm.poll(
                     hand.state, hand.gdone_count, hand.gdone_ok, now
