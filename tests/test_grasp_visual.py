@@ -219,6 +219,22 @@ def test_fixed_urdf_rejects_unknown_declared_joint(tmp_path):
         )
 
 
+def test_fixed_mesh_rejects_directory_path(tmp_path):
+    module, fixture, tool = _assets(tmp_path)
+
+    with pytest.raises(ValueError, match="dir_mesh.mesh must be a file"):
+        GraspVisual(
+            module=FixedUrdf("module", module, _translation(0.03)),
+            fixture=FixedUrdf("fixture", fixture, _translation(1.0)),
+            tool_urdf=tool,
+            tool_root_link="tool_root",
+            ee_frame="tcp",
+            finger_joints=("left_joint", "right_joint"),
+            intended_tool_links=frozenset({"left_finger", "right_finger"}),
+            meshes=(FixedMesh("dir_mesh", tmp_path, _translation()),),
+        )
+
+
 def test_visual_fk_applies_declared_world_mount(tmp_path):
     _module, _fixture, tool = _assets(tmp_path)
     visual = VisualFK(

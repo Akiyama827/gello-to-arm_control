@@ -266,6 +266,8 @@ class GraspVisual:
             self._frames[asset.name] = fixed_frames
         for mesh in meshes:
             path = Path(mesh.mesh).resolve(strict=True)
+            if not path.is_file():
+                raise ValueError(f"{mesh.name}.mesh must be a file")
             color = tuple(float(value) for value in mesh.color)
             scale = tuple(float(value) for value in mesh.scale)
             if len(color) != 4 or not np.isfinite(color).all():
