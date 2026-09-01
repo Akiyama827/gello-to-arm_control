@@ -68,6 +68,19 @@ class MuJoCoUnavailableError(RuntimeError):
 # with libs/arm_control/scripts/dm_read_params.py when one is reachable.
 MODULE_ARMATURE = 10.0**2 * 1.8e-5  # 0.0018
 
+# Grip-pad contact stiffness. MuJoCo's default (0.02 s, damping ratio 1) is a
+# 20 ms spring, soft enough that a firmly held module still creeps millimetres
+# under a steady load. These are applied ONLY to the grip pads, which take
+# geom_priority 1 so the pair uses them rather than averaging with the part.
+# 0.005 s is 5x the 1 ms timestep -- measured as the stiffest value that still
+# holds: at MuJoCo's 2x floor (0.002) the pads TUNNEL, closing through the
+# module to their 0 mm stop with no contact at all, while the 0.02 default sinks
+# them to a 46 mm width on a ~58 mm module. At 0.005 they rest at 60.3 mm, on
+# the surface.
+# ponytail: like the torsional 0.02 above, POC-firm rather than bench-measured.
+PAD_SOLREF = (0.005, 1.0)
+PAD_SOLIMP = (0.99, 0.9999, 1e-4, 0.5, 2.0)
+
 @dataclass(frozen=True)
 class SceneModelSpec:
     model_path: str
@@ -938,6 +951,18 @@ class MuJoCoBackend:
             # ponytail: 0.02 m is a POC-firm guess, not a bench measurement
             # (2026-08-04 user call: sim is POC-only) — retune if a rung needs
             # sim/bench roll parity.
+            #
+            # The pads are also STIFFENED. condim and friction mix per-pair by
+            # maximum, but solref/solimp do not -- they come from the higher
+            # geom_priority (equal priority averages them) -- so the pad must
+            # win the pair for its value to govern the contact at all.
+            #
+            # Why: at the default 20 ms contact the carried module drifted
+            # 1.2 mm in the jaws over a 24 s carry while using only 5-9% of the
+            # available friction cone (measured). Nothing was sliding; the
+            # contacts were deforming under a steady 61 N. Friction cannot fix
+            # a displacement the cone never limits -- stiffness can, the same
+            # way it fixed the jaw coupling's 1.4 mm of stretch.
             for gid in range(self.model.ngeom):
                 body = self.model.body(self.model.geom_bodyid[gid]).name
                 if any(tok in body for tok in self.finger_body_match):
@@ -947,6 +972,11 @@ class MuJoCoBackend:
                     self.model.geom_friction[gid, 1] = max(
                         0.02, float(self.model.geom_friction[gid, 1])
                     )
+                    self.model.geom_priority[gid] = max(
+                        1, int(self.model.geom_priority[gid])
+                    )
+                    self.model.geom_solref[gid] = PAD_SOLREF
+                    self.model.geom_solimp[gid] = PAD_SOLIMP
         if not self.enable_self_collision:
             self._contacts_ground_only()
         for name in gripper_present:
