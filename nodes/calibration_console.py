@@ -85,6 +85,7 @@ class GraspEditorPanel:
         bind: str,
         port: int,
         target: str | None = None,
+        storage: str | None = None,
         placement: str | None = None,
         context: str | None = None,
     ) -> None:
@@ -94,6 +95,10 @@ class GraspEditorPanel:
             raise ValueError("grasp editor bind must be a loopback address") from exc
         if not loopback:
             raise ValueError("grasp editor bind must be a loopback address")
+        if storage is not None:
+            if placement is not None and placement != storage:
+                raise ValueError("storage and placement disagree")
+            placement = storage
         if isinstance(workspace, GraspEditorWorkspace):
             self.workspace = workspace
         else:
@@ -252,7 +257,8 @@ class GraspEditorPanel:
         for name, path in self.workspace.targets.items():
             if not name:
                 raise ValueError("workspace target names must be non-empty")
-            Path(path).resolve(strict=True)
+            if not Path(path).resolve(strict=True).is_file():
+                raise ValueError(f"profile path must be a file: {name}")
             placement = self.workspace.default_placements.get(name)
             if placement not in self.workspace.placements:
                 raise ValueError(f"missing default storage for module: {name}")

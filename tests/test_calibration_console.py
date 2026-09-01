@@ -162,6 +162,8 @@ def test_grasp_page_uses_real_geometry_and_finger_control():
     assert "setTimeout(runEditorChecks, 150)" in app
     assert "result.edit_revision !== editorEditRevision" in app
     assert 'new THREE.Euler(roll, pitch, yaw, "ZYX")' in app
+    assert "for (const name of editorContexts)" in app
+    assert 'for (const name of ["storage", "dock"])' not in app
 
 
 def _grasp_profile_assets(tmp_path):
@@ -469,6 +471,53 @@ def test_grasp_panel_workspace_selection_stale_checks_and_save(tmp_path, monkeyp
         assert built[-1] == ("part_a", "storage_2", "dock")
     finally:
         panel.close()
+
+
+def test_grasp_panel_accepts_storage_initial_argument(tmp_path, monkeypatch):
+    module_urdf, tool_urdf, raw = _grasp_profile_assets(tmp_path)
+    profile = tmp_path / "part_a.yaml"
+    profile.write_text(yaml.safe_dump(raw, sort_keys=False))
+    mesh = tmp_path / "part.stl"
+    mesh.write_bytes(b"solid part\nendsolid part\n")
+    workspace = GraspEditorWorkspace(
+        targets={"part_a": profile},
+        default_placements={"part_a": "storage_1"},
+        placements=("storage_1", "storage_2"),
+        contexts=("storage",),
+        build_visual=lambda _target, _placement, _context: _FakeGraspVisual(
+            module_urdf, tool_urdf, mesh
+        ),
+        evaluate=lambda _target, _placement, _grasp_raw: {
+            "storage": GraspCheck("checking")
+        },
+        arm_visual=_FakeArmVisual(mesh),
+    )
+    monkeypatch.setattr(calibration_console_node, "ThreadingHTTPServer", _FakeServer)
+    panel = GraspEditorPanel(
+        workspace,
+        bind="127.0.0.1",
+        port=0,
+        storage="storage_2",
+    )
+    try:
+        assert panel.state()["module"]["selection"]["storage"] == "storage_2"
+    finally:
+        panel.close()
+
+
+def test_grasp_panel_rejects_directory_profile_path(tmp_path):
+    workspace = GraspEditorWorkspace(
+        targets={"part_a": tmp_path},
+        default_placements={"part_a": "storage_1"},
+        placements=("storage_1",),
+        contexts=("storage",),
+        build_visual=lambda _target, _placement, _context: None,
+        evaluate=lambda _target, _placement, _grasp_raw: {},
+        arm_visual=_FakeArmVisual(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="profile path must be a file: part_a"):
+        GraspEditorPanel(workspace, bind="127.0.0.1", port=0)
 
 
 def test_grasp_panel_rejects_non_loopback_bind(tmp_path):

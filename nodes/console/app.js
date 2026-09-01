@@ -133,6 +133,7 @@ let editorArmBaseColors = [];
 let editorCheckTimer = null;
 let editorEditRevision = 0;
 let editorChecks = null;
+let editorContexts = [];
 const previousQuaternion = new THREE.Quaternion();
 gizmo.addEventListener("dragging-changed", (event) => {
   draggingGizmo = event.value;
@@ -419,8 +420,7 @@ const showSelectedArm = () => {
 const scheduleEditorChecks = () => {
   clearTimeout(editorCheckTimer);
   editorChecks = null;
-  setCheckBadge("storage", "checking", "");
-  setCheckBadge("dock", "checking", "");
+  for (const name of editorContexts) setCheckBadge(name, "checking", "");
   showSelectedArm();
   editorCheckTimer = setTimeout(runEditorChecks, 150);
 };
@@ -432,19 +432,19 @@ const runEditorChecks = async () => {
     });
     if (result.stale || result.edit_revision !== editorEditRevision) return;
     editorChecks = result.checks;
-    for (const name of ["storage", "dock"]) {
+    for (const name of editorContexts) {
       const check = editorChecks[name];
       setCheckBadge(name, check.status, check.detail);
     }
     showSelectedArm();
   } catch (error) {
-    setCheckBadge("storage", "error", error.message);
-    setCheckBadge("dock", "error", error.message);
+    for (const name of editorContexts) setCheckBadge(name, "error", error.message);
   }
 };
 
 const updateEditorState = (editor) => {
   if (!editor) return;
+  editorContexts = editor.choices.contexts;
   editorEditRevision = editor.edit_revision;
   setToolPose(editorPregraspTool, editor.pregrasp_pose);
   setToolPose(editorRetreatTool, editor.retreat_pose);
