@@ -241,6 +241,7 @@ def main() -> None:
         "cartesian": None,
     }
     last_cmd_time: dict[str, float] = {arm: 0.0 for arm in arm_slices}
+    idle_warned: dict[str, bool] = {arm: False for arm in arm_slices}
     last_step = 0.0
     last_qpos_pub = 0.0
     last_grip_pub = 0.0
@@ -347,7 +348,21 @@ def main() -> None:
 
             for arm in arm_slices:
                 if last_cmd_time[arm] > 0.0 and now - last_cmd_time[arm] > idle_timeout:
+                    # Say it out loud. A silent slice going limp looks
+                    # downstream like a servo that cannot track: the arm sags
+                    # off its target and whoever measures next reads the sag
+                    # as tracking error. Once per gap, not per tick.
+                    if not idle_warned[arm]:
+                        idle_warned[arm] = True
+                        print(
+                            f"[mujoco_interface] {arm}: no command for "
+                            f"{now - last_cmd_time[arm]:.2f} s — zeroing gains "
+                            f"(idle_timeout_sec={idle_timeout})",
+                            flush=True,
+                        )
                     _zero_slice(arm)
+                elif last_cmd_time[arm] > 0.0:
+                    idle_warned[arm] = False
 
             state = backend.step(command)
             # Warn on CUMULATIVE drift, not single-step spikes: viewer sync
