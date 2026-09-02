@@ -243,6 +243,7 @@ def main() -> None:
     last_cmd_time: dict[str, float] = {arm: 0.0 for arm in arm_slices}
     idle_warned: dict[str, bool] = {arm: False for arm in arm_slices}
     last_gain_sig: dict[str, tuple] = {}
+    _plant_err_at = [0.0]
     last_step = 0.0
     last_qpos_pub = 0.0
     last_grip_pub = 0.0
@@ -385,6 +386,56 @@ def main() -> None:
                     idle_warned[arm] = False
 
             state = backend.step(command)
+            # The PLANT's own view of its steady error, straight from the
+            # servo's inputs: no bridge, no decimation, no orchestrator. If
+            # this reads ~0 while the orchestrator reports a residual, the
+            # miss is in the state path, not the servo.
+            if arm_slices and now - _plant_err_at[0] > 2.0:
+                _plant_err_at[0] = now
+                for _arm, _info in arm_slices.items():
+                    _s, _m = _info["start"], _info["n"]
+                    _v = np.max(np.abs(state["velocity"][_s : _s + _m]))
+                    if _v > 0.01 or command["kp"][_s] <= 0.0:
+                        continue  # moving, or the slice is limp: not a steady error
+                    _e = command["position"][_s : _s + _m] - state["position"][_s : _s + _m]
+                    # Decompose what BALANCES the servo at steady state.
+                    # kp*err says how hard the servo pushes; these say what
+                    # pushes back, by name, instead of by inference.
+                    _d = backend.data
+                    _v6 = backend._vadr[_s : _s + _m]
+                    _bits = {
+                        "applied": _d.qfrc_actuator[_v6],
+                        "constraint": _d.qfrc_constraint[_v6],
+                        "passive": _d.qfrc_passive[_v6],
+                        "bias": _d.qfrc_bias[_v6],
+                        "gravcomp": _d.qfrc_gravcomp[_v6],
+                    }
+                    print(
+                        f"[mujoco_interface] {_arm} steady err (plant's own): "
+                        f"max={np.max(np.abs(_e)):.5f} rad "
+                        f"{np.round(_e, 4).tolist()}\n"
+                        + "\n".join(
+                            f"[mujoco_interface]     qfrc_{k:11s}"
+                            f"{np.round(v, 2).tolist()}"
+                            for k, v in _bits.items()
+                        )
+                        + "\n[mujoco_interface]     active equalities: "
+                        + str({
+                            _k: [round(float(x), 2) for x in _val[:3]]
+                            for _k, _val in backend.active_constraint_reactions().items()
+                        })
+                        + f"\n[mujoco_interface]     ncon={_d.ncon} pairs="
+                        + str(sorted({
+                            tuple(sorted((
+                                backend.model.body(
+                                    backend.model.geom_bodyid[_d.contact[_c].geom1]).name,
+                                backend.model.body(
+                                    backend.model.geom_bodyid[_d.contact[_c].geom2]).name,
+                            )))
+                            for _c in range(_d.ncon)
+                        })),
+                        flush=True,
+                    )
             # Warn on CUMULATIVE drift, not single-step spikes: viewer sync
             # steps legitimately take ~14 ms 15x/s while the physics has
             # ample headroom (0.04 ms/step measured) and queued timer ticks
