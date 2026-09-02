@@ -242,6 +242,7 @@ def main() -> None:
     }
     last_cmd_time: dict[str, float] = {arm: 0.0 for arm in arm_slices}
     idle_warned: dict[str, bool] = {arm: False for arm in arm_slices}
+    last_gain_sig: dict[str, tuple] = {}
     last_step = 0.0
     last_qpos_pub = 0.0
     last_grip_pub = 0.0
@@ -319,6 +320,25 @@ def main() -> None:
                         last_cmd_time[arm] = time.monotonic()
                         for key in ("position", "velocity", "torque", "kp", "kd"):
                             command[key][s : s + m] = sub[key]
+                        # What the plant is actually GIVEN, whenever it
+                        # changes. Every servo diagnosis upstream of here is
+                        # guesswork without it: the sender's gains and the
+                        # applied gains are two different numbers separated by
+                        # a bridge, a slice and a pack/unpack.
+                        _sig = (
+                            tuple(np.round(sub["kp"], 3)),
+                            tuple(np.round(sub["kd"], 3)),
+                            bool(np.any(np.abs(sub["torque"]) > 1e-9)),
+                        )
+                        if _sig != last_gain_sig.get(arm):
+                            last_gain_sig[arm] = _sig
+                            print(
+                                f"[mujoco_interface] {arm} gains applied: "
+                                f"kp={np.round(sub['kp'], 1).tolist()} "
+                                f"kd={np.round(sub['kd'], 2).tolist()} "
+                                f"|tau_ff|max={float(np.max(np.abs(sub['torque']))):.3f}",
+                                flush=True,
+                            )
                         # Cartesian impedance is an EE-level term, so it has no
                         # slice — the arm that owns the configured EE body owns
                         # it. Last writer wins; in every scene we run, exactly
