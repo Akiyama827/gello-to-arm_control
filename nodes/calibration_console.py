@@ -16,45 +16,9 @@ import yaml
 
 from arm_control import frames
 from arm_control.calibration_console import CalibrationStore, validate_grasp_profile
+# One allowlist, shared with the operator panel -- see arm_control/console_assets.py.
+from arm_control.console_assets import CONSOLE_ASSETS, console_asset  # noqa: F401
 from arm_control.grasp_visual import GraspVisual, VisualFK
-
-
-_CONSOLE_DIR = Path(__file__).resolve().parent / "console"
-CONSOLE_ASSETS = {
-    "": ("text/html; charset=utf-8", "index.html", "no-store"),
-    "index.html": ("text/html; charset=utf-8", "index.html", "no-store"),
-    "static/style.css": ("text/css; charset=utf-8", "style.css", "no-store"),
-    "static/app.js": ("text/javascript", "app.js", "no-store"),
-    "static/vendor/three.module.js": (
-        "text/javascript",
-        "vendor/three.module.js",
-        "public, max-age=31536000, immutable",
-    ),
-    "static/vendor/OrbitControls.js": (
-        "text/javascript",
-        "vendor/OrbitControls.js",
-        "public, max-age=31536000, immutable",
-    ),
-    "static/vendor/TransformControls.js": (
-        "text/javascript",
-        "vendor/TransformControls.js",
-        "public, max-age=31536000, immutable",
-    ),
-    "static/vendor/STLLoader.js": (
-        "text/javascript",
-        "vendor/STLLoader.js",
-        "public, max-age=31536000, immutable",
-    ),
-}
-
-
-def console_asset(route: str) -> tuple[str, bytes, str]:
-    """Return one allowlisted offline console asset."""
-    try:
-        content_type, relative, cache = CONSOLE_ASSETS[route.strip("/")]
-    except KeyError as exc:
-        raise KeyError(f"unknown console asset: {route}") from exc
-    return content_type, (_CONSOLE_DIR / relative).read_bytes(), cache
 
 
 def _pose_json(transform: np.ndarray) -> dict[str, list[float]]:

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operator gate</title>
+  <link rel="stylesheet" href="/static/operator.css">
+</head>
+<body>
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">Local operator authority</p>
+      <h1>Operator gate</h1>
+    </div>
+    <div class="session">
+      <span id="phase-now">Waiting</span>
+      <span id="connection" class="status neutral">Connecting</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="rack" aria-labelledby="sequence-title">
+      <div class="rack-title"><span>Sequence</span><strong id="sequence-title">Phases</strong></div>
+      <ol id="phases" class="phases"></ol>
+    </section>
+
+    <section class="rack" aria-labelledby="review-title">
+      <div class="rack-title"><span>Review</span><strong id="review-title">Held step</strong></div>
+      <p id="held-none" class="muted">Nothing is held for review.</p>
+      <div id="held" hidden>
+        <h2 id="held-phase"></h2>
+        <p id="held-summary" class="summary"></p>
+        <table id="held-detail" class="detail"></table>
+      </div>
+
+      <div class="authority">
+        <span id="gatebadge" class="status neutral">Unknown</span>
+        <div class="buttons">
+          <button id="go" type="button" class="go">GO</button>
+          <button id="plan" type="button">RE-PLAN</button>
+          <button id="stop" type="button" class="stop">STOP</button>
+        </div>
+        <p class="muted note">
+          This page can send exactly these three signals. It holds no
+          trajectory and cannot command a motor.
+        </p>
+      </div>
+
+      <p id="failure" class="failure" hidden></p>
+    </section>
+
+    <section class="rack" aria-labelledby="log-title">
+      <div class="rack-title"><span>Activity</span><strong id="log-title">Log</strong></div>
+      <ul id="log" class="log"></ul>
+    </section>
+  </main>
+
+  <script src="/static/operator.js"></script>
+</body>
+</html>
