@@ -59,7 +59,11 @@ from arm_control.planning.trajectory import (
     JointTrajectory,
     time_parameterize_blended,
 )
-from arm_control.node_utils import _load_mode_config, expand_named_values
+from arm_control.node_utils import (
+    _load_mode_config,
+    expand_named_values,
+    next_event_gil_friendly,
+)
 try:
     from nodes.calibration_console import CONSOLE_ASSETS, console_asset
 except ModuleNotFoundError:
@@ -563,7 +567,7 @@ def main() -> None:
     plan_box: list = []  # worker appends ("ok", traj, goal_q) | ("err", msg)
 
     while True:
-        event = node.next(timeout=0.05)
+        event = next_event_gil_friendly(node, idle_sleep=0.05)
         now = time.monotonic()
         panel.expire_deadman()
         if event is not None:

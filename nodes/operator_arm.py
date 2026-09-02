@@ -29,6 +29,7 @@ from dora import Node
 
 
 from arm_control.messages import pack_json_message
+from arm_control.node_utils import next_event_gil_friendly
 
 _PANEL_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>operator gate</title><style>
@@ -242,7 +243,7 @@ def main() -> None:
     baseline = _file_mtime(trigger)
     fired = 0
     while True:
-        event = node.next(timeout=poll_s)
+        event = next_event_gil_friendly(node, idle_sleep=poll_s)
         if event is not None and event["type"] == "STOP":
             return
         if (

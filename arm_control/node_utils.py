@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+import time
+
 import numpy as np
 import yaml
 
@@ -34,6 +36,31 @@ def install_signal_handlers(flag: ShutdownFlag):
     signal.signal(signal.SIGINT, _handler)
     signal.signal(signal.SIGTERM, _handler)
     return _handler
+
+
+def next_event_gil_friendly(node, *, idle_sleep: float = 0.01):
+    """``node.next()`` for a node that also runs a server thread.
+
+    dora's ``next(timeout=T)`` holds the GIL for essentially the whole of T.
+    Measured in ``nodes/operator_console.py``: a plain Python thread ticking
+    every 10 ms got **2 ticks in 5 seconds** against an ideal of ~500 -- the
+    GIL was held 99.6% of the time. Any HTTP server in the same process is
+    starved by that: the operator panel's ``/state`` took 3.4 s to answer,
+    requests piled up 44 threads deep, and the page stopped responding
+    altogether. These panels are the ARM and STOP controls; they do not get to
+    be starved by an event loop.
+
+    ``time.sleep()`` DOES release the GIL, so polling with a near-zero dora
+    timeout and sleeping explicitly gives the same service rate with the GIL
+    free for most of each cycle. Measured after: 3380 ms -> 1.0 ms.
+
+    Only worth using in a node that shares its process with a server thread; a
+    pure compute node should keep blocking, which is cheaper.
+    """
+    event = node.next(timeout=0.001)
+    if event is None:
+        time.sleep(idle_sleep)
+    return event
 
 
 def _zeros(n: int) -> np.ndarray:
@@ -89,6 +116,7 @@ def expand_named_values(
 
 
 __all__ = [
+    "next_event_gil_friendly",
     "ShutdownFlag",
     "install_signal_handlers",
     "_zeros",
