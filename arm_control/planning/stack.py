@@ -43,11 +43,32 @@ __all__ = [
 
 
 def arm_urdf(cfg) -> str:
+    """The arm's URDF, resolved against the DEPLOYMENT root.
+
+    Relative paths resolve against ``CONTROL_ROOT``, which is this package's
+    own root standalone and ``$ARM_CONTROL_ROOT`` when embedded. That seam is
+    deliberate -- this repo owns the CODE and the arm identity configs, the
+    consuming project owns the CAD -- but it means a config shipped HERE can
+    name a URDF that only exists THERE, and the failure then surfaces as an
+    unreadable urdfdom parse error several frames down. Say it plainly
+    instead: this is the first thing a new consumer of this package hits.
+    """
     raw = _arm_block(cfg).get("urdf") or cfg.get("urdf_path")
     if not raw:
         raise ValueError("config missing an arm URDF (arm.urdf / urdf_path)")
     path = Path(str(raw))
-    return str(path if path.is_absolute() else CONTROL_ROOT / path)
+    resolved = path if path.is_absolute() else CONTROL_ROOT / path
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"arm URDF {str(raw)!r} not found at {resolved}.\n"
+            f"Relative URDF paths resolve against the deployment root, which "
+            f"is currently {CONTROL_ROOT}.\n"
+            f"If this package is embedded in a project that owns the CAD, "
+            f"export ARM_CONTROL_ROOT=<that project's root>; if you are using "
+            f"it standalone, point arm.urdf / urdf_path at your own robot "
+            f"description (absolute paths are honoured as-is)."
+        )
+    return str(resolved)
 
 
 def gain_vector(cfg, key: str, n: int) -> np.ndarray:
