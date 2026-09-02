@@ -223,6 +223,27 @@ def main() -> None:
     _sim_steps = [0]
     _wall_t0 = [0.0]
     model_revision_sent = False
+    _stall = [0.0]   # seconds this node spent NOT listening, since last step
+
+    def _credit_stall(seconds: float) -> None:
+        """Forgive time this node spent blocked inside its own work.
+
+        The idle timer's rule is "wall time passed and no command arrived, so
+        the commander is dead". That premise is FALSE while this node is
+        blocked in a model recompile: nobody was listening, and no sim time
+        passed either -- the loop is single-threaded, so the physics was
+        frozen right along with the event drain. Charging the stall to the
+        commander zeroed the arm's gains for a beat on every graft (measured:
+        4 windows per add, 0.27-0.35 s, and the BASE slice reported the same
+        gap in the same second from a different process, which is the tell
+        that it was the plant and not the arm path).
+
+        Deadman safety is preserved: the clock restarts at the resume, so a
+        commander that really did die is still caught one timeout later --
+        during a window in which the plant was not advancing anyway.
+        """
+        if seconds > 0.0:
+            _stall[0] += float(seconds)
 
     def _zero_slice(arm: str) -> None:
         info = arm_slices[arm]
@@ -262,7 +283,9 @@ def main() -> None:
                         next_state = scene_state_from_payload(
                             backend.scene_state, request["state"], request["revision"]
                         )
+                        _t_compile = time.monotonic()
                         backend.apply_scene_state(next_state)
+                        _credit_stall(time.monotonic() - _t_compile)
                     except (KeyError, TypeError, ValueError) as exc:
                         node.send_output(
                             "scene_result",
@@ -334,6 +357,15 @@ def main() -> None:
             last_step += period
             if now - last_step > period:
                 last_step = now
+
+            if _stall[0] > 0.0:
+                # Push every idle deadline forward by the blocked time, so the
+                # test below asks "has the commander been quiet while we were
+                # LISTENING?" rather than "has wall time passed?".
+                for arm in last_cmd_time:
+                    if last_cmd_time[arm] > 0.0:
+                        last_cmd_time[arm] += _stall[0]
+                _stall[0] = 0.0
 
             for arm in arm_slices:
                 if last_cmd_time[arm] > 0.0 and now - last_cmd_time[arm] > idle_timeout:
