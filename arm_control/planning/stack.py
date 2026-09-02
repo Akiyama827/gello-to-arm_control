@@ -30,6 +30,7 @@ from arm_control.planning.preview_rerun import scene_obstacle_geoms
 from arm_control.planning.ik import PinocchioIK
 
 __all__ = [
+    "build_executor",
     "PlanningStack",
     "arm_urdf",
     "build_planning_stack",
@@ -140,6 +141,44 @@ class PlanningStack:
         return len(self.joints)
 
 
+def build_executor(cfg, *, arm_id: str = "arm") -> JointTrajectoryExecutor:
+    """The EXECUTION half of an arm's stack, with no planning half at all.
+
+    Split out of build_planning_stack so ``arm_controller`` can have a servo
+    without an IK, an OMPL instance, a collision world or a scene -- the whole
+    point of the planner/controller split is that the controller loads none of
+    those, and calling build_planning_stack just to reach ``.executor`` would
+    load every one of them.
+    """
+    joints = arm_joints(cfg)
+    n = len(joints)
+    # done() tolerances are per-arm feedback facts (DM quantization, payload
+    # sag); absent keys keep the executor's sim-tuned defaults.
+    arm_blk = _arm_block(cfg)
+    tolerances = {
+        k: float(arm_blk[k]) for k in ("done_pos_tol", "done_vel_tol") if k in arm_blk
+    }
+    executor = JointTrajectoryExecutor(
+        arm_id=arm_id,
+        joint_names=joints,
+        dynamics=PinocchioDynamics(arm_urdf(cfg), joints),
+        kp_default=gain_vector(cfg, "kp", n),
+        kd_default=gain_vector(cfg, "kd", n),
+        max_torque=gain_vector(cfg, "max_tau", n),
+        # The plant compensates gravity (the FR3 control box on the bench, and
+        # now the twin too), so ship RNEA MINUS gravity or the arm gets it
+        # twice. nodes/trajectory_executor.py already honoured this flag; this
+        # path silently ignored it.
+        gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
+        **tolerances,
+    )
+    # Payload feedforward frame (mass toggles on grasp/release results): RNEA
+    # knows only the bare arm; a held module otherwise sags on the soft contact-
+    # phase gains (centimeters at the EE — measured in the twin).
+    executor.set_payload(0.0, ee_frame(cfg))
+    return executor
+
+
 def build_planning_stack(
     cfg, *, arm_id: str = "arm", collision_world=None
 ) -> PlanningStack:
@@ -188,30 +227,7 @@ def build_planning_stack(
         max_acc=gain_vector(cfg, "max_acc", n),
         world=world,
     )
-    # done() tolerances are per-arm feedback facts (DM quantization, payload
-    # sag); absent keys keep the executor's sim-tuned defaults.
-    arm_blk = _arm_block(cfg)
-    tolerances = {
-        k: float(arm_blk[k]) for k in ("done_pos_tol", "done_vel_tol") if k in arm_blk
-    }
-    executor = JointTrajectoryExecutor(
-        arm_id=arm_id,
-        joint_names=joints,
-        dynamics=PinocchioDynamics(urdf, joints),
-        kp_default=gain_vector(cfg, "kp", n),
-        kd_default=gain_vector(cfg, "kd", n),
-        max_torque=gain_vector(cfg, "max_tau", n),
-        # The plant compensates gravity (the FR3 control box on the bench, and
-        # now the twin too), so ship RNEA MINUS gravity or the arm gets it
-        # twice. nodes/trajectory_executor.py already honoured this flag; this
-        # path silently ignored it.
-        gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
-        **tolerances,
-    )
-    # Payload feedforward frame (mass toggles on grasp/release results): RNEA
-    # knows only the bare arm; a held module otherwise sags on the soft contact-
-    # phase gains (centimeters at the EE — measured in the twin).
-    executor.set_payload(0.0, ee_frame(cfg))
+    executor = build_executor(cfg, arm_id=arm_id)
 
     return PlanningStack(
         arm_id=arm_id,

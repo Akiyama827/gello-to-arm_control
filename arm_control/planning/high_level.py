@@ -103,12 +103,6 @@ class ArmPlanner:
         self._max_acc = np.asarray(max_acc, dtype=float).ravel()
         if self._max_vel.shape != self._max_acc.shape:
             raise ValueError("max_vel and max_acc must have matching shape")
-        # Optional callable invoked ~every 20 ms while OMPL solves in a worker
-        # thread. The hardware orchestrator uses it to keep streaming a hold
-        # command: OMPL's solve budget (seconds) dwarfs the bridge's 0.1 s
-        # deadman, so blocking the event loop during planning would disarm the
-        # arm mid-sequence. None (default) keeps planning synchronous.
-        self.keepalive = None
 
     @property
     def ik(self) -> PinocchioIK:
@@ -239,7 +233,7 @@ class ArmPlanner:
             return JointTrajectory(times=times, positions=positions, velocities=velocities)
 
         if self._ompl is not None and collision_check:
-            waypoints = self._plan_with_keepalive(q_start, q_goal)
+            waypoints = self._ompl.plan(q_start, q_goal)
             if waypoints is None:
                 return None
         else:
@@ -249,25 +243,6 @@ class ArmPlanner:
         return time_parameterize_blended(
             waypoints, self._max_vel * speed_scale, self._max_acc * speed_scale
         )
-
-    def _plan_with_keepalive(
-        self, q_start: np.ndarray, q_goal: np.ndarray
-    ) -> np.ndarray | None:
-        if self.keepalive is None:
-            return self._ompl.plan(q_start, q_goal)
-        # OMPL runs in a worker; its Python validity callback releases the GIL
-        # at every collision query, so this thread gets scheduled to pump the
-        # keepalive between checks.
-        from concurrent.futures import ThreadPoolExecutor
-        from concurrent.futures import TimeoutError as FutureTimeout
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(self._ompl.plan, q_start, q_goal)
-            while True:
-                try:
-                    return future.result(timeout=0.02)
-                except FutureTimeout:
-                    self.keepalive()
 
 
 def _self_check() -> None:

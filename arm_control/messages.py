@@ -215,6 +215,147 @@ def unpack_trajectory(arrow: pa.Array) -> dict:
     }
 
 
+def pack_plan(
+    *,
+    plan_id: str,
+    phase: str,
+    gated: bool,
+    times,
+    positions,
+    velocities,
+    kp,
+    kd,
+    cartesian_poses=None,
+    cartesian=None,
+    done_mode: str = "normal",
+    seat_goal_q=None,
+) -> pa.Array:
+    """One planned leg, planner -> controller.
+
+    JSON, not a packed float layout, and deliberately so: this crosses the wire
+    ONCE PER LEG (a long 7-DOF leg is a few thousand floats, ~50 kB), never per
+    tick, so the 1 kHz-stream argument for a binary layout does not apply and a
+    self-describing message is worth far more here -- every field below is one
+    the controller must not have to guess.
+
+    ``gated`` is the operator contract: a gated plan is loaded for REVIEW and
+    must not run until an ``execute`` naming this exact ``plan_id`` arrives.
+    ``done_mode`` carries the leg-completion RULE with the leg, so the
+    controller never has to know which phase is special -- "seat" is the
+    insertion leg, judged by settle rather than by joint residual.
+    """
+    times = np.asarray(times, dtype=float).ravel()
+    q = np.asarray(positions, dtype=float).reshape(len(times), -1)
+    qd = np.asarray(velocities, dtype=float).reshape(q.shape)
+    body = {
+        "plan_id": str(plan_id),
+        "phase": str(phase),
+        "gated": bool(gated),
+        "times": times.tolist(),
+        "positions": q.tolist(),
+        "velocities": qd.tolist(),
+        "kp": np.asarray(kp, dtype=float).ravel().tolist(),
+        "kd": np.asarray(kd, dtype=float).ravel().tolist(),
+        "done_mode": str(done_mode),
+        "seat_goal_q": (
+            None if seat_goal_q is None
+            else np.asarray(seat_goal_q, dtype=float).ravel().tolist()
+        ),
+        # FK of every sample, precomputed in WORLD. The controller owns no
+        # kinematics by design, and the Cartesian impedance target is exactly
+        # FK(q_des) -- so it ships with the samples rather than being re-derived
+        # downstream from a model the controller is not allowed to load.
+        "cartesian_poses": (
+            None if cartesian_poses is None
+            else np.asarray(cartesian_poses, dtype=float).reshape(len(times), 7).tolist()
+        ),
+        "cartesian": (
+            None if cartesian is None
+            else {
+                "task_R": np.asarray(cartesian["task_R"], dtype=float).reshape(3, 3).tolist(),
+                "kc": np.asarray(cartesian["kc"], dtype=float).ravel().tolist(),
+                "dc": np.asarray(cartesian["dc"], dtype=float).ravel().tolist(),
+            }
+        ),
+    }
+    return pack_json_message("plan", body)
+
+
+def unpack_plan(payload: pa.Array) -> dict:
+    body = unpack_json_message(payload, expected_schema="plan")
+    n = len(body["times"])
+    for key in ("positions", "velocities"):
+        if len(body[key]) != n:
+            raise ValueError(f"unpack_plan: {key} has {len(body[key])} rows, want {n}")
+    for key in ("times", "positions", "velocities", "kp", "kd"):
+        body[key] = np.asarray(body[key], dtype=float)
+    for key in ("seat_goal_q", "cartesian_poses"):
+        if body.get(key) is not None:
+            body[key] = np.asarray(body[key], dtype=float)
+    if body.get("cartesian") is not None:
+        body["cartesian"] = {
+            k: np.asarray(v, dtype=float) for k, v in body["cartesian"].items()
+        }
+    return body
+
+
+def pack_control(**fields) -> pa.Array:
+    """Control-plane updates that are not a leg: arm, payload, execute, hold, stop.
+
+    One topic rather than five, because they are all the same thing -- the
+    planner telling the controller something about how to behave that is not a
+    trajectory -- and because they must arrive in ORDER relative to each other
+    (a payload declaration that overtook the execute it belongs to would servo
+    one leg with the wrong feedforward). Absent keys mean "unchanged".
+    """
+    known = {"arm", "payload", "execute", "hold", "stop", "reason"}
+    unknown = set(fields) - known
+    if unknown:
+        raise ValueError(f"pack_control: unknown field(s) {sorted(unknown)}")
+    return pack_json_message("control", dict(fields))
+
+
+def unpack_control(payload: pa.Array) -> dict:
+    body = unpack_json_message(payload, expected_schema="control")
+    body.pop("schema", None)
+    return body
+
+
+def pack_controller_event(
+    *, kind: str, plan_id: str = "", ok: bool = True, reason: str = "", q=None
+) -> pa.Array:
+    """Controller -> planner. ``kind`` is one of:
+
+    ``ready``      the plant is armed and reporting; ``q`` is the first fresh
+                   measured pose, which is where the sequence must start from.
+    ``leg_result`` ``plan_id`` finished (``ok``) or gave up (``reason``).
+    ``fault``      the controller stopped driving; nothing else will move.
+
+    Every result carries its ``plan_id`` so a late reply from a superseded plan
+    is dropped rather than credited to the current one.
+    """
+    if kind not in {"ready", "leg_result", "fault"}:
+        raise ValueError(f"pack_controller_event: unknown kind {kind!r}")
+    return pack_json_message(
+        "controller_event",
+        {
+            "kind": kind,
+            "plan_id": str(plan_id),
+            "ok": bool(ok),
+            "reason": str(reason),
+            "q": None if q is None else np.asarray(q, dtype=float).ravel().tolist(),
+        },
+    )
+
+
+def unpack_controller_event(payload: pa.Array) -> dict:
+    body = unpack_json_message(payload, expected_schema="controller_event")
+    body.pop("schema", None)
+    if body.get("q") is not None:
+        body["q"] = np.asarray(body["q"], dtype=float)
+    return body
+
+
 def pack_controller_settings(payload: dict) -> pa.Array:
     return pack_json_message("controller_settings", payload)
 
@@ -413,6 +554,12 @@ __all__ = [
     "pack_cartesian_block",
     "pack_trajectory",
     "unpack_trajectory",
+    "pack_plan",
+    "unpack_plan",
+    "pack_control",
+    "unpack_control",
+    "pack_controller_event",
+    "unpack_controller_event",
     "pack_controller_settings",
     "unpack_controller_settings",
     "pack_json_message",
@@ -428,3 +575,67 @@ __all__ = [
     "pack_module_poses",
     "unpack_module_poses",
 ]
+
+
+def _self_check() -> None:
+    """Round-trip the planner/controller wire pair (arm_control/messages)."""
+    n, samples = 7, 5
+    times = np.linspace(0.0, 1.0, samples)
+    q = np.tile(np.arange(n, dtype=float), (samples, 1))
+    plan = unpack_plan(
+        pack_plan(
+            plan_id="p1", phase="final_approach", gated=True,
+            times=times, positions=q, velocities=q * 0.0,
+            kp=np.full(n, 1200.0), kd=np.full(n, 30.0),
+            cartesian_poses=np.tile([0, 0, 0, 1, 0, 0, 0], (samples, 1)),
+            cartesian={"task_R": np.eye(3), "kc": np.ones(6), "dc": np.ones(6)},
+            done_mode="seat", seat_goal_q=np.arange(n, dtype=float),
+        )
+    )
+    assert plan["plan_id"] == "p1" and plan["gated"] is True
+    assert plan["positions"].shape == (samples, n), plan["positions"].shape
+    assert plan["cartesian_poses"].shape == (samples, 7)
+    assert plan["cartesian"]["task_R"].shape == (3, 3)
+    assert plan["done_mode"] == "seat" and plan["seat_goal_q"].shape == (n,)
+
+    # A leg with no Cartesian block and no seat goal stays None, not zeros --
+    # the controller branches on exactly this.
+    bare = unpack_plan(
+        pack_plan(plan_id="p2", phase="lift", gated=False, times=times,
+                  positions=q, velocities=q, kp=np.ones(n), kd=np.ones(n))
+    )
+    assert bare["cartesian"] is None and bare["seat_goal_q"] is None
+    assert bare["cartesian_poses"] is None
+
+    # control: absent keys mean "unchanged", so an empty dict must survive and
+    # an unknown key must be refused at PACK time, not silently ignored.
+    assert unpack_control(pack_control()) == {}
+    assert unpack_control(pack_control(arm=True, execute="p1")) == {
+        "arm": True, "execute": "p1"
+    }
+    try:
+        pack_control(payload={"mass_kg": 1.0}, bogus=1)
+    except ValueError as exc:
+        assert "bogus" in str(exc), exc
+    else:
+        raise AssertionError("pack_control accepted an unknown field")
+
+    ev = unpack_controller_event(
+        pack_controller_event(kind="ready", q=np.zeros(n))
+    )
+    assert ev["kind"] == "ready" and ev["q"].shape == (n,)
+    ev = unpack_controller_event(
+        pack_controller_event(kind="leg_result", plan_id="p1", ok=False, reason="x")
+    )
+    assert ev["plan_id"] == "p1" and ev["ok"] is False and ev["q"] is None
+    try:
+        pack_controller_event(kind="nope")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("pack_controller_event accepted an unknown kind")
+    print("messages self-check ok")
+
+
+if __name__ == "__main__":
+    _self_check()
