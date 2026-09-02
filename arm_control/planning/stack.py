@@ -113,6 +113,12 @@ def _build_preview(cfg, world, ik, urdf: str, joints: list[str], grip: list[str]
         gripper_joints=grip,
     )
     ghost = MeasuredGhost(urdf, joints + grip, world_T_arm=world_T_arm)
+    # Both go behind DeferredPreview: every Rerun call is queued and drained on
+    # a daemon thread, so a viewer nobody opened costs dropped frames and never
+    # a blocked caller. See its docstring for why that is not optional.
+    from arm_control.planning.preview_rerun import DeferredPreview
+
+    preview, ghost = DeferredPreview(preview), DeferredPreview(ghost)
     print(
         "[planning.stack] plan preview streaming to Rerun "
         "(STL measured arm, green planned motion, orange plan target)",

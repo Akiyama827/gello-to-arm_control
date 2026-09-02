@@ -332,6 +332,77 @@ class PreviewScene:
         )
 
 
+class DeferredPreview:
+    """Make every call on a Rerun preview object return immediately.
+
+    The gRPC sink BLOCKS its caller once the channel fills with no viewer
+    attached -- "batcher_input: Sender has been blocked for over 5 seconds",
+    after which the calling node stops servicing dora inputs entirely. That is
+    why the plan preview was switched off: on the pre-split orchestrator it
+    froze the CONTROL stream and the arm went limp.
+
+    Since the planner/controller split a stall here can no longer drop the arm
+    (the controller holds its anchor from a different process), but it would
+    still hang the SEQUENCE -- a safe state instead of an unsafe one, which is
+    better and still not acceptable. So every call is queued and drained on a
+    daemon thread, the same isolation ``start_mirror_thread`` already gives the
+    twin's ground-truth mirror; the difference is only that the preview is
+    PUSHED, so it needs a queue rather than its own poll loop.
+
+    The queue is bounded and drops the OLDEST frame when full. Visualization is
+    expendable and the newest pose is the interesting one; the sequence is not
+    expendable, and must never wait on a viewer nobody opened.
+    """
+
+    def __init__(self, inner, maxsize: int = 64) -> None:
+        import queue
+        import threading
+
+        self._inner = inner
+        self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._dropped = 0
+        self._q = queue
+
+        def _drain() -> None:
+            while True:
+                name, args, kwargs = self._queue.get()
+                try:
+                    getattr(self._inner, name)(*args, **kwargs)
+                except Exception:
+                    # A dead viewer, a torn pose, a renamed entity -- none of
+                    # it may propagate into the planner, which is not even on
+                    # this thread any more.
+                    pass
+
+        threading.Thread(target=_drain, daemon=True, name="rerun-preview").start()
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        # Fail fast on a typo'd method rather than swallowing it on the thread.
+        getattr(self._inner, name)
+
+        def _call(*args, **kwargs) -> None:
+            try:
+                self._queue.put_nowait((name, args, kwargs))
+            except self._q.Full:
+                try:
+                    self._queue.get_nowait()          # drop the oldest frame
+                    self._queue.put_nowait((name, args, kwargs))
+                except (self._q.Empty, self._q.Full):
+                    return
+                self._dropped += 1
+                if self._dropped in (1, 100, 1000):
+                    print(
+                        f"[preview] no viewer draining Rerun — dropped "
+                        f"{self._dropped} preview frames (the sequence is "
+                        "unaffected; run `rerun` to watch)",
+                        flush=True,
+                    )
+
+        return _call
+
+
 def static_scene_geoms(cfg) -> list:
     """[(body, mesh_name, mesh_path, arm_T_geom)] for every non-arm scene body.
 
@@ -542,3 +613,53 @@ def scene_obstacle_geoms(cfg) -> list[dict]:
     if out:
         print(f"[scene] {len(out)} obstacles from scene", flush=True)
     return out
+
+
+def _self_check() -> None:
+    """A blocked sink must cost frames, never the caller."""
+    import threading
+    import time
+
+    class _Blocking:
+        """Stands in for the gRPC sink with no viewer attached."""
+
+        def __init__(self) -> None:
+            self.released = threading.Event()
+            self.calls: list[tuple] = []
+
+        def show_plan_pose(self, q) -> None:
+            self.released.wait(timeout=5.0)
+            self.calls.append(("show_plan_pose", q))
+
+        def update(self, q) -> None:
+            self.calls.append(("update", q))
+
+    inner = _Blocking()
+    preview = DeferredPreview(inner, maxsize=4)
+
+    # The first call parks the drain thread inside the sink. Every later call
+    # must still return promptly -- that is the whole property.
+    start = time.monotonic()
+    for i in range(50):
+        preview.show_plan_pose(i)
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.5, f"caller blocked for {elapsed:.2f}s behind a dead sink"
+    assert preview._dropped > 0, "a full queue must drop, not grow without bound"
+    assert preview._queue.qsize() <= 4, preview._queue.qsize()
+
+    inner.released.set()
+    time.sleep(0.2)
+    assert inner.calls, "nothing was ever delivered once the sink unblocked"
+
+    # A typo'd method fails at the call site, not silently on the thread.
+    try:
+        preview.no_such_method(1)
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("an unknown preview method was swallowed")
+    print("preview_rerun self-check ok")
+
+
+if __name__ == "__main__":
+    _self_check()
