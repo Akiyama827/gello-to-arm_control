@@ -68,6 +68,16 @@ class MuJoCoUnavailableError(RuntimeError):
 # with libs/arm_control/scripts/dm_read_params.py when one is reachable.
 MODULE_ARMATURE = 10.0**2 * 1.8e-5  # 0.0018
 
+# Reflected rotor inertia (kg.m^2) for the ARM's joints. Franka's own published
+# MJCF uses 0.1 across the arm, and the twin needs it for the same reason the
+# module joints do: a harmonic drive's rotor dominates the link inertia, and
+# without it the discrete PD is unstable. Measured on this scene at the graph's
+# 10 ms control period, kp*dt^2/I was 1.37 on joint 5, 0.86 on joint 6 and
+# 15.53 on joint 7 -- whose link inertia is only 0.0026 kg.m^2 because it
+# carries just the hand. Joint 7 duly oscillated at 30+ rad/s and the phase
+# never converged. At 0.1 every joint lands under 0.5.
+ARM_ARMATURE = 0.1
+
 # Grip-pad contact stiffness. MuJoCo's default (0.02 s, damping ratio 1) is a
 # 20 ms spring, soft enough that a firmly held module still creeps millimetres
 # under a steady load. These are applied ONLY to the grip pads, which take
@@ -1025,6 +1035,23 @@ class MuJoCoBackend:
                     raise ValueError(f"unknown scene constraint: {name}")
                 self.data.eq_active[equality] = int(active)
             self._applied_attachments = dict(self.scene_state.attachments)
+            if self.gravcomp_prefixes:
+                # Same actor as gravcomp: the arm, not the base or the modules.
+                prefixes = tuple(self.gravcomp_prefixes)
+                # The GRIPPER's joints are excluded: they match the arm prefix
+                # but are prismatic fingers whose "armature" is a mass, and
+                # 0.1 kg of it stops them closing on the module entirely
+                # (measured: the force-mode grip went 2/2 pads to 0/2).
+                fingers = set(self.gripper_joints)
+                for jid in range(self.model.njnt):
+                    joint = self.model.joint(jid)
+                    if joint.name in fingers:
+                        continue
+                    if (joint.name or "").startswith(prefixes):
+                        dof = joint.dofadr[0]
+                        self.model.dof_armature[dof] = max(
+                            ARM_ARMATURE, float(self.model.dof_armature[dof])
+                        )
             driven = set(self._actuated_joints(spec))
             for name in self._joint_object:
                 dof = self.model.joint(name).dofadr[0]
