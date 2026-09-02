@@ -168,6 +168,31 @@ def main() -> None:
         print(f"[mujoco_interface] single model: {backend.model_path}", flush=True)
     backend.load()
 
+    # THE PLANT DECLARES THE STARTING STATE. On the bench the arm is wherever
+    # it is and the host reads it; in the twin the plant spawns it somewhere
+    # defined. MuJoCo's implicit zero is not a declaration, it is an accident --
+    # and for the FR3's Hand zero means SHUT, so every graph started with the
+    # jaws closed around whatever they were parked over. Measured: at the bench
+    # grasp pose the shut jaws bury 29.85 mm into the module, the contact
+    # solver pushes back, and the approach settles ~0.039 rad short of target
+    # forever (the planner never sees it -- it checks collisions at the grasp
+    # profile's finger width, not the plant's actual one). Open to the arm's
+    # own configured width, exactly as run_workcell_add_demo.py does.
+    # NB the count comes from the PLANT, not gripper_joints(cfg): that list is
+    # deliberately EMPTY for an arm whose gripper is its own device (the FR3's
+    # Hand), while the composed scene still has the finger joints.
+    _fingers = int(backend.gripper_positions().size)
+    # Same accessor sim_bridge uses for this block (the gripper config sits
+    # under the robot key, not the arm block).
+    _gcfg = dict((cfg.get("franka") or {}).get("gripper") or {})
+    _open_w = float(_gcfg.get("open_width_m", 0.0))
+    if _fingers and _open_w > 0:
+        backend.apply_gripper_command([_open_w / _fingers] * _fingers)
+        print(
+            f"[mujoco_interface] jaws spawned OPEN at {_open_w * 1000:.0f} mm",
+            flush=True,
+        )
+
     # Mirror the twin's ground truth (module/base/fixtures) into Rerun so ONE
     # viewer shows sim truth + plan previews. Fully thread-isolated: with no
     # viewer attached the gRPC sink blocks, and that must only ever park the
