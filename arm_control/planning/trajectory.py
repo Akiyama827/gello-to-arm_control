@@ -125,7 +125,13 @@ def time_parameterize_blended(
     pts: list[np.ndarray] = [wps[0]]
     for i in np.flatnonzero(keep):
         seg = wps[i + 1] - wps[i]
-        n_sub = max(1, int(np.ceil(np.linalg.norm(seg) / float(ds))))
+        # >= 2, never 1: a single interval has no INTERIOR sample, and both
+        # endpoint caps are pinned to zero below — the forward/backward passes
+        # then leave v == 0 everywhere and the time integration falls back on
+        # its 1e-9 divide-by-zero floor, so a 1.7 mrad move retimed to 40 DAYS
+        # (measured; the executor's done() waits on plan time and hung there
+        # forever). Any move shorter than `ds` hit this.
+        n_sub = max(2, int(np.ceil(np.linalg.norm(seg) / float(ds))))
         for k in range(1, n_sub + 1):
             pts.append(wps[i] + seg * (k / n_sub))
     path = np.vstack(pts)
@@ -172,3 +178,27 @@ def time_parameterize_blended(
     return JointTrajectory(times=times, positions=path, velocities=velocities)
 
 
+
+
+def _self_check() -> None:
+    """A move must be retimed to a sane duration at EVERY scale."""
+    vmax = np.full(7, 1.0)
+    amax = np.full(7, 2.0)
+    for delta in (1e-4, 1.7e-3, 0.02, 0.5, 2.0):
+        wps = np.zeros((2, 7))
+        wps[1, 0] = delta
+        traj = time_parameterize_blended(wps, vmax, amax)
+        # Bracket: never faster than the velocity limit allows, never slower
+        # than a full-stop-at-both-ends triangular profile at the acc floor.
+        floor = delta / vmax[0]
+        ceiling = 4.0 * np.sqrt(delta / (0.15 * amax[0])) + 1.0
+        assert floor <= traj.duration_sec <= ceiling, (
+            f"{delta} rad retimed to {traj.duration_sec}s "
+            f"(expected {floor:.3f}..{ceiling:.3f})"
+        )
+        print(f"  {delta:8.4f} rad -> {traj.duration_sec:7.3f} s")
+    print("trajectory self-check OK")
+
+
+if __name__ == "__main__":
+    _self_check()
