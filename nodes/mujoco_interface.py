@@ -82,7 +82,13 @@ def _warn_undamped(command: dict) -> None:
         )
 
 
-def _scene_state_from_payload(current: SceneState, payload: dict) -> SceneState:
+def _scene_state_from_payload(
+    current: SceneState, payload: dict, revision: int | None = None
+) -> SceneState:
+    """``revision`` is a SIBLING of ``state`` on a scene_command
+    (``pack_scene_command`` puts it there), not a member of it, so a command's
+    state dict carries none and the caller must pass it. Only a scene_STATE
+    echo, where revision does sit inside, may leave it out."""
     attachments = {
         name: Attachment(**value) for name, value in dict(payload.get("attachments", {})).items()
     }
@@ -90,7 +96,7 @@ def _scene_state_from_payload(current: SceneState, payload: dict) -> SceneState:
         actor_q={name: list(values) for name, values in dict(payload.get("actor_q", current.actor_q)).items()},
         attachments=attachments,
         constraints={name: bool(value) for name, value in dict(payload.get("constraints", current.constraints)).items()},
-        revision=int(payload["revision"]),
+        revision=int(payload["revision"] if revision is None else revision),
     )
 
 
@@ -240,6 +246,7 @@ def main() -> None:
     last_grip_pub = 0.0
     last_inhand_pub = 0.0
     last_wrench_pub = 0.0
+    last_eqf_pub = 0.0
     _slow_warned_at = [0.0]
     _slow_debt = [0.0]   # debt at last warning (warn only on NEW drift)
     _sim_steps = [0]
@@ -281,7 +288,9 @@ def main() -> None:
                     try:
                         if request["revision"] <= backend.scene_state.revision:
                             raise ValueError("stale scene revision")
-                        next_state = _scene_state_from_payload(backend.scene_state, request["state"])
+                        next_state = _scene_state_from_payload(
+                            backend.scene_state, request["state"], request["revision"]
+                        )
                         backend.apply_scene_state(next_state)
                     except (KeyError, TypeError, ValueError) as exc:
                         node.send_output(
@@ -430,6 +439,23 @@ def main() -> None:
                         )
                     except Exception:
                         pass  # graphs without the output declared still run
+            # Named equality reactions at 20 Hz. The plant reports WHICH
+            # constraints are carrying load and how much; it never decides
+            # what that means. A holder that lets go when the arm pulls hard
+            # enough is scene knowledge, so the threshold and the release
+            # both live with the consumer that owns the scene.
+            if scene_cfg and now - last_eqf_pub > 0.05:
+                last_eqf_pub = now
+                try:
+                    node.send_output(
+                        "constraint_force",
+                        pack_json_message(
+                            "constraint_force",
+                            {"reactions": backend.active_constraint_reactions()},
+                        ),
+                    )
+                except Exception:
+                    pass  # graphs without the output declared still run
             # Measured EE wrench at 20 Hz — the sim's stand-in for the FR3's
             # O_F_ext_hat_K (same frame, same sign). Published so contact
             # detection has a signal to grow into; nothing acts on it yet.
@@ -494,6 +520,21 @@ def main() -> None:
                         },
                     ),
                 )
+                # The plant's scene revision, once, at startup. Every scene
+                # consumer starts at revision 0 and learns the real one from
+                # an echo -- but echoes were only sent AFTER a successful
+                # command, so the first command any consumer sent was built
+                # on 0 and the plant rejected it as stale. Chicken and egg:
+                # you needed a successful scene_command to learn how to make
+                # a successful scene_command.
+                if backend.scene_state is not None:
+                    try:
+                        node.send_output(
+                            "scene_state",
+                            pack_scene_state(**_scene_state_payload(backend.scene_state)),
+                        )
+                    except Exception:
+                        pass  # graphs without the output declared still run
                 model_revision_sent = True
     finally:
         backend.close()

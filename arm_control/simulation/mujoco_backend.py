@@ -1026,9 +1026,27 @@ class MuJoCoBackend:
         else:
             _transfer_state(*previous, self.model, self.data)
         if self.workcell_scene is not None and self.scene_state is not None:
-            for actor in self.workcell_scene.actors:
-                for joint, value in zip(actor.joints, self.scene_state.actor_q[actor.name]):
-                    self.data.qpos[self.model.joint(_prefixed(actor.name, joint)).qposadr[0]] = value
+            if previous[0] is None:
+                # SPAWN ONLY. actor_q is the scene's declared start pose, and
+                # nothing updates it as the plant runs, so re-applying it on a
+                # recompile teleports every actor joint back to spawn --
+                # undoing the _transfer_state directly above, whose entire job
+                # is carrying live state across a rebuild. Measured: clearing
+                # the storage weld mid-grip snapped the arm from the grasp
+                # pose to its ready pose (finger geom moved 0.86 m) while the
+                # module stayed put, so the pads left the part, the fingers
+                # closed on air and the module dropped. Constraints and
+                # attachments below DO re-apply every time -- they are what a
+                # scene command is for. An actor pose commanded through
+                # scene_state would need a changed-vs-applied diff here;
+                # nothing drives one today (the base is a motor slice).
+                for actor in self.workcell_scene.actors:
+                    for joint, value in zip(
+                        actor.joints, self.scene_state.actor_q[actor.name]
+                    ):
+                        self.data.qpos[
+                            self.model.joint(_prefixed(actor.name, joint)).qposadr[0]
+                        ] = value
             for name, active in self.scene_state.constraints.items():
                 equality = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, name)
                 if equality < 0:
@@ -1679,6 +1697,24 @@ class MuJoCoBackend:
         count = min(6, len(rows))
         result[:count] = self.data.efc_force[rows[:count]]
         return result
+
+    def active_constraint_reactions(self) -> dict[str, list[float]]:
+        """Every ACTIVE named equality's 6-vector reaction, by name.
+
+        Names only -- no notion of what any constraint MEANS. A consumer that
+        knows the scene (which axis a holder releases along, what force counts
+        as free) applies that knowledge to this stream; the plant just reports.
+        """
+        self.load()
+        out: dict[str, list[float]] = {}
+        for equality in range(self.model.neq):
+            name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_EQUALITY, equality
+            )
+            if not name or not self.data.eq_active[equality]:
+                continue
+            out[name] = self.equality_reaction(name).tolist()
+        return out
 
     def release_constraint_if_force_exceeds(
         self,
