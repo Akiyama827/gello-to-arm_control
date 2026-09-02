@@ -398,6 +398,93 @@ def pack_scene_state(*, revision: int, actor_q: dict, attachments: dict, constra
     return _scene_message("scene_state", {"revision": revision, "actor_q": actor_q, "attachments": attachments, "constraints": constraints})
 
 
+# --------------------------------------------------------------------------- #
+# SceneState <-> wire. These lived twice -- once in nodes/scene_grafter.py, once
+# in nodes/mujoco_interface.py -- written independently and genuinely divergent
+# by the time anyone noticed: one took `revision` as an argument and one
+# demanded it inside the payload, one omitted `actor_q` when empty and one
+# always sent it. That divergence produced the KeyError('revision') that made
+# every scene command fail. One copy, here, next to the messages they encode.
+#
+# There are TWO encoders because there are two messages, and they legitimately
+# differ. Naming both is the point: a single encoder with a flag is how the
+# rules drifted back into the callers last time.
+
+
+def scene_command_state(state) -> dict:
+    """The ``state`` field of a ``scene_command``: what the sender WANTS.
+
+    No ``revision``: on a command that is a SIBLING of this dict, not a member
+    (see ``pack_scene_command``), and a copy inside would be a second source of
+    truth for the value the whole optimistic-concurrency check turns on.
+
+    ``actor_q`` is OMITTED while empty, never sent as ``{}``. The plant reads a
+    present-but-empty actor_q as "set every actor to nothing" and would drop the
+    base tilt on the next recompile; absent means "no opinion, keep yours". A
+    node learns actor_q only from a scene_state echo, and the plant publishes
+    one only after a command -- so the FIRST command any node sends is always
+    the empty case, and this is not a rare path.
+    """
+    payload: dict = {
+        "attachments": {
+            name: {
+                "object_name": a.object_name,
+                "body": a.body,
+                "parent_frame": a.parent_frame,
+                "child_frame": a.child_frame,
+                "mate_pose": list(a.mate_pose),
+            }
+            for name, a in state.attachments.items()
+        },
+        "constraints": dict(state.constraints),
+    }
+    if state.actor_q:
+        payload["actor_q"] = dict(state.actor_q)
+    return payload
+
+
+def scene_state_payload(state) -> dict:
+    """A full ``scene_state`` echo: what the plant HAS. All four keys, always.
+
+    This one is authoritative rather than a request, so nothing may be elided:
+    a consumer bootstrapping from an echo needs every field, and ``revision``
+    sits inside because there is no command to carry it alongside.
+    """
+    return {"revision": int(state.revision), "actor_q": dict(state.actor_q),
+            **{k: v for k, v in scene_command_state(state).items()
+               if k != "actor_q"}}
+
+
+def scene_state_from_payload(current, payload: dict, revision: int | None = None):
+    """Decode either message back onto ``current`` (absent keys keep its values).
+
+    ``revision`` is passed in for a scene_COMMAND, whose state dict carries
+    none by the rule above; a scene_STATE echo has it inside and may leave the
+    argument out.
+    """
+    from arm_control.scene import Attachment, SceneState
+
+    return SceneState(
+        actor_q={
+            name: list(values)
+            for name, values in dict(
+                payload.get("actor_q", current.actor_q)
+            ).items()
+        },
+        attachments={
+            name: Attachment(**value)
+            for name, value in dict(payload.get("attachments", {})).items()
+        },
+        constraints={
+            name: bool(value)
+            for name, value in dict(
+                payload.get("constraints", current.constraints)
+            ).items()
+        },
+        revision=int(payload["revision"] if revision is None else revision),
+    )
+
+
 def _check_length(name: str, values: np.ndarray, expected: int) -> None:
     if values.size != expected:
         raise ValueError(f"{name}: expected {expected} float64 values, got {values.size}")
@@ -562,6 +649,9 @@ __all__ = [
     "unpack_controller_event",
     "pack_controller_settings",
     "unpack_controller_settings",
+    "scene_command_state",
+    "scene_state_payload",
+    "scene_state_from_payload",
     "pack_json_message",
     "unpack_json_message",
     "pack_grasp_request",
@@ -627,6 +717,7 @@ def _self_check() -> None:
     ev = unpack_controller_event(
         pack_controller_event(kind="leg_result", plan_id="p1", ok=False, reason="x")
     )
+    _check_scene_codec()
     assert ev["plan_id"] == "p1" and ev["ok"] is False and ev["q"] is None
     try:
         pack_controller_event(kind="nope")
@@ -635,6 +726,41 @@ def _self_check() -> None:
     else:
         raise AssertionError("pack_controller_event accepted an unknown kind")
     print("messages self-check ok")
+
+
+def _check_scene_codec() -> None:
+    """The two encoders differ ON PURPOSE; assert exactly how, in one place."""
+    from arm_control.scene import Attachment, SceneState
+
+    empty = SceneState(actor_q={}, attachments={}, constraints={}, revision=3)
+    # A command with nothing to say about actors must not say "no actors".
+    assert "actor_q" not in scene_command_state(empty), scene_command_state(empty)
+    assert "revision" not in scene_command_state(empty)
+    # The echo is authoritative: every key, every time.
+    echo = scene_state_payload(empty)
+    assert set(echo) == {"revision", "actor_q", "attachments", "constraints"}, echo
+    assert echo["revision"] == 3 and echo["actor_q"] == {}
+
+    full = SceneState(
+        actor_q={"base": [0.1, 0.0]},
+        attachments={"m": Attachment("row_01", "body", "p", "c", (0, 0, 0, 1, 0, 0, 0))},
+        constraints={"hold": False},
+        revision=7,
+    )
+    assert scene_command_state(full)["actor_q"] == {"base": [0.1, 0.0]}
+    # Round trip both ways. A command's revision arrives as an ARGUMENT (it is
+    # a sibling on the wire); demanding it inside the payload is the
+    # KeyError('revision') this consolidation exists to prevent.
+    back = scene_state_from_payload(empty, scene_command_state(full), revision=7)
+    assert back.revision == 7 and back.actor_q == {"base": [0.1, 0.0]}
+    assert back.attachments["m"].object_name == "row_01"
+    assert back.constraints == {"hold": False}
+    echoed = scene_state_from_payload(empty, scene_state_payload(full))
+    assert echoed.revision == 7 and echoed.actor_q == {"base": [0.1, 0.0]}
+    # Absent keys keep the CURRENT value rather than clearing it -- which is
+    # what makes the omit-when-empty rule safe on the receiving side.
+    kept = scene_state_from_payload(full, {"revision": 9, "attachments": {}})
+    assert kept.actor_q == {"base": [0.1, 0.0]} and kept.constraints == {"hold": False}
 
 
 if __name__ == "__main__":

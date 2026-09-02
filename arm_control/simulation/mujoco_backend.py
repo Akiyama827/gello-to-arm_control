@@ -91,6 +91,18 @@ ARM_ARMATURE = 0.1
 PAD_SOLREF = (0.005, 1.0)
 PAD_SOLIMP = (0.99, 0.9999, 1e-4, 0.5, 2.0)
 
+def contacts_possible(
+    contype_a: int, conaffinity_a: int, contype_b: int, conaffinity_b: int
+) -> bool:
+    """MuJoCo's own contact-bit rule, written once.
+
+    Two geoms are a candidate pair when either one's ``contype`` shares a bit
+    with the other's ``conaffinity``. It is a disjunction, not a conjunction,
+    and that is the half people drop when deriving it from memory.
+    """
+    return bool(contype_a & conaffinity_b) or bool(contype_b & conaffinity_a)
+
+
 SEAT_TOL_M = 0.001
 SEAT_TOL_DEG = 1.0
 """Mate seat tolerance: how close the connector must be for the keyed mate
@@ -1227,9 +1239,15 @@ class MuJoCoBackend:
         the (padded) planner owns self-collision avoidance, welds own
         grasp/dock. Grip contact runs on the finger SDF meshes (true printed
         geometry, 2026-07-22 experiment replacing the flat-pad stand-ins).
-        Bit layout: world 1/2, robot 2/1, fingers 2|4 / 1|8, module 2|8 /
-        1|4 — finger&module intersect (4 and 8); finger&finger,
-        module&module and arm&module all stay OFF.
+        Bit layout: world 1/2, robot 2/1, fingers 2|4 / 1|8, module 2|8 / 1|4.
+
+        DO NOT re-derive what that layout permits by eye. Reading these four
+        pairs off the comment produced a confidently WRONG answer twice in one
+        session -- that module<->dock and module<->fixture contact were
+        filtered, when the live plant generates both (a fixture is a WORLD
+        geom, 1/2, and (2|8) & 2 is 2: they collide, which is why a module can
+        rest in its rack at all). Ask ``may_collide()`` instead; it reads the
+        bits off the compiled model rather than off this paragraph.
         """
         module_prefixes = (
             tuple(s.prefix for s in self.scene.modules)
@@ -1276,6 +1294,50 @@ class MuJoCoBackend:
             else:
                 geom.contype[:] = 2
                 geom.conaffinity[:] = 1
+
+    def may_collide(self, a: str, b: str) -> bool:
+        """Can anything named ``a`` touch anything named ``b`` in THIS model?
+
+        ``a`` and ``b`` are matched as substrings of geom or body names, so
+        the question can be asked the way people ask it ("can the module hit
+        the dock?") rather than geom index by geom index.
+
+        This exists because the contact policy above is stated as a comment,
+        and re-deriving it by eye got the answer wrong twice in one session.
+        The answer here comes from ``model.geom_contype`` /
+        ``geom_conaffinity`` after every rule has been applied -- including
+        the ones that zero a geom out entirely -- so it cannot disagree with
+        the plant. Geoms on the same body are excluded, as MuJoCo does.
+        """
+        left = self._geoms_matching(a)
+        right = self._geoms_matching(b)
+        if not left or not right:
+            raise ValueError(
+                f"may_collide: no geoms match {a!r}" if not left
+                else f"may_collide: no geoms match {b!r}"
+            )
+        for i in left:
+            for j in right:
+                if self.model.geom_bodyid[i] == self.model.geom_bodyid[j]:
+                    continue  # same body: MuJoCo never pairs these
+                if contacts_possible(
+                    int(self.model.geom_contype[i]),
+                    int(self.model.geom_conaffinity[i]),
+                    int(self.model.geom_contype[j]),
+                    int(self.model.geom_conaffinity[j]),
+                ):
+                    return True
+        return False
+
+    def _geoms_matching(self, needle: str) -> list[int]:
+        """Geom indices whose own name or body name contains ``needle``."""
+        found = []
+        for i in range(self.model.ngeom):
+            name = self.model.geom(i).name or ""
+            body = self.model.body(self.model.geom_bodyid[i]).name or ""
+            if needle in name or needle in body:
+                found.append(i)
+        return found
 
     def apply_gripper_command(self, positions, force_n: float = 0.0) -> None:
         """Servo the finger joints toward ``positions`` (clamped to travel).
@@ -2143,6 +2205,49 @@ def _scene_demo() -> None:
     print("mujoco_backend: scene composition OK")
 
 
+def _check_contact_policy() -> None:
+    """The four pairs people get wrong, asserted against the documented bits.
+
+    Pure bit arithmetic, no model: the layout in _contacts_ground_only is the
+    input, and the point is that nobody has to read that paragraph and reason
+    it out -- which produced a confidently wrong answer twice in one session.
+    ``may_collide()`` asks the same question of the compiled model.
+    """
+    world, arm = (1, 2), (2, 1)
+    finger, module = (2 | 4, 1 | 8), (2 | 8, 1 | 4)
+
+    def pair(a, b) -> bool:
+        return contacts_possible(a[0], a[1], b[0], b[1])
+
+    # These MUST collide, and each is load-bearing:
+    assert pair(finger, module), "the gripper could never grasp anything"
+    assert pair(module, world), (
+        "a module could not rest in its rack or on the dock -- this is the "
+        "pair that was twice, wrongly, called filtered"
+    )
+    assert pair(arm, world), "the arm would fall through the floor"
+    assert pair(finger, world)
+
+    # These must NOT, and each is why the policy exists at all:
+    assert not pair(finger, arm), (
+        "the fingers are part of the arm's own hull-self-contact exemption "
+        "(6 & 1 = 0, 2 & 9 = 0) -- writing this check, the author asserted "
+        "the opposite by eye and it failed, which is the whole argument for "
+        "asking may_collide() instead of reading the layout"
+    )
+    assert not pair(arm, module), (
+        "arm<->module contact returns, and a carried module fouls the links"
+    )
+    assert not pair(module, module), "two free modules would jostle each other"
+    assert not pair(finger, finger), "the jaws would collide with each other"
+
+    # A visual-class geom (0/0) touches nothing, in either argument order.
+    assert not pair((0, 0), module) and not pair(module, (0, 0))
+    # And the rule really is a disjunction: one direction alone is enough.
+    assert contacts_possible(4, 0, 0, 4) and contacts_possible(0, 4, 4, 0)
+    print("mujoco_backend: contact policy OK")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -2150,5 +2255,7 @@ if __name__ == "__main__":
         _demo()
     elif "--scene-demo" in sys.argv:
         _scene_demo()
+    elif "--self-check" in sys.argv:
+        _check_contact_policy()
     else:
         print(__doc__)

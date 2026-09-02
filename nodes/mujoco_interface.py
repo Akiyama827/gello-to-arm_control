@@ -35,6 +35,8 @@ from arm_control.messages import (
     pack_motor_state,
     pack_scene_result,
     pack_scene_state,
+    scene_state_from_payload,
+    scene_state_payload,
     unpack_motor_command,
     unpack_scene_command,
 )
@@ -45,7 +47,6 @@ from arm_control.simulation.scene_backend import (
     build_scene_backend,
     build_workcell_backend,
 )
-from arm_control.scene import Attachment, SceneState
 
 
 def _without_schema(payload: dict) -> dict:
@@ -80,40 +81,6 @@ def _warn_undamped(command: dict) -> None:
             "controller owns damping still needs a damped value here.",
             flush=True,
         )
-
-
-def _scene_state_from_payload(
-    current: SceneState, payload: dict, revision: int | None = None
-) -> SceneState:
-    """``revision`` is a SIBLING of ``state`` on a scene_command
-    (``pack_scene_command`` puts it there), not a member of it, so a command's
-    state dict carries none and the caller must pass it. Only a scene_STATE
-    echo, where revision does sit inside, may leave it out."""
-    attachments = {
-        name: Attachment(**value) for name, value in dict(payload.get("attachments", {})).items()
-    }
-    return SceneState(
-        actor_q={name: list(values) for name, values in dict(payload.get("actor_q", current.actor_q)).items()},
-        attachments=attachments,
-        constraints={name: bool(value) for name, value in dict(payload.get("constraints", current.constraints)).items()},
-        revision=int(payload["revision"] if revision is None else revision),
-    )
-
-
-def _scene_state_payload(state: SceneState) -> dict:
-    return {
-        "revision": state.revision,
-        "actor_q": state.actor_q,
-        "attachments": {
-            name: {
-                "object_name": item.object_name, "body": item.body,
-                "parent_frame": item.parent_frame, "child_frame": item.child_frame,
-                "mate_pose": item.mate_pose,
-            }
-            for name, item in state.attachments.items()
-        },
-        "constraints": state.constraints,
-    }
 
 
 def main() -> None:
@@ -250,6 +217,7 @@ def main() -> None:
     last_inhand_pub = 0.0
     last_wrench_pub = 0.0
     last_eqf_pub = 0.0
+    last_scene_pub = 0.0
     _slow_warned_at = [0.0]
     _slow_debt = [0.0]   # debt at last warning (warn only on NEW drift)
     _sim_steps = [0]
@@ -291,7 +259,7 @@ def main() -> None:
                     try:
                         if request["revision"] <= backend.scene_state.revision:
                             raise ValueError("stale scene revision")
-                        next_state = _scene_state_from_payload(
+                        next_state = scene_state_from_payload(
                             backend.scene_state, request["state"], request["revision"]
                         )
                         backend.apply_scene_state(next_state)
@@ -304,7 +272,7 @@ def main() -> None:
                             ),
                         )
                     else:
-                        payload = _scene_state_payload(backend.scene_state)
+                        payload = scene_state_payload(backend.scene_state)
                         node.send_output(
                             "scene_result",
                             pack_scene_result(
@@ -498,6 +466,24 @@ def main() -> None:
             # mirrors this qpos into its own copy of the composed model, so
             # the sampled cloud TRACKS the physics (a static spawn snapshot
             # kept "seeing" the module at the fixture after pickup).
+            # The scene state as a CURRENT-VALUE channel, not just an event.
+            # Consumers start at revision 0 and can only learn the real one
+            # from an echo; echoes used to follow a successful command, which
+            # made the first command any consumer sent unsendable (it was
+            # built on 0 and rejected as stale). The startup publish below
+            # patches a cold start, but a node that comes up LATE -- or comes
+            # back -- has already missed it and is stuck the same way. This is
+            # the current value, always available, cheap: a handful of names
+            # and ints every 2 s.
+            if backend.scene_state is not None and now - last_scene_pub > 2.0:
+                last_scene_pub = now
+                try:
+                    node.send_output(
+                        "scene_state",
+                        pack_scene_state(**scene_state_payload(backend.scene_state)),
+                    )
+                except Exception:
+                    pass  # graphs without the output declared still run
             if backend.data is not None and now - last_qpos_pub > 0.2:
                 last_qpos_pub = now
                 try:
@@ -617,7 +603,7 @@ def main() -> None:
                     try:
                         node.send_output(
                             "scene_state",
-                            pack_scene_state(**_scene_state_payload(backend.scene_state)),
+                            pack_scene_state(**scene_state_payload(backend.scene_state)),
                         )
                     except Exception:
                         pass  # graphs without the output declared still run

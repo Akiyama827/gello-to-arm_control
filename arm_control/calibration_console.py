@@ -156,6 +156,28 @@ class ConsoleAuthority:
         return self._stop(actor)
 
 
+#: How many timestamped backups of one profile to keep. Every save writes one,
+#: and nothing ever removed them: six copies of a single 30-line YAML had
+#: accumulated in configs/modules/, which grep hits before the real file.
+#:
+#: They are NOT junk -- each is a distinct earlier calibration, and they are
+#: gitignored, so git holds no copy and a delete is the only copy gone. That is
+#: why this keeps several rather than one, and why it says out loud what it
+#: removes instead of tidying up silently.
+KEEP_BACKUPS = 5
+
+
+def _prune_backups(target: Path) -> None:
+    """Keep the newest KEEP_BACKUPS backups of ``target``; report any removal."""
+    backups = sorted(target.parent.glob(f"{target.name}.*.bak"))  # stamps sort
+    for stale in backups[:-KEEP_BACKUPS] if len(backups) > KEEP_BACKUPS else []:
+        try:
+            stale.unlink()
+        except OSError:
+            continue
+        print(f"[calibration_store] pruned old backup {stale.name}", flush=True)
+
+
 class CalibrationStore:
     def __init__(self, allowed_roots: tuple[Path, ...]):
         if not allowed_roots:
@@ -201,6 +223,7 @@ class CalibrationStore:
                 shutil.copy2(target, backup)
                 with backup.open("rb") as handle:
                     os.fsync(handle.fileno())
+                _prune_backups(target)
             os.replace(temporary, target)
             temporary = None
             directory = os.open(target.parent, os.O_RDONLY)
@@ -334,3 +357,33 @@ def validate_grasp_profile(
         _vector(grasp.get("approach_offset_m"), 3, "grasp.approach_offset_m"),
         _vector(grasp.get("retreat_offset_m"), 3, "grasp.retreat_offset_m"),
     )
+
+
+def _self_check() -> None:
+    """Backups stay bounded, and the newest survive."""
+    import tempfile
+    import time
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        target = d / "row.yaml"
+        store = CalibrationStore((d,))
+        for i in range(KEEP_BACKUPS + 3):
+            store.save_yaml(
+                target, {"n": i}, expected_revision=store.revision(target)
+            )
+            time.sleep(0.002)  # distinct UTC stamps; the sort is by name
+        backups = sorted(d.glob("row.yaml.*.bak"))
+        assert len(backups) == KEEP_BACKUPS, [b.name for b in backups]
+        # The ones kept must be the LATEST, not whichever the glob happened to
+        # return first -- dropping the newest calibration would be the worst
+        # possible outcome of a cleanup.
+        contents = [yaml.safe_load(b.read_text())["n"] for b in backups]
+        assert contents == sorted(contents), contents
+        assert contents[-1] == KEEP_BACKUPS + 1, contents
+        assert yaml.safe_load(target.read_text())["n"] == KEEP_BACKUPS + 2
+    print("calibration_console self-check ok")
+
+
+if __name__ == "__main__":
+    _self_check()
