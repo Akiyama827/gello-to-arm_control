@@ -299,8 +299,12 @@ def unpack_plan(payload: pa.Array) -> dict:
     return body
 
 
-def pack_control(**fields) -> pa.Array:
+def pack_control_update(**fields) -> pa.Array:
     """Control-plane updates that are not a leg: arm, payload, execute, hold, stop.
+
+    NOT ``rt_protocol.pack_control``, which is the RT server's binary link
+    frame (ctl_type / seq / t_mono_ns) and has nothing to do with this. Same
+    package, unrelated jobs -- hence the longer name here.
 
     One topic rather than five, because they are all the same thing -- the
     planner telling the controller something about how to behave that is not a
@@ -311,11 +315,11 @@ def pack_control(**fields) -> pa.Array:
     known = {"arm", "payload", "execute", "hold", "stop", "reason"}
     unknown = set(fields) - known
     if unknown:
-        raise ValueError(f"pack_control: unknown field(s) {sorted(unknown)}")
+        raise ValueError(f"pack_control_update: unknown field(s) {sorted(unknown)}")
     return pack_json_message("control", dict(fields))
 
 
-def unpack_control(payload: pa.Array) -> dict:
+def unpack_control_update(payload: pa.Array) -> dict:
     body = unpack_json_message(payload, expected_schema="control")
     body.pop("schema", None)
     return body
@@ -643,8 +647,8 @@ __all__ = [
     "unpack_trajectory",
     "pack_plan",
     "unpack_plan",
-    "pack_control",
-    "unpack_control",
+    "pack_control_update",
+    "unpack_control_update",
     "pack_controller_event",
     "unpack_controller_event",
     "pack_controller_settings",
@@ -699,16 +703,16 @@ def _self_check() -> None:
 
     # control: absent keys mean "unchanged", so an empty dict must survive and
     # an unknown key must be refused at PACK time, not silently ignored.
-    assert unpack_control(pack_control()) == {}
-    assert unpack_control(pack_control(arm=True, execute="p1")) == {
+    assert unpack_control_update(pack_control_update()) == {}
+    assert unpack_control_update(pack_control_update(arm=True, execute="p1")) == {
         "arm": True, "execute": "p1"
     }
     try:
-        pack_control(payload={"mass_kg": 1.0}, bogus=1)
+        pack_control_update(payload={"mass_kg": 1.0}, bogus=1)
     except ValueError as exc:
         assert "bogus" in str(exc), exc
     else:
-        raise AssertionError("pack_control accepted an unknown field")
+        raise AssertionError("pack_control_update accepted an unknown field")
 
     ev = unpack_controller_event(
         pack_controller_event(kind="ready", q=np.zeros(n))

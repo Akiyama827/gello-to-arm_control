@@ -43,7 +43,7 @@ from arm_control.joint_motor_map import (
 from arm_control.messages import (
     pack_controller_event,
     pack_json_message,
-    unpack_control,
+    unpack_control_update,
     unpack_json_message,
     unpack_plan,
 )
@@ -151,7 +151,7 @@ class ArmController:
             self._release(plan["plan_id"])
 
     def on_control(self, value) -> None:
-        fields = unpack_control(value)
+        fields = unpack_control_update(value)
         if "arm" in fields:
             self._set_arm(bool(fields["arm"]))
         if "payload" in fields:
@@ -520,7 +520,7 @@ def _plan_msg(plan_id: str, *, gated: bool, done_mode: str = "normal", seat_goal
 
 
 def _self_check() -> None:
-    from arm_control.messages import pack_control, unpack_controller_event
+    from arm_control.messages import pack_control_update, unpack_controller_event
 
     # 1. A gated plan does NOT run until an execute names it -- and while it
     #    waits, the controller still streams. That stream is the whole point of
@@ -534,9 +534,9 @@ def _self_check() -> None:
 
     # 2. An execute naming a DIFFERENT plan is refused: a plan reviewed and then
     #    superseded by a re-plan must never run.
-    c.on_control(pack_control(execute="p-stale"))
+    c.on_control(pack_control_update(execute="p-stale"))
     assert c._running is False
-    c.on_control(pack_control(execute="p1"))
+    c.on_control(pack_control_update(execute="p1"))
     assert c._running is True
 
     # 3. A plan arriving mid-flight is refused, not swapped.
@@ -574,7 +574,7 @@ def _self_check() -> None:
 
     # 6. Payload crosses as a control message, not as config.
     c = _controller()
-    c.on_control(pack_control(payload={"mass_kg": 0.4051, "com_ee": [0.013, 0.0, 0.0]}))
+    c.on_control(pack_control_update(payload={"mass_kg": 0.4051, "com_ee": [0.013, 0.0, 0.0]}))
     assert abs(c.executor.payload[0] - 0.4051) < 1e-9, c.executor.payload
 
     # 7. Disarmed, it streams NOTHING (the bridge zero-holds); armed but before
