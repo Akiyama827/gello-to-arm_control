@@ -164,6 +164,8 @@ class SimHand:
         self.gdone_count = 0
         self.gdone_ok = False
         self.state: dict | None = None
+        self.effort = 0.0  # last summed finger servo load (N), for diagnostics
+        self._broke = False  # one hold-broken report per grasp, not per tick
         self.finger_cmd: np.ndarray | None = None  # per-finger targets to send
         self.finger_force = 0.0  # >0 = plant closes under this force cap
         self._cmd_w: float | None = None    # ramped width command
@@ -176,6 +178,7 @@ class SimHand:
             self.fsm.grasp_width_m if action == "grasp" else self.fsm.open_width_m
         )
         self.mode = "closing" if action == "grasp" else "opening"
+        self._broke = False
         self.finger_force = 0.0
         self._last_t = now
         self._hist.clear()
@@ -250,9 +253,22 @@ class SimHand:
         # riding). A dropped module parks the servos AT target with ~zero
         # effort; a held one keeps them loaded (5-12 N measured).
         effort = float(sum(abs(float(e)) for e in efforts))
+        self.effort = effort  # kept for the drop diagnostics below
         is_grasped = (
             self.mode == "holding" and in_band and effort > self.EFFORT_FLOOR_N
         )
+        if self.mode == "holding" and not is_grasped and not self._broke:
+            self._broke = True
+            # Name WHICH of the three terms failed. "object lost" alone cannot
+            # distinguish the module being pulled out of the jaws (width
+            # collapses) from a transient unload while it is still riding
+            # (width holds, effort dips) — and the two want opposite fixes.
+            print(
+                f"[sim_bridge] hold broken: width={width * 1000:.1f} mm "
+                f"in_band={in_band} effort={effort:.2f} N "
+                f"(floor {self.EFFORT_FLOOR_N})",
+                flush=True,
+            )
         self.state = {"width": width, "is_grasped": is_grasped}
 
 
@@ -365,13 +381,23 @@ def main() -> None:
         elif topic == "gripper_state":
             gs_ticks += 1
             if gs_ticks % 500 == 0:  # ~10 s heartbeat: prove the sensor flows
-                active = (hand.mode if hand is not None
-                          else f"grasp_active={grasp.active}")
-                print(
-                    f"[sim_bridge] gripper sensing alive: tick {gs_ticks}, "
-                    f"tau_est={tau_est:.3f} N.m, {active}",
-                    flush=True,
-                )
+                if hand is not None:
+                    # tau_est is the DM gripper-motor estimate and is
+                    # identically zero on the hand path — printing it there
+                    # read as "no grip force" during a perfectly good carry.
+                    print(
+                        f"[sim_bridge] gripper sensing alive: tick {gs_ticks}, "
+                        f"width={float((hand.state or {}).get('width', 0.0)) * 1000:.1f} mm, "
+                        f"effort={hand.effort:.2f} N, {hand.mode}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[sim_bridge] gripper sensing alive: tick {gs_ticks}, "
+                        f"tau_est={tau_est:.3f} N.m, "
+                        f"grasp_active={grasp.active}",
+                        flush=True,
+                    )
             body = unpack_json_message(event["value"])
             fingers = body.get("positions") or []
             efforts = body.get("efforts") or []
