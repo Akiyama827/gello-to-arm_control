@@ -20,26 +20,17 @@ from __future__ import annotations
 
 import time
 
-import numpy as np
 from dora import Node
 
 from arm_control.config import arm_joints, ee_frame, load_robot_config
 from arm_control.hardware.rt_backend import RtBackend, RtLinkError
 from arm_control.messages import (
     pack_json_message,
-    pack_motor_state,
+    pack_motor_state_dict as _pack,
     unpack_json_message,
     unpack_motor_command,
 )
 from arm_control.node_utils import ShutdownFlag, install_signal_handlers
-
-
-def _pack(state: dict[str, np.ndarray]):
-    return pack_motor_state(
-        state["position"], state["velocity"], state["position_cmd"],
-        state["velocity_cmd"], state["torque_cmd"], state["kp"],
-        state["kd"], state["torque"],
-    )
 
 
 def main() -> None:

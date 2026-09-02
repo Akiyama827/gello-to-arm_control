@@ -91,6 +91,13 @@ ARM_ARMATURE = 0.1
 PAD_SOLREF = (0.005, 1.0)
 PAD_SOLIMP = (0.99, 0.9999, 1e-4, 0.5, 2.0)
 
+SEAT_TOL_M = 0.001
+SEAT_TOL_DEG = 1.0
+"""Mate seat tolerance: how close the connector must be for the keyed mate
+to engage. The single source — the plant's capture gate and the
+orchestrator's dock verify are the SAME gate and must not drift apart.
+"""
+
 @dataclass(frozen=True)
 class SceneModelSpec:
     model_path: str
@@ -597,10 +604,12 @@ class MuJoCoBackend:
     default_joint_positions: dict[str, float] = field(default_factory=dict)
     # Seat gate for the dock weld: NO magnets — the weld models the keyed
     # mechanical mate, which only engages within its lead-in chamfer
-    # (bench rung 14a measures the real lead-in).
+    # (bench rung 14a measures the real lead-in). SEAT_TOL_* is the ONE
+    # definition of that tolerance; every other consumer imports it rather
+    # than restating the number (a scene/scenario may still override).
     static_boxes: list = field(default_factory=list)
-    dock_capture_m: float = 0.004
-    dock_capture_deg: float = 5.0
+    dock_capture_m: float = SEAT_TOL_M
+    dock_capture_deg: float = SEAT_TOL_DEG
     # REQUIRED in scene mode (validated in load()); irrelevant in single-model
     # mode. No robot-shaped defaults: these are model facts the scene config
     # states (scene.welds.*).
@@ -1930,7 +1939,7 @@ class MuJoCoBackend:
         if dist > float(self.dock_capture_m):
             delta = (mod.xpos - dock.xpos) * 1e3
             return False, (
-                f"dock gap {dist*1e3:.1f} mm > seat {self.dock_capture_m*1e3:.1f} mm "
+                f"dock gap {dist*1e3:.2f} mm > seat {self.dock_capture_m*1e3:.2f} mm "
                 f"(connector - dock = [{delta[0]:.1f}, {delta[1]:.1f}, {delta[2]:.1f}] mm)"
             )
         z_dock = dock.xmat.reshape(3, 3)[:, 2]
@@ -1939,7 +1948,7 @@ class MuJoCoBackend:
         # count as capturable, so no abs() here.
         angle = float(np.degrees(np.arccos(np.clip(z_dock @ z_mod, -1.0, 1.0))))
         if angle > float(self.dock_capture_deg):
-            return False, f"dock axis off {angle:.0f}° > {self.dock_capture_deg:.0f}°"
+            return False, f"dock axis off {angle:.2f}° > {self.dock_capture_deg:.2f}°"
         return True, ""
 
     def _pad_forces(self, slot) -> dict[str, float]:

@@ -80,6 +80,19 @@ def pack_motor_state(pos, vel, pos_cmd, vel_cmd, tor_cmd, kp, kd, torque) -> pa.
     return _pack(buf)
 
 
+def pack_motor_state_dict(state: dict[str, np.ndarray]) -> pa.Array:
+    """Round-trip partner of :func:`unpack_motor_state` — pack its own dict.
+
+    Every backend node held a private copy of this splat; they are one
+    function, so it lives here beside the field order it depends on.
+    """
+    return pack_motor_state(
+        state["position"], state["velocity"], state["position_cmd"],
+        state["velocity_cmd"], state["torque_cmd"], state["kp"],
+        state["kd"], state["torque"],
+    )
+
+
 def unpack_motor_state(arrow: pa.Array, n: int) -> dict:
     flat_raw = _unpack(arrow)
     _check_length("unpack_motor_state", flat_raw, n * _MS)
@@ -393,6 +406,7 @@ def unpack_module_poses(payload: pa.Array) -> dict:
 
 __all__ = [
     "pack_motor_state",
+    "pack_motor_state_dict",
     "unpack_motor_state",
     "pack_motor_command",
     "unpack_motor_command",

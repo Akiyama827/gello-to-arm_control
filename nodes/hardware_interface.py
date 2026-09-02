@@ -19,6 +19,7 @@ from arm_control.hardware.dm_backend import DmBackendUnavailableError, DmHardwar
 from arm_control.messages import (
     pack_json_message,
     pack_motor_state,
+    pack_motor_state_dict as _pack_visual_motor_state,
     unpack_json_message,
     unpack_motor_command,
 )
@@ -82,19 +83,6 @@ def _make_safety(cfg, backend) -> SafetyController:
         temp_limit_c=float(safety.get("temp_limit_c", 85.0)),
         torque_limits=_safety_torque_limits(cfg, backend),
         arm_ramp_sec=float(safety.get("arm_ramp_sec", 1.0)),
-    )
-
-
-def _pack_visual_motor_state(state: dict[str, np.ndarray]):
-    return pack_motor_state(
-        state["position"],
-        state["velocity"],
-        state["position_cmd"],
-        state["velocity_cmd"],
-        state["torque_cmd"],
-        state["kp"],
-        state["kd"],
-        state["torque"],
     )
 
 

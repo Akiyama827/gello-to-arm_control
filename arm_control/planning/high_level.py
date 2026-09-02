@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from arm_control.frames import T_to_pose_xyzquat, pose_xyzquat_to_T
 from arm_control.planning.ik import PinocchioIK
 from arm_control.planning.trajectory import (
     JointTrajectory,
@@ -14,6 +15,22 @@ from arm_control.planning.trajectory import (
 if TYPE_CHECKING:
     from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
     from arm_control.planning.ompl_planner import OMPLPlanner
+
+
+def _quat_of(T: np.ndarray) -> np.ndarray:
+    """[w,x,y,z] of a homogeneous transform, via the wire pose convention."""
+    return np.asarray(T_to_pose_xyzquat(T), dtype=float)[3:]
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, s: float) -> np.ndarray:
+    dot = float(np.clip(q0 @ q1, -1.0, 1.0))
+    if dot > 0.9995:  # nearly parallel: lerp is exact enough and slerp blows up
+        out = q0 + s * (q1 - q0)
+        return out / np.linalg.norm(out)
+    theta = np.arccos(dot) * s
+    basis = q1 - q0 * dot
+    basis = basis / np.linalg.norm(basis)
+    return q0 * np.cos(theta) + basis * np.sin(theta)
 
 
 def build_collision_stack(
@@ -129,6 +146,71 @@ class ArmPlanner:
             q_goal, q_start, collision_check=collision_check, speed_scale=speed_scale
         )
 
+    def plan_linear(
+        self,
+        target_T: np.ndarray,
+        q_start: np.ndarray,
+        *,
+        collision_check: bool = True,
+        speed_scale: float = 1.0,
+        max_step_m: float = 0.005,
+    ) -> JointTrajectory | None:
+        """A STRAIGHT line in Cartesian space, not just a Cartesian goal.
+
+        ``plan_cartesian`` solves IK for the goal and then interpolates in
+        JOINT space, so the tool traces whatever curve the joints happen to
+        sweep -- measured 0.34 mm of lateral bow over a 40 mm insertion, a
+        third of the seat gate, and unbounded because it depends on posture.
+        A connector being pushed into its socket has to travel down its own
+        axis, so this samples the line itself and solves IK per sample.
+
+        Returns None if any sample is unreachable (the caller can fall back
+        to a joint-space plan) -- a partially-straight path is not a thing
+        worth shipping.
+        """
+        target_T = np.asarray(target_T, dtype=float)
+        lo, hi = self._ik.hard_limits
+        q_start = np.clip(np.asarray(q_start, dtype=float).ravel(), lo, hi)
+        if not 0.0 < speed_scale <= 1.0:
+            raise ValueError("speed_scale must be in (0, 1]")
+        start_T = self._ik.fk(q_start)
+        p0, p1 = start_T[:3, 3], target_T[:3, 3]
+        span = float(np.linalg.norm(p1 - p0))
+        if span < 1e-9:
+            return self.plan_joint(
+                q_start, q_start, collision_check=collision_check,
+                speed_scale=speed_scale,
+            )
+        steps = max(2, int(np.ceil(span / float(max_step_m))) + 1)
+        q0 = _quat_of(start_T)
+        q1 = _quat_of(target_T)
+        if float(q0 @ q1) < 0.0:
+            q1 = -q1  # shortest arc: quaternions double-cover rotations
+        validate = None
+        if collision_check and self._world is not None:
+            validate = lambda q: not self._world.in_collision(q)  # noqa: E731
+        waypoints = [q_start]
+        seed = q_start
+        for step in range(1, steps):
+            s = step / (steps - 1)
+            pose = np.empty(7)
+            pose[:3] = p0 + s * (p1 - p0)
+            pose[3:] = _slerp(q0, q1, s)
+            q = self._ik.solve(pose_xyzquat_to_T(pose), seed, validate=validate)
+            if q is None:
+                print(
+                    f"[planner:{self.arm_id}] straight-line insertion is not "
+                    f"reachable at {s * span * 1e3:.0f} mm of {span * 1e3:.0f} mm",
+                    flush=True,
+                )
+                return None
+            waypoints.append(q)
+            seed = q
+        return time_parameterize_blended(
+            np.vstack(waypoints), self._max_vel * speed_scale,
+            self._max_acc * speed_scale,
+        )
+
     def plan_joint(
         self,
         q_goal: np.ndarray,
@@ -186,3 +268,55 @@ class ArmPlanner:
                     return future.result(timeout=0.02)
                 except FutureTimeout:
                     self.keepalive()
+
+
+def _self_check() -> None:
+    """plan_linear really is straight, and _slerp really interpolates.
+
+    Uses a fake arm whose joints ARE the tool position, so the correct path
+    is exactly the straight line and any bow is the sampler's own error --
+    no URDF, no solver tolerance to hide behind.
+
+    Run: python -m arm_control.planning.high_level
+    """
+    q0 = np.array([1.0, 0.0, 0.0, 0.0])
+    q1 = np.array([0.0, 1.0, 0.0, 0.0])
+    assert np.allclose(_slerp(q0, q1, 0.0), q0), "slerp must start at q0"
+    assert np.allclose(_slerp(q0, q1, 1.0), q1), "slerp must end at q1"
+    mid = _slerp(q0, q1, 0.5)
+    assert abs(np.linalg.norm(mid) - 1.0) < 1e-12, "slerp must stay on the unit sphere"
+    assert abs(float(mid @ q0) - float(mid @ q1)) < 1e-12, "half-way must be equidistant"
+    near = _slerp(q0, q0 + 1e-9, 0.5)  # the lerp branch must not divide by zero
+    assert np.isfinite(near).all(), "slerp degenerates on nearly-parallel inputs"
+
+    class _FakeIK:
+        """Tool position == first three joints; orientation ignored."""
+
+        hard_limits = (np.full(3, -10.0), np.full(3, 10.0))
+
+        def fk(self, q):
+            T = np.eye(4)
+            T[:3, 3] = np.asarray(q, dtype=float)[:3]
+            return T
+
+        def solve(self, T, seed, validate=None):
+            return np.asarray(T, dtype=float)[:3, 3].copy()
+
+    planner = ArmPlanner("fake", _FakeIK(), None, np.full(3, 1.0), np.full(3, 2.0))
+    goal = np.eye(4)
+    goal[:3, 3] = [0.3, 0.4, 0.0]  # 0.5 m, not axis-aligned
+    traj = planner.plan_linear(goal, np.zeros(3), collision_check=False)
+    assert traj is not None, "straight-line plan failed on a trivially reachable goal"
+    start, end = traj.positions[0], traj.positions[-1]
+    axis = (end - start) / np.linalg.norm(end - start)
+    bow = max(
+        float(np.linalg.norm((p - start) - np.dot(p - start, axis) * axis))
+        for p in traj.positions
+    )
+    assert bow < 1e-9, f"plan_linear bowed {bow * 1e3:.4f} mm off its own line"
+    assert np.allclose(end, [0.3, 0.4, 0.0]), "plan_linear did not reach the goal"
+    print(f"high_level self-check OK: {len(traj.positions)} samples, bow {bow:.2e} m")
+
+
+if __name__ == "__main__":
+    _self_check()

@@ -85,7 +85,7 @@ measured:
   # swung, because vibration breaks stiction loose.
   stiction_nm: {base_yaw: 0.49, base_pitch: 0.36}
   # Hold deadband = stiction / hold_kp. At kp 15 this measured 1.8 deg / 1.4 deg,
-  # which eats 50-60% of scenario.yaml's dock_seat_ang_tol_deg: 3.0. kp 50 puts
+  # which would blow the 1 deg seat gate (SEAT_TOL_DEG) outright. kp 50 puts
   # it near 0.55 deg. Raise kp for docking; the two joints differ, so per-joint
   # gains eventually.
   gravity_peak_nm: 0.21
