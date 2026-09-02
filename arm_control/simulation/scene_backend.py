@@ -213,6 +213,9 @@ def build_workcell_backend(
         gripper_joints=tuple(
             _prefixed(assembler, name) for name in getattr(editor, "finger_joints", ())
         ),
+        # The arm holds itself up; the base and modules do not (see
+        # MuJoCoBackend.gravcomp_prefixes).
+        gravcomp_prefixes=((f"{assembler}__",) if assembler is not None else ()),
         finger_body_match=tuple(
             _prefixed(assembler, name)
             for name in getattr(editor, "intended_contact_links", ())

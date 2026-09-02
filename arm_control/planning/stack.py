@@ -201,6 +201,11 @@ def build_planning_stack(
         kp_default=gain_vector(cfg, "kp", n),
         kd_default=gain_vector(cfg, "kd", n),
         max_torque=gain_vector(cfg, "max_tau", n),
+        # The plant compensates gravity (the FR3 control box on the bench, and
+        # now the twin too), so ship RNEA MINUS gravity or the arm gets it
+        # twice. nodes/trajectory_executor.py already honoured this flag; this
+        # path silently ignored it.
+        gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
         **tolerances,
     )
     # Payload feedforward frame (mass toggles on grasp/release results): RNEA

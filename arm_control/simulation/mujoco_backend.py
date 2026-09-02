@@ -621,6 +621,17 @@ class MuJoCoBackend:
     gripper_kp: float = 1200.0
     gripper_kd: float = 5.0
     gripper_force_n: float = 45.0  # per-finger servo cap (headroom over kp x 0.031)
+    # Body-name prefixes whose weight the PLANT carries, modelling a robot that
+    # holds itself up when nobody is commanding it. The FR3's control box does
+    # exactly this -- its own gravity/friction compensation runs whether or not
+    # a host is streaming -- so a twin that lets the arm fall is the one telling
+    # the lie. Measured before this existed: left disarmed for 60 s the arm sank
+    # from its ready pose into a self-collided tangle
+    # (q=[2.32, 1.63, -0.50, -2.95, -2.44, 2.33, 1.14]) and the first plan was
+    # correctly refused. Deliberately NOT applied to the docking base or the
+    # modules: the base has no gravity-stable park pose and an unpowered module
+    # joint really does sag, so those must keep falling.
+    gravcomp_prefixes: tuple = ()
     # Substrings naming this scene's grip-finger BODIES (scene.finger_body_match):
     # they get fine CoACD decomposition, module-only contact bits, and pad-force
     # readout. Empty = a scene with no grip fingers.
@@ -912,6 +923,15 @@ class MuJoCoBackend:
                 spec, bodies_containing=[s.prefix for s in self.scene.modules],
                 cache_dir=cache, mesh_search_dirs=dirs, threshold=0.06,
             )
+        if self.gravcomp_prefixes:
+            # MUST be baked into the spec: body_gravcomp written to a COMPILED
+            # model is silently ignored (measured on mujoco 3.10 -- a hinge with
+            # gravcomp set post-compile reports qfrc_gravcomp 0.0, the same
+            # value baked into the spec reports -2.4525).
+            prefixes = tuple(self.gravcomp_prefixes)
+            for body in spec.bodies:
+                if (body.name or "").startswith(prefixes):
+                    body.gravcomp = 1.0
         model = spec.compile()
         data = mujoco.MjData(model)
         previous = (self.model, self.data)
