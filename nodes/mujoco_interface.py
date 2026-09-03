@@ -92,17 +92,34 @@ def main() -> None:
     scene_path = os.environ.get("WORKCELL_SCENE")
     scene_cfg = cfg.get("scene")
     if scene_path:
-        loader = None
-        loader_name = os.environ.get("WORKCELL_LOADER")
-        if loader_name:
-            module_name, function_name = loader_name.split(":", 1)
-            loader = getattr(importlib.import_module(module_name), function_name)
+        def _entry_point(env_var: str):
+            """Resolve a ``module:name`` env var into the object it names.
+
+            The seam that lets a PROJECT inject its own types into this generic
+            node without this package importing that project -- WORKCELL_LOADER
+            has always worked this way, and CHAIN_FACTORY joins it.
+            """
+            spec = os.environ.get(env_var)
+            if not spec:
+                return None
+            module_name, attribute = spec.split(":", 1)
+            return getattr(importlib.import_module(module_name), attribute)
+
+        loader = _entry_point("WORKCELL_LOADER")
+        # What an assembly chain IS belongs to the project with modules; this
+        # plant grafts bodies and reads seated clockings but defines no
+        # topology. A module-free scene never needs one.
+        chain_cls = _entry_point("CHAIN_FACTORY")
         backend, arm_slices, joint_names, n = build_workcell_backend(
             scene_path,
             control_period=period,
             launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
             enable_self_collision=bool(cfg.get("sim_self_collision", False)),
             loader=loader,
+            chain_factory=(
+                None if chain_cls is None
+                else (lambda root_port: chain_cls(root_port=root_port))
+            ),
         )
         print(
             f"[mujoco_interface] generic workcell: {n} actuators, slices={arm_slices}",

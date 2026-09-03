@@ -26,7 +26,6 @@ import numpy as np
 from arm_control.planning.mujoco_collision import _rpy_to_quat
 from arm_control.scene import SceneSpec, SceneState
 from arm_control.simulation.convex_decomp import replace_with_decomposition
-from arm_control.topology import AssemblyChain
 
 # THE law, compiled once (rt/include/arm_rt/servo_law.hpp via rt/bindings).
 # Optional by construction — a plain `pip install -e .` of arm_control does not
@@ -465,7 +464,7 @@ def compose_scene(
     spec_cfg: MuJoCoSceneSpec,
     ground_z: float | None = 0.0,
     static_boxes: list[dict] | None = None,
-    chain: AssemblyChain | None = None,
+    chain=None,
 ) -> mujoco.MjSpec:
     """mjSpec world: ground plane + arm + base + every inventory module.
 
@@ -662,6 +661,12 @@ class MuJoCoBackend:
     # correctly refused. Deliberately NOT applied to the docking base or the
     # modules: the base has no gravity-stable park pose and an unpowered module
     # joint really does sag, so those must keep falling.
+    # callable(root_port: str) -> chain, supplied by whoever owns the assembly
+    # model. Required only for a scene WITH inventory modules; a plain arm or a
+    # module-free scene never needs one. The returned object must offer
+    # ``attach``, ``modules``, ``slots``, ``tip_port``, ``root_port`` and
+    # ``state`` -- see Control's assembly/chain.py for the reference one.
+    chain_factory: object = None
     gravcomp_prefixes: tuple = ()
     # Substrings naming this scene's grip-finger BODIES (scene.finger_body_match):
     # they get fine CoACD decomposition, module-only contact bits, and pad-force
@@ -825,7 +830,19 @@ class MuJoCoBackend:
                 )
             # The topology graph is the ground truth this plant derives its
             # model from; ``dock_site`` names the base's own port, the root.
-            self.chain = AssemblyChain(root_port=str(self.dock_site))
+            #
+            # INJECTED, not constructed: what an assembly chain IS belongs to
+            # the project that has modules, not to a generic arm plant. This
+            # backend knows how to graft a body into a spec and how to read a
+            # seated clocking; it does not know what a chain is.
+            if self.chain_factory is None:
+                raise ValueError(
+                    "a workcell scene with inventory modules needs a "
+                    "chain_factory: callable(root_port) -> chain. The plant "
+                    "grafts modules but does not define the assembly model "
+                    "(see Control's assembly/chain.py)."
+                )
+            self.chain = self.chain_factory(str(self.dock_site))
             self._slots = {s.slot: s for s in self.scene.modules}
             self._joint_slot = {
                 name: slot for slot in self.scene.modules for name in slot.joint_names
@@ -1865,7 +1882,7 @@ class MuJoCoBackend:
 
         Roll about the mate axis, port x-axis to module x-axis, quantized to
         the four keys. On the bench this integer comes from the dock MCU's
-        one-hot sensor word instead (``topology.clocking_from_onehot``) — same
+        one-hot sensor word instead (Control's ``assembly.chain``) — same
         quantity, so sim and bench topology are directly comparable.
         """
         port = self.data.site(self.dock_target_site)

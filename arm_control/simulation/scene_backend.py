@@ -197,6 +197,7 @@ def build_workcell_backend(
     launch_viewer: bool = False,
     enable_self_collision: bool = False,
     loader: Callable | None = None,
+    chain_factory: Callable | None = None,
 ) -> tuple[MuJoCoBackend, dict[str, dict[str, int]], list[str], int]:
     """Load a generic workcell file and derive actor ports from its schema."""
     loaded = loader(scene_path) if loader is not None else load_scene(scene_path)
@@ -209,6 +210,7 @@ def build_workcell_backend(
         scene,
         state,
         object_joint_owner=object_joint_owner,
+        chain_factory=chain_factory,
         control_period=control_period,
         launch_viewer=launch_viewer,
         enable_self_collision=enable_self_collision,
