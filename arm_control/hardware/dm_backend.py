@@ -826,25 +826,25 @@ def _self_check() -> None:
     )
     assert backend.num_motors == 2
 
-    index = backend.attach(motor("row_01", 0x03))
+    index = backend.attach(motor("added_joint", 0x03))
     assert index == 2 and backend.num_motors == 3
     # The three structures grow together -- a reply routed by the id map must
     # always find both arrays long enough.
     assert len(backend._states) == len(backend.motors) == 3
     assert backend._motor_index_by_can_id[0x03] == 2
-    assert backend.motors[2].name == "row_01"
+    assert backend.motors[2].name == "added_joint"
     # It arrives with nothing commanded: attaching is not energising.
     assert backend._states[2].kp == 0.0 and backend._states[2].torque_cmd == 0.0
 
     try:
         backend.attach(motor("impostor", 0x03))
     except ValueError as exc:
-        assert "already attached" in str(exc) and "row_01" in str(exc), exc
+        assert "already attached" in str(exc) and "added_joint" in str(exc), exc
     else:
         raise AssertionError("a duplicate can_id must be refused")
 
     try:
-        backend.attach(motor("row_02", 0x04, enabled_on_open=True))
+        backend.attach(motor("second_added", 0x04, enabled_on_open=True))
     except ValueError as exc:
         assert "disabled" in str(exc), exc
     else:
