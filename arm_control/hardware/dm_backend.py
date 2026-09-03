@@ -453,6 +453,51 @@ class DmHardwareBackend:
             self._send_frame(motor, DM_ENABLE_FRAME)
         self._motors_enabled = True
 
+    def attach(self, motor: DmMotorConfig) -> int:
+        """Add one motor to a LIVE bus, DISABLED. Returns its index.
+
+        For a bus whose motor set is not known at construction -- a joint that
+        is bolted on mid-run. The backend builds its motor table in
+        ``__init__``; this is the only sanctioned way to grow it.
+
+        Three rules, each of them a failure this would otherwise have:
+
+        - **A duplicate id is refused.** Two motors answering on one id is a
+          config error, not a hot-swap: replies would route to whichever won
+          the map and the other joint would look dead.
+        - **The id map is written LAST.** ``_on_can_recv`` runs on the
+          transport's callback thread; it resolves an index from the map and
+          then indexes ``motors``/``_states``. Growing those two first means a
+          reply arriving mid-attach either finds no mapping (and is dropped)
+          or finds one whose arrays are already long enough. It can never
+          index off the end.
+        - **It arrives disabled.** Attaching must never by itself energise a
+          joint -- enabling stays a separate, operator-gated action. A motor
+          declaring ``enabled_on_open`` is refused rather than quietly
+          ignored, because that flag means "the caller expects torque".
+
+        Callers holding a command width must re-read :attr:`num_motors`;
+        ``apply_command`` raises on a stale length rather than commanding a
+        prefix of the bus.
+        """
+        if motor.can_id in self._motor_index_by_can_id:
+            existing = self.motors[self._motor_index_by_can_id[motor.can_id]]
+            raise ValueError(
+                f"can_id {motor.can_id:#x} is already attached as "
+                f"{existing.name!r}; refusing to attach {motor.name!r}"
+            )
+        if motor.enabled_on_open:
+            raise ValueError(
+                f"{motor.name!r}: a motor attached to a live bus must arrive "
+                "disabled; enable it explicitly once the operator arms"
+            )
+        with self._states_lock:
+            index = len(self._states)
+            self._states.append(DmMotorState())
+            self.motors.append(motor)
+            self._motor_index_by_can_id[motor.can_id] = index
+        return index
+
     def listen_step(self) -> None:
         """Send one MIT zero-torque frame per motor to solicit feedback replies.
 
@@ -764,3 +809,61 @@ __all__ = [
     "dm_spec_from_config",
     "pack_mit_control_frame",
 ]
+
+
+def _self_check() -> None:
+    """In-memory only: attach touches no transport and needs no bus."""
+    from collections import deque
+
+    def motor(name: str, can_id: int, **kw) -> DmMotorConfig:
+        return DmMotorConfig(name=name, joint=name, can_id=can_id,
+                             motor_type="4310", **kw)
+
+    backend = DmHardwareBackend(
+        bus=DmCanBusConfig(),
+        motors=deque([motor("j1", 0x01), motor("j2", 0x02)]),
+        transport=object(),  # never touched by attach
+    )
+    assert backend.num_motors == 2
+
+    index = backend.attach(motor("row_01", 0x03))
+    assert index == 2 and backend.num_motors == 3
+    # The three structures grow together -- a reply routed by the id map must
+    # always find both arrays long enough.
+    assert len(backend._states) == len(backend.motors) == 3
+    assert backend._motor_index_by_can_id[0x03] == 2
+    assert backend.motors[2].name == "row_01"
+    # It arrives with nothing commanded: attaching is not energising.
+    assert backend._states[2].kp == 0.0 and backend._states[2].torque_cmd == 0.0
+
+    try:
+        backend.attach(motor("impostor", 0x03))
+    except ValueError as exc:
+        assert "already attached" in str(exc) and "row_01" in str(exc), exc
+    else:
+        raise AssertionError("a duplicate can_id must be refused")
+
+    try:
+        backend.attach(motor("row_02", 0x04, enabled_on_open=True))
+    except ValueError as exc:
+        assert "disabled" in str(exc), exc
+    else:
+        raise AssertionError("attaching an enable-on-open motor must be refused")
+    assert backend.num_motors == 3, "a refused attach must not grow the table"
+
+    # A command sized for the pre-attach bus is refused, not sent as a prefix.
+    backend._is_open = True
+    stale = {k: np.zeros(2) for k in
+             ("position", "velocity", "torque", "kp", "kd")}
+    try:
+        backend.apply_command(stale)
+    except ValueError as exc:
+        assert "!= 3" in str(exc), exc
+    else:
+        raise AssertionError("a stale command width must raise")
+
+    print("dm_backend: OK")
+
+
+if __name__ == "__main__":
+    _self_check()
