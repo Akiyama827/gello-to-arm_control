@@ -97,18 +97,33 @@ class RerunSceneMirror:
             )
 
 
-def start_mirror_thread(model, data, hz: float = 15.0, exclude_prefixes: tuple[str, ...] = ()) -> None:
+def start_mirror_thread(
+    source, data=None, hz: float = 15.0, exclude_prefixes: tuple[str, ...] = ()
+) -> None:
     """Run the whole mirror (init, asset upload, updates) on a daemon thread.
 
+    ``source`` is a zero-arg callable returning the CURRENT ``(model, data)``;
+    a plain ``(model, data)`` pair is still accepted for scenes that never
+    recompile. The callable form matters for any scene that GROWS: a docked
+    module rebinds ``backend.model``/``backend.data`` to new objects, and a
+    mirror holding the originals keeps streaming the dead model -- the scene
+    silently freezes at the graft and never shows the module docked, which is
+    worse than showing nothing. Rebuilt on identity change, so the new
+    module's geometry is uploaded as static assets exactly once.
+
     The gRPC sink BLOCKS the calling thread once its channel fills with no
-    viewer attached — on the sim's step thread that freezes the plant and
+    viewer attached -- on the sim's step thread that freezes the plant and
     starves the whole graph (measured: load-25 stall). Isolating everything
     Rerun-related here means a missing viewer costs one parked thread, never
-    the sim. Pose reads are unsynchronized snapshots of ``data`` — worst case
+    the sim. Pose reads are unsynchronized snapshots of ``data`` -- worst case
     a torn frame, acceptable for visualization.
     """
     import threading
     import time
+
+    if data is not None:
+        model, fixed = source, data
+        source = lambda: (model, fixed)  # noqa: E731
 
     def _run() -> None:
         from arm_control.planning.preview_rerun import (
@@ -120,9 +135,16 @@ def start_mirror_thread(model, data, hz: float = 15.0, exclude_prefixes: tuple[s
         # the orchestrator's overlays merge into ONE viewer recording.
         rr.init(DEFAULT_APP_ID, recording_id=DEFAULT_RECORDING_ID, spawn=False)
         rr.connect_grpc()
-        mirror = RerunSceneMirror(model, data, exclude_prefixes=exclude_prefixes)
+        mirror = None
+        bound = None
         period = 1.0 / max(1.0, float(hz))
         while True:
+            model, data_now = source()
+            if bound != (id(model), id(data_now)):
+                bound = (id(model), id(data_now))
+                mirror = RerunSceneMirror(
+                    model, data_now, exclude_prefixes=exclude_prefixes
+                )
             mirror.update()
             time.sleep(period)
 

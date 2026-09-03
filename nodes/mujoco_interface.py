@@ -190,9 +190,10 @@ def main() -> None:
     if cfg.get("sim_scene_rerun"):
         from arm_control.simulation.rerun_scene import start_mirror_thread
 
+        # A GETTER, not a snapshot: a graft rebinds backend.model/.data, and a
+        # mirror holding the originals would freeze the scene at the dock.
         start_mirror_thread(
-            backend.model,
-            backend.data,
+            lambda: (backend.model, backend.data),
             exclude_prefixes=tuple(dict(scene_cfg or {}).get("arm_prefixes") or ()),
         )
         print("[mujoco_interface] twin ground truth mirrored to Rerun (sim/…)", flush=True)
