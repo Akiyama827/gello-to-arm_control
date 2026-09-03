@@ -691,6 +691,12 @@ class MuJoCoBackend:
     _joint_slot: dict = field(default_factory=dict, init=False, repr=False)
     _joint_object: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _object_free_roots: tuple[str, ...] = field(default=(), init=False, repr=False)
+    # Every body of every inventory module, captured at the FIRST compile while
+    # the free joints still exist. A graft re-roots the module into the base's
+    # tree and deletes its free joint, so "has a free joint" stops identifying
+    # it -- which is exactly how a docked module silently lost its grip bits.
+    # Body NAMES survive a recompile; body ids and roots do not.
+    _module_bodies: frozenset = field(default=frozenset(), init=False, repr=False)
     _held: Any = field(default=None, init=False, repr=False)
     _driven: np.ndarray | None = field(default=None, init=False, repr=False)
     _applied_attachments: dict = field(default_factory=dict, init=False, repr=False)
@@ -1276,6 +1282,16 @@ class MuJoCoBackend:
             for name in self._object_free_roots
             if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name) >= 0
         }
+        if not self._module_bodies and module_roots:
+            # First compile, while the modules are still free: remember which
+            # bodies ARE modules. After a graft they are welded into the base's
+            # tree and their free joint is gone, so module_roots no longer finds
+            # them -- and they would fall through to the generic-robot branch.
+            object.__setattr__(self, "_module_bodies", frozenset(
+                self.model.body(b).name or ""
+                for b in range(self.model.nbody)
+                if self.model.body_rootid[b] in module_roots
+            ))
         for i in range(self.model.ngeom):
             geom = self.model.geom(i)
             if geom.contype[0] == 0 and geom.conaffinity[0] == 0:
@@ -1305,8 +1321,23 @@ class MuJoCoBackend:
             elif (
                 (module_prefixes and body.startswith(module_prefixes))
                 or self.model.body_rootid[self.model.geom_bodyid[i]] in module_roots
+                or body in self._module_bodies
             ):
-                geom.contype[:] = 2 | 8
+                free = (
+                    self.model.body_rootid[self.model.geom_bodyid[i]] in module_roots
+                )
+                # A FREE module is its own island (8/4): it may touch the
+                # fingers and the world and nothing else. A DOCKED one is part
+                # of the robot (2/1) -- but it KEEPS bit 4, so the fingers can
+                # still feel it.
+                #
+                # Without that bit, the graft made the module vanish from
+                # between the jaws in one timestep while they were still
+                # commanded shut at 71.5 N: they slammed from 59.6 mm to 4.5 mm
+                # at 3.45 m/s (measured). On the bench the part does not
+                # disappear when the dock latches, so the twin was doing
+                # something the robot cannot.
+                geom.contype[:] = 2 | (8 if free else 0)
                 geom.conaffinity[:] = 1 | 4
             else:
                 geom.contype[:] = 2
@@ -2257,6 +2288,25 @@ def _check_contact_policy() -> None:
     )
     assert not pair(module, module), "two free modules would jostle each other"
     assert not pair(finger, finger), "the jaws would collide with each other"
+
+    # A DOCKED module: generic robot bits PLUS the grip bit. It must keep
+    # feeling the fingers -- the jaws are still shut on it when the dock
+    # latches -- while gaining nothing else.
+    docked = (2, 1 | 4)
+    assert pair(finger, docked), (
+        "a docked module the jaws are still holding must stay solid to them, "
+        "or they close through it: measured 59.6 -> 4.5 mm at 3.45 m/s"
+    )
+    assert pair(docked, world), "a docked module would fall through the floor"
+    assert not pair(docked, arm), "docked module vs arm links must stay filtered"
+    assert not pair(docked, module), "a docked module must not jostle the rack"
+    assert not pair(docked, docked), "two docked modules must not self-collide"
+
+    # The arithmetic that has now been got wrong THREE times by eye, pinned:
+    # 2 & 1 == 0, which is why the generic 2/1 pair is self-collision-free and
+    # why a docked module taking those bits was NOT arm-collidable.
+    assert (2 & 1) == 0
+    assert not pair(arm, arm), "generic robot bits must not self-collide"
 
     # A visual-class geom (0/0) touches nothing, in either argument order.
     assert not pair((0, 0), module) and not pair(module, (0, 0))
