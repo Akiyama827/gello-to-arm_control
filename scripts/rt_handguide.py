@@ -27,9 +27,21 @@ force at a given misalignment — the two numbers that size the Cartesian
 impedance stiffness. Needs a backend that estimates a wrench (franka does;
 fake/DM log zeros with ``wrench_valid`` 0).
 
-    python -m arm_control.rt_handguide --host 172.16.1.2 --log guide.csv
+    python scripts/rt_handguide.py --host 172.16.1.2 --log guide.csv
 """
 from __future__ import annotations
+
+# ruff: noqa: E402  (path bootstrap must precede the arm_control import)
+
+import sys
+from pathlib import Path
+
+# scripts/ is not a package -- bench tools are run as `python scripts/<tool>.py`,
+# so put the repo root on the path the way the sibling tools do.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 
 import argparse
 import csv

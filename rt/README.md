@@ -111,12 +111,12 @@ review-caught, all in the stale-authority class):
    recovery. GREEN 2026-07-27; keep it green.
 1. **Fake on the RT box**: same demo with `rt.host` pointed at the box.
    Proves the link, the kernel, and the service unit. Quantify with
-   `python -m arm_control.rt_timing_bench --host <box>` — it listens to the
+   `python scripts/rt_timing_bench.py --host <box>` — it listens to the
    disarmed state stream (states only, sends one zero-gain packet) and
    reports the servo's per-tick wakeup jitter from the tick stamps.
 2. **FR3 gravity-float, then impedance-hold** — first hardware validation of
    `backend_franka`, zero PC-side commands, driven by
-   `python -m arm_control.rt_handguide` (arms, logs, disarms — it cannot
+   `python scripts/rt_handguide.py` (arms, logs, disarms — it cannot
    send motion). Run the server manually in the foreground for this rung,
    `--fault-ms 3600000` (armed-with-no-commander is the test's steady
    state; see rt_handguide docstring), operator on the stop:

@@ -13,15 +13,27 @@ server reports ARMED.
 
 Usage (rung 1 has the service on the box, rung 0 a local server):
 
-    python -m arm_control.rt_timing_bench --host 172.16.1.2 --seconds 60
+    python scripts/rt_timing_bench.py --host 172.16.1.2 --seconds 60
 """
 from __future__ import annotations
+
+# ruff: noqa: E402  (path bootstrap must precede the arm_control import)
+
+import sys
+from pathlib import Path
+
+# scripts/ is not a package -- bench tools are run as `python scripts/<tool>.py`,
+# so put the repo root on the path the way the sibling tools do.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 
 import argparse
 import socket
 import time
 
-from . import rt_protocol as rtp
+from arm_control import rt_protocol as rtp
 
 TICK_NS = 1_000_000  # servo tick, all backends run 1 kHz
 

@@ -15,12 +15,12 @@ MX_FDCAN1_Init):
 
 Then:
 
-    python -m arm_control.dock_bench watch  --active 0xF1 --passive 0xF3
-    python -m arm_control.dock_bench latch  --active 0xF1
-    python -m arm_control.dock_bench unlatch --active 0xF1
-    python -m arm_control.dock_bench state  --active 0xF1
-    python -m arm_control.dock_bench sense  --passive 0xF3
-    python -m arm_control.dock_bench scan
+    python scripts/dock_bench.py watch  --active 0xF1 --passive 0xF3
+    python scripts/dock_bench.py latch  --active 0xF1
+    python scripts/dock_bench.py unlatch --active 0xF1
+    python scripts/dock_bench.py state  --active 0xF1
+    python scripts/dock_bench.py sense  --passive 0xF3
+    python scripts/dock_bench.py scan
 
 `watch` prints a line on every observed CHANGE with a relative timestamp —
 read the debounce directly off the flap timestamps during a hand insert.
@@ -29,6 +29,18 @@ target state lands (exit 0) or --timeout expires (exit 1). `scan` is
 read-only (state + sensor queries, never latch verbs).
 """
 from __future__ import annotations
+
+# ruff: noqa: E402  (path bootstrap must precede the arm_control import)
+
+import sys
+from pathlib import Path
+
+# scripts/ is not a package -- bench tools are run as `python scripts/<tool>.py`,
+# so put the repo root on the path the way the sibling tools do.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 
 import argparse
 import sys
