@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET
 import numpy as np
 
 from arm_control import frames
-from arm_control.planning.preview_rerun import _mesh_package_dirs
+from arm_control.assets import mesh_package_dirs as _mesh_package_dirs
 
 
 @dataclass(frozen=True)
@@ -434,8 +434,6 @@ class VisualFK:
         world_T_root: np.ndarray | None = None,
     ) -> None:
         import pinocchio as pin
-
-        from arm_control.planning.preview_rerun import _mesh_package_dirs
 
         self._pin = pin
         root = np.eye(4) if world_T_root is None else np.asarray(world_T_root, dtype=float)

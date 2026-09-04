@@ -30,6 +30,7 @@ import rerun.blueprint as rrb
 from dora import Node
 
 
+from arm_control.assets import mesh_package_dirs
 from arm_control.config import load_robot_config_dict
 from arm_control.joint_motor_map import gripper_motor_to_finger
 # Same scene draw as the teleop preview — one implementation, so the two Rerun
@@ -106,16 +107,6 @@ def _resolve_joint_names(cfg: dict, urdf_path: str) -> list[str]:
         return []
 
 
-def _mesh_package_dirs(urdf_path: str) -> list[str]:
-    urdf_dir = Path(urdf_path).resolve().parent
-    package_root = urdf_dir.parent if (urdf_dir.parent / "package.xml").is_file() else urdf_dir
-    # Hint Pinocchio's URDF parser at the parent ROS package layout used
-    # for our generated combined URDFs: <root>/models/urdf with sibling
-    # ``meshes`` and ``meshes_collision`` directories one level up.
-    candidates = [urdf_dir, urdf_dir.parent, package_root, package_root.parent]
-    return [str(path) for path in candidates if path.is_dir()]
-
-
 def _build_render_model(urdf_path: str, joint_names: list[str],
                         extra_joints: list[str] | None = None):
     """Returns (model, data, q_indices, visual_model, visual_data, render_names)
@@ -130,7 +121,7 @@ def _build_render_model(urdf_path: str, joint_names: list[str],
     if not _PIN_OK or not urdf_path or not Path(urdf_path).is_file() or not joint_names:
         return None
     try:
-        package_dirs = _mesh_package_dirs(urdf_path)
+        package_dirs = mesh_package_dirs(urdf_path)
         model, visual_model = pin.buildModelsFromUrdf(
             urdf_path,
             package_dirs=package_dirs or None,

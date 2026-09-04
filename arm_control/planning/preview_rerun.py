@@ -26,6 +26,8 @@ from pathlib import Path
 import numpy as np
 import rerun as rr
 
+from arm_control.assets import mesh_package_dirs as _mesh_package_dirs
+
 # ONE recording for every node that logs 3D state (plan preview, teleop, the
 # sim twin mirror): same app + recording id means the streams MERGE in the
 # viewer — the arm ghost, overlays, and the twin's true scene share one view
@@ -86,13 +88,6 @@ def log_frame_transform(entity_root: str, T: np.ndarray | None) -> None:
         rr.Transform3D(translation=T[:3, 3], mat3x3=T[:3, :3]),
         static=True,
     )
-
-
-def _mesh_package_dirs(urdf_path: str | Path) -> list[str]:
-    urdf_dir = Path(urdf_path).resolve().parent
-    package_root = urdf_dir.parent
-    candidates = [urdf_dir, package_root, package_root.parent]
-    return [str(path) for path in candidates if path.is_dir()]
 
 
 def _rgba8(color) -> list[int]:
