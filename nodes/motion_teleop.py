@@ -28,13 +28,10 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 
-import json
-import hashlib
 import os
 import threading
 import time
 from collections import deque
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 from dora import Node
@@ -64,10 +61,7 @@ from arm_control.node_utils import (
     expand_named_values,
     next_event_gil_friendly,
 )
-try:
-    from nodes.calibration_console import CONSOLE_ASSETS, console_asset
-except ModuleNotFoundError:
-    from calibration_console import CONSOLE_ASSETS, console_asset
+from arm_control.console_server import ConsoleServer, file_asset
 
 _BUTTONS = ("Sync target to robot", "Plan + preview", "Execute", "Stop (hold)")
 # The operator gate, when this node OWNS it (real motion graphs wire our `arm`
@@ -121,113 +115,53 @@ class ControlPanel:
         self._ident = ident
         self._authority = ConsoleAuthority(("robot",), deadman_timeout_s=0.3)
         self._authority.select("robot", now=time.monotonic())
-        panel = self
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args) -> None:  # quiet
-                pass
+        # Loopback by DEFAULT but not by refusal: unlike the operator gate,
+        # LAN exposure here is an explicit config decision (teleop.http_bind).
+        self._server = ConsoleServer(
+            name="control panel", bind=str(bind), port=int(port),
+            get=self._get, post=self._post, require_loopback=False,
+        )
+        self.port = self._server.port
 
-            def _json(self, payload: dict, code: int = 200) -> None:
-                body = json.dumps(payload).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+    # -- routes ---------------------------------------------------------------
+    def _get(self, route: str):
+        if route == "state":
+            return self._state()
+        if route == "scene":
+            return {
+                "geoms": self._vfk.scene_json(),
+                "static": self._vfk.static_json(),
+            }
+        if route == "plan":
+            return self.plan_json()
+        if route.startswith("mesh/"):
+            try:
+                index = int(route[len("mesh/"):])
+            except ValueError:
+                return None
+            return file_asset(self._vfk.mesh_path(index))
+        return None
 
-            def do_GET(self) -> None:
-                route = self.path.split("?")[0].strip("/")
-                if route in CONSOLE_ASSETS:
-                    content_type, body, cache = console_asset(route)
-                    etag = hashlib.sha256(body).hexdigest()
-                    if self.headers.get("If-None-Match") == etag:
-                        self.send_response(304)
-                        self.end_headers()
-                        return
-                    self.send_response(200)
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("Content-Length", str(len(body)))
-                    self.send_header("Cache-Control", cache)
-                    self.send_header("ETag", etag)
-                    self.end_headers()
-                    self.wfile.write(body)
-                elif route == "state":
-                    self._json(panel._state())
-                elif route == "scene":
-                    self._json(
-                        {
-                            "geoms": panel._vfk.scene_json(),
-                            "static": panel._vfk.static_json(),
-                        }
-                    )
-                elif route == "plan":
-                    self._json(panel.plan_json())
-                elif route.startswith("mesh/"):
-                    try:
-                        mesh = panel._vfk.mesh_path(int(route.split("/", 1)[1]))
-                    except ValueError:
-                        mesh = None
-                    if mesh is None:
-                        self._json({"error": "not found"}, 404)
-                        return
-                    body = mesh.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.send_header("Cache-Control", "max-age=86400")
-                    self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    self._json({"error": "not found"}, 404)
-
-            def do_POST(self) -> None:
-                # This server ARMS a torque-controlled arm. Two cheap gates:
-                # a cross-origin browser POST always carries an Origin header
-                # that won't match ours (kills the CSRF class — any website
-                # the operator visits could otherwise click ARM/Execute), and
-                # a declared multi-GB body must not OOM the only node that
-                # can DISARM.
-                origin = self.headers.get("Origin")
-                if origin is not None:
-                    host = self.headers.get("Host", "")
-                    if origin not in (f"http://{host}", f"https://{host}"):
-                        self._json({"error": "cross-origin refused"}, 403)
-                        return
-                length = int(self.headers.get("Content-Length", 0) or 0)
-                if length > 64 * 1024:
-                    self._json({"error": "body too large"}, 413)
-                    return
-                raw = self.rfile.read(length)
-                try:
-                    payload = json.loads(raw or b"{}")
-                except json.JSONDecodeError:
-                    self._json({"error": "bad json"}, 400)
-                    return
-                if self.path.endswith("sliders"):
-                    panel.set_sliders(payload.get("values") or [])
-                elif self.path.endswith("cart"):
-                    panel.set_cart_pending(
-                        payload.get("axis"),
-                        value=payload.get("value"),
-                        delta=payload.get("delta"),
-                    )
-                elif self.path.endswith("gripper"):
-                    panel.set_gripper(payload.get("value"), dirty=True)
-                elif self.path.endswith("deadman"):
-                    panel.set_deadman(bool(payload.get("held")))
-                elif self.path.endswith("click"):
-                    panel._click(str(payload.get("button", "")))
-                else:
-                    self._json({"error": "not found"}, 404)
-                    return
-                self._json({"ok": True})
-
-        # Loopback by default: every mutating endpoint on this server can
-        # ARM and move the arm, unauthenticated. LAN exposure is an
-        # explicit config decision (teleop.http_bind), not a default.
-        self._server = ThreadingHTTPServer((str(bind), int(port)), Handler)
-        self.port = self._server.server_address[1]
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+    def _post(self, route: str, payload: dict):
+        # Exact routes, not endswith(): that also matched /anything/click.
+        if route == "sliders":
+            self.set_sliders(payload.get("values") or [])
+        elif route == "cart":
+            self.set_cart_pending(
+                payload.get("axis"),
+                value=payload.get("value"),
+                delta=payload.get("delta"),
+            )
+        elif route == "gripper":
+            self.set_gripper(payload.get("value"), dirty=True)
+        elif route == "deadman":
+            self.set_deadman(bool(payload.get("held")))
+        elif route == "click":
+            self._click(str(payload.get("button", "")))
+        else:
+            return None
+        return {"ok": True}
 
     def _state(self) -> dict:
         self.expire_deadman()
@@ -812,5 +746,54 @@ def main() -> None:
                           "plant bridge still starting)")
 
 
+def _check_routes() -> None:
+    """Every route the page calls must be handled by one of the two panels.
+
+    The page (``nodes/console/app.js``) is shared: it drives the teleop panel
+    AND the grasp editor, which are separate Python classes on separate ports.
+    Nothing but this check ties the two sides together, and the dispatch used
+    to be ``self.path.endswith(name)`` -- which matched loosely enough that a
+    renamed or mistyped route could still land somewhere. It is exact now, so a
+    drift between the JS and either table is a 404 at the operator's fingertip
+    rather than a failure here. This is that failure, moved earlier.
+    """
+    import inspect
+    import re
+    from pathlib import Path
+
+    try:
+        from nodes.calibration_console import GraspEditorPanel
+    except ModuleNotFoundError:
+        from calibration_console import GraspEditorPanel
+
+    handled: set[str] = set()
+    for panel in (ControlPanel, GraspEditorPanel):
+        for method in ("_get", "_post"):
+            source = inspect.getsource(getattr(panel, method))
+            handled |= set(re.findall(r'route(?:\[len\()?[^\n]*?[=.]=?\s*"([^"]+)"', source))
+            handled |= set(re.findall(r'startswith\("([^"]+)"\)', source))
+
+    asset_dir = Path(__file__).resolve().parent / "console"
+    called: set[str] = set()
+    for page in ("app.js", "operator.js"):
+        text = (asset_dir / page).read_text()
+        called |= {m.lstrip("/") for m in re.findall(r'fetch\("(/[^"]*)"', text)}
+        called |= {m.lstrip("/") for m in re.findall(r'post\("(/[^"]*)"', text)}
+    # The operator gate is its own class in the package, with its own two
+    # routes and its own self-check; it shares only the asset directory.
+    called -= {"state", "action"}
+
+    missing = sorted(r for r in called if r not in handled)
+    assert not missing, f"page calls routes no panel handles: {missing}"
+    assert "mesh/" in handled, "the mesh prefix route vanished"
+    print(f"motion_teleop: {len(called)} page routes all handled")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    # dora runs a node as `python <node>.py`, so __main__ MUST be the node.
+    if "--self-check" in sys.argv:
+        _check_routes()
+    else:
+        main()

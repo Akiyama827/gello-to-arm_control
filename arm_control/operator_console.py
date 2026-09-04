@@ -20,15 +20,12 @@ is a robot anyone on the network can start.
 
 from __future__ import annotations
 
-import hashlib
-import ipaddress
 import json
 import threading
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Sequence
 
-from arm_control.console_assets import console_asset
+from arm_control.console_server import ConsoleServer
 
 #: The only actions the panel will accept. GO is the confirm/arm press (the
 #: same signal the terminal gate sends); STOP is the abort; PLAN re-plans the
@@ -104,78 +101,26 @@ class OperatorPanel:
         bind: str = "127.0.0.1",
         port: int = 7503,
     ) -> None:
-        try:
-            loopback = ipaddress.ip_address(bind).is_loopback
-        except ValueError as exc:
-            raise ValueError("operator panel bind must be a loopback address") from exc
-        if not loopback:
-            raise ValueError("operator panel bind must be a loopback address")
         self._read = read
         self._signal = signal
         self._lock = threading.Lock()
         self.log: list[str] = ["operator panel ready — nothing moves without a press"]
-        panel = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_args) -> None:
-                pass
-
-            def json(self, value: object, code: int = 200) -> None:
-                body = json.dumps(value).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self) -> None:
-                route = self.path.split("?", 1)[0].strip("/")
-                if route == "":
-                    route = "operator.html"
-                if route == "operator.html" or route.startswith("static/"):
-                    try:
-                        content_type, body, cache = console_asset(route)
-                    except KeyError:
-                        self.json({"error": "not found"}, 404)
-                        return
-                    self.send_response(200)
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("Content-Length", str(len(body)))
-                    self.send_header("Cache-Control", cache)
-                    self.send_header("ETag", hashlib.sha256(body).hexdigest())
-                    self.end_headers()
-                    self.wfile.write(body)
-                elif route == "state":
-                    self.json(panel.state())
-                else:
-                    self.json({"error": "not found"}, 404)
-
-            def do_POST(self) -> None:
-                origin = self.headers.get("Origin")
-                host = self.headers.get("Host", "")
-                if origin is not None and origin not in (
-                    f"http://{host}", f"https://{host}"
-                ):
-                    self.json({"error": "cross-origin refused"}, 403)
-                    return
-                if self.path.split("?", 1)[0].strip("/") != "action":
-                    self.json({"error": "not found"}, 404)
-                    return
-                length = int(self.headers.get("Content-Length", 0) or 0)
-                if length > 4096:
-                    self.json({"error": "body too large"}, 413)
-                    return
-                try:
-                    payload = json.loads(self.rfile.read(length) or b"{}")
-                    result = panel.act(payload)
-                except (TypeError, ValueError) as exc:
-                    self.json({"error": str(exc)}, 400)
-                    return
-                self.json(result)
-
-        self.server = ThreadingHTTPServer((bind, int(port)), Handler)
-        self.port = self.server.server_address[1]
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        # The gate's surface is TWO routes, and that is the security property:
+        # `state` to read and `action` to press. Anything else 404s, so there is
+        # no route here that could command motion and no method that could
+        # reach one. ConsoleServer supplies the loopback refusal, the
+        # same-origin check and the body cap that this file used to hand-roll.
+        self._server = ConsoleServer(
+            name="operator panel",
+            bind=bind,
+            port=port,
+            get=lambda route: self.state() if route == "state" else None,
+            post=lambda route, body: self.act(body) if route == "action" else None,
+            index="operator.html",
+            max_body=4096,
+        )
+        self.server = self._server.server
+        self.port = self._server.port
 
     # -- surface --------------------------------------------------------------
     def state(self) -> dict:
@@ -203,8 +148,7 @@ class OperatorPanel:
             self.log.append(str(message))
 
     def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
+        self._server.close()
 
 
 def _self_check() -> None:

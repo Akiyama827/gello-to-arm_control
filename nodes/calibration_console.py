@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import ipaddress
-import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-import threading
 from typing import Callable, Mapping
 
 import numpy as np
@@ -18,6 +14,7 @@ from arm_control import frames
 from arm_control.calibration_console import CalibrationStore, validate_grasp_profile
 # One allowlist, shared with the operator panel -- see arm_control/console_assets.py.
 from arm_control.console_assets import CONSOLE_ASSETS, console_asset  # noqa: F401
+from arm_control.console_server import ConsoleServer, file_asset
 from arm_control.grasp_visual import GraspVisual, VisualFK
 
 
@@ -87,12 +84,6 @@ class GraspEditorPanel:
         placement: str | None = None,
         context: str | None = None,
     ) -> None:
-        try:
-            loopback = ipaddress.ip_address(bind).is_loopback
-        except ValueError as exc:
-            raise ValueError("grasp editor bind must be a loopback address") from exc
-        if not loopback:
-            raise ValueError("grasp editor bind must be a loopback address")
         if storage is not None:
             if placement is not None and placement != storage:
                 raise ValueError("storage and placement disagree")
@@ -136,111 +127,53 @@ class GraspEditorPanel:
         self.raw: Mapping[str, object]
         self.grasp: object
         self._activate(self.target, self.placement, self.context)
-        panel = self
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_args) -> None:
-                pass
+        self._server = ConsoleServer(
+            name="grasp editor", bind=bind, port=port,
+            get=self._get, post=self._post,
+        )
+        self.server = self._server.server
+        self.port = self._server.port
 
-            def json(self, value: object, code: int = 200) -> None:
-                body = json.dumps(value).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self) -> None:
-                route = self.path.split("?", 1)[0].strip("/")
-                if route in ("", "index.html") or route.startswith("static/"):
-                    try:
-                        content_type, body, cache = console_asset(route)
-                    except KeyError:
-                        self.json({"error": "not found"}, 404)
-                        return
-                    etag = hashlib.sha256(body).hexdigest()
-                    self.send_response(200)
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("Content-Length", str(len(body)))
-                    self.send_header("Cache-Control", cache)
-                    self.send_header("ETag", etag)
-                    self.end_headers()
-                    self.wfile.write(body)
-                elif route == "state":
-                    self.json(panel.state())
-                elif route == "scene":
-                    self.json(panel.scene())
-                elif route == "plan":
-                    self.json({"version": 0, "times": [], "frames": []})
-                elif route.startswith("mesh/"):
-                    try:
-                        path = panel.mesh_path(int(route.split("/", 1)[1]))
-                    except ValueError:
-                        path = None
-                    if path is None:
-                        self.json({"error": "not found"}, 404)
-                        return
-                    body = path.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                elif route.startswith("arm-mesh/"):
-                    try:
-                        path = panel.workspace.arm_visual.mesh_path(
-                            int(route.split("/", 1)[1])
-                        )
-                    except ValueError:
-                        path = None
-                    if path is None:
-                        self.json({"error": "not found"}, 404)
-                        return
-                    body = path.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    self.json({"error": "not found"}, 404)
-
-            def do_POST(self) -> None:
-                origin = self.headers.get("Origin")
-                host = self.headers.get("Host", "")
-                if origin is not None and origin not in (f"http://{host}", f"https://{host}"):
-                    self.json({"error": "cross-origin refused"}, 403)
-                    return
-                length = int(self.headers.get("Content-Length", 0) or 0)
-                if length > 64 * 1024:
-                    self.json({"error": "body too large"}, 413)
-                    return
+    # -- routes ---------------------------------------------------------------
+    def _get(self, route: str):
+        """JSON-able, an :class:`Asset`, or None for 404."""
+        if route == "state":
+            return self.state()
+        if route == "scene":
+            return self.scene()
+        if route == "plan":
+            return {"version": 0, "times": [], "frames": []}
+        # Meshes are content-addressed by index; file_asset turns a missing one
+        # straight into a 404, and ConsoleServer answers 304 to a client that
+        # already holds the bytes (this used to re-send every STL per load).
+        for prefix, lookup in (
+            ("mesh/", self.mesh_path),
+            ("arm-mesh/", self.workspace.arm_visual.mesh_path),
+        ):
+            if route.startswith(prefix):
                 try:
-                    payload = json.loads(self.rfile.read(length) or b"{}")
-                    if self.path.endswith("/grasp"):
-                        editor = panel.update(payload)
-                    elif self.path.endswith("/grasp/save"):
-                        panel.save(payload)
-                        editor = panel.state()["module"]
-                    elif self.path.endswith("/selection"):
-                        editor = panel.select(payload)
-                    elif self.path.endswith("/grasp/check"):
-                        self.json(panel.check(payload))
-                        return
-                    else:
-                        self.json({"error": "not found"}, 404)
-                        return
-                except (KeyError, TypeError, ValueError) as exc:
-                    self.json({"error": str(exc)}, 400)
-                    return
-                self.json(
-                    {"ok": True, "revision": panel.revision, "editor": editor}
-                )
+                    index = int(route[len(prefix):])
+                except ValueError:
+                    return None
+                return file_asset(lookup(index))
+        return None
 
-        self.server = ThreadingHTTPServer((bind, int(port)), Handler)
-        self.port = self.server.server_address[1]
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+    def _post(self, route: str, payload: dict):
+        # Exact routes, not the endswith() this used to do -- that also matched
+        # anything ending in the name, e.g. /anything/selection.
+        if route == "grasp/check":
+            return self.check(payload)
+        if route == "grasp":
+            editor = self.update(payload)
+        elif route == "grasp/save":
+            self.save(payload)
+            editor = self.state()["module"]
+        elif route == "selection":
+            editor = self.select(payload)
+        else:
+            return None
+        return {"ok": True, "revision": self.revision, "editor": editor}
 
     def _validate_workspace(self) -> None:
         if not self.workspace.targets:
