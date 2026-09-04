@@ -190,7 +190,7 @@ def load_robot_config(path: str | Path | None = None) -> RobotConfig:
         # because an env var was forgotten is how the wrong robot gets driven.
         raise RuntimeError(
             "no robot config: pass a path or set ARM_CONTROL_CONFIG "
-            "(scripts/view.py exports it for every node it launches)"
+            "(a launcher normally exports it for every node it starts)"
         )
     return RobotConfig.from_yaml(config_path)
 

@@ -84,10 +84,9 @@ class ArmController:
         # to advance _plant_t ONLY when a period was configured, while
         # exec_time always returned _plant_t -- so with the key absent the
         # clock sat at 0.0 forever, the executor never left its first sample,
-        # and no leg could ever complete. configs/sim/franka_workcell_add.yaml
-        # sets it (0.05) and configs/real/franka.yaml does NOT, so every green
-        # sim run hid a controller that would have hung on the first bench
-        # move. An arm that cannot finish a motion is not an acceptable
+        # and no leg could ever complete. The caller's sim config set it
+        # (0.05) and its real config did NOT, so every green sim run hid a
+        # controller that would have hung on the first bench move. An arm that cannot finish a motion is not an acceptable
         # response to a missing optional key.
         #
         # On the bench states tick at wall rate, so the two policies agree

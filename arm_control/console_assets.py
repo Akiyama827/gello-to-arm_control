@@ -22,8 +22,8 @@ CONSOLE_ASSETS: dict[str, tuple[str, str, str]] = {
     "index.html": ("text/html; charset=utf-8", "index.html", _NO_STORE),
     "static/style.css": ("text/css; charset=utf-8", "style.css", _NO_STORE),
     "static/app.js": ("text/javascript", "app.js", _NO_STORE),
-    # The operator panel (nodes/operator_console.py). Same directory, same
-    # loader, same ETag path -- a different page.
+    # The operator panel (the caller's ``nodes/operator_console.py``). Same
+    # directory, same loader, same ETag path -- a different page.
     "operator.html": ("text/html; charset=utf-8", "operator.html", _NO_STORE),
     "static/operator.css": ("text/css; charset=utf-8", "operator.css", _NO_STORE),
     "static/operator.js": ("text/javascript", "operator.js", _NO_STORE),

@@ -1,7 +1,7 @@
 """Arrow packing and unpacking for Dora inter-node communication.
 
 All messages are flat float64 Arrow arrays. The layouts intentionally match
-the historical ``Control/nodes/schemas.py`` functions.
+the caller's historical ``nodes/schemas.py`` functions.
 """
 from __future__ import annotations
 
@@ -433,8 +433,8 @@ def pack_scene_state(*, revision: int, actor_q: dict, attachments: dict, constra
 
 
 # --------------------------------------------------------------------------- #
-# SceneState <-> wire. These lived twice -- once in nodes/scene_grafter.py, once
-# in nodes/mujoco_interface.py -- written independently and genuinely divergent
+# SceneState <-> wire. These lived twice -- once in the caller's scene grafter,
+# once in its MuJoCo interface -- written independently and genuinely divergent
 # by the time anyone noticed: one took `revision` as an argument and one
 # demanded it inside the payload, one omitted `actor_q` when empty and one
 # always sent it. That divergence produced the KeyError('revision') that made
@@ -791,7 +791,7 @@ def _check_scene_codec() -> None:
 
     full = SceneState(
         actor_q={"base": [0.1, 0.0]},
-        attachments={"m": Attachment("row_01", "body", "p", "c", (0, 0, 0, 1, 0, 0, 0))},
+        attachments={"m": Attachment("part_a", "body", "p", "c", (0, 0, 0, 1, 0, 0, 0))},
         constraints={"hold": False},
         revision=7,
     )
@@ -801,7 +801,7 @@ def _check_scene_codec() -> None:
     # KeyError('revision') this consolidation exists to prevent.
     back = scene_state_from_payload(empty, scene_command_state(full), revision=7)
     assert back.revision == 7 and back.actor_q == {"base": [0.1, 0.0]}
-    assert back.attachments["m"].object_name == "row_01"
+    assert back.attachments["m"].object_name == "part_a"
     assert back.constraints == {"hold": False}
     echoed = scene_state_from_payload(empty, scene_state_payload(full))
     assert echoed.revision == 7 and echoed.actor_q == {"base": [0.1, 0.0]}

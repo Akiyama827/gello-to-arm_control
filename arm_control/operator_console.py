@@ -228,7 +228,7 @@ def _self_check() -> None:
         current="grasp",
         accepted=("move",),
         holding="grasp",
-        step=OperatorStep("grasp", "close on row_01", 1.5, {"width": "40 mm"}),
+        step=OperatorStep("grasp", "close on part_a", 1.5, {"width": "40 mm"}),
         started=True,
     )
     panel = OperatorPanel(lambda: workspace, fired.append, port=0)

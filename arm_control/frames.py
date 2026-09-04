@@ -1,7 +1,7 @@
 """Static frame transforms — ONE root for the whole workcell.
 
 The ChArUco plate bolted flat to the table **is** the world frame (it is the
-only calibration artifact; ``scripts/calibrate_hand_eye.py`` measures every
+only calibration artifact; the caller's hand-eye calibration measures every
 extrinsic against it). Everything perception publishes — ``module_poses``,
 ``scene_cloud``, the workspace crop — is expressed in that world frame, and
 each arm converts to its own base with its own ``world_T_arm``.

@@ -6,8 +6,9 @@ gripper expressed as a finger coordinate (metres). The real arm has 7 DM motors:
 prismatic fingers. This module owns the bidirectional map between the two.
 
 The gripper mimic (motor radians <-> finger metres) is a linear interpolation
-through the calibrated endpoints in ``configs/real/assembler.yaml`` ``joint_mimics``
-(``motor_open``/``motor_closed`` <-> ``lower``/``upper``). All calibration is read
+through the calibrated endpoints in the caller's ``configs/real/assembler.yaml``
+``joint_mimics`` (``motor_open``/``motor_closed`` <-> ``lower``/``upper``).
+All calibration is read
 from that per-joint ``mimic_cfg`` dict; nothing is hardcoded here. The same
 calibration was previously applied only for rendering in ``nodes/visualizer.py``;
 it now lives here so both directions share one source of truth.

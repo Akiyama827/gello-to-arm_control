@@ -52,9 +52,9 @@ def _module_slots(scene_cfg: dict) -> tuple[ModuleSlot, ...]:
     bench scenarios that use it are owned by the hardware thread.
 
     Port SITE names default to the connector standard because the dock IS one
-    printed part shared by every module (see modules/row_module_free.xml and
-    scripts/derive_connector_port.py); ``body`` and ``joints`` have no such
-    standard and must be stated, same rule as every other model fact here.
+    printed part shared by every module (the caller derives the standard from
+    its own connector model); ``body`` and ``joints`` have no such standard
+    and must be stated, same rule as every other model fact here.
     """
     entries = list(scene_cfg.get("inventory") or [])
     if entries and scene_cfg.get("module"):
