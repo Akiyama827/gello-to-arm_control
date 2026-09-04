@@ -3,9 +3,11 @@
 A thin adapter. Everything real lives in
 ``arm_control.execution.arm_controller.ArmController``; this file owns the Dora
 seam and builds the one thing the controller needs: an executor, via
-``build_executor`` — NOT ``build_planning_stack``, which would drag in the IK,
-the OMPL instance, the collision world and the scene this node exists to be
-free of.
+``build_executor`` from ``arm_control.execution.factory`` — NOT from
+``planning.stack``, which would drag in the IK, the OMPL instance, the
+collision world, and (through ``preview_rerun``) a hard ``rerun`` import that
+this node has no display for. The factory exists so a headless install without
+the optional ``[viz]`` extra can still servo.
 
 It is arm-agnostic. ``ARM_CONTROL_CONFIG`` picks the arm; the dataflow picks the
 plant. Pair it with ``arm_planner`` (Control-side for a workcell add, but the
@@ -28,7 +30,7 @@ if str(ARM_CONTROL_ROOT) not in sys.path:
 
 from arm_control.config import load_robot_config
 from arm_control.execution.arm_controller import ArmController
-from arm_control.planning.stack import build_executor, gripper_command_cfg
+from arm_control.execution.factory import build_executor, gripper_command_cfg
 
 
 def main() -> None:

@@ -29,6 +29,9 @@ The one rule that makes the split safe is ``plan_id``:
 
 from __future__ import annotations
 
+import math
+import time
+
 import numpy as np
 
 from arm_control.execution.trajectory_executor import (
@@ -84,19 +87,45 @@ class ArmController:
         arm_id: str = "arm",
         gripper: dict,
         state_period_s: float | None = None,
+        clock=None,
     ) -> None:
         self.node = node
         self.executor = executor
         self.arm_id = str(arm_id)
         self.gripper = dict(gripper)
         self.n_arm = executor.n_joints
-        # PLANT clock (opt-in via motor_state_period_s): trajectory time
-        # advances one nominal period per received motor_state, i.e. by how far
-        # the PLANT actually progressed -- never by wall time. A slow sim then
-        # plays the plan in lockstep slow-motion instead of letting the setpoint
-        # race ahead and discharge the gap as one PD yank (18 rad/s whip,
-        # measured). On the bench states tick at wall rate, so the two agree.
+        # TWO clock policies, and the choice is `motor_state_period_s`:
+        #
+        #   set    -> PLANT clock. Trajectory time advances one nominal period
+        #             per received motor_state, i.e. by how far the PLANT
+        #             actually progressed, never by wall time. A slow sim then
+        #             plays the plan in lockstep slow-motion instead of letting
+        #             the setpoint race ahead and discharge the gap as one PD
+        #             yank (18 rad/s whip, measured).
+        #   unset  -> WALL clock, time.monotonic().
+        #
+        # The fallback is the fix for a real bug, not a convenience. This used
+        # to advance _plant_t ONLY when a period was configured, while
+        # exec_time always returned _plant_t -- so with the key absent the
+        # clock sat at 0.0 forever, the executor never left its first sample,
+        # and no leg could ever complete. configs/sim/franka_workcell_add.yaml
+        # sets it (0.05) and configs/real/franka.yaml does NOT, so every green
+        # sim run hid a controller that would have hung on the first bench
+        # move. An arm that cannot finish a motion is not an acceptable
+        # response to a missing optional key.
+        #
+        # On the bench states tick at wall rate, so the two policies agree
+        # there; the plant clock stays the right choice for a sim that cannot
+        # keep up with real time.
         self._state_period = None if state_period_s is None else float(state_period_s)
+        if self._state_period is not None and not (
+            math.isfinite(self._state_period) and self._state_period > 0.0
+        ):
+            raise ValueError(
+                f"motor_state_period_s must be finite and positive, "
+                f"got {state_period_s!r}"
+            )
+        self._clock = clock or time.monotonic
         self._plant_t = 0.0
         self._finger_m = 0.0
 
@@ -229,7 +258,13 @@ class ArmController:
     # -- leg lifecycle -------------------------------------------------------
     @property
     def exec_time(self) -> float:
-        return self._plant_t
+        """Trajectory time under whichever clock policy is configured.
+
+        Both are monotonic and both are anchored the same way (``_release``
+        stamps ``t_start`` from this property), so the executor never sees the
+        absolute value -- only differences.
+        """
+        return self._plant_t if self._state_period is not None else self._clock()
 
     def _release(self, plan_id: str) -> None:
         """Start a named plan. Anchors t_start NOW, never at plan time.
@@ -489,6 +524,10 @@ _GRIPPER = {"n_motors": 7, "mimic": None, "open_finger_m": 0.04, "gains": (100.0
 
 def _controller(**kw) -> "ArmController":
     node = _FakeNode()
+    # PLANT clock by default: these checks fast-forward by assigning _plant_t,
+    # which only means anything under that policy. The WALL policy -- what a
+    # config without motor_state_period_s gets -- has its own check below.
+    kw.setdefault("state_period_s", 0.01)
     c = ArmController(node, _FakeExecutor(), gripper=dict(_GRIPPER), **kw)
     c._set_arm(True)
     c.bridge_armed = True
@@ -517,6 +556,46 @@ def _plan_msg(plan_id: str, *, gated: bool, done_mode: str = "normal", seat_goal
         positions=q, velocities=q, kp=np.full(7, 1200.0), kd=np.full(7, 30.0),
         done_mode=done_mode, seat_goal_q=seat_goal_q,
     )
+
+
+def _check_clock_policies() -> None:
+    """Either clock must actually advance, and a bad period must be refused.
+
+    The regression this pins: _plant_t advanced only when a period was
+    configured, while exec_time always returned it -- so a config WITHOUT
+    motor_state_period_s (which is every real/*.yaml here) froze trajectory
+    time at 0.0 and no leg could ever finish. It passed every sim run because
+    the sim config happens to set the key.
+    """
+    # WALL policy: no period configured. Time must move without any state.
+    ticks = iter([10.0, 10.5, 11.25])
+    c = ArmController(
+        _FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), clock=lambda: next(ticks)
+    )
+    assert c.exec_time == 10.0
+    assert c.exec_time == 10.5
+    assert c.exec_time == 11.25, "wall clock must advance with no motor_state"
+
+    # PLANT policy: time moves per state message and NOT with wall time.
+    frozen = ArmController(
+        _FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
+        state_period_s=0.02, clock=lambda: 999.0,
+    )
+    assert frozen.exec_time == 0.0
+    frozen.on_motor_state(_state())
+    frozen.on_motor_state(_state())
+    assert abs(frozen.exec_time - 0.04) < 1e-12, frozen.exec_time
+
+    # A period that is present but nonsense is a config error, not a fallback:
+    # silently switching clocks on a typo is how the original bug felt normal.
+    for bad in (0.0, -0.01, float("inf"), float("nan")):
+        try:
+            ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
+                          state_period_s=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"motor_state_period_s={bad} must be refused")
 
 
 def _self_check() -> None:
@@ -580,7 +659,8 @@ def _self_check() -> None:
     # 7. Disarmed, it streams NOTHING (the bridge zero-holds); armed but before
     #    the health ACK it streams nothing either, then announces ready once.
     node = _FakeNode()
-    c = ArmController(node, _FakeExecutor(), gripper=dict(_GRIPPER))
+    c = ArmController(node, _FakeExecutor(), gripper=dict(_GRIPPER),
+                      state_period_s=0.01)
     c.on_motor_state(_state())
     assert node.topics() == [], node.topics()
     c._set_arm(True)
@@ -593,6 +673,8 @@ def _self_check() -> None:
     assert [e["kind"] for e in readies] == ["ready"], readies
     assert readies[0]["q"] is not None
     assert "motor_command" in node.topics(), "no hold streaming after ready"
+
+    _check_clock_policies()
 
     print("arm_controller self-check ok")
 

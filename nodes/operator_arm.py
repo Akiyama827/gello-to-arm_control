@@ -115,6 +115,16 @@ class OperatorPanel:
                     self._send(_PANEL_PAGE.encode(), "text/html; charset=utf-8")
 
             def do_POST(self) -> None:
+                # EVERY route, not just takeover. `fire` is the signal that
+                # releases a gated motion leg -- the single most consequential
+                # thing this process can emit -- and it had no peer check at
+                # all while the socket listened on every interface. Anyone who
+                # could reach the port could start the arm. The bind below is
+                # loopback now; this is the second lock, so a future bind
+                # change cannot silently re-open the gate.
+                if self.client_address[0] not in ("127.0.0.1", "::1"):
+                    self._send(b'{"ok": false}', "application/json", 403)
+                    return
                 if self.path.endswith("fire"):
                     with panel._lock:
                         panel._pending += 1
@@ -128,10 +138,7 @@ class OperatorPanel:
                     # A NEWER session is claiming the port: this panel belongs
                     # to a dead/killed graph (the recurring orphan trap — its
                     # buttons look alive but publish into nothing). Release the
-                    # port; loopback peers only.
-                    if self.client_address[0] not in ("127.0.0.1", "::1"):
-                        self._send(b'{"ok": false}', "application/json", 403)
-                        return
+                    # port. (Peer check is now at the top of do_POST.)
                     panel.evicted = True
                     threading.Timer(0.2, panel.close).start()
                 self._send(b'{"ok": true}', "application/json")
@@ -139,7 +146,12 @@ class OperatorPanel:
         self._server = None
         for attempt in range(4):
             try:
-                self._server = ThreadingHTTPServer(("0.0.0.0", int(port)), Handler)
+                # Loopback ONLY, matching arm_control.operator_console.OperatorPanel,
+                # which REFUSES a non-loopback bind outright. Two operator
+                # gates with two answers to "who may release motion" is one
+                # answer too many. For a remote desk, tunnel the port
+                # (ssh -L) rather than listening on the network.
+                self._server = ThreadingHTTPServer(("127.0.0.1", int(port)), Handler)
                 break
             except OSError:
                 if attempt == 3 or int(port) == 0:
@@ -233,7 +245,7 @@ def main() -> None:
             print(f"[operator_arm] panel disabled ({exc})", flush=True)
     print(
         "[operator_arm] DISARMED — arm gate ready. "
-        + (f"Button panel at http://0.0.0.0:{panel.port} " if panel else "")
+        + (f"Button panel at http://127.0.0.1:{panel.port} " if panel else "")
         + ("| Enter to ARM/CONFIRM " if use_stdin else "")
         + f"(or in another shell: touch {trigger})",
         flush=True,
@@ -302,5 +314,52 @@ def main() -> None:
                 panel.log(message)
 
 
+def _self_check() -> None:
+    """The gate must not be reachable from the network. Assert it, do not read it.
+
+    This panel can emit the signal that RELEASES a gated motion leg. It used to
+    bind 0.0.0.0 with a peer check on /takeover only, so /fire -- the arm
+    signal itself -- was open to anyone who could reach the port, while
+    arm_control.operator_console.OperatorPanel refuses a non-loopback bind
+    outright. Two gates, two answers. This pins the one answer.
+    """
+    import urllib.request
+
+    panel = OperatorPanel(0)
+    try:
+        host, port = panel._server.server_address[:2]
+        assert host == "127.0.0.1", f"operator gate bound {host}, not loopback"
+
+        def post(path: str) -> int:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/{path}", method="POST"
+            )
+            return opener.open(req, timeout=2.0).status
+
+        # The gate still works from loopback -- a lock that breaks the button
+        # is not a fix.
+        assert post("fire") == 200
+        assert panel.take_trigger(), "a loopback click must still fire the gate"
+        assert not panel.take_trigger(), "one click is one fire, never batched"
+
+        # And the guard sits at the TOP of do_POST, so it covers fire/replay/
+        # replan and not just takeover. Checked by source rather than by
+        # spoofing a peer, which needs a second interface.
+        import inspect
+
+        body = inspect.getsource(OperatorPanel.__init__)
+        guard = body.index('self.client_address[0] not in ("127.0.0.1", "::1")')
+        assert guard < body.index('self.path.endswith("fire")'), (
+            "the peer check must precede every route, not just takeover"
+        )
+    finally:
+        panel.close()
+    print("operator_arm: OK")
+
+
 if __name__ == "__main__":
-    main()
+    if "--self-check" in sys.argv:
+        _self_check()
+    else:
+        main()
