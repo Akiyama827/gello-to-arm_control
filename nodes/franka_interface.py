@@ -128,10 +128,10 @@ def main() -> None:
                     )
                 elif etype == "INPUT" and eid == "grasp_request":
                     payload = unpack_grasp_request(event["value"])
-                    module_id = str(payload.get("module_id", ""))
+                    target_id = str(payload.get("target_id", ""))
                     immediate = backend.request_grasp(
                         str(payload.get("request_id", "")),
-                        module_id,
+                        target_id,
                         str(payload.get("mode", "close")),
                     )
                     if immediate is not None:
@@ -158,7 +158,7 @@ def main() -> None:
             result = backend.poll_grasp_result()
             if result is not None:
                 node.send_output("grasp_result", pack_grasp_result(**result))
-                grasp_cfg = dict(grasps.get(result["module_id"]) or {})
+                grasp_cfg = dict(grasps.get(result["target_id"]) or {})
                 if result["ok"] and grasp_cfg:
                     backend.set_payload(
                         float(grasp_cfg.get("mass_kg", 0.0)),

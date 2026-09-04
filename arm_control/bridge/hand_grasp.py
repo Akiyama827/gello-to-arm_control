@@ -26,8 +26,8 @@ from __future__ import annotations
 GRASP_TIMEOUT_S = 8.0
 
 
-def _result(rid: str, mid: str, ok: bool, reason: str) -> dict:
-    return {"request_id": rid, "module_id": mid, "ok": ok, "reason": reason}
+def _result(rid: str, tid: str, ok: bool, reason: str) -> dict:
+    return {"request_id": rid, "target_id": tid, "ok": ok, "reason": reason}
 
 
 class HandGraspFsm:
@@ -48,15 +48,15 @@ class HandGraspFsm:
     def on_request(self, payload: dict, gdone_count: int, now: float):
         """-> (action: 'grasp' | 'open', immediate grasp_result | None)."""
         rid = str(payload.get("request_id", ""))
-        mid = str(payload.get("module_id", ""))
+        tid = str(payload.get("target_id", ""))
         if str(payload.get("mode", "close")) == "release":
             # Unsensed, like the DM release: ack now, jaws travel after.
             self._pending = None
             self._held = None
-            return "open", _result(rid, mid, True, "released")
+            return "open", _result(rid, tid, True, "released")
         self._pending = {
             "request_id": rid,
-            "module_id": mid,
+            "target_id": tid,
             "deadline": now + GRASP_TIMEOUT_S,
             "gdone_base": gdone_count,
         }
@@ -73,8 +73,8 @@ class HandGraspFsm:
                 if gdone_ok:
                     self._held = p
                     self._held_seen_grasped = False
-                    return _result(p["request_id"], p["module_id"], True, "grasped")
-                return _result(p["request_id"], p["module_id"], False, "no object")
+                    return _result(p["request_id"], p["target_id"], True, "grasped")
+                return _result(p["request_id"], p["target_id"], False, "no object")
             if now >= p["deadline"]:
                 # Verdict lost (GSTOP kill / bridge reconnect): the freshest
                 # is_grasped sample is the best remaining truth.
@@ -84,7 +84,7 @@ class HandGraspFsm:
                     self._held = p
                     self._held_seen_grasped = False
                 return _result(
-                    p["request_id"], p["module_id"], ok,
+                    p["request_id"], p["target_id"], ok,
                     "grasped (is_grasped fallback)" if ok
                     else "no result from hand (timeout)",
                 )
@@ -97,7 +97,7 @@ class HandGraspFsm:
                 # Drop event: a second, failed result under the close
                 # request_id — the orchestrator freezes on it (LOST semantics).
                 self._held = None
-                return _result(h["request_id"], h["module_id"], False, "object lost")
+                return _result(h["request_id"], h["target_id"], False, "object lost")
         return None
 
 

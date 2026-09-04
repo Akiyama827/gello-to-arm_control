@@ -2,7 +2,7 @@
 
 The ChArUco plate bolted flat to the table **is** the world frame (it is the
 only calibration artifact; the caller's hand-eye calibration measures every
-extrinsic against it). Everything perception publishes — ``module_poses``,
+extrinsic against it). Everything perception publishes — ``object_poses``,
 ``scene_cloud``, the workspace crop — is expressed in that world frame, and
 each arm converts to its own base with its own ``world_T_arm``.
 

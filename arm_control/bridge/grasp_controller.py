@@ -23,7 +23,7 @@ class GraspController:
         self.gi = int(gripper_index)
         self._active = False
         self._request_id = ""
-        self._module_id = ""
+        self._target_id = ""
         self._result_sent = False
 
     @property
@@ -33,7 +33,7 @@ class GraspController:
     def request(self, payload: dict) -> dict | None:
         """Handle a grasp_request; return an immediate grasp_result or None."""
         self._request_id = str(payload.get("request_id", ""))
-        self._module_id = str(payload.get("module_id", ""))
+        self._target_id = str(payload.get("target_id", ""))
         mode = str(payload.get("mode", "close"))
         if mode == "release":
             self.gate.release()
@@ -91,7 +91,7 @@ class GraspController:
     def _result(self, ok: bool, reason: str) -> dict:
         return {
             "request_id": self._request_id,
-            "module_id": self._module_id,
+            "target_id": self._target_id,
             "ok": bool(ok),
             "reason": reason,
         }

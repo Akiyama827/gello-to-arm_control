@@ -340,7 +340,7 @@ class FrankaHardwareBackend:
     def grasp_busy(self) -> bool:
         return self._grip_busy
 
-    def request_grasp(self, request_id: str, module_id: str, mode: str) -> dict | None:
+    def request_grasp(self, request_id: str, target_id: str, mode: str) -> dict | None:
         """Start a close/release on a worker thread; result arrives via poll.
 
         Returns an immediate result only for the failure cases that need no
@@ -348,24 +348,24 @@ class FrankaHardwareBackend:
         """
         if self.gripper is None:
             return {
-                "request_id": request_id, "module_id": module_id,
+                "request_id": request_id, "target_id": target_id,
                 "ok": False, "reason": "no gripper configured",
             }
         if self._grip_busy:
             return {
-                "request_id": request_id, "module_id": module_id,
+                "request_id": request_id, "target_id": target_id,
                 "ok": False, "reason": "gripper busy",
             }
         self._grip_busy = True
         self._grip_thread = threading.Thread(
             target=self._grasp_worker,
-            args=(request_id, module_id, mode),
+            args=(request_id, target_id, mode),
             daemon=True,
         )
         self._grip_thread.start()
         return None
 
-    def _grasp_worker(self, request_id: str, module_id: str, mode: str) -> None:
+    def _grasp_worker(self, request_id: str, target_id: str, mode: str) -> None:
         cfg = self.config
         try:
             if mode == "release":
@@ -392,7 +392,7 @@ class FrankaHardwareBackend:
         except Exception as exc:
             ok, reason = False, f"gripper error: {exc}"
         self._grip_results.put(
-            {"request_id": request_id, "module_id": module_id, "ok": ok, "reason": reason}
+            {"request_id": request_id, "target_id": target_id, "ok": ok, "reason": reason}
         )
         self._grip_busy = False
 

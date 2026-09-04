@@ -222,7 +222,7 @@ def _demo() -> None:
     """Self-check: FSM verdict flow + line framing over a real socket."""
     fsm = HandGraspFsm({})
     # close -> GDONE ok -> grasped -> is_grasped falling edge = LOST
-    action, imm = fsm.on_request({"request_id": "r1", "module_id": "m"}, 0, 100.0)
+    action, imm = fsm.on_request({"request_id": "r1", "target_id": "m"}, 0, 100.0)
     assert action == "grasp" and _grasp_line(fsm).startswith("GRASP ") and imm is None
     assert fsm.poll(None, 0, False, 100.5) is None  # still in flight
     r = fsm.poll(None, 1, True, 101.0)
@@ -232,16 +232,16 @@ def _demo() -> None:
     assert not r["ok"] and r["reason"] == "object lost" and r["request_id"] == "r1"
     assert fsm.poll({"is_grasped": False}, 1, True, 102.5) is None  # fires once
     # failed close (GDONE 0); the pre-grasp is_grasped=False must NOT re-fire LOST
-    fsm.on_request({"request_id": "r2", "module_id": "m"}, 1, 103.0)
+    fsm.on_request({"request_id": "r2", "target_id": "m"}, 1, 103.0)
     r = fsm.poll({"is_grasped": False}, 2, False, 103.5)
     assert not r["ok"] and r["reason"] == "no object"
     # timeout fallback: no GDONE, freshest sample says held
-    fsm.on_request({"request_id": "r3", "module_id": "m"}, 2, 104.0)
+    fsm.on_request({"request_id": "r3", "target_id": "m"}, 2, 104.0)
     r = fsm.poll({"is_grasped": True}, 2, False, 104.0 + GRASP_TIMEOUT_S + 1)
     assert r["ok"] and "fallback" in r["reason"]
     # release: immediate ack, held cleared (no LOST afterwards)
     action, imm = fsm.on_request(
-        {"request_id": "r4", "module_id": "m", "mode": "release"}, 2, 105.0
+        {"request_id": "r4", "target_id": "m", "mode": "release"}, 2, 105.0
     )
     assert action == "open" and _open_line(fsm).startswith("MOVE ")
     assert imm["ok"] and imm["reason"] == "released"

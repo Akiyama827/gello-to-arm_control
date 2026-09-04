@@ -535,7 +535,7 @@ def _check_length(name: str, values: np.ndarray, expected: int) -> None:
 def pack_grasp_request(
     *,
     request_id: str,
-    module_id: str,
+    target_id: str,
     mode: str = "close",
     gripper_body: str = "gripper",
 ) -> pa.Array:
@@ -543,7 +543,7 @@ def pack_grasp_request(
         "grasp_request",
         {
             "request_id": request_id,
-            "module_id": module_id,
+            "target_id": target_id,
             "mode": mode,
             "gripper_body": gripper_body,
         },
@@ -554,12 +554,12 @@ def unpack_grasp_request(payload: pa.Array) -> dict:
     return unpack_json_message(payload, expected_schema="grasp_request")
 
 
-def pack_grasp_result(*, request_id: str, module_id: str, ok: bool, reason: str = "") -> pa.Array:
+def pack_grasp_result(*, request_id: str, target_id: str, ok: bool, reason: str = "") -> pa.Array:
     return pack_json_message(
         "grasp_result",
         {
             "request_id": request_id,
-            "module_id": module_id,
+            "target_id": target_id,
             "ok": bool(ok),
             "reason": reason,
         },
@@ -628,42 +628,47 @@ def unpack_base_tilt_result(payload: pa.Array) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# module_poses — the perception -> orchestrator contract. Hand-rolled on both
+# object_poses — the pose-estimator -> consumer contract. Hand-rolled on both
 # ends until 2026-07-26; once perception lives in its own repo this codec is
 # the ONLY place the schema exists, so drift between publisher and consumer
 # becomes an import error instead of a silent field mismatch.
+#
+# ``object_id`` is OPAQUE here: this package never interprets it. What the
+# tracked bodies ARE -- modules, fixtures, bricks -- is the caller's domain,
+# and naming them in the wire format is what made this codec look like an
+# assembly-task message rather than the pose contract it is.
 # --------------------------------------------------------------------------- #
 
 
-def pack_module_poses(
+def pack_object_poses(
     *,
     camera: str,
     frame: str,
     stamp: float,
-    modules: list[dict],
+    objects: list[dict],
     tags: list[dict] | None = None,
 ) -> pa.Array:
-    """``modules``: dicts with ``module_id`` and ``pose_xyzquat`` (7 floats,
+    """``objects``: dicts with ``object_id`` and ``pose_xyzquat`` (7 floats,
     [x y z qw qx qy qz]) plus free-form extras (``fitness``…). ``frame`` names
     the frame the poses are expressed in — consumers assert on it."""
-    for m in modules:
+    for m in objects:
         pose = m.get("pose_xyzquat")
         if pose is None or len(pose) != 7:
-            raise ValueError(f"module entry needs a 7-float pose_xyzquat: {m}")
+            raise ValueError(f"object entry needs a 7-float pose_xyzquat: {m}")
     return pack_json_message(
-        "module_poses",
+        "object_poses",
         {
             "camera": camera,
             "frame": frame,
             "stamp": float(stamp),
-            "modules": modules,
+            "objects": objects,
             "tags": list(tags or []),
         },
     )
 
 
-def unpack_module_poses(payload: pa.Array) -> dict:
-    return unpack_json_message(payload, expected_schema="module_poses")
+def unpack_object_poses(payload: pa.Array) -> dict:
+    return unpack_json_message(payload, expected_schema="object_poses")
 
 
 __all__ = [
@@ -696,8 +701,8 @@ __all__ = [
     "unpack_base_tilt_request",
     "pack_base_tilt_result",
     "unpack_base_tilt_result",
-    "pack_module_poses",
-    "unpack_module_poses",
+    "pack_object_poses",
+    "unpack_object_poses",
 ]
 
 
