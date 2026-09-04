@@ -102,13 +102,6 @@ def contacts_possible(
     return bool(contype_a & conaffinity_b) or bool(contype_b & conaffinity_a)
 
 
-SEAT_TOL_M = 0.001
-SEAT_TOL_DEG = 1.0
-"""Mate seat tolerance: how close the connector must be for the keyed mate
-to engage. The single source — the plant's capture gate and the
-orchestrator's dock verify are the SAME gate and must not drift apart.
-"""
-
 @dataclass(frozen=True)
 class SceneModelSpec:
     model_path: str
@@ -613,14 +606,18 @@ class MuJoCoBackend:
     launch_viewer: bool = False
     enable_self_collision: bool = False
     default_joint_positions: dict[str, float] = field(default_factory=dict)
-    # Seat gate for the dock weld: NO magnets — the weld models the keyed
-    # mechanical mate, which only engages within its lead-in chamfer
-    # (bench rung 14a measures the real lead-in). SEAT_TOL_* is the ONE
-    # definition of that tolerance; every other consumer imports it rather
-    # than restating the number (a scene/scenario may still override).
     static_boxes: list = field(default_factory=list)
-    dock_capture_m: float = SEAT_TOL_M
-    dock_capture_deg: float = SEAT_TOL_DEG
+    # Seat gate for the dock weld: NO magnets — the weld models a keyed
+    # mechanical mate, which only engages within its lead-in chamfer (bench
+    # rung 14a measures the real lead-in). How tight that chamfer is, is a
+    # fact about the CALLER's hardware and not about MuJoCo, so this package
+    # holds no number for it: the scene config states both and load() refuses
+    # scene mode without them. (They used to default to a SEAT_TOL_* pair
+    # defined in this file, which made the arm library the source of truth for
+    # an assembly-task tolerance — the consuming project imported it back out
+    # for its own dock verify.)
+    dock_capture_m: float | None = None
+    dock_capture_deg: float | None = None
     # REQUIRED in scene mode (validated in load()); irrelevant in single-model
     # mode. No robot-shaped defaults: these are model facts the scene config
     # states (scene.welds.*).
@@ -823,11 +820,16 @@ class MuJoCoBackend:
         if self.loaded:
             return
         if self.scene is not None:
-            missing = [k for k in ("ee_body", "dock_site") if not getattr(self, k)]
+            missing = [
+                k
+                for k in ("ee_body", "dock_site", "dock_capture_m", "dock_capture_deg")
+                if getattr(self, k) is None or getattr(self, k) == ""
+            ]
             if missing:
                 raise ValueError(
                     f"scene mode requires {missing} (scene.welds.* in the "
-                    "scenario config — model facts, no default robot)"
+                    "caller's scenario config — model and mate facts, and this "
+                    "package holds no default for either)"
                 )
             if not self.scene.modules:
                 raise ValueError(
@@ -2315,6 +2317,48 @@ def _check_contact_policy() -> None:
     print("mujoco_backend: contact policy OK")
 
 
+def _check_scene_requirements() -> None:
+    """Scene mode must refuse to load without the caller's mate facts.
+
+    These four used to be two: ``ee_body``/``dock_site`` were required, while
+    the seat tolerances defaulted to a ``SEAT_TOL_*`` pair defined in this file.
+    That default was the arm library deciding an assembly-task number, and the
+    consuming project imported it back out for its own dock verify. Now the
+    scenario config states all four, and a config that forgets one fails HERE,
+    by key name, instead of seating against a number nobody chose.
+    """
+    model = SceneModelSpec(model_path="unused.xml", name="arm", prefix="asm_")
+    scene = MuJoCoSceneSpec(arm=model, base=model, modules=())
+    full = {
+        "ee_body": "asm_Link6",
+        "dock_site": "base_dock_port",
+        "dock_capture_m": 0.001,
+        "dock_capture_deg": 1.0,
+    }
+    for dropped in full:
+        kwargs = {k: v for k, v in full.items() if k != dropped}
+        backend = MuJoCoBackend(joint_names=["Joint1"], scene=scene, **kwargs)
+        try:
+            backend.load()
+        except ValueError as exc:
+            assert dropped in str(exc), (dropped, str(exc))
+        else:
+            raise AssertionError(f"scene mode loaded without {dropped}")
+
+    # A zero tolerance is a CHOICE (nothing will ever seat), not a missing key:
+    # `not 0.0` is True, so a naive falsiness check would reject it as absent
+    # and send the reader hunting for a key that is right there in the config.
+    backend = MuJoCoBackend(
+        joint_names=["Joint1"], scene=scene,
+        **{**full, "dock_capture_m": 0.0, "dock_capture_deg": 0.0},
+    )
+    try:
+        backend.load()
+    except ValueError as exc:
+        assert "dock_capture" not in str(exc), f"0.0 read as a missing key: {exc}"
+    print("mujoco_backend: scene requirements OK")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -2324,5 +2368,6 @@ if __name__ == "__main__":
         _scene_demo()
     elif "--self-check" in sys.argv:
         _check_contact_policy()
+        _check_scene_requirements()
     else:
         print(__doc__)

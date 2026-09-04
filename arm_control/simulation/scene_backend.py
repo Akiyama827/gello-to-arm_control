@@ -17,8 +17,6 @@ from arm_control.simulation.mujoco_backend import (
     ModuleSlot,
     MuJoCoBackend,
     MuJoCoSceneSpec,
-    SEAT_TOL_DEG,
-    SEAT_TOL_M,
     SceneModelSpec,
     _prefixed,
 )
@@ -180,8 +178,11 @@ def build_scene_backend(
         },
         ee_body=str(weld_cfg["ee_body"]),
         dock_site=str(weld_cfg["dock_site"]),
-        dock_capture_m=float(weld_cfg.get("dock_capture_m", SEAT_TOL_M)),
-        dock_capture_deg=float(weld_cfg.get("dock_capture_deg", SEAT_TOL_DEG)),
+        # No fallback: the mate's lead-in is the caller's hardware fact. A
+        # missing key fails by name in MuJoCoSceneSpec.load() rather than
+        # silently seating against a number this package invented.
+        dock_capture_m=float(weld_cfg["dock_capture_m"]),
+        dock_capture_deg=float(weld_cfg["dock_capture_deg"]),
         gripper_joints=tuple(str(j) for j in (scene_cfg.get("gripper_joints") or [])),
         finger_body_match=tuple(
             str(m) for m in (scene_cfg.get("finger_body_match") or [])
