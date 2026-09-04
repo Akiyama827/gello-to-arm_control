@@ -215,6 +215,32 @@ def unpack_trajectory(arrow: pa.Array) -> dict:
     }
 
 
+def _completion_body(completion) -> dict | None:
+    """Validate the leg-completion rule. Unknown keys are a caller bug.
+
+    Silently dropping a misspelled tolerance would leave the leg judged by a
+    default the caller never chose -- and the failure mode is a leg that
+    completes while still moving.
+    """
+    if completion is None:
+        return None
+    unknown = set(completion) - {"vel_tol", "goal_q", "residual_max"}
+    if unknown:
+        raise ValueError(f"pack_plan: unknown completion key(s) {sorted(unknown)}")
+    goal = completion.get("goal_q")
+    if goal is not None and completion.get("residual_max") is None:
+        raise ValueError("pack_plan: completion goal_q needs a residual_max")
+    return {
+        "vel_tol": float(completion["vel_tol"]),
+        "goal_q": None if goal is None
+        else np.asarray(goal, dtype=float).ravel().tolist(),
+        "residual_max": (
+            None if completion.get("residual_max") is None
+            else float(completion["residual_max"])
+        ),
+    }
+
+
 def pack_plan(
     *,
     plan_id: str,
@@ -227,8 +253,7 @@ def pack_plan(
     kd,
     cartesian_poses=None,
     cartesian=None,
-    done_mode: str = "normal",
-    seat_goal_q=None,
+    completion=None,
 ) -> pa.Array:
     """One planned leg, planner -> controller.
 
@@ -240,9 +265,15 @@ def pack_plan(
 
     ``gated`` is the operator contract: a gated plan is loaded for REVIEW and
     must not run until an ``execute`` naming this exact ``plan_id`` arrives.
-    ``done_mode`` carries the leg-completion RULE with the leg, so the
-    controller never has to know which phase is special -- "seat" is the
-    insertion leg, judged by settle rather than by joint residual.
+
+    ``completion`` carries the leg-completion RULE with the leg, so the
+    controller never has to know which leg is special -- or what makes it
+    special. Absent (the default) means the executor's own done(): the plan
+    played out and the arm is at the target. Present, it is the SETTLE rule --
+    the plan played out, the arm has stopped to ``vel_tol``, and (if
+    ``goal_q`` is given) it stopped within ``residual_max`` of it. The caller
+    picks those numbers because the caller is the one that knows why this leg
+    cannot be judged on joint residual.
     """
     times = np.asarray(times, dtype=float).ravel()
     q = np.asarray(positions, dtype=float).reshape(len(times), -1)
@@ -256,11 +287,7 @@ def pack_plan(
         "velocities": qd.tolist(),
         "kp": np.asarray(kp, dtype=float).ravel().tolist(),
         "kd": np.asarray(kd, dtype=float).ravel().tolist(),
-        "done_mode": str(done_mode),
-        "seat_goal_q": (
-            None if seat_goal_q is None
-            else np.asarray(seat_goal_q, dtype=float).ravel().tolist()
-        ),
+        "completion": _completion_body(completion),
         # FK of every sample, precomputed in WORLD. The controller owns no
         # kinematics by design, and the Cartesian impedance target is exactly
         # FK(q_des) -- so it ships with the samples rather than being re-derived
@@ -289,9 +316,12 @@ def unpack_plan(payload: pa.Array) -> dict:
             raise ValueError(f"unpack_plan: {key} has {len(body[key])} rows, want {n}")
     for key in ("times", "positions", "velocities", "kp", "kd"):
         body[key] = np.asarray(body[key], dtype=float)
-    for key in ("seat_goal_q", "cartesian_poses"):
-        if body.get(key) is not None:
-            body[key] = np.asarray(body[key], dtype=float)
+    if body.get("cartesian_poses") is not None:
+        body["cartesian_poses"] = np.asarray(body["cartesian_poses"], dtype=float)
+    if body.get("completion") is not None:
+        spec = body["completion"]
+        if spec.get("goal_q") is not None:
+            spec["goal_q"] = np.asarray(spec["goal_q"], dtype=float)
     if body.get("cartesian") is not None:
         body["cartesian"] = {
             k: np.asarray(v, dtype=float) for k, v in body["cartesian"].items()
@@ -683,22 +713,36 @@ def _self_check() -> None:
             kp=np.full(n, 1200.0), kd=np.full(n, 30.0),
             cartesian_poses=np.tile([0, 0, 0, 1, 0, 0, 0], (samples, 1)),
             cartesian={"task_R": np.eye(3), "kc": np.ones(6), "dc": np.ones(6)},
-            done_mode="seat", seat_goal_q=np.arange(n, dtype=float),
+            completion={"vel_tol": 0.002, "goal_q": np.arange(n, dtype=float),
+                        "residual_max": 0.01},
         )
     )
     assert plan["plan_id"] == "p1" and plan["gated"] is True
     assert plan["positions"].shape == (samples, n), plan["positions"].shape
     assert plan["cartesian_poses"].shape == (samples, 7)
     assert plan["cartesian"]["task_R"].shape == (3, 3)
-    assert plan["done_mode"] == "seat" and plan["seat_goal_q"].shape == (n,)
+    assert plan["completion"]["goal_q"].shape == (n,), plan["completion"]
+    assert plan["completion"]["vel_tol"] == 0.002
 
-    # A leg with no Cartesian block and no seat goal stays None, not zeros --
-    # the controller branches on exactly this.
+    # A misspelled tolerance must not silently leave the leg on the default
+    # rule: that is a leg judged done while it is still moving.
+    for bad in ({"vel_tol": 0.1, "residual": 0.01}, {"vel_tol": 0.1, "goal_q": q[0]}):
+        try:
+            pack_plan(plan_id="p", phase="x", gated=False, times=times,
+                      positions=q, velocities=q, kp=np.ones(n), kd=np.ones(n),
+                      completion=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"completion={bad} must be refused")
+
+    # A leg with no Cartesian block and no completion rule stays None, not
+    # zeros -- the controller branches on exactly this.
     bare = unpack_plan(
         pack_plan(plan_id="p2", phase="lift", gated=False, times=times,
                   positions=q, velocities=q, kp=np.ones(n), kd=np.ones(n))
     )
-    assert bare["cartesian"] is None and bare["seat_goal_q"] is None
+    assert bare["cartesian"] is None and bare["completion"] is None
     assert bare["cartesian_poses"] is None
 
     # control: absent keys mean "unchanged", so an empty dict must survive and

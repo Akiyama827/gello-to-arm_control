@@ -51,30 +51,6 @@ from arm_control.messages import (
     unpack_plan,
 )
 
-# Seat-leg completion. The insertion leg is judged differently from every
-# other: it drives the module INTO the dock, where success is the MODULE's pose
-# and the arm is expected to stop wherever the seat stops it, so a joint-space
-# residual there measures the servo and not the dock (measured: the leg settled
-# 0.024 rad short with zero velocity against a 0.01 rad tolerance while the
-# module sat correctly at the seat).
-#
-# So: the arm has genuinely STOPPED, and is not parked absurdly far from the
-# plan. An earlier test asked the residual to be FLAT to 2e-4 rad over a
-# window, which is the plant's own encoder jitter (measured 1e-4 flicker at
-# |qd| = 0.0000) -- so the leg completed in 81 s on one run and never on the
-# next, from identical code. Velocity is the honest "stopped" signal; the
-# residual bound only has to reject a leg that stalled, because the SEAT itself
-# is verified separately by REQUEST_DOCK against SEAT_TOL_*.
-#
-# 0.002 rad/s is ~1.6 mm/s at this reach: two decades under done_vel_tol's
-# 0.05, still two decades over the noise. (done_vel_tol alone is ~40 mm/s here
-# -- a leg clears it while still closing its last 0.02 rad, and the dock verify
-# one phase later then measures a moving arm.) The residual bound sits between
-# the 0.0014 rad a healthy seated leg holds and the 0.018-0.021 rad a jammed
-# one showed, so a jam is refused here rather than at the dock verify.
-SEAT_SETTLE_VEL_RADS = 0.002
-SEAT_RESIDUAL_MAX_RAD = 0.01
-
 
 class ArmController:
     """Owns the executor and the plant stream. Bounded work per event."""
@@ -281,6 +257,18 @@ class ArmController:
                 flush=True,
             )
             return
+        if not self.armed or not self.ready_sent:
+            # Not a race we can wait out: the plant is limp (or has not ACKed
+            # the arm), so the pose this plan was built from is already stale.
+            # FAIL the leg rather than sit on it -- the planner is blocked on a
+            # leg_result and would otherwise wait for one that never comes.
+            print(
+                f"[arm_controller] execute {plan_id!r} REFUSED — "
+                f"armed={self.armed} ready={self.ready_sent}",
+                flush=True,
+            )
+            self._finish_leg(ok=False, reason="not armed")
+            return
         if self._running:
             return
         self.executor.load_trajectory(self._pending_traj, t_start=self.exec_time)
@@ -294,27 +282,29 @@ class ArmController:
     def _leg_done(self, state: JointState) -> bool:
         """Has this leg finished? The RULE arrives with the plan.
 
-        ``normal`` is the executor's own done(): the plan played out and the
-        arm is at the target. ``seat`` drops the position term -- see
-        SEAT_SETTLE_VEL_RADS -- and judges settle instead. The seat itself is
-        judged one phase later by the dock verify, which owns the accept, the
-        reject and the one retry; duplicating that tolerance here would only
-        add a second place to hang.
+        No rule means the executor's own done(): the plan played out and the
+        arm is at the target. A ``completion`` spec means the SETTLE rule
+        instead -- the plan played out, the arm has genuinely STOPPED, and it
+        did not stop absurdly far from the plan. That rule exists for legs
+        whose success is not the arm's joint residual (a leg that drives a part
+        into a fixture succeeds at the PART's pose), but this node is not the
+        one that gets to know which legs those are, or what tolerances their
+        physics deserves. Both numbers ride in with the leg.
         """
-        mode = (self._plan or {}).get("done_mode", "normal")
-        if mode != "seat":
+        spec = (self._plan or {}).get("completion")
+        if spec is None:
             return self.executor.done(self.exec_time, state)
         if not self.executor.done(
             self.exec_time, state, pos_tol=float("inf"), vel_tol=float("inf")
         ):
             return False  # the plan has not played out yet
-        if float(np.max(np.abs(np.asarray(state.velocity)))) > SEAT_SETTLE_VEL_RADS:
-            return False  # still moving: the seat is not final yet
-        goal = (self._plan or {}).get("seat_goal_q")
+        if float(np.max(np.abs(np.asarray(state.velocity)))) > spec["vel_tol"]:
+            return False  # still moving: not settled yet
+        goal = spec.get("goal_q")
         if goal is None:
             return True
         residual = float(np.max(np.abs(np.asarray(state.position) - goal)))
-        return residual <= SEAT_RESIDUAL_MAX_RAD
+        return residual <= spec["residual_max"]
 
     def _finish_leg(self, *, ok: bool, reason: str) -> None:
         plan_id = "" if self._plan is None else self._plan["plan_id"]
@@ -415,8 +405,34 @@ class ArmController:
         )
 
     def _set_arm(self, armed: bool) -> None:
-        self.armed = bool(armed)
+        armed = bool(armed)
+        if self.armed and not armed:
+            self._disarm_reset()
+        self.armed = armed
         self.node.send_output("arm", pack_json_message("arm", {"armed": self.armed}))
+
+    def _disarm_reset(self) -> None:
+        """Disarming is a lifecycle event, not just a flag.
+
+        The plant goes limp the moment the bridge sees ``armed=False``, so
+        everything the controller still believes is stale: the running leg will
+        never finish (and the planner blocks on its leg_result), a loaded plan
+        was built from a pose the arm has since sagged out of, the hold anchor
+        names a target nothing is holding, and ``ready_sent`` would suppress
+        the fresh ready the planner needs to re-anchor. Re-arming must look
+        exactly like arming for the first time -- including waiting for the
+        plant to ACK again before a single command streams.
+        """
+        if self._running:
+            self._finish_leg(ok=False, reason="disarmed mid-leg")
+        self._plan = None
+        self._pending_traj = None
+        self._running = False
+        self.executor.clear_trajectory()
+        self.ready_sent = False
+        self.bridge_armed = False
+        self._hold_anchor = None
+        self.last_command = None
 
     def _fault(self, reason: str) -> None:
         if self._running:
@@ -531,6 +547,7 @@ def _controller(**kw) -> "ArmController":
     c = ArmController(node, _FakeExecutor(), gripper=dict(_GRIPPER), **kw)
     c._set_arm(True)
     c.bridge_armed = True
+    c.on_motor_state(_state())   # the post-arm state that earns `ready`
     node.sent.clear()
     return c
 
@@ -546,7 +563,7 @@ def _state(n: int = 7, vel: float = 0.0):
     )
 
 
-def _plan_msg(plan_id: str, *, gated: bool, done_mode: str = "normal", seat_goal_q=None):
+def _plan_msg(plan_id: str, *, gated: bool, completion=None):
     from arm_control.messages import pack_plan
 
     times = np.array([0.0, 1.0])
@@ -554,7 +571,7 @@ def _plan_msg(plan_id: str, *, gated: bool, done_mode: str = "normal", seat_goal
     return pack_plan(
         plan_id=plan_id, phase="move", gated=gated, times=times,
         positions=q, velocities=q, kp=np.full(7, 1200.0), kd=np.full(7, 30.0),
-        done_mode=done_mode, seat_goal_q=seat_goal_q,
+        completion=completion,
     )
 
 
@@ -632,24 +649,25 @@ def _self_check() -> None:
     assert len(legs) == 1 and legs[0]["plan_id"] == "p1" and legs[0]["ok"], legs
     assert c._running is False and c._plan is None
 
-    # 5. Seat mode: the plan playing out is not enough -- a still-moving arm is
-    #    not seated, and a residual beyond the bound is not either.
+    # 5. The settle rule, with the tolerances the LEG carried in: the plan
+    #    playing out is not enough -- a still-moving arm is not settled, and a
+    #    residual beyond the bound is not either.
+    settle = {"vel_tol": 0.002, "goal_q": np.zeros(7), "residual_max": 0.01}
     c = _controller()
-    c.on_plan(_plan_msg("s1", gated=False, done_mode="seat",
-                        seat_goal_q=np.zeros(7)))
+    c.on_plan(_plan_msg("s1", gated=False, completion=settle))
     c._plant_t = 5.0
     c.on_motor_state(_state(vel=0.05))          # moving: 25x the settle gate
-    assert c._running is True, "seat leg completed while still moving"
+    assert c._running is True, "settle leg completed while still moving"
     c.on_motor_state(_state(vel=0.0))
-    assert c._running is False, "settled seat leg never completed"
+    assert c._running is False, "stopped settle leg never completed"
 
-    # A seat leg parked far from its plan must NOT be called done.
+    # A settle leg parked far from its plan must NOT be called done.
     c = _controller()
-    c.on_plan(_plan_msg("s2", gated=False, done_mode="seat",
-                        seat_goal_q=np.full(7, 0.5)))
+    c.on_plan(_plan_msg("s2", gated=False,
+                        completion=dict(settle, goal_q=np.full(7, 0.5))))
     c._plant_t = 5.0
     c.on_motor_state(_state(vel=0.0))
-    assert c._running is True, "seat leg completed 0.5 rad from its plan"
+    assert c._running is True, "settle leg completed 0.5 rad from its plan"
 
     # 6. Payload crosses as a control message, not as config.
     c = _controller()
@@ -673,6 +691,44 @@ def _self_check() -> None:
     assert [e["kind"] for e in readies] == ["ready"], readies
     assert readies[0]["q"] is not None
     assert "motor_command" in node.topics(), "no hold streaming after ready"
+
+    # 8. Disarming is a lifecycle reset, not a flag flip: the running leg fails
+    #    back (the planner is blocked on it), the loaded plan is dropped, and
+    #    re-arming re-earns both the plant ACK and `ready` before anything runs.
+    c = _controller()
+    c.on_plan(_plan_msg("d1", gated=False))
+    assert c._running is True
+    c.node.sent.clear()
+    c.on_control(pack_control_update(arm=False))
+    legs = [unpack_controller_event(a) for t, a in c.node.sent
+            if t == "controller_event"]
+    assert [(e["plan_id"], e["ok"]) for e in legs] == [("d1", False)], legs
+    assert c._plan is None and c._running is False
+    assert not c.ready_sent and not c.bridge_armed, "re-arm would skip the ACK"
+
+    c.on_control(pack_control_update(arm=True))
+    c.node.sent.clear()
+    c.on_motor_state(_state())
+    assert c.node.topics() == [], "streamed on a re-arm without a fresh ACK"
+    c.bridge_armed = True
+    c.on_motor_state(_state())
+    kinds = [unpack_controller_event(a)["kind"] for t, a in c.node.sent
+             if t == "controller_event"]
+    assert kinds == ["ready"], kinds
+
+    # 9. An execute that lands while disarmed is refused AND fails the leg, so
+    #    the planner learns instead of waiting on a leg that will never run.
+    #    (Flag set directly: a real disarm would have dropped the plan already,
+    #    which is check 8 -- this isolates the release guard itself.)
+    c = _controller()
+    c.on_plan(_plan_msg("x1", gated=True))
+    c.armed = False
+    c.node.sent.clear()
+    c.on_control(pack_control_update(execute="x1"))
+    assert c._running is False, "started a leg while disarmed"
+    legs = [unpack_controller_event(a) for t, a in c.node.sent
+            if t == "controller_event"]
+    assert [(e["kind"], e["ok"]) for e in legs] == [("leg_result", False)], legs
 
     _check_clock_policies()
 
