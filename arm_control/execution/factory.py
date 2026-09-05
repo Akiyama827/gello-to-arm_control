@@ -95,7 +95,9 @@ def gripper_command_cfg(cfg) -> dict:
     }
 
 
-def build_executor(cfg, *, arm_id: str = "arm") -> JointTrajectoryExecutor:
+def build_executor(
+    cfg, *, arm_id: str = "arm", gains: dict | None = None
+) -> JointTrajectoryExecutor:
     """The EXECUTION half of an arm's stack, with no planning half at all.
 
     Split out of build_planning_stack so ``arm_controller`` can have a servo
@@ -103,6 +105,15 @@ def build_executor(cfg, *, arm_id: str = "arm") -> JointTrajectoryExecutor:
     point of the planner/controller split is that the controller loads none of
     those, and calling build_planning_stack just to reach ``.executor`` would
     load every one of them.
+
+    ``gains`` (per-MOTOR vectors, as ``node_utils.resolve_gains`` returns them)
+    overrides the arm table. Two config styles have to meet here: an assembly
+    config states ``arm.kp``, while a motion mode config states
+    ``controller.kp`` and its robot config states no gains at all. Reading only
+    the arm table meant this executor could not be built for a motion graph --
+    it raised "config missing arm.kp" and the node died on startup. The caller
+    resolves across both and passes the answer in; absent, the arm table is
+    still the source, so every existing caller is unchanged.
     """
     joints = arm_joints(cfg)
     n = len(joints)
@@ -112,13 +123,18 @@ def build_executor(cfg, *, arm_id: str = "arm") -> JointTrajectoryExecutor:
     tolerances = {
         k: float(arm_blk[k]) for k in ("done_pos_tol", "done_vel_tol") if k in arm_blk
     }
+    def _gain(key: str, arm_key: str) -> np.ndarray:
+        if gains is None:
+            return gain_vector(cfg, arm_key, n)
+        return np.asarray(gains[key], dtype=float).ravel()[:n]
+
     executor = JointTrajectoryExecutor(
         arm_id=arm_id,
         joint_names=joints,
         dynamics=PinocchioDynamics(arm_urdf(cfg), joints),
-        kp_default=gain_vector(cfg, "kp", n),
-        kd_default=gain_vector(cfg, "kd", n),
-        max_torque=gain_vector(cfg, "max_tau", n),
+        kp_default=_gain("kp", "kp"),
+        kd_default=_gain("kd", "kd"),
+        max_torque=_gain("torque_limits", "max_tau"),
         # The plant compensates gravity (the FR3 control box on the bench, and
         # now the twin too), so ship RNEA MINUS gravity or the arm gets it
         # twice. nodes/trajectory_executor.py already honoured this flag; this

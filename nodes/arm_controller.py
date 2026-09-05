@@ -28,16 +28,29 @@ ARM_CONTROL_ROOT = Path(__file__).resolve().parents[1]
 if str(ARM_CONTROL_ROOT) not in sys.path:
     sys.path.insert(0, str(ARM_CONTROL_ROOT))
 
-from arm_control.config import load_robot_config
+from arm_control.config import arm_joints, load_robot_config
 from arm_control.execution.arm_controller import ArmController
 from arm_control.execution.factory import build_executor, gripper_command_cfg
+from arm_control.node_utils import _load_mode_config, resolve_gains
 
 
 def main() -> None:
     cfg = load_robot_config()
+    mode_cfg = _load_mode_config()
+    # Gains span two config styles: an assembly config states `arm.kp`, a
+    # motion mode config states `controller.kp` and its robot config states
+    # none. resolve_gains prefers the mode config and falls back to the arm
+    # table, so one node serves both -- with no mode config (the assembly
+    # graphs set none) it resolves exactly what the arm table always gave.
+    gains = resolve_gains(
+        cfg,
+        mode_cfg,
+        list(cfg.joint_names or cfg.motor_names),
+        len(arm_joints(cfg)),
+    )
     controller = ArmController(
         Node(),
-        build_executor(cfg, arm_id=os.environ.get("ARM_ID", "arm")),
+        build_executor(cfg, arm_id=os.environ.get("ARM_ID", "arm"), gains=gains),
         arm_id=os.environ.get("ARM_ID", "arm"),
         gripper=gripper_command_cfg(cfg),
         # A bare sim plant (mujoco_interface with no sim_bridge) publishes no
