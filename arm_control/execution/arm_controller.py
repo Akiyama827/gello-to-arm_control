@@ -45,6 +45,7 @@ from arm_control.joint_motor_map import (
 )
 from arm_control.messages import (
     pack_controller_event,
+    unpack_motor_command,
     pack_json_message,
     unpack_control_update,
     unpack_json_message,
@@ -63,6 +64,7 @@ class ArmController:
         arm_id: str = "arm",
         gripper: dict,
         state_period_s: float | None = None,
+        plant_reports_health: bool = True,
         clock=None,
     ) -> None:
         self.node = node
@@ -103,6 +105,13 @@ class ArmController:
         self._clock = clock or time.monotonic
         self._plant_t = 0.0
         self._finger_m = 0.0
+        # Operator-commanded finger target, or None to hold the configured open
+        # width. The assembly path leaves this None on purpose: the bridge's
+        # grasp gate owns the gripper slot from close_gripper onward, and a
+        # second writer would fight it. A manual console has no grasp gate, so
+        # its slider has to reach the jaws somehow -- this is that path, and it
+        # is the capability the trajectory executor used to provide.
+        self._finger_cmd: float | None = None
 
         self.last_state = JointState(np.zeros(self.n_arm), np.zeros(self.n_arm))
         self.last_command: JointServoCommand | None = None
@@ -112,7 +121,17 @@ class ArmController:
         self._last_cartesian_pose: np.ndarray | None = None
 
         self.armed = False
-        self.bridge_armed = False   # bridge-confirmed (motor_health armed edge)
+        # Does this plant have a safety bridge that ACKs the arm? A bridge
+        # publishes motor_state while DISARMED, so a queued pre-arm sample can
+        # arrive after our arm message and we would anchor on a stale or zero
+        # pose; waiting for the armed health edge is what makes a first state
+        # provably post-enable. A bare sim plant has no gate and no health
+        # topic -- every state it sends is live -- and waiting for an edge that
+        # cannot come means it never streams at all. That is a fact about the
+        # GRAPH, so the graph says it (the node reads ARM_CONTROL_PLANT_HEALTH),
+        # and it is opt-OUT: a real bridge must never be assumed absent.
+        self._needs_health = bool(plant_reports_health)
+        self.bridge_armed = not self._needs_health
         self.ready_sent = False
         self.frozen = False         # holding forever (milestone reached)
         self.stopped = False
@@ -166,6 +185,8 @@ class ArmController:
             )
         if "execute" in fields:
             self._release(str(fields["execute"]))
+        if fields.get("cancel"):
+            self._cancel(str(fields.get("reason") or "cancelled"))
         if fields.get("hold"):
             # Milestone reached: hold this pose forever rather than disarming.
             self.frozen = True
@@ -177,6 +198,11 @@ class ArmController:
             )
         if "stop" in fields:
             self._stop(str(fields.get("reason") or fields["stop"]))
+
+    def on_gripper(self, value) -> None:
+        """A commanded finger width, in metres, from an operator console."""
+        command = unpack_motor_command(value, 2)
+        self._finger_cmd = float(np.asarray(command["position"], dtype=float)[0])
 
     def on_motor_health(self, value) -> None:
         payload = unpack_json_message(value)
@@ -203,11 +229,7 @@ class ArmController:
             return
         if not self.ready_sent:
             if not self.bridge_armed:
-                # The bridge publishes motor_state while disarmed, so a queued
-                # pre-arm sample can arrive after our arm message. Only a state
-                # received AFTER the armed health edge is provably post-enable;
-                # starting from anything earlier could plan from a stale/zero
-                # pose and jump the arm.
+                # Waiting for the armed health edge -- see _needs_health.
                 return
             self.ready_sent = True
             self.node.send_output(
@@ -277,6 +299,31 @@ class ArmController:
             f"({plan_id}, {self._pending_traj.duration_sec:.2f}s)",
             flush=True,
         )
+
+    def _cancel(self, reason: str) -> None:
+        """Abort the current leg and hold, still ARMED and still runnable.
+
+        None of the three existing stops means this. ``stop`` is terminal (it
+        disarms and latches). ``hold`` freezes forever -- it is the milestone
+        signal, and a frozen controller refuses every later plan. Disarming is
+        a lifecycle reset that makes the plant go limp. An operator pressing
+        Stop on a console means none of those: put the arm down where it is,
+        forget the plan, and let me try again without re-arming.
+
+        Dropping ``_hold_anchor`` is what makes it land in the right place. The
+        anchor normally follows the last COMMANDED target so a settled hold
+        does not dip, but a leg aborted mid-motion has a moving command, so
+        ``_anchored_hold`` falls through to a static hold at the MEASURED
+        pose -- which is where the arm actually is when the button is pressed.
+        """
+        if self._running:
+            self._finish_leg(ok=False, reason=reason)
+        self._plan = None
+        self._pending_traj = None
+        self._running = False
+        self.executor.clear_trajectory()
+        self._hold_anchor = None
+        print(f"[arm_controller] cancelled: {reason}", flush=True)
 
     def _leg_done(self, state: JointState) -> bool:
         """Has this leg finished? The RULE arrives with the plan.
@@ -396,7 +443,9 @@ class ArmController:
                 command.tau_ff,
                 command.kp,
                 command.kd,
-                self.gripper["open_finger_m"],
+                self.gripper["open_finger_m"]
+                if self._finger_cmd is None
+                else self._finger_cmd,
                 self.gripper["gains"],
                 self.gripper["mimic"],
                 cartesian=cartesian,
@@ -429,7 +478,7 @@ class ArmController:
         self._running = False
         self.executor.clear_trajectory()
         self.ready_sent = False
-        self.bridge_armed = False
+        self.bridge_armed = not self._needs_health
         self._hold_anchor = None
         self.last_command = None
 
@@ -457,15 +506,35 @@ class ArmController:
             "motor_health": self.on_motor_health,
             "plan": self.on_plan,
             "control": self.on_control,
+            "gripper": self.on_gripper,
+            # A second motion source speaks the same contract under its own
+            # topic name (dora maps one producer per input, so an alias is how
+            # two of them reach one handler -- the trajectory executor did the
+            # same for its replay input).
+            "plan_replay": self.on_plan,
+            "control_replay": self.on_control,
         }
+        seen_unknown: set[str] = set()
         for event in self.node:
             if event["type"] == "STOP":
                 break
             if event["type"] != "INPUT":
                 continue
             handler = handlers.get(event["id"])
-            if handler is not None:
-                handler(event["value"])
+            if handler is None:
+                # A graph can wire an input this controller has no handler for
+                # -- renaming `trajectory` to `plan` did exactly that -- and a
+                # silent drop makes it look like the producer is broken. Say it
+                # once per topic; every tick would be a log flood.
+                if event["id"] not in seen_unknown:
+                    seen_unknown.add(event["id"])
+                    print(
+                        f"[arm_controller] IGNORING input {event['id']!r}: no "
+                        f"handler (known: {sorted(handlers)})",
+                        flush=True,
+                    )
+                continue
+            handler(event["value"])
             if self.stopped:
                 break
 
@@ -730,6 +799,91 @@ def _self_check() -> None:
     assert [(e["kind"], e["ok"]) for e in legs] == [("leg_result", False)], legs
 
     _check_clock_policies()
+
+    # N. Cancel is the OPERATOR stop, and it is none of the other three.
+    #    A running leg aborts, the plan is dropped, and the arm stays armed and
+    #    still accepts the next plan -- unlike `hold` (frozen forever) and
+    #    `stop` (terminal), both of which refuse everything after.
+    c = _controller()
+    c.on_plan(_plan_msg("run1", gated=False))
+    c.on_motor_state(_state())
+    c.on_motor_state(_state(vel=0.5))
+    assert c._running, "leg should be running before the cancel"
+    c.on_control(pack_control_update(cancel=True, reason="operator stop"))
+    assert not c._running and c._plan is None, (c._running, c._plan)
+    assert c.armed and not c.stopped and not c.frozen, (c.armed, c.stopped, c.frozen)
+    # It reports the abort rather than letting a caller block on a leg that
+    # will never finish.
+    kinds = [unpack_controller_event(a)["kind"] for _t, a in c.node.sent
+             if _t == "controller_event"]
+    assert "leg_result" in kinds, kinds
+    # And the arm is still usable: the next plan loads and runs.
+    c.on_plan(_plan_msg("run2", gated=False))
+    c.on_motor_state(_state())
+    assert c._running, "a cancelled controller must still accept a new plan"
+
+    # Contrast, so the three cannot quietly converge: `hold` refuses the next
+    # plan outright.
+    c = _controller()
+    c.on_motor_state(_state())
+    c.on_control(pack_control_update(hold=True, reason="milestone"))
+    c.on_plan(_plan_msg("after_hold", gated=False))
+    assert c._plan is None, "a frozen controller must not load a plan"
+
+    # N+1. A plant with no health topic still streams; one WITH a bridge still
+    #      waits for the armed edge. Getting this backwards is silent either
+    #      way -- an arm that never moves, or one anchored on a pre-arm pose.
+    # (built raw, not via _controller(), which pre-sets bridge_armed for the
+    #  checks above -- that shortcut is the very thing under test here)
+    c = ArmController(
+        _FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
+        state_period_s=0.01, plant_reports_health=False,
+    )
+    c._set_arm(True)
+    c.on_motor_state(_state())
+    assert c.ready_sent, "a bridgeless plant must not wait for a health edge"
+    assert any(t == "motor_command" for t, _a in c.node.sent), c.node.topics
+
+    c = ArmController(
+        _FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), state_period_s=0.01,
+    )  # the default: there IS a bridge
+    c._set_arm(True)
+    c.on_motor_state(_state())
+    assert not c.ready_sent, "a bridged plant must wait for the armed edge"
+    c.on_motor_health(pack_json_message("motor_health", {"armed": True}))
+    c.on_motor_state(_state())
+    assert c.ready_sent, "the armed edge should have released it"
+
+    # N+2. The console's gripper slider reaches the jaws. Needs an arm whose
+    #      gripper IS a motor slot (mimic_cfg=None means the jaws are their own
+    #      device and no slot is packed at all -- the FR3 case). Default is the
+    #      configured open width: the assembly path never sends this input,
+    #      because the bridge's grasp gate owns the slot there and two writers
+    #      would fight over it.
+    from arm_control.joint_motor_map import gripper_finger_to_motor
+    from arm_control.messages import pack_motor_command
+    from arm_control.messages import unpack_motor_command as _umc
+
+    mimic = {"source": "Gripper", "motor_open": 0.0, "motor_closed": -4.985,
+             "lower": 0.0, "upper": 0.0439}
+    node = _FakeNode()
+    c = ArmController(
+        node, _FakeExecutor(n=6), state_period_s=0.01,
+        gripper={"n_motors": 7, "mimic": mimic, "open_finger_m": 0.04,
+                 "gains": (40.0, 2.0)},
+    )
+    c._set_arm(True)
+    c.bridge_armed = True
+    c.on_motor_state(_state(n=7))
+    held = _umc([a for t, a in node.sent if t == "motor_command"][-1], 7)
+    assert held["position"][6] == gripper_finger_to_motor(0.04, mimic), held["position"][6]
+
+    zeros2 = np.zeros(2)
+    c.on_gripper(pack_motor_command([0.01, 0.01], zeros2, zeros2, zeros2, zeros2))
+    c.on_motor_state(_state(n=7))
+    moved = _umc([a for t, a in node.sent if t == "motor_command"][-1], 7)
+    assert moved["position"][6] == gripper_finger_to_motor(0.01, mimic), moved["position"][6]
+    assert moved["position"][6] != held["position"][6]
 
     print("arm_controller self-check ok")
 

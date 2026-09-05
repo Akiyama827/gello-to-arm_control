@@ -122,6 +122,13 @@ rerun_app_id: arm_control_real_fr3
 
 motor_log_path: /tmp/fr3_motor_log.csv
 
+# --- Operator console -------------------------------------------------------
+# See the assembler arm's fragment: per-instance, hence here. 7501 keeps this
+# arm's panel clear of the assembler's 7500 so both can run at once.
+console:
+  http_port: 7501
+  http_bind: 127.0.0.1
+
 # --- Camera rig -------------------------------------------------------------
 # Same physical rig as the assembler arm: perception publishes in the WORLD
 # (board) frame, so both arms consume the identical module_poses stream and each

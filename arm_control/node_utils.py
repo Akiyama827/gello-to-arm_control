@@ -124,3 +124,61 @@ __all__ = [
     "_load_mode_config",
     "expand_named_values",
 ]
+
+
+def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict:
+    """Per-motor kp / kd / torque_limits: mode config first, arm table second.
+
+    Shared by every node that has to state gains -- the trajectory executor
+    servos with them, and the console must now ship them WITH each plan
+    (``pack_plan`` carries kp/kd, which is how a plan and its stiffness cannot
+    be separated in flight). Two copies of this would be two chances to resolve
+    a different number for the same arm.
+
+    Without the arm-table fallback a mode config keyed by ANOTHER arm's joint
+    names expands to all-zeros -- a limp arm on the bench, silently. The arm
+    table (``arm.<key>``) is arm-length and says nothing about non-arm motor
+    slots such as the DM gripper, so it is zero-padded up to the full motor
+    list; those trailing slots are only ever set by an explicit mode entry.
+
+    Gain CEILINGS are per-arm hardware facts, not policy: 500/5 are the DM MIT
+    wire-format limits (``pack_mit_control_frame`` clips above them), while the
+    FR3 takes joint stiffness in N*m/rad and needs ~1200. An arm needing other
+    bounds states them as ``controller.{kp,kd,torque_limit}_max``.
+    """
+    import numpy as np
+
+    from arm_control.config import _arm_block
+
+    controller_cfg = dict(mode_cfg.get("controller") or {})
+    clamps = {
+        "kp": float(controller_cfg.get("kp_max", 500.0)),
+        "kd": float(controller_cfg.get("kd_max", 5.0)),
+        "torque_limits": float(controller_cfg.get("torque_limit_max", 100.0)),
+    }
+    arm_keys = {"kp": "kp", "kd": "kd", "torque_limits": "max_tau"}
+
+    out = {}
+    for key, clamp_max in clamps.items():
+        spec = controller_cfg.get(key)
+        if spec is None:
+            spec = _arm_block(cfg).get(arm_keys[key])
+            if isinstance(spec, list) and len(spec) == n_arm < len(names):
+                spec = list(spec) + [0.0] * (len(names) - n_arm)
+        out[key] = expand_named_values(
+            spec, names=names, default=0.0, clamp_min=0.0, clamp_max=clamp_max
+        )
+
+    if not float(np.max(np.abs(out["kp"][:n_arm]))) > 0.0:
+        # All-zero arm stiffness is never intentional -- it is a limp arm that
+        # holds nothing. The usual cause is a mode config whose per-joint gain
+        # keys name a DIFFERENT arm (expand_named_values falls back to 0.0 per
+        # missing name), which a dataflow's per-node ARM_CONTROL_MODE_CONFIG can
+        # pin behind your back. Fail here, not on the bench.
+        raise ValueError(
+            f"resolved kp is all zeros for joints {names[:n_arm]}. Check that "
+            "controller.kp in the mode config is keyed by THESE joint names "
+            "(ARM_CONTROL_MODE_CONFIG, including any per-node env: override in "
+            "the dataflow), or drop it to inherit arm.kp from the arm config."
+        )
+    return out

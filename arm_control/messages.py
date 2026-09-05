@@ -330,7 +330,8 @@ def unpack_plan(payload: pa.Array) -> dict:
 
 
 def pack_control_update(**fields) -> pa.Array:
-    """Control-plane updates that are not a leg: arm, payload, execute, hold, stop.
+    """Control-plane updates that are not a leg: arm, payload, execute, cancel,
+    hold, stop.
 
     NOT ``rt_protocol.pack_control``, which is the RT server's binary link
     frame (ctl_type / seq / t_mono_ns) and has nothing to do with this. Same
@@ -342,7 +343,10 @@ def pack_control_update(**fields) -> pa.Array:
     (a payload declaration that overtook the execute it belongs to would servo
     one leg with the wrong feedforward). Absent keys mean "unchanged".
     """
-    known = {"arm", "payload", "execute", "hold", "stop", "reason"}
+    # `cancel`, `hold` and `stop` are three DIFFERENT things and the names are
+    # worth keeping apart: cancel aborts a leg and stays armed (an operator's
+    # Stop button), hold freezes at a milestone forever, stop is terminal.
+    known = {"arm", "payload", "execute", "cancel", "hold", "stop", "reason"}
     unknown = set(fields) - known
     if unknown:
         raise ValueError(f"pack_control_update: unknown field(s) {sorted(unknown)}")

@@ -61,5 +61,5 @@ planner:
   simplify_time_sec: 0.5
   resolution_frac: 0.005
 
-teleop:
-  http_port: 7501   # 7500 is the assembler arm's panel — both can run at once
+# See motion.yaml: the panel address moved to the robot config's
+# `console.http_port`, which is what actually keeps two arms apart.

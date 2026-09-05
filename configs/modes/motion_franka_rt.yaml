@@ -75,10 +75,8 @@ replay:
   join_time_min_s: 2.5     # never join to the recording start faster than this
   still_speed: 0.02        # rad/s — trim motionless head/tail of the recording
 
-teleop:
-  # NOT 7501 (the sim franka panel): a browser tab left over from a sim
-  # rehearsal must never silently reattach to the REAL graph.
-  http_port: 7502
-  # Loopback only by default — every endpoint on this panel can ARM the
-  # arm, unauthenticated. Set an explicit LAN address to expose it.
-  http_bind: 127.0.0.1
+# The panel address moved to the robot config (`console.http_port` /
+# `http_bind`). That also makes the old warning here structural rather
+# than coincidental: a sim rehearsal and the real arm are DIFFERENT entry
+# configs, so they no longer have to remember to pick different numbers
+# for a browser tab to be unable to reattach across them.

@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import os
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -30,11 +31,12 @@ from dora import Node
 
 from arm_control.config import arm_joints, load_robot_config
 from arm_control.messages import (
-    pack_trajectory,
+    pack_control_update,
+    pack_plan,
     unpack_json_message,
     unpack_motor_state,
 )
-from arm_control.node_utils import _load_mode_config
+from arm_control.node_utils import _load_mode_config, resolve_gains
 
 # Trigger files live in the user-private runtime dir (mode 0700), NOT /tmp:
 # a world-writable trigger is motion authority for ANY local process/user,
@@ -112,8 +114,13 @@ def build_replay(
 
 def main() -> None:
     cfg = load_robot_config()
-    rp = dict(_load_mode_config().get("replay") or {})
+    mode_cfg = _load_mode_config()
+    rp = dict(mode_cfg.get("replay") or {})
     n_arm = len(arm_joints(cfg))
+    # Gains travel WITH the plan (pack_plan carries kp/kd), resolved by the same
+    # helper the controller's own node uses -- one number for one arm.
+    _gains = resolve_gains(cfg, mode_cfg, list(cfg.joint_names or cfg.motor_names), n_arm)
+    plan_kp, plan_kd = _gains["kp"][:n_arm], _gains["kd"][:n_arm]
     n = cfg.num_motors
     for f in (GO_FILE, STOP_FILE):
         f.unlink(missing_ok=True)  # stale triggers from a previous session
@@ -142,10 +149,10 @@ def main() -> None:
         if STOP_FILE.exists():
             STOP_FILE.unlink(missing_ok=True)
             node.send_output(
-                "trajectory",
-                pack_trajectory(np.zeros(0), np.zeros((0, n_arm)), np.zeros((0, n_arm))),
+                "control",
+                pack_control_update(cancel=True, reason="replay stop file"),
             )
-            print("[trajectory_replay] STOP sent — executor holds in place", flush=True)
+            print("[trajectory_replay] STOP sent — controller holds in place", flush=True)
         if not GO_FILE.exists():
             continue
         try:
@@ -186,7 +193,21 @@ def main() -> None:
         except (ValueError, IndexError) as exc:
             print(f"[trajectory_replay] REFUSED: {exc}", flush=True)
             continue
-        node.send_output("trajectory", pack_trajectory(times, qs, vs))
+        # gated=False: the trigger file IS the operator's press. A gated plan
+        # would wait for an `execute` that nothing here ever sends.
+        node.send_output(
+            "plan",
+            pack_plan(
+                plan_id=f"replay-{uuid.uuid4().hex[:8]}",
+                phase="replay",
+                gated=False,
+                times=times,
+                positions=qs,
+                velocities=vs,
+                kp=plan_kp,
+                kd=plan_kd,
+            ),
+        )
         print(f"[trajectory_replay] sent {csv_path.name}: {summary}", flush=True)
         time.sleep(0.2)  # debounce editor double-writes of the trigger file
 

@@ -171,6 +171,16 @@ rerun_app_id: arm_control_real_assembler
 
 motor_log_path: /tmp/assembler_gripper_motor_log.csv
 
+# --- Operator console -------------------------------------------------------
+# Per-INSTANCE, which is why it sits with the robot and not with the mode: two
+# arms running the same mode must not fight over one port, and a sim rehearsal
+# and this arm are different entry configs, so a browser tab cannot reattach
+# across them. Loopback only by default -- every endpoint on this panel can ARM
+# the arm, unauthenticated. Set an explicit LAN address to expose it.
+console:
+  http_port: 7500
+  http_bind: 127.0.0.1
+
 # ---------------------------------------------------------------------------
 # Camera rig identity + registration pipeline tuning (nodes/perception.py, one
 # node per camera via CAM_ROLE). The MEASURED extrinsics that pair with these

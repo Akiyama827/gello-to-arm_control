@@ -62,5 +62,6 @@ planner:
   simplify_time_sec: 0.5
   resolution_frac: 0.005   # validity-check resolution, fraction of joint-space extent
 
-teleop:
-  http_port: 7500   # stdlib control panel (sliders/buttons); visuals in Rerun
+# The panel's address is NOT here: a port is a per-instance fact, so it
+# lives in the robot config as `console.http_port` (two arms sharing a
+# mode must not share a port). Mode-level teleop knobs still belong here.

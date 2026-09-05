@@ -448,9 +448,9 @@ class GraspEditorPanel:
 
 def main() -> None:
     try:
-        from nodes.motion_teleop import main as motion_main
+        from nodes.arm_console import main as motion_main
     except ModuleNotFoundError:
-        from motion_teleop import main as motion_main
+        from arm_console import main as motion_main
     motion_main()
 
 

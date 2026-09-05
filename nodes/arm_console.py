@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 import time
 from collections import deque
 
@@ -43,9 +44,9 @@ from arm_control.config import arm_joints, ee_frame, gripper_joints, load_robot_
 from arm_control.grasp_visual import VisualFK
 from arm_control.joint_motor_map import gripper_motor_to_finger
 from arm_control.messages import (
-    pack_json_message,
+    pack_control_update,
     pack_motor_command,
-    pack_trajectory,
+    pack_plan,
     unpack_json_message,
     unpack_motor_state,
 )
@@ -60,6 +61,7 @@ from arm_control.node_utils import (
     _load_mode_config,
     expand_named_values,
     next_event_gil_friendly,
+    resolve_gains,
 )
 from arm_control.console_server import ConsoleServer, file_asset
 
@@ -325,7 +327,7 @@ class ControlPanel:
             return fresh
 
     def log(self, message: str) -> None:
-        print(f"[motion_teleop] {message}", flush=True)
+        print(f"[arm_console] {message}", flush=True)
         with self._lock:
             self._log.append(message)
 
@@ -393,6 +395,14 @@ def main() -> None:
     # prefix of the motor list.
     if planned != names[: len(planned)]:
         raise ValueError(f"planner.joints {planned} must be a prefix of {names}")
+    # Gains ship WITH the plan now (pack_plan carries kp/kd), so a plan and the
+    # stiffness it was reviewed at cannot be separated in flight. Resolved by
+    # the same helper the executor node uses -- one number for one arm, not two
+    # resolutions that can disagree. Arm-length: the controller's executor
+    # servos the arm joints only, and set_gains checks that shape.
+    _gains = resolve_gains(cfg, mode_cfg, names, len(planned))
+    plan_kp = _gains["kp"][: len(planned)]
+    plan_kd = _gains["kd"][: len(planned)]
     vmax = expand_named_values(planner_cfg.get("vel_limits", 0.5), names=planned, default=0.5)
     amax = expand_named_values(planner_cfg.get("acc_limits", 1.0), names=planned, default=1.0)
     soft_speed_frac = float(planner_cfg.get("soft_speed_frac", 0.5))
@@ -452,20 +462,30 @@ def main() -> None:
     # The page must SAY which arm it drives: a browser tab from a sim
     # rehearsal silently reattaches to a real graph on the same port, and the
     # first click lands on hardware.
-    ident = os.environ.get("ARM_CONTROL_CONFIG", "") or "unknown config"
-    bind = str(teleop_cfg.get("http_bind", "127.0.0.1"))
+    # ARM_ID names the INSTANCE (two arms on one bench are "left"/"right");
+    # the config path is the fallback so a single-arm graph needs no env at all.
+    arm_id = os.environ.get("ARM_ID", "").strip()
+    ident = arm_id or os.environ.get("ARM_CONTROL_CONFIG", "") or "unknown config"
+    # The panel's address is a per-INSTANCE fact, so it lives with the robot,
+    # not with the mode. It used to sit in the mode config, where it only
+    # avoided a collision because the two arms happened to run different modes
+    # -- two FR3s would have fought over 7501, and the fix would have been to
+    # fork a mode config to change a port. Modes say how to control; the robot
+    # config says which robot and which instance.
+    console_cfg = dict(cfg.get("console") or {})
+    bind = str(console_cfg.get("http_bind", "127.0.0.1"))
     panel = ControlPanel(
         planned,
         world.lower,
         world.upper,
-        port=int(teleop_cfg.get("http_port", 7500)),
+        port=int(console_cfg.get("http_port", 7500)),
         vfk=vfk,
         grip_range=grip_range,
         bind=bind,
         ident=ident,
     )
     print(
-        f"[motion_teleop] control panel at http://{bind}:{panel.port} "
+        f"[arm_console] control panel at http://{bind}:{panel.port} "
         f"[{ident}] — visuals in Rerun: solid robot = target, green ghost = "
         "live arm, orange = plan",
         flush=True,
@@ -479,6 +499,8 @@ def main() -> None:
     armed: bool | None = None
     fault = ""
     pending: JointTrajectory | None = None
+    # The id the controller knows this plan by; `execute` must name it.
+    pending_id = ""
     shown: np.ndarray | None = None
     # Cartesian drag reference: (position, rotation) latched when a drag streak
     # starts on an axis; the untouched axes are held to it so IK tolerance
@@ -557,7 +579,10 @@ def main() -> None:
                     # marching — the quick DISARM->ARM recovery would otherwise
                     # re-arm onto a target up to abort-tol away (a saturated-
                     # torque yank). The plan preview is kept for re-Execute.
-                    node.send_output("trajectory", pack_trajectory([], [], []))
+                    node.send_output(
+                        "control",
+                        pack_control_update(cancel=True, reason=f"server fault: {fault}"),
+                    )
                 elif was_fault and not fault:
                     panel.log("fault cleared")
                 if was is not None and was != armed:
@@ -685,6 +710,24 @@ def main() -> None:
                     [pending.times[i] for i in idx],
                     [vfk.poses(pending.positions[i], grip)["geoms"] for i in idx],
                 )
+                # Hand the controller the plan GATED and named. It loads it,
+                # keeps streaming its hold, and runs nothing until an `execute`
+                # names this exact id -- so a plan superseded by a re-plan can
+                # never run, which a bare trajectory topic could not express.
+                pending_id = f"teleop-{uuid.uuid4().hex[:8]}"
+                node.send_output(
+                    "plan",
+                    pack_plan(
+                        plan_id=pending_id,
+                        phase="teleop",
+                        gated=True,
+                        times=pending.times,
+                        positions=pending.positions,
+                        velocities=pending.velocities,
+                        kp=plan_kp,
+                        kd=plan_kd,
+                    ),
+                )
                 # An Execute click that queued up DURING the solve would fire
                 # on this brand-new, never-reviewed plan — consume and drop it
                 # (clicked() is consume-and-report). Execute must postdate the
@@ -709,41 +752,50 @@ def main() -> None:
                 panel.log("REFUSED: DISARMED — press ARM above, then Execute")
             else:
                 node.send_output(
-                    "trajectory",
-                    pack_trajectory(pending.times, pending.positions, pending.velocities),
+                    "control", pack_control_update(execute=pending_id)
                 )
-                panel.log("trajectory sent")
+                panel.log(f"executing {pending_id}")
                 pending = None
+                pending_id = ""
                 panel.clear_plan()
 
         if panel.clicked("Stop (hold)"):
-            node.send_output("trajectory", pack_trajectory([], [], []))
+            # `cancel`, not `hold` and not `stop`: the arm must come to rest
+            # where it is and STAY RUNNABLE. `hold` freezes it forever and
+            # `stop` is terminal -- either would need a graph restart to undo.
+            node.send_output(
+                "control", pack_control_update(cancel=True, reason="operator stop")
+            )
             pending = None
+            pending_id = ""
             panel.clear_plan()
-            panel.log("STOP sent — executor holds measured pose")
+            panel.log("STOP sent — controller holds the measured pose")
 
-        # The operator gate, owned by this page in the real motion graphs
-        # (our `arm` output feeds the bridge directly — single producer).
-        # `armed is None` = no motor_health wire = this graph has no gate
-        # (sim), and the `arm` output is likely unwired too: don't send.
+        # The operator gate. This page presses it; the CONTROLLER owns the
+        # `arm` topic downstream (it is the single producer of both `arm` and
+        # `motor_command`, which is the whole point of the split), so the press
+        # travels as a control update rather than as a second `arm` publisher.
+        #
+        # It is no longer gated on `armed is not None`. That test meant "is
+        # there a motor_health wire", which was a proxy for "is there a bridge
+        # to arm" -- but the controller must be armed in EVERY graph now,
+        # including a sim one with no bridge and no health topic, or it streams
+        # nothing and the arm never moves.
         if panel.clicked("ARM"):
-            if armed is None:
-                panel.log("no arm gate in this graph (sim, or health not up yet)")
-            else:
-                node.send_output("arm", pack_json_message("arm", {"armed": True}))
-                panel.log("ARM requested — bridge enables, server holds this pose")
+            node.send_output("control", pack_control_update(arm=True))
+            panel.log("ARM requested — controller enables and holds this pose")
         if panel.clicked("DISARM"):
-            if armed is not None:
-                # Executor to hold FIRST: a disarm+rearm inside the executor's
-                # 2 s runaway window must never resume a stale trajectory.
-                node.send_output("trajectory", pack_trajectory([], [], []))
-                node.send_output("arm", pack_json_message("arm", {"armed": False}))
-                panel.log("DISARM requested — authority drop (bridge verifies)")
-            else:
-                # Reachable by a programmatic supervisor before the first
-                # health message: never a SILENT no-op on the stop path.
-                panel.log("DISARM ignored — no health wire yet (sim, or "
-                          "plant bridge still starting)")
+            # Cancel FIRST: a disarm+rearm inside the runaway window must never
+            # resume a stale trajectory. ArmController's own _disarm_reset also
+            # clears it, but the ORDERING is the point, so it stays explicit.
+            node.send_output(
+                "control", pack_control_update(cancel=True, reason="disarm")
+            )
+            node.send_output("control", pack_control_update(arm=False))
+            pending = None
+            pending_id = ""
+            panel.clear_plan()
+            panel.log("DISARM requested — authority drop (bridge verifies)")
 
 
 def _check_routes() -> None:
@@ -786,7 +838,53 @@ def _check_routes() -> None:
     missing = sorted(r for r in called if r not in handled)
     assert not missing, f"page calls routes no panel handles: {missing}"
     assert "mesh/" in handled, "the mesh prefix route vanished"
-    print(f"motion_teleop: {len(called)} page routes all handled")
+    print(f"arm_console: {len(called)} page routes all handled")
+
+
+def _check_graphs() -> None:
+    """Every arm_controller in every graph must be able to stream.
+
+    The controller waits for a bridge's armed health edge before its first
+    command, because a bridge publishes motor_state while DISARMED and only a
+    state after that edge is provably post-enable. A graph whose plant has no
+    bridge publishes no motor_health at all, so the wait never ends and the arm
+    simply never moves -- with no error anywhere, which is the worst shape a
+    bug can have. Exactly one of the two must hold per graph: a motor_health
+    wire, or the ARM_CONTROL_PLANT_HEALTH=0 opt-out.
+    """
+    import re
+    from pathlib import Path as _Path
+
+    import yaml
+
+    root = _Path(__file__).resolve().parents[1]
+    controller = (root / "arm_control" / "execution" / "arm_controller.py").read_text()
+    handled = set(re.findall(r'"(\w+)": self\.on_', controller))
+
+    checked = 0
+    for graph in sorted((root / "dataflows").glob("*.yml")):
+        spec = yaml.safe_load(graph.read_text()) or {}
+        for node in spec.get("nodes", []):
+            if not str(node.get("path", "")).endswith("arm_controller.py"):
+                continue
+            checked += 1
+            inputs = set(node.get("inputs") or {})
+            unhandled = sorted(inputs - handled)
+            assert not unhandled, (
+                f"{graph.name}: arm_controller is wired {unhandled}, which it "
+                f"has no handler for -- the input would be silently dropped"
+            )
+            has_health = "motor_health" in inputs
+            opts_out = str(
+                (node.get("env") or {}).get("ARM_CONTROL_PLANT_HEALTH", "")
+            ) in ("0", "false", "no")
+            assert has_health != opts_out, (
+                f"{graph.name}: arm_controller has motor_health={has_health} and "
+                f"ARM_CONTROL_PLANT_HEALTH opt-out={opts_out}. Exactly one is "
+                f"needed, or it waits forever for an armed edge and never streams"
+            )
+    assert checked, "no arm_controller found in any graph -- did paths change?"
+    print(f"arm_console: {checked} arm_controller wirings can stream")
 
 
 if __name__ == "__main__":
@@ -795,5 +893,6 @@ if __name__ == "__main__":
     # dora runs a node as `python <node>.py`, so __main__ MUST be the node.
     if "--self-check" in sys.argv:
         _check_routes()
+        _check_graphs()
     else:
         main()

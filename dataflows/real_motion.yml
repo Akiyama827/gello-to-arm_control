@@ -1,20 +1,24 @@
-# MoveIt-lite motion graph: meshcat teleop (sliders -> plan -> preview) feeds a
-# trajectory executor that streams motor commands through the command-mode DM
-# bridge. Self-collision-aware planning runs in the teleop node (MuJoCo
-# collision world + OMPL).
+# MoveIt-lite motion graph: the operator console (3D page -> plan -> preview)
+# hands named, gated plans to arm_controller, which streams motor commands
+# through the command-mode DM bridge. Self-collision-aware planning runs in the
+# console (MuJoCo collision world + OMPL); the controller never plans.
 #
-# SAFETY — the graph comes up DISARMED. The teleop page OWNS the operator
-# gate (ARM/DISARM buttons + armed badge, same page as planning; motion_teleop
-# is the single producer of the bridge `arm` topic). Arming enables the motors
-# into the executor's measured-pose hold; motion happens only on the Execute
-# button, which is refused visibly while disarmed. The 0.1s deadman + fault
-# reflex are live the whole time.
+# ONE command owner. The console has no motor_command and no plant handle: it
+# emits `plan` and `control`, and arm_controller is the single producer of both
+# `motor_command` and the bridge's `arm` topic. A plan runs only when an
+# `execute` names its exact id, so a plan superseded by a re-plan never runs.
+#
+# SAFETY — the graph comes up DISARMED. The console page carries the operator
+# gate (ARM/DISARM + armed badge, same page as planning); ARM travels as a
+# control update and the controller enables into a measured-pose hold. Motion
+# happens only on Execute, which is refused visibly while disarmed. The 0.1s
+# deadman + fault reflex are live the whole time.
 #
 #   ARM_CONTROL_CONFIG=configs/real/assembler.yaml dora run dataflows/real_motion.yml
 #   (or: python scripts/view.py real motion)
 nodes:
-  - id: motion_teleop
-    path: ../nodes/motion_teleop.py
+  - id: arm_console
+    path: ../nodes/arm_console.py
     env:
       ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
     inputs:
@@ -23,29 +27,36 @@ nodes:
       # of a silent bridge drop + executor abort 2 s later).
       motor_health: plant_interface/motor_health
     outputs:
-      - trajectory
+      - plan
+      - control
       - gripper
-      - arm
 
-  - id: trajectory_executor
-    path: ../nodes/trajectory_executor.py
+  - id: arm_controller
+    path: ../nodes/arm_controller.py
     env:
       ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
     inputs:
       motor_state: plant_interface/motor_state
-      trajectory:  motion_teleop/trajectory
-      gripper:     motion_teleop/gripper
+      # The armed edge. Without it the controller never leaves its pre-arm
+      # wait, because a bridge publishes motor_state while DISARMED and only a
+      # state received AFTER this edge is provably post-enable.
+      motor_health: plant_interface/motor_health
+      plan:        arm_console/plan
+      control:     arm_console/control
+      gripper:     arm_console/gripper
     outputs:
-      - motor_command
+      - motor_command     # the ONLY producer of this topic
+      - arm               # and of this one — the console presses, this owns
+      - controller_event  # ready / leg_result / fault
 
   - id: plant_interface
     path: ../nodes/hardware_interface.py
-    # Command mode: safety layer built, disarmed until the teleop gate fires.
+    # Command mode: safety layer built, disarmed until the console gate fires.
     env:
       ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
     inputs:
-      motor_command: trajectory_executor/motor_command
-      arm:           motion_teleop/arm
+      motor_command: arm_controller/motor_command
+      arm:           arm_controller/arm
     outputs:
       - motor_state
       - motor_state_viz
@@ -66,4 +77,4 @@ nodes:
     path: ../nodes/motor_state_logger.py
     inputs:
       motor_state:   plant_interface/motor_state
-      motor_command: trajectory_executor/motor_command
+      motor_command: arm_controller/motor_command

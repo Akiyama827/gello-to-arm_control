@@ -40,6 +40,12 @@ def main() -> None:
         build_executor(cfg, arm_id=os.environ.get("ARM_ID", "arm")),
         arm_id=os.environ.get("ARM_ID", "arm"),
         gripper=gripper_command_cfg(cfg),
+        # A bare sim plant (mujoco_interface with no sim_bridge) publishes no
+        # motor_health, so the controller would wait forever for an armed edge
+        # that cannot come. The GRAPH knows whether a bridge is in the path, so
+        # the graph says so -- opt-out, never inferred.
+        plant_reports_health=os.environ.get("ARM_CONTROL_PLANT_HEALTH", "1")
+        not in ("0", "false", "no"),
         state_period_s=(
             float(cfg.get("motor_state_period_s"))
             if cfg.get("motor_state_period_s") is not None

@@ -38,7 +38,7 @@ from arm_control.messages import (
     unpack_trajectory,
 )
 from arm_control.planning.trajectory import JointTrajectory
-from arm_control.node_utils import _load_mode_config, expand_named_values
+from arm_control.node_utils import _load_mode_config, resolve_gains
 
 
 def accept_trajectory(traj: dict, measured: np.ndarray, n_arm: int, tol: float) -> str | None:
@@ -129,47 +129,8 @@ def main() -> None:
     start_tol = float(controller_cfg.get("start_pos_tol_rad", 0.1))
     abort_tol = float(controller_cfg.get("abort_pos_err_rad", 0.35))
     relatch_cfg = float(controller_cfg.get("hold_relatch_rad", 0.3))
-    # Gain CEILINGS are per-arm hardware facts, not policy: 500/5 are the DM MIT
-    # wire-format limits (pack_mit_control_frame clips above them), while the
-    # FR3 takes joint stiffness in N·m/rad and needs ~1200. Defaults keep the DM
-    # path byte-identical; an arm that needs other bounds states them.
-    kp_max = float(controller_cfg.get("kp_max", 500.0))
-    kd_max = float(controller_cfg.get("kd_max", 5.0))
-    tau_max = float(controller_cfg.get("torque_limit_max", 100.0))
-    def _gains(key: str, arm_key: str, clamp_max: float) -> np.ndarray:
-        """Per-motor gain vector from the mode config, else the arm's own table.
-
-        Without the fallback a mode config keyed by ANOTHER arm's joint names
-        expands to all-zeros — a limp arm on the bench, silently. The arm table
-        (``arm.<arm_key>``) is arm-length (it says nothing about non-arm motor
-        slots such as the DM gripper), so it is zero-padded up to the full motor
-        list; those trailing slots are only ever set by an explicit mode-config
-        entry.
-        """
-        spec = controller_cfg.get(key)
-        if spec is None:
-            spec = _arm_block(cfg).get(arm_key)
-            if isinstance(spec, list) and len(spec) == n_arm < len(names):
-                spec = list(spec) + [0.0] * (len(names) - n_arm)
-        return expand_named_values(
-            spec, names=names, default=0.0, clamp_min=0.0, clamp_max=clamp_max
-        )
-
-    kp = _gains("kp", "kp", kp_max)
-    kd = _gains("kd", "kd", kd_max)
-    tau_lim = _gains("torque_limits", "max_tau", tau_max)
-    if not float(np.max(np.abs(kp[:n_arm]))) > 0.0:
-        # All-zero arm stiffness is never intentional — it is a limp arm that
-        # holds nothing. The usual cause is a mode config whose per-joint gain
-        # keys name a DIFFERENT arm (expand_named_values falls back to 0.0 per
-        # missing name), which a dataflow's per-node ARM_CONTROL_MODE_CONFIG can
-        # pin behind your back. Fail here, not on the bench.
-        raise ValueError(
-            f"resolved kp is all zeros for joints {arm_names}. Check that "
-            "controller.kp in the mode config is keyed by THESE joint names "
-            "(ARM_CONTROL_MODE_CONFIG, including any per-node env: override in "
-            "the dataflow), or drop it to inherit arm.kp from the arm config."
-        )
+    gains = resolve_gains(cfg, mode_cfg, names, n_arm)
+    kp, kd, tau_lim = gains["kp"], gains["kd"], gains["torque_limits"]
 
     # Plants that compensate gravity themselves (FR3 control box) get RNEA
     # MINUS gravity — full RNEA would double-count it and push the arm up.
