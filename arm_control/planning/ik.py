@@ -83,6 +83,52 @@ class PinocchioIK:
         """(lower, upper) actual URDF joint limits."""
         return self._q_lower_hard.copy(), self._q_upper_hard.copy()
 
+    def jacobian(self, q: np.ndarray) -> np.ndarray:
+        """6 x n end-effector Jacobian in the LOCAL frame, controlled columns only.
+
+        Same call the solver makes each iteration, exposed because a jog needs
+        it for a reason the solver does not: how close this pose is to losing a
+        Cartesian direction entirely.
+        """
+        q = np.asarray(q, dtype=float).ravel()
+        if q.shape != (self.n_joints,):
+            raise ValueError(f"q must have shape ({self.n_joints},)")
+        q_full = pin.neutral(self._model)
+        q_full[self._q_indices_arr] = q
+        pin.forwardKinematics(self._model, self._data, q_full)
+        pin.updateFramePlacements(self._model, self._data)
+        J_full = pin.computeFrameJacobian(
+            self._model, self._data, q_full, self._frame_id, pin.LOCAL
+        )
+        return np.asarray(J_full[:, self._v_indices_arr], dtype=float)
+
+    def sigma_min(self, q: np.ndarray, *, rows: str = "pos") -> float:
+        """Smallest singular value of the Jacobian: distance to a singularity.
+
+        At a singularity some Cartesian direction costs unbounded joint rate,
+        which is exactly the failure a velocity jog walks into -- the operator
+        asks for 1 cm/s and the wrist tries to slew. sigma_min collapsing toward
+        zero is that condition, and it is cheap enough to evaluate per tick.
+
+        ``rows="pos"`` (default) uses the three TRANSLATIONAL rows. That is the
+        honest measure for a translation jog: the full 6xn matrix mixes metres
+        with radians, so its singular values depend on the unit choice and a
+        threshold tuned on one arm means nothing on another. ``rows="all"`` is
+        there for an orientation jog, where the mixing is unavoidable and the
+        threshold has to be read as arm-specific.
+
+        Computed here rather than read from a vendor API on purpose. libfranka
+        exposes a Jacobian, but this package drives more than one arm, and on
+        the FR3 the motion path lives on the RT machine while this host is
+        read-only -- Pinocchio gives the same matrix for every arm we support.
+        """
+        J = self.jacobian(q)
+        if rows == "pos":
+            J = J[:3, :]
+        elif rows != "all":
+            raise ValueError(f"rows must be 'pos' or 'all', got {rows!r}")
+        return float(np.linalg.svd(J, compute_uv=False)[-1])
+
     def fk(self, q: np.ndarray) -> np.ndarray:
         """4x4 EE pose at ``q`` in the same frame IK targets live in.
 

@@ -59,6 +59,11 @@ def main() -> None:
         # the graph says so -- opt-out, never inferred.
         plant_reports_health=os.environ.get("ARM_CONTROL_PLANT_HEALTH", "1")
         not in ("0", "false", "no"),
+        # How long a jog setpoint stays live here. Must agree with the console's
+        # re-send period with room to spare -- too tight and a normal scheduling
+        # hiccup stutters the arm, too loose and it coasts after the button is
+        # released. Same mode config both sides read.
+        jog_timeout_s=float((mode_cfg.get("jog") or {}).get("timeout_s", 0.2)),
         state_period_s=(
             float(cfg.get("motor_state_period_s"))
             if cfg.get("motor_state_period_s") is not None

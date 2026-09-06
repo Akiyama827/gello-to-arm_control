@@ -331,7 +331,7 @@ def unpack_plan(payload: pa.Array) -> dict:
 
 def pack_control_update(**fields) -> pa.Array:
     """Control-plane updates that are not a leg: arm, payload, execute, cancel,
-    hold, stop.
+    gains, hold, stop.
 
     NOT ``rt_protocol.pack_control``, which is the RT server's binary link
     frame (ctl_type / seq / t_mono_ns) and has nothing to do with this. Same
@@ -346,7 +346,7 @@ def pack_control_update(**fields) -> pa.Array:
     # `cancel`, `hold` and `stop` are three DIFFERENT things and the names are
     # worth keeping apart: cancel aborts a leg and stays armed (an operator's
     # Stop button), hold freezes at a milestone forever, stop is terminal.
-    known = {"arm", "payload", "execute", "cancel", "hold", "stop", "reason"}
+    known = {"arm", "payload", "execute", "cancel", "gains", "hold", "stop", "reason"}
     unknown = set(fields) - known
     if unknown:
         raise ValueError(f"pack_control_update: unknown field(s) {sorted(unknown)}")
@@ -536,6 +536,29 @@ def _check_length(name: str, values: np.ndarray, expected: int) -> None:
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# jog — a live joint setpoint from an operator holding a direction, at whatever
+# rate the console ticks. Deliberately NOT a trajectory and NOT a plan: it has
+# no duration, no review, and no completion. It EXPIRES, which is the whole
+# safety property (see ArmController.on_jog), so nothing here carries a
+# timestamp -- the receiver stamps arrival, because a clock the sender controls
+# is a clock a wedged sender can lie about.
+# --------------------------------------------------------------------------- #
+
+
+def pack_jog(*, q, reason: str = "") -> pa.Array:
+    """One joint-space setpoint for the arm joints, in order."""
+    return pack_json_message(
+        "jog",
+        {"q": [float(v) for v in np.asarray(q, dtype=float).ravel()],
+         "reason": str(reason)},
+    )
+
+
+def unpack_jog(payload: pa.Array) -> dict:
+    return unpack_json_message(payload, expected_schema="jog")
+
+
 def pack_grasp_request(
     *,
     request_id: str,
@@ -640,6 +663,8 @@ __all__ = [
     "scene_state_from_payload",
     "pack_json_message",
     "unpack_json_message",
+    "pack_jog",
+    "unpack_jog",
     "pack_grasp_request",
     "unpack_grasp_request",
     "pack_grasp_result",

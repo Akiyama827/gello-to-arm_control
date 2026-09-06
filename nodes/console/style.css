@@ -219,3 +219,27 @@ input[type="range"] { width: 100%; accent-color: var(--blue); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+/* Jog pad: one row per axis, a label and two direction buttons. Deliberately
+   plain -- these are press-and-hold controls that move a real arm, so they
+   read as buttons and nothing else. */
+.jog-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.25rem;
+}
+.jog-row span {
+  min-width: 2.2rem;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+.jog-row button {
+  flex: 1;
+  min-width: 2.5rem;
+  touch-action: none;   /* a held button must not scroll the page under a thumb */
+}
+#jog-note {
+  opacity: 0.8;
+  font-size: 0.85em;
+}

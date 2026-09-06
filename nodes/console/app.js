@@ -246,6 +246,28 @@ function releaseDeadman() {
   authorityText.textContent = "Deadman released — hold and disarm requested";
   sendDeadman();
 }
+let jogAxis = null;
+let jogTimer = null;
+const sendJog = () => {
+  if (!jogAxis) return;
+  post("/jog", { axis: jogAxis.axis, dir: jogAxis.dir, held: true })
+    .catch(releaseJog);
+};
+function releaseJog() {
+  if (!jogAxis) return;
+  const last = jogAxis;
+  jogAxis = null;
+  clearInterval(jogTimer);
+  jogTimer = null;
+  post("/jog", { axis: last.axis, dir: last.dir, held: false }).catch(() => {});
+}
+addEventListener("pointerup", releaseJog);
+addEventListener("pointercancel", releaseJog);
+addEventListener("blur", releaseJog);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) releaseJog();
+});
+
 deadmanButton.addEventListener("pointerdown", holdDeadman);
 addEventListener("pointerup", releaseDeadman);
 addEventListener("pointercancel", releaseDeadman);
@@ -679,6 +701,47 @@ const build = async (state) => {
   } else {
     $("grip").textContent = "No Hand configured";
   }
+  // Jog pad. Press-and-hold: the button IS the deadman, so a jog needs one
+  // finger and stops the instant it lifts -- and because the page only asserts
+  // "still held" while it is down, a closed tab or a dead network stops the arm
+  // without anything having to send a stop.
+  if (state.jog) {
+    $("jog-panel").hidden = false;
+    const pad = $("jog-pad");
+    pad.innerHTML = "";
+    const holdJog = (axis, dir) => (event) => {
+      if (event) event.preventDefault();
+      // NOT holdDeadman(): that deadman drops authority on release (Stop +
+      // DISARM), which would disarm the arm between every jog nudge. The held
+      // button is its own deadman -- it re-asserts below and expires at both
+      // the console and the controller.
+      jogAxis = { axis, dir };
+      sendJog();
+      if (jogTimer) clearInterval(jogTimer);
+      jogTimer = setInterval(sendJog, 100);
+    };
+    const addRow = (label, entries) => {
+      const row = document.createElement("div");
+      row.className = "jog-row";
+      const tag = document.createElement("span");
+      tag.textContent = label;
+      row.appendChild(tag);
+      for (const [text, axis, dir] of entries) {
+        const b = document.createElement("button");
+        b.textContent = text;
+        b.addEventListener("pointerdown", holdJog(axis, dir));
+        row.appendChild(b);
+      }
+      pad.appendChild(row);
+    };
+    for (const axis of state.jog.axes) {
+      addRow(axis.toUpperCase(), [["-", axis, -1], ["+", axis, 1]]);
+    }
+    for (let j = 0; j < state.jog.joints; j += 1) {
+      addRow(`J${j + 1}`, [["-", `j${j}`, -1], ["+", `j${j}`, 1]]);
+    }
+  }
+
   for (const name of state.buttons) {
     const button = document.createElement("button");
     button.textContent = name;
@@ -715,6 +778,9 @@ const updateGate = (state) => {
 const poll = async () => {
   try {
     const state = await (await fetch("/state", { cache: "no-store" })).json();
+    if (state.jog) {
+      $("jog-note").textContent = state.jog.note || (state.jog.held ? "jogging" : "idle");
+    }
     $("connection").textContent = "Live";
     $("connection").className = "status live";
     if (state.ident) {

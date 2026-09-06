@@ -21,6 +21,7 @@ nodes:
     outputs:
       - plan
       - control
+      - jog
       - gripper
 
   # Drag-teach replay driver (file-triggered, inert otherwise): validates a
@@ -47,6 +48,7 @@ nodes:
       motor_state: plant_interface/motor_state
       plan:     arm_console/plan
       control:  arm_console/control
+      jog:      arm_console/jog
       # Aliased inputs: dora maps one producer per input, so a second
       # motion source reaches the same handlers under its own names.
       plan_replay:    trajectory_replay/plan

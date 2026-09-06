@@ -46,11 +46,13 @@ from arm_control.joint_motor_map import gripper_motor_to_finger
 from arm_control.messages import (
     pack_control_update,
     pack_motor_command,
+    pack_jog,
     pack_plan,
     unpack_json_message,
     unpack_motor_state,
 )
 from arm_control.planning.high_level import build_collision_stack
+from arm_control.planning.jog import JogLimits, check_step
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.planning.ompl_planner import OMPLPlanner
 from arm_control.planning.trajectory import (
@@ -66,6 +68,10 @@ from arm_control.node_utils import (
 from arm_control.console_server import ConsoleServer, file_asset
 
 _BUTTONS = ("Sync target to robot", "Plan + preview", "Execute", "Stop (hold)")
+#: Gain presets are just buttons -- the page renders whatever `state.buttons`
+#: lists, so a control law the operator can switch mid-session costs no page
+#: code at all. Named at runtime from the mode config's `gain_presets`.
+_GAIN_PREFIX = "Gains: "
 # The operator gate, when this node OWNS it (real motion graphs wire our `arm`
 # output straight into the bridge — one page, one producer). Rendered as a
 # separate styled row with the armed badge, never mixed into the generic
@@ -73,6 +79,13 @@ _BUTTONS = ("Sync target to robot", "Plan + preview", "Execute", "Stop (hold)")
 _GATE_BUTTONS = ("ARM", "DISARM")
 
 _CART_NAMES = ("x", "y", "z", "roll", "pitch", "yaw")
+#: Jog axes the page offers. World frame for translation -- an operator asking
+#: for "down" means down in the room, not down along a tool that may be tilted.
+_JOG_AXES = ("x", "y", "z")
+#: How long a held-jog assertion stays good at the console. The page re-asserts
+#: every 100 ms, so this tolerates a few missed polls and no more -- it is the
+#: browser->console half of the jog's two independent deadmen.
+JOG_STALE_S = 0.4
 
 
 class ControlPanel:
@@ -89,6 +102,7 @@ class ControlPanel:
         grip_range: tuple[float, float] = (0.0, 0.0),
         bind: str = "127.0.0.1",
         ident: str = "",
+        extra_buttons: tuple[str, ...] = (),
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
         # arm config (gripper_range_m) or its joint_mimics entry — never a
@@ -103,12 +117,21 @@ class ControlPanel:
         # (axis, abs_value|None, rot_delta|None); translation = latest wins,
         # rotation increments accumulate until the node loop consumes them.
         self._cart_pending: tuple[int, float | None, float | None] | None = None
+        # A held jog direction: ("x".."z" | "rx".."rz" | "j0".."jN", +1/-1), or
+        # None while nothing is held. The page re-asserts it; releasing clears
+        # it. Held state, not a queue -- a jog is "keep going", not "go once".
+        self._jog: tuple[str, int] | None = None
+        self._jog_at = 0.0
+        self._jog_note = ""
         self._plan: dict = {"version": 0, "times": [], "frames": []}
         self._grip_lo, self._grip_hi = float(grip_range[0]), float(grip_range[1])
         self._grip = self._grip_hi               # start open
         self._grip_dirty = False
-        self._clicks = {name: 0 for name in _BUTTONS + _GATE_BUTTONS}
-        self._seen = {name: 0 for name in _BUTTONS + _GATE_BUTTONS}
+        # Gain presets (and anything else runtime-named) join the same strip:
+        # the page renders `state.buttons`, so this costs no page code.
+        self._buttons = tuple(_BUTTONS) + tuple(extra_buttons)
+        self._clicks = {name: 0 for name in self._buttons + _GATE_BUTTONS}
+        self._seen = {name: 0 for name in self._buttons + _GATE_BUTTONS}
         self._armed: bool | None = None  # None = no health wire (sim: no gate)
         self._fault = ""  # server latched-fault text; badge shows FAULTED
         self._measured_grip: float | None = None  # live finger m (Franka Hand)
@@ -157,6 +180,8 @@ class ControlPanel:
             )
         elif route == "gripper":
             self.set_gripper(payload.get("value"), dirty=True)
+        elif route == "jog":
+            self.set_jog(payload.get("axis"), payload.get("dir"), payload.get("held"))
         elif route == "deadman":
             self.set_deadman(bool(payload.get("held")))
         elif route == "click":
@@ -186,12 +211,18 @@ class ControlPanel:
                     "step": 0.001,
                     "value": grip,
                 },
-                "buttons": list(_BUTTONS),
+                "buttons": list(self._buttons),
                 "armed": self._armed,
                 "fault": self._fault,
                 "log": list(self._log)[-8:],  # deque: copy THEN slice
                 "plan_version": self._plan["version"],
                 "ident": self._ident,
+                "jog": {
+                    "axes": list(_JOG_AXES),
+                    "joints": len(self._names),
+                    "held": None if self._jog is None else list(self._jog),
+                    "note": self._jog_note,
+                },
                 "deadman": self._authority.may_move(
                     "robot", now=time.monotonic()
                 ),
@@ -218,6 +249,52 @@ class ControlPanel:
         for action, _actor in actions:
             button = "Stop (hold)" if action == "hold" else "DISARM"
             self._clicks[button] += 1
+
+    def set_jog(self, axis, direction, held) -> None:
+        """Hold or release one jog direction. Unknown axes are refused loudly."""
+        with self._lock:
+            if not held:
+                self._jog = None
+                return
+            axis = str(axis or "")
+            if axis not in _JOG_AXES and not (
+                axis.startswith("j") and axis[1:].isdigit()
+                and int(axis[1:]) < len(self._names)
+            ):
+                raise ValueError(f"unknown jog axis {axis!r}")
+            self._jog = (axis, 1 if float(direction or 0) >= 0 else -1)
+            self._jog_at = time.monotonic()
+
+    def jog_held(self) -> tuple[str, int] | None:
+        """The held direction, while the page keeps saying it is still held.
+
+        Deliberately NOT gated on ``ConsoleAuthority``. That deadman drops
+        authority on release -- it synthesises a Stop AND a DISARM -- which is
+        right for the gizmo/Execute path but wrong here: an operator nudging a
+        part into place would have to re-ARM between every press, and an arm
+        that disarms twenty times a minute is one whose gate stops meaning
+        anything.
+
+        A held jog button IS a deadman with the same properties, so it gets its
+        own: the page re-asserts every 100 ms and this goes stale in
+        JOG_STALE_S. Releasing stops the motion and leaves the arm armed and
+        holding. The controller's own expiry is the second, independent stop --
+        this one cannot save an arm from a console that has itself wedged.
+        """
+        with self._lock:
+            if self._jog is None:
+                return None
+            if time.monotonic() - self._jog_at > JOG_STALE_S:
+                self._jog = None
+                return None
+            return self._jog
+
+    def set_jog_note(self, note: str) -> None:
+        with self._lock:
+            if note != self._jog_note:
+                self._jog_note = note
+                if note:
+                    self._log.append(note)
 
     def set_deadman(self, held: bool) -> None:
         with self._lock:
@@ -403,6 +480,37 @@ def main() -> None:
     _gains = resolve_gains(cfg, mode_cfg, names, len(planned))
     plan_kp = _gains["kp"][: len(planned)]
     plan_kd = _gains["kd"][: len(planned)]
+    # Gain presets: name -> (kp, kd) over the planned joints. An empty entry
+    # means "the configured tracking law", so a config can name `track` without
+    # restating numbers that already sit in controller.kp/kd above it.
+    # Jog envelope. Every bound is a config number, and the defaults are the
+    # conservative ones: 1 cm/s, 20 cm of stroke, a floor at z=0.
+    jog_cfg = dict(mode_cfg.get("jog") or {})
+    jog_limits = JogLimits(
+        max_travel_m=float(jog_cfg.get("max_travel_m", 0.20)),
+        speed_m_s=float(jog_cfg.get("speed_m_s", 0.01)),
+        rot_speed_rad_s=float(jog_cfg.get("rot_speed_rad_s", 0.10)),
+        floor_z=(
+            None if jog_cfg.get("floor_z", 0.0) is None
+            else float(jog_cfg.get("floor_z", 0.0))
+        ),
+        floor_clearance_m=float(jog_cfg.get("floor_clearance_m", 0.02)),
+        workspace_min=jog_cfg.get("workspace_min"),
+        workspace_max=jog_cfg.get("workspace_max"),
+        joint_margin_rad=float(jog_cfg.get("joint_margin_rad", 0.05)),
+        sigma_min=float(jog_cfg.get("sigma_min", 0.02)),
+    )
+    jog_joint_speed = float(jog_cfg.get("joint_speed_rad_s", 0.15))
+
+    gain_presets: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for preset_name, spec in (mode_cfg.get("gain_presets") or {}).items():
+        spec = dict(spec or {})
+        gain_presets[str(preset_name)] = (
+            plan_kp if spec.get("kp") is None
+            else expand_named_values(spec["kp"], names=planned, default=0.0),
+            plan_kd if spec.get("kd") is None
+            else expand_named_values(spec["kd"], names=planned, default=0.0),
+        )
     vmax = expand_named_values(planner_cfg.get("vel_limits", 0.5), names=planned, default=0.5)
     amax = expand_named_values(planner_cfg.get("acc_limits", 1.0), names=planned, default=1.0)
     soft_speed_frac = float(planner_cfg.get("soft_speed_frac", 0.5))
@@ -483,6 +591,7 @@ def main() -> None:
         grip_range=grip_range,
         bind=bind,
         ident=ident,
+        extra_buttons=tuple(f"{_GAIN_PREFIX}{n}" for n in gain_presets),
     )
     print(
         f"[arm_console] control panel at http://{bind}:{panel.port} "
@@ -501,6 +610,12 @@ def main() -> None:
     pending: JointTrajectory | None = None
     # The id the controller knows this plan by; `execute` must name it.
     pending_id = ""
+    # Live jog state: the setpoint being walked, the EE position the stroke
+    # limit is measured from, and the last tick's clock. All three clear on
+    # release, so every press re-anchors.
+    jog_q: np.ndarray | None = None
+    jog_anchor: np.ndarray | None = None
+    jog_t: float | None = None
     shown: np.ndarray | None = None
     # Cartesian drag reference: (position, rotation) latched when a drag streak
     # starts on an axis; the untouched axes are held to it so IK tolerance
@@ -758,6 +873,90 @@ def main() -> None:
                 pending = None
                 pending_id = ""
                 panel.clear_plan()
+
+        # ---- jog: one small step per tick, five gates, then emit -----------
+        jog_held = panel.jog_held()
+        if jog_held is None:
+            jog_q = None          # released: the next press re-anchors
+            jog_anchor = None
+            jog_t = None
+        elif measured is not None:
+            axis, direction = jog_held
+            now_t = time.monotonic()
+            if jog_q is None:
+                # Anchor on the PRESS, from the measured pose. The stroke limit
+                # is measured from here, so "20 cm" means 20 cm from where the
+                # operator started this jog -- not an unbounded walk made of
+                # individually-legal millimetres.
+                jog_q = np.asarray(measured, dtype=float).copy()
+                jog_anchor = ik.fk(jog_q)[:3, 3].copy()
+                jog_t = now_t
+                panel.set_jog_note(f"jog {axis}{'+' if direction > 0 else '-'} started")
+            dt = min(max(now_t - jog_t, 0.0), 0.1)  # a stalled loop must not leap
+            jog_t = now_t
+            joint_jog = axis.startswith("j")
+
+            if joint_jog:
+                q_next = jog_q.copy()
+                q_next[int(axis[1:])] += direction * jog_joint_speed * dt
+                T_next = ik.fk(q_next)
+                p_next = T_next[:3, 3]
+            else:
+                T = ik.fk(jog_q)
+                p_next = T[:3, 3].copy()
+                p_next["xyz".index(axis)] += direction * jog_limits.speed_m_s * dt
+                T_next = T.copy()
+                T_next[:3, 3] = p_next
+                q_next = ik.solve(T_next, q0=jog_q)
+
+            if q_next is None:
+                panel.set_jog_note(
+                    f"jog {axis}: no IK solution — try a joint jog to back out"
+                )
+            else:
+                verdict = check_step(
+                    p_next, q_next,
+                    anchor=jog_anchor,
+                    limits=jog_limits,
+                    q_lower=world.lower,
+                    q_upper=world.upper,
+                    # so a joint already resting on a hard stop can still be
+                    # jogged OFF it -- some spawn poses sit exactly there.
+                    q_now=jog_q,
+                    # A JOINT jog is the escape hatch FROM a singularity, so it
+                    # is not gated on one -- refusing it would strand an
+                    # operator in the pose they are trying to leave.
+                    sigma_min=None if joint_jog else (
+                        lambda qq: ik.sigma_min(qq, rows="pos")
+                    ),
+                    collides=world.in_collision,
+                )
+                if not verdict.ok:
+                    panel.set_jog_note(f"jog {axis} refused — {verdict.reason}")
+                else:
+                    panel.set_jog_note("")
+                    jog_q = q_next
+                    node.send_output("jog", pack_jog(q=jog_q, reason=axis))
+
+        for preset_name, (preset_kp, preset_kd) in gain_presets.items():
+            if not panel.clicked(f"{_GAIN_PREFIX}{preset_name}"):
+                continue
+            # The controller cancels any running leg before applying these --
+            # a plan reviewed at one stiffness must not finish at another.
+            node.send_output(
+                "control",
+                pack_control_update(
+                    gains={"kp": preset_kp.tolist(), "kd": preset_kd.tolist()},
+                    reason=f"preset {preset_name}",
+                ),
+            )
+            pending = None
+            pending_id = ""
+            panel.clear_plan()
+            panel.log(
+                f"gains -> {preset_name} (kp {preset_kp.min():.1f}-"
+                f"{preset_kp.max():.1f}, kd {preset_kd.min():.2f}-{preset_kd.max():.2f})"
+            )
 
         if panel.clicked("Stop (hold)"):
             # `cancel`, not `hold` and not `stop`: the arm must come to rest

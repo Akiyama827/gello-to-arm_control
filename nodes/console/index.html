@@ -53,6 +53,12 @@
         <button id="mode-r">Rotate</button>
       </div>
       <div id="buttons" class="command-stack"></div>
+      <!-- Jog. Hidden until the node reports a jog envelope, so a graph
+           without one shows no controls rather than dead buttons. -->
+      <div id="jog-panel" hidden>
+        <div class="subhead"><span>Jog</span><output id="jog-note">—</output></div>
+        <div id="jog-pad" class="command-stack"></div>
+      </div>
 
       <div class="subsection">
         <div class="subhead"><span>Hand</span><output id="grip-readout">—</output></div>

@@ -19,7 +19,8 @@ nodes:
       motor_state: plant_interface/motor_state
     outputs:
       - plan       # gated, named
-      - control    # arm / execute / cancel
+      - control    # arm / execute / cancel / gains
+      - jog        # live setpoint while a direction is held
       - gripper
 
   - id: arm_controller
@@ -35,6 +36,7 @@ nodes:
       motor_state: plant_interface/motor_state
       plan:        arm_console/plan
       control:     arm_console/control
+      jog:         arm_console/jog
     outputs:
       - motor_command     # the ONLY producer of this topic
       - arm               # and of this one

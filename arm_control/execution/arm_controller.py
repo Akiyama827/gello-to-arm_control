@@ -45,6 +45,7 @@ from arm_control.joint_motor_map import (
 )
 from arm_control.messages import (
     pack_controller_event,
+    unpack_jog,
     unpack_motor_command,
     pack_json_message,
     unpack_control_update,
@@ -65,6 +66,7 @@ class ArmController:
         gripper: dict,
         state_period_s: float | None = None,
         plant_reports_health: bool = True,
+        jog_timeout_s: float = 0.2,
         clock=None,
     ) -> None:
         self.node = node
@@ -112,6 +114,17 @@ class ArmController:
         # its slider has to reach the jaws somehow -- this is that path, and it
         # is the capability the trajectory executor used to provide.
         self._finger_cmd: float | None = None
+        # A jog is a hold whose anchor MOVES, and which dies of old age. The
+        # timeout is the safety property: the console re-sends while a button
+        # is held, so a closed tab, a wedged console, a dropped network or a
+        # crashed browser all look identical to the controller -- setpoints
+        # stop arriving and the arm stops. Nothing has to notice and send a
+        # stop; not sending IS the stop.
+        self._jog_q: np.ndarray | None = None
+        self._jog_at = 0.0
+        self._jog_timeout = float(jog_timeout_s)
+        if not (self._jog_timeout > 0.0):
+            raise ValueError("jog_timeout_s must be positive")
 
         self.last_state = JointState(np.zeros(self.n_arm), np.zeros(self.n_arm))
         self.last_command: JointServoCommand | None = None
@@ -185,6 +198,8 @@ class ArmController:
             )
         if "execute" in fields:
             self._release(str(fields["execute"]))
+        if "gains" in fields:
+            self._set_gains(fields["gains"] or {})
         if fields.get("cancel"):
             self._cancel(str(fields.get("reason") or "cancelled"))
         if fields.get("hold"):
@@ -198,6 +213,49 @@ class ArmController:
             )
         if "stop" in fields:
             self._stop(str(fields.get("reason") or fields["stop"]))
+
+    def on_jog(self, value) -> None:
+        """Take a live setpoint, if this is a moment a jog may move at all.
+
+        Refused while a plan runs: a reviewed plan owns the arm until it ends
+        or is cancelled, and a jog arriving underneath it would fight the
+        trajectory for the same joints.
+        """
+        if self.stopped or self.frozen or not self.armed or not self.ready_sent:
+            return
+        if self._running:
+            return
+        q = np.asarray(unpack_jog(value)["q"], dtype=float).ravel()
+        if q.shape != (self.n_arm,):
+            raise ValueError(f"jog q must have {self.n_arm} values, got {q.size}")
+        self._jog_q = q
+        self._jog_at = self._clock()
+
+    def _jog_command(self) -> JointServoCommand | None:
+        """The servo command for a FRESH jog, or None once it has gone stale."""
+        if self._jog_q is None:
+            return None
+        if self._clock() - self._jog_at > self._jog_timeout:
+            self._jog_q = None
+            # Anchor at the MEASURED pose, explicitly. Clearing the anchor is
+            # not enough: _anchored_hold rebuilds it from the last COMMANDED
+            # target whenever that command was quiescent, and a jog command is
+            # quiescent by construction (a hold with zero qd_des). So the arm
+            # would have carried on to the last setpoint it was asked for --
+            # exactly the extra travel the timeout exists to prevent. That
+            # heuristic is right for a leg that SETTLED at its target and wrong
+            # for a jog that was cut off mid-flight.
+            self._hold_anchor = self._static_hold()
+            print(
+                f"[arm_controller] jog expired after {self._jog_timeout:.2f}s "
+                f"— holding",
+                flush=True,
+            )
+            return None
+        hold = getattr(self.executor, "hold_command", None)
+        if hold is None:
+            return None
+        return hold(self.last_state, q_des=self._jog_q)
 
     def on_gripper(self, value) -> None:
         """A commanded finger width, in metres, from an operator console."""
@@ -244,6 +302,11 @@ class ArmController:
             self._send(command, self._cartesian_for_time(self.exec_time))
             if self._leg_done(arm):
                 self._finish_leg(ok=True, reason="")
+            return
+        jog = self._jog_command()
+        if jog is not None:
+            self._hold_anchor = None   # a jog moves: the next hold re-anchors
+            self._send(jog, self._last_cartesian_pose)
             return
         # No trajectory released: hold the anchor. This is the keepalive the
         # plant's deadman needs while the planner searches, while an operator
@@ -300,6 +363,34 @@ class ArmController:
             flush=True,
         )
 
+    def _set_gains(self, gains: dict) -> None:
+        """Change the control law under an operator's hand.
+
+        A running leg is CANCELLED first, always. The plan was reviewed at one
+        stiffness and released at that stiffness; swapping the law underneath it
+        mid-flight means the arm is no longer doing the thing that was approved
+        -- and the most useful preset, float, would drop kp to zero on a moving
+        trajectory and let the arm fall through the rest of its path.
+        """
+        kp = gains.get("kp")
+        kd = gains.get("kd")
+        if kp is None and kd is None:
+            return
+        if self._running:
+            self._cancel("gains changed mid-leg")
+        self.executor.set_gains(
+            kp=None if kp is None else np.asarray(kp, dtype=float),
+            kd=None if kd is None else np.asarray(kd, dtype=float),
+        )
+        # The anchor was built at the OLD stiffness; a softer law holding a
+        # stiffer law's target is how an arm sags at a gate.
+        self._hold_anchor = None
+        print(
+            f"[arm_controller] gains set: kp={None if kp is None else np.round(kp, 2)} "
+            f"kd={None if kd is None else np.round(kd, 2)}",
+            flush=True,
+        )
+
     def _cancel(self, reason: str) -> None:
         """Abort the current leg and hold, still ARMED and still runnable.
 
@@ -322,6 +413,7 @@ class ArmController:
         self._pending_traj = None
         self._running = False
         self.executor.clear_trajectory()
+        self._jog_q = None
         self._hold_anchor = None
         print(f"[arm_controller] cancelled: {reason}", flush=True)
 
@@ -480,6 +572,7 @@ class ArmController:
         self.ready_sent = False
         self.bridge_armed = not self._needs_health
         self._hold_anchor = None
+        self._jog_q = None
         self.last_command = None
 
     def _fault(self, reason: str) -> None:
@@ -507,6 +600,7 @@ class ArmController:
             "plan": self.on_plan,
             "control": self.on_control,
             "gripper": self.on_gripper,
+            "jog": self.on_jog,
             # A second motion source speaks the same contract under its own
             # topic name (dora maps one producer per input, so an alias is how
             # two of them reach one handler -- the trajectory executor did the
@@ -884,6 +978,57 @@ def _self_check() -> None:
     moved = _umc([a for t, a in node.sent if t == "motor_command"][-1], 7)
     assert moved["position"][6] == gripper_finger_to_motor(0.01, mimic), moved["position"][6]
     assert moved["position"][6] != held["position"][6]
+
+    # N+3. Gains change the control law, so a running leg is cancelled first --
+    #      float (kp=0) applied to a moving trajectory would drop the arm
+    #      through the rest of its path.
+    c = _controller()
+    c.on_plan(_plan_msg("gainrun", gated=False))
+    c.on_motor_state(_state())
+    c.on_motor_state(_state(vel=0.5))
+    assert c._running
+    c.on_control(pack_control_update(gains={"kp": [0.0] * 7, "kd": [1.0] * 7}))
+    assert not c._running, "a gains change must not ride on top of a running leg"
+    assert float(np.max(np.abs(c.executor.kp))) == 0.0, c.executor.kp
+    assert c.armed and not c.stopped, "and it must leave the arm armed"
+
+    # N+4. Jog: it moves the arm, and it DIES IF IT STOPS ARRIVING. That
+    #      expiry is the whole safety story -- a closed tab, a wedged console
+    #      and a cut network are indistinguishable here, and all three must
+    #      stop the arm without anything having to notice and send a stop.
+    from arm_control.messages import pack_jog
+
+    now = [1000.0]
+    c = _controller(clock=lambda: now[0])
+    c.on_jog(pack_jog(q=[0.4] * 7))
+    c.on_motor_state(_state())
+    cmd = [a for t, a in c.node.sent if t == "motor_command"][-1]
+    served = _umc(cmd, 7)["position"][:7]
+    assert float(np.max(np.abs(served - 0.4))) < 1e-9, served
+
+    # still fresh just inside the timeout
+    now[0] += 0.19
+    c.node.sent.clear()
+    c.on_motor_state(_state())
+    served = _umc([a for t, a in c.node.sent if t == "motor_command"][-1], 7)["position"][:7]
+    assert float(np.max(np.abs(served - 0.4))) < 1e-9, "a fresh jog stopped early"
+
+    # ...and dead just past it: the arm holds where it IS (measured = zeros),
+    # not where the last setpoint was still asking it to go.
+    now[0] += 0.5
+    c.node.sent.clear()
+    c.on_motor_state(_state())
+    served = _umc([a for t, a in c.node.sent if t == "motor_command"][-1], 7)["position"][:7]
+    assert float(np.max(np.abs(served))) < 1e-9, f"a stale jog kept commanding: {served}"
+    assert c.armed, "expiry holds the arm; it does not disarm it"
+
+    # A jog must never fight a reviewed plan for the same joints.
+    c = _controller(clock=lambda: now[0])
+    c.on_plan(_plan_msg("owns", gated=False))
+    c.on_motor_state(_state())
+    assert c._running
+    c.on_jog(pack_jog(q=[0.9] * 7))
+    assert c._jog_q is None, "a jog was accepted while a plan was running"
 
     print("arm_controller self-check ok")
 

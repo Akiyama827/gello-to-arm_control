@@ -29,6 +29,7 @@ nodes:
     outputs:
       - plan
       - control
+      - jog
       - gripper
 
   - id: arm_controller
@@ -43,6 +44,7 @@ nodes:
       motor_health: plant_interface/motor_health
       plan:        arm_console/plan
       control:     arm_console/control
+      jog:         arm_console/jog
       gripper:     arm_console/gripper
     outputs:
       - motor_command     # the ONLY producer of this topic
