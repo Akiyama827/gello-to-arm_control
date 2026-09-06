@@ -1,0 +1,18 @@
+# A SECOND arm, to show that two run at once without forking any code.
+#
+# This is the whole two-arm story: an arm is a config, so a second arm is a
+# second config, and the only things that have to differ are the per-INSTANCE
+# facts -- which port its console binds, which log it writes, which Rerun entity
+# root it draws under. Identity, gains, limits and geometry are all inherited.
+#
+#     dora run dataflows/dual_arm_sim.yml
+#
+# The consoles come up on 7500 and 7510. If those had lived in the mode config
+# (they used to), both arms would run the same mode and fight over one port.
+include:
+  - sim_demo.yaml
+
+console:
+  http_port: 7510
+
+motor_log_path: /tmp/arm_control_sim_demo_b.csv

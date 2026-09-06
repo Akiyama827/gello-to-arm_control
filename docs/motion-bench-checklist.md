@@ -38,7 +38,7 @@ reflex live in command mode; executor aborts on >0.35 rad tracking error;
 
 - [ ] `python scripts/view.py real motion`
       Expect in the logs: bridge `command mode — DISARMED`,
-      `[trajectory_executor] ready`, `[motion_teleop] control panel at http://...:7500`
+      `[arm_controller] idle — DISARMED`, `[arm_console] control panel at http://...:7500`
 - [ ] Desk browser → `http://<jetson-ip>:7001` — robot renders,
       sliders equal the measured pose (auto-synced on first state)
 - [ ] **Disarmed dry-run:** small target (+0.3 rad on Joint1) → `Plan + preview`

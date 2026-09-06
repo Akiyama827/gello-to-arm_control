@@ -14,17 +14,24 @@ of its identity fails loudly by key name.
 | `arm_control/hardware/` | DM CAN + SocketCAN transport, libfranka backend (read-only + gripper) |
 | `arm_control/bridge/` | Safety controller, grasp gate, grasp controller |
 | `arm_control/execution/` | Servo law / trajectory executor |
-| `arm_control/planning/` | Pinocchio IK, OMPL, retiming, MuJoCo collision oracle, Rerun preview, `stack.py` (one-arm stack builder) |
+| `arm_control/planning/` | Pinocchio IK, OMPL, retiming, MuJoCo collision oracle, Rerun preview, `jog.py` (the jog safety envelope), `stack.py` (one-arm stack builder) |
 | `arm_control/simulation/` | MuJoCo backend, composed-scene builder, Rerun mirror, convex decomposition |
-| `nodes/` | Thin Dora node adapters, one per process (launched by path from a dataflow) |
+| `nodes/` | Thin Dora node adapters, one per process (launched by path from a dataflow). `arm_console.py` is the operator page; `arm_controller.py` is the only producer of `motor_command` |
 | `dataflows/` | Dora graph YAMLs for motion / view / float / listen |
 | `configs/` | `modes/` (controller modes) + `real/<arm>/{hardware,calibration}.yaml` (per-robot fragments) |
-| `scripts/` | `bench_ramp.py` (DM gain ladder), `setup_fr3_assets.py`, DM bench probes |
+| `scripts/` | `run_console.py` (the demo launcher), `bench_ramp.py` (DM gain ladder), `setup_fr3_assets.py`, DM bench probes |
 | `rt/` | The RT machine's C++ 1 kHz torque server + wire protocol + the shared servo-law binding — see `rt/README.md` |
 
 Runnable ENTRY configs (the ones that compose hardware + calibration +
 scenario into one tree) live with the deployment, not here — this repo ships
 per-robot fragments a project includes.
+
+**One narrow exception: `configs/entry/`.** Those are EXAMPLES, not a
+deployment. Without a single entry that runs, "arm-agnostic library" is a claim
+nobody can check and a new consumer has nothing to copy. `sim_demo.yaml` drives
+the console against a simulated FR3; `sim_demo_b.yaml` is a second arm that
+overrides only its console port and log path. A real robot's entry config still
+lives with the project that owns its CAD.
 
 ## What this is NOT
 
@@ -82,8 +89,30 @@ ruff check .
 python -m arm_control.frames                       # frame algebra asserts
 python -m arm_control.config                       # include/merge/circular-include asserts
 python -m arm_control.hardware.franka_backend      # FR3 config parsing asserts
+python -m arm_control.planning.jog                 # the five jog safety gates
+python -m arm_control.execution.arm_controller     # cancel vs hold vs stop, jog expiry
+python -m arm_control.console_server               # loopback / CSRF / body cap
 python scripts/setup_fr3_assets.py --self-check    # asset staging asserts
+
+python nodes/arm_console.py --self-check           # page routes + graphs can stream
+python nodes/visualizer.py --self-check            # no entity path bypasses ARM_ID
+python scripts/run_console.py --check              # assets, config, graph
 ```
+
+## The operator console
+
+One page per arm: plan and execute a move, jog by hand inside a checked
+envelope, switch the control law, arm and disarm. It runs from a fresh clone:
+
+```bash
+python scripts/setup_fr3_assets.py --source <franka_description checkout>
+python scripts/run_console.py            # console on http://127.0.0.1:7500
+python scripts/run_console.py --dual     # two arms at once, :7500 and :7510
+```
+
+See `docs/operator-console.md` — in particular the jog envelope (stroke limit,
+floor, joint limits, singularity, self-collision, all checked per step) and the
+two independent deadmen that stop the arm when the page goes away.
 
 Graphs need a config: point `ARM_CONTROL_CONFIG` at an entry YAML (there is no
 default robot) and run e.g. `dora run dataflows/sim_motion.yml`.

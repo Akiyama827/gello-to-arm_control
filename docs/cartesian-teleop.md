@@ -1,7 +1,12 @@
 # Interactive 3D teleop (motion mode)
 
-`motion_teleop` serves an interactive 3D page at `http://<arm-pc>:7500`
-(`nodes/teleop_page.html`). The node stays stdlib-HTTP; the page uses
+> The node is now `nodes/arm_console.py`, and what it is ALLOWED to make the arm
+> do -- the command-owner split, gain presets, and the jog safety envelope --
+> lives in [operator-console.md](operator-console.md). This file stays the
+> reference for the PAGE: what it draws and how.
+
+It serves an interactive 3D page at `http://<arm-pc>:7500`
+(`nodes/console/index.html`). The node stays stdlib-HTTP; the page uses
 three.js (pinned r160, CDN import map — the desk browser needs internet, the
 arm PC does not) with `STLLoader` + `TransformControls`, the standard stack
 for browser robot teleop. Everything downstream of the target

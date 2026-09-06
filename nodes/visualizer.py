@@ -70,6 +70,22 @@ _CMD_ALPHA = 140
 _LINE_WIDTH = 1.5
 
 
+#: Entity-path prefix, set once from ARM_ID. Empty for a single-arm graph, so
+#: every path is byte-identical to what it has always been and no existing
+#: layout or bookmark moves. With two arms it is what keeps their streams apart:
+#: `rerun_app_id` alone gives two SEPARATE recordings, which is exactly what you
+#: do NOT want when the question is where one arm is relative to the other.
+_ARM_NS = ""
+
+
+def ns(path: str) -> str:
+    """Entity path under this arm's namespace, leading slash preserved."""
+    if not _ARM_NS:
+        return path
+    lead = "/" if path.startswith("/") else ""
+    return f"{lead}{_ARM_NS}/{path.lstrip('/')}"
+
+
 def _cmd_color(c: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     return (c[0], c[1], c[2], _CMD_ALPHA)
 
@@ -158,7 +174,7 @@ def _log_visual_assets(visual_model) -> None:
         if not mesh_path.is_file():
             print(f"[viz] skipping missing mesh: {mesh_path}")
             continue
-        entity_path = f"robot/visuals/{geom.name}"
+        entity_path = ns(f"robot/visuals/{geom.name}")
         rr.log(
             entity_path,
             rr.Asset3D(path=mesh_path, albedo_factor=_rgba8(geom.meshColor)),
@@ -229,7 +245,7 @@ def _log_render_pose(
         pin.updateGeometryPlacements(model, data, visual_model, visual_data, q)
         for geom, placement in zip(visual_model.geometryObjects, visual_data.oMg):
             rr.log(
-                f"robot/visuals/{geom.name}",
+                ns(f"robot/visuals/{geom.name}"),
                 rr.Transform3D(
                     translation=placement.translation,
                     mat3x3=placement.rotation,
@@ -250,12 +266,12 @@ def _setup_blueprint(motor_names: list[str], has_3d: bool, time_ranges=None) -> 
     Edit this function to reorganise panels.  The blueprint is sent once
     at startup; the user can still rearrange panels manually in the viewer.
     """
-    pos_reading = ["motors/position"]
-    pos_cmd     = ["motors/pos_cmd"]
-    vel_reading = ["motors/velocity"]
-    vel_cmd     = ["motors/vel_cmd"]
-    tor_reading = ["motors/torque"]
-    tor_cmd     = ["motors/tor_cmd"]
+    pos_reading = [ns("motors/position")]
+    pos_cmd     = [ns("motors/pos_cmd")]
+    vel_reading = [ns("motors/velocity")]
+    vel_cmd     = [ns("motors/vel_cmd")]
+    tor_reading = [ns("motors/torque")]
+    tor_cmd     = [ns("motors/tor_cmd")]
 
     pos_view = rrb.TimeSeriesView(
         name="Position [rad]", origin="/", contents=pos_reading, time_ranges=time_ranges
@@ -278,14 +294,14 @@ def _setup_blueprint(motor_names: list[str], has_3d: bool, time_ranges=None) -> 
     bus_view = rrb.TimeSeriesView(
         name="CAN Bus Load [%]",
         origin="/",
-        contents=["can/bus_load_pct"],
+        contents=[ns("can/bus_load_pct")],
         time_ranges=time_ranges,
     )
 
     err_view = rrb.TimeSeriesView(
         name="Tracking Error [rad]",
         origin="/",
-        contents=["motors/pos_err"],
+        contents=[ns("motors/pos_err")],
         time_ranges=time_ranges,
     )
 
@@ -302,7 +318,7 @@ def _setup_blueprint(motor_names: list[str], has_3d: bool, time_ranges=None) -> 
         # simply outside the viewport — invisible for the same reason an
         # unplugged monitor is black (bench 2026-08-06).
         spatial_view = rrb.Spatial3DView(
-            name="3D (FK)", origin="/", contents=["/robot/**", "/scene/**"]
+            name="3D (FK)", origin="/", contents=[ns("/robot/**"), ns("/scene/**")]
         )
         root = rrb.Horizontal(right_col, spatial_view, column_shares=[2, 1])
     else:
@@ -325,7 +341,7 @@ def _setup_series_style(motor_names: list[str]) -> None:
     colors = [_MOTOR_COLORS[i % len(_MOTOR_COLORS)] for i in range(len(motor_names))]
     cmd_colors = [_cmd_color(color) for color in colors]
     rr.log(
-        "motors/position",
+        ns("motors/position"),
         rr.SeriesLines(
             colors=colors,
             names=[_label_with_unit(name, "rad") for name in motor_names],
@@ -335,7 +351,7 @@ def _setup_series_style(motor_names: list[str]) -> None:
         static=True,
     )
     rr.log(
-        "motors/pos_cmd",
+        ns("motors/pos_cmd"),
         rr.SeriesLines(
             colors=cmd_colors,
             names=[_label_with_unit(f"{name} (cmd)", "rad") for name in motor_names],
@@ -345,7 +361,7 @@ def _setup_series_style(motor_names: list[str]) -> None:
         static=True,
     )
     rr.log(
-        "motors/pos_err",
+        ns("motors/pos_err"),
         rr.SeriesLines(
             colors=colors,
             names=[_label_with_unit(f"{name} (err)", "rad") for name in motor_names],
@@ -355,7 +371,7 @@ def _setup_series_style(motor_names: list[str]) -> None:
         static=True,
     )
     rr.log(
-        "motors/velocity",
+        ns("motors/velocity"),
         rr.SeriesLines(
             colors=colors,
             names=[_label_with_unit(name, "rad/s") for name in motor_names],
@@ -365,7 +381,7 @@ def _setup_series_style(motor_names: list[str]) -> None:
         static=True,
     )
     rr.log(
-        "motors/vel_cmd",
+        ns("motors/vel_cmd"),
         rr.SeriesLines(
             colors=cmd_colors,
             names=[_label_with_unit(f"{name} (cmd)", "rad/s") for name in motor_names],
@@ -375,7 +391,7 @@ def _setup_series_style(motor_names: list[str]) -> None:
         static=True,
     )
     rr.log(
-        "motors/torque",
+        ns("motors/torque"),
         rr.SeriesLines(
             colors=colors,
             names=[_label_with_unit(name, "N*m") for name in motor_names],
@@ -385,7 +401,7 @@ def _setup_series_style(motor_names: list[str]) -> None:
         static=True,
     )
     rr.log(
-        "motors/tor_cmd",
+        ns("motors/tor_cmd"),
         rr.SeriesLines(
             colors=cmd_colors,
             names=[_label_with_unit(f"{name} (cmd)", "N*m") for name in motor_names],
@@ -430,16 +446,16 @@ def _fk_position_changed(previous, current, *, min_delta_rad: float) -> bool:
 
 
 def _log_motor_state_metrics(state: dict[str, np.ndarray], *, rerun_module=rr) -> None:
-    rerun_module.log("motors/position", rerun_module.Scalars(state["position"]))
-    rerun_module.log("motors/velocity", rerun_module.Scalars(state["velocity"]))
-    rerun_module.log("motors/pos_cmd", rerun_module.Scalars(state["position_cmd"]))
+    rerun_module.log(ns("motors/position"), rerun_module.Scalars(state["position"]))
+    rerun_module.log(ns("motors/velocity"), rerun_module.Scalars(state["velocity"]))
+    rerun_module.log(ns("motors/pos_cmd"), rerun_module.Scalars(state["position_cmd"]))
     rerun_module.log(
-        "motors/pos_err",
+        ns("motors/pos_err"),
         rerun_module.Scalars(state["position_cmd"] - state["position"]),
     )
-    rerun_module.log("motors/vel_cmd", rerun_module.Scalars(state["velocity_cmd"]))
-    rerun_module.log("motors/torque", rerun_module.Scalars(state["torque"]))
-    rerun_module.log("motors/tor_cmd", rerun_module.Scalars(state["torque_cmd"]))
+    rerun_module.log(ns("motors/vel_cmd"), rerun_module.Scalars(state["velocity_cmd"]))
+    rerun_module.log(ns("motors/torque"), rerun_module.Scalars(state["torque"]))
+    rerun_module.log(ns("motors/tor_cmd"), rerun_module.Scalars(state["torque_cmd"]))
 
 
 def _init_rerun(app_id: str, *, rerun_module=rr) -> None:
@@ -448,6 +464,42 @@ def _init_rerun(app_id: str, *, rerun_module=rr) -> None:
     # launcher (scripts/view.py) guarantees one persistent viewer beforehand.
     rerun_module.init(app_id, spawn=False)
     rerun_module.connect_grpc()
+
+
+def _check_namespacing() -> None:
+    """No entity path may bypass ns(), and ns() must be identity when unset.
+
+    A missed literal is the worst kind of miss: with one arm everything looks
+    right, and with two the plot silently shows the OTHER arm's data. So this
+    reads its own source rather than trusting that the sweep was complete.
+    """
+    import re
+    from pathlib import Path as _Path
+
+    global _ARM_NS
+    # Only the code ABOVE this function: the assertions below deliberately
+    # write bare paths as their expected values.
+    source = _Path(__file__).read_text().split("def _check_namespacing")[0]
+    # An entity path is a string literal starting with one of our roots; every
+    # one must sit inside an ns(...) call.
+    stray = [
+        m.group(0)
+        for m in re.finditer(r'(?<!ns\()(?<!ns\(f)"(?:motors|can|robot)/[^"]*"', source)
+    ]
+    assert not stray, f"entity paths bypassing ns(): {stray}"
+
+    was = _ARM_NS
+    try:
+        _ARM_NS = ""
+        assert ns("motors/position") == "motors/position"
+        assert ns("/robot/**") == "/robot/**"
+        _ARM_NS = "left"
+        assert ns("motors/position") == "left/motors/position"
+        # a leading slash is a Rerun path anchor and has to stay in front
+        assert ns("/robot/**") == "/left/robot/**"
+    finally:
+        _ARM_NS = was
+    print("visualizer: entity paths all namespaced")
 
 
 def _shutdown_from_signal(signum=None, frame=None, *, exit_func=os._exit) -> None:
@@ -463,6 +515,10 @@ def main() -> None:
     n_motors     = int(cfg.get("num_motors", 7))
     motor_names  = list(cfg.get("motor_names") or [f"joint_{i}" for i in range(n_motors)])
     urdf_path    = str(cfg.get("urdf_path") or "")
+    global _ARM_NS
+    # Two arms sharing one rerun_app_id land in ONE recording, which is the
+    # point; ARM_ID is what stops them drawing on top of each other there.
+    _ARM_NS = os.environ.get("ARM_ID", "").strip()
     app_id       = str(cfg.get("rerun_app_id", "arm_control"))
     fk_period_s  = _fk_publish_period(cfg)
     fk_min_delta = _fk_min_delta_rad(cfg)
@@ -543,7 +599,7 @@ def main() -> None:
 
         elif eid == "can_bus_status":
             payload = unpack_json_message(event["value"], expected_schema="can_bus_status")
-            rr.log("can/bus_load_pct", rr.Scalars(float(payload["bus_load_pct"])))
+            rr.log(ns("can/bus_load_pct"), rr.Scalars(float(payload["bus_load_pct"])))
 
         if log_rates and now - last_rate_log >= 1.0:
             if last_rate_log > 0:
@@ -564,4 +620,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    # dora runs a node as `python <node>.py`, so __main__ MUST be the node.
+    if "--self-check" in sys.argv:
+        _check_namespacing()
+    else:
+        main()
