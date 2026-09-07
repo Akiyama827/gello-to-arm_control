@@ -325,7 +325,7 @@ class MuJoCoCollisionWorld:
         if actor is None:
             raise KeyError(f"unknown planned actor: {planned_actor}")
         # Local import avoids the composer/collision helper import cycle.
-        from arm_control.simulation.mujoco_backend import compose_workcell_scene
+        from arm_control.plants.mujoco.backend import compose_workcell_scene
 
         self = cls.__new__(cls)
         self.model = compose_workcell_scene(

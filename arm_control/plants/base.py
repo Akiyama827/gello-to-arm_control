@@ -24,7 +24,7 @@ def _self_check() -> None:
     from arm_control.plants.dm.backend import DmHardwareBackend
     from arm_control.plants.franka.backend import FrankaHardwareBackend
     from arm_control.plants.remote_rt.client import RtBackend
-    from arm_control.simulation.mujoco_backend import MuJoCoBackend
+    from arm_control.plants.mujoco.backend import MuJoCoBackend
 
     for backend in (DmHardwareBackend, FrankaHardwareBackend, RtBackend, MuJoCoBackend):
         for name in ('num_motors', 'motor_state', 'close'):
