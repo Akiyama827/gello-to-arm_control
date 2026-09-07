@@ -84,7 +84,7 @@ def _load_mode_config() -> dict:
     path = Path(raw)
     if not path.is_absolute():
         # Deployment root first (a project may override a mode wholesale),
-        # then this repo (the shipped modes under configs/modes/).
+        # then this repo (the shipped modes under examples/profiles/).
         for root in (CONTROL_ROOT, REPO_ROOT):
             if (root / path).exists():
                 path = root / path

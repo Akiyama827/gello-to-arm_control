@@ -14,7 +14,7 @@ __version__ = "0.1.0"
 #: This repository's own root (the directory holding ``arm_control/``,
 #: ``nodes/``, ``configs/``, ``dataflows/``). Fixed by the package location —
 #: used for things that SHIP WITH THIS REPO: the mode configs under
-#: ``configs/modes/`` and the DM vendor shared objects under ``dlls/``.
+#: ``examples/profiles/`` and the DM vendor shared objects under ``dlls/``.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: The DEPLOYMENT root — the directory RELATIVE ASSET PATHS in runtime configs

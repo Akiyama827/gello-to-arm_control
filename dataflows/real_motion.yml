@@ -20,7 +20,7 @@ nodes:
   - id: arm_console
     path: ../nodes/arm_console.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
     inputs:
       motor_state: plant_interface/motor_state_viz
       # Lets the panel gate Execute while DISARMED (visible refusal instead
@@ -35,7 +35,7 @@ nodes:
   - id: arm_controller
     path: ../nodes/arm_controller.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
     inputs:
       motor_state: plant_interface/motor_state
       # The armed edge. Without it the controller never leaves its pre-arm
@@ -55,7 +55,7 @@ nodes:
     path: ../nodes/hardware_interface.py
     # Command mode: safety layer built, disarmed until the console gate fires.
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
     inputs:
       motor_command: arm_controller/motor_command
       arm:           arm_controller/arm

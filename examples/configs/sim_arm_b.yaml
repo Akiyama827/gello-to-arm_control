@@ -10,7 +10,7 @@
 # The consoles come up on 7500 and 7510. If those had lived in the mode config
 # (they used to), both arms would run the same mode and fight over one port.
 include:
-  - sim_demo.yaml
+  - sim_arm.yaml
 
 console:
   http_port: 7510

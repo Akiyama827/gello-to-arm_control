@@ -1,7 +1,7 @@
 # Sim twin of real_franka_motion.yml — the FR3 through the MuJoCo plant.
 #
 # Identical to sim_motion.yml except for the pinned mode config: every node's
-# `env:` block names configs/modes/motion_franka.yaml so a bare `dora run` gets
+# `env:` block names examples/profiles/motion_franka.yaml so a bare `dora run` gets
 # the FR3's gains. That pin is why this file has to exist at all — a per-node
 # `env:` entry OVERRIDES the launcher's environment, so pointing view.py at a
 # different mode config is not enough on its own. Getting this wrong is silent:
@@ -15,7 +15,7 @@ nodes:
   - id: arm_console
     path: ../nodes/arm_console.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
     inputs:
       motor_state: plant_interface/motor_state
     outputs:
@@ -30,7 +30,7 @@ nodes:
   - id: trajectory_replay
     path: ../nodes/trajectory_replay.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
     inputs:
       motor_state: plant_interface/motor_state
     outputs:
@@ -40,7 +40,7 @@ nodes:
   - id: arm_controller
     path: ../nodes/arm_controller.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
       # mujoco_interface is the plant here: no safety bridge in the path, so
       # no motor_health, so no armed edge to wait for. Opt-out only.
       ARM_CONTROL_PLANT_HEALTH: "0"

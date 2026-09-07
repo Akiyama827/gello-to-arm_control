@@ -5,7 +5,7 @@
 # (`nodes/impedance_controller.py`, 238 lines) computing gravity + damping in a
 # second place; `arm_controller`'s hold command already ships gravity + payload
 # at the measured pose, and float is that with kp = 0 -- which is exactly what
-# configs/modes/float.yaml states. One command owner, one servo law, one place
+# examples/profiles/float.yaml states. One command owner, one servo law, one place
 # a torque can come from.
 #
 # Unlike the old graph this comes up DISARMED, and the console is here to arm
@@ -17,7 +17,7 @@ nodes:
   - id: plant_interface
     path: ../nodes/hardware_interface.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/float.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/float.yaml
     inputs:
       motor_command: arm_controller/motor_command
     outputs:
@@ -29,7 +29,7 @@ nodes:
   - id: arm_console
     path: ../nodes/arm_console.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/float.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/float.yaml
     inputs:
       motor_state: plant_interface/motor_state
     outputs:
@@ -41,7 +41,7 @@ nodes:
   - id: arm_controller
     path: ../nodes/arm_controller.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/float.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/float.yaml
       # No safety bridge in this graph, so no motor_health edge to wait for.
       ARM_CONTROL_PLANT_HEALTH: "0"
     inputs:

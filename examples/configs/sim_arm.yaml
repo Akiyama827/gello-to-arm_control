@@ -17,12 +17,11 @@
 #
 #     python scripts/run_console.py
 #
-# The identity comes from the fragments this repo already ships, so the demo is
-# the same arm the bench drives; only the PLANT differs. That is the whole point
-# of the split -- sim and real differ by a plant, not by a duplicated file.
+# A neutral standalone example: origin at zero, no deployed bench collision
+# table. The previous concrete bench example is preserved by the consuming
+# project as configs/entries/sim_console_demo.yaml, with its original values.
 include:
-  - ../real/franka/hardware.yaml
-  - ../real/franka/calibration.yaml
+  - franka.yaml
 
 # --- Plant: MuJoCo, no libfranka, no FCI, no RT box -------------------------
 # WHICH plant runs is the GRAPH's choice, not a key here: sim_franka_motion.yml

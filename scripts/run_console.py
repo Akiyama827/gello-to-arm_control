@@ -32,7 +32,7 @@ if str(REPO_ROOT) not in sys.path:
 
 SINGLE = REPO_ROOT / "dataflows" / "sim_franka_motion.yml"
 DUAL = REPO_ROOT / "dataflows" / "dual_arm_sim.yml"
-DEFAULT_CONFIG = REPO_ROOT / "configs" / "entry" / "sim_demo.yaml"
+DEFAULT_CONFIG = REPO_ROOT / "examples" / "configs" / "sim_arm.yaml"
 
 
 def assets_ready() -> tuple[bool, str]:
@@ -264,7 +264,7 @@ def _self_check() -> None:
 
     cfg = load_config_tree(DEFAULT_CONFIG)
     assert cfg["console"]["http_port"], cfg.get("console")
-    dual_cfg = load_config_tree(REPO_ROOT / "configs/entry/sim_demo_b.yaml")
+    dual_cfg = load_config_tree(REPO_ROOT / "examples/configs/sim_arm_b.yaml")
     assert dual_cfg["console"]["http_port"] != cfg["console"]["http_port"], (
         "the two demo arms must not share a console port -- that collision is "
         "the exact thing per-instance config exists to prevent"
@@ -296,7 +296,7 @@ def _check_entry_keys() -> None:
         for directory in ("arm_control", "nodes", "scripts")
         for path in sorted((REPO_ROOT / directory).rglob("*.py"))
     )
-    for entry in sorted((REPO_ROOT / "configs" / "entry").glob("*.yaml")):
+    for entry in sorted((REPO_ROOT / "examples" / "configs").glob("sim_arm*.yaml")):
         # The file's own top-level keys, read as text: parsing the tree back
         # would hand us the merged result and lose exactly this distinction.
         own = [

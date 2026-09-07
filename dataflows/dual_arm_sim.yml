@@ -16,7 +16,7 @@
 # other's arm: each controller subscribes only to its own console.
 #
 #   python scripts/setup_fr3_assets.py --source <franka_description checkout>
-#   ARM_CONTROL_CONFIG=configs/entry/sim_demo.yaml dora run dataflows/dual_arm_sim.yml
+#   ARM_CONTROL_CONFIG=examples/configs/sim_arm.yaml dora run dataflows/dual_arm_sim.yml
 #
 # (The per-node env below overrides that outer value; it is set only so a bare
 # `dora run` has something to resolve if a node is added without one.)
@@ -25,8 +25,8 @@ nodes:
   - id: left_console
     path: ../nodes/arm_console.py
     env:
-      ARM_CONTROL_CONFIG: configs/entry/sim_demo.yaml
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
       ARM_ID: left
     inputs:
       motor_state: left_plant/motor_state
@@ -35,8 +35,8 @@ nodes:
   - id: left_controller
     path: ../nodes/arm_controller.py
     env:
-      ARM_CONTROL_CONFIG: configs/entry/sim_demo.yaml
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
       ARM_ID: left
       ARM_CONTROL_PLANT_HEALTH: "0"   # bare mujoco plant, no safety bridge
     inputs:
@@ -50,7 +50,7 @@ nodes:
   - id: left_plant
     path: ../nodes/mujoco_interface.py
     env:
-      ARM_CONTROL_CONFIG: configs/entry/sim_demo.yaml
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm.yaml
       ARM_ID: left
     inputs:
       motor_command: left_controller/motor_command
@@ -59,7 +59,7 @@ nodes:
   - id: left_viz
     path: ../nodes/visualizer.py
     env:
-      ARM_CONTROL_CONFIG: configs/entry/sim_demo.yaml
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm.yaml
       ARM_ID: left           # -> entity paths under left/...
     inputs:
       motor_state: left_plant/motor_state
@@ -68,8 +68,8 @@ nodes:
   - id: right_console
     path: ../nodes/arm_console.py
     env:
-      ARM_CONTROL_CONFIG: configs/entry/sim_demo_b.yaml
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm_b.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
       ARM_ID: right
     inputs:
       motor_state: right_plant/motor_state
@@ -78,8 +78,8 @@ nodes:
   - id: right_controller
     path: ../nodes/arm_controller.py
     env:
-      ARM_CONTROL_CONFIG: configs/entry/sim_demo_b.yaml
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion_franka.yaml
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm_b.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
       ARM_ID: right
       ARM_CONTROL_PLANT_HEALTH: "0"
     inputs:
@@ -93,7 +93,7 @@ nodes:
   - id: right_plant
     path: ../nodes/mujoco_interface.py
     env:
-      ARM_CONTROL_CONFIG: configs/entry/sim_demo_b.yaml
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm_b.yaml
       ARM_ID: right
     inputs:
       motor_command: right_controller/motor_command
@@ -102,7 +102,7 @@ nodes:
   - id: right_viz
     path: ../nodes/visualizer.py
     env:
-      ARM_CONTROL_CONFIG: configs/entry/sim_demo_b.yaml
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm_b.yaml
       ARM_ID: right          # same rerun_app_id, different entity root
     inputs:
       motor_state: right_plant/motor_state

@@ -14,7 +14,7 @@ nodes:
   - id: arm_console
     path: ../nodes/arm_console.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
     inputs:
       motor_state: plant_interface/motor_state
     outputs:
@@ -26,7 +26,7 @@ nodes:
   - id: arm_controller
     path: ../nodes/arm_controller.py
     env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/motion.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
       # No sim_bridge in this graph: mujoco_interface is the plant and has no
       # arm gate, so it publishes no motor_health. Without this the controller
       # waits forever for an armed edge that cannot come. Opt-out, and only
