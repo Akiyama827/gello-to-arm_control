@@ -48,7 +48,7 @@ inline void servo_torque(int n,
 }
 
 // ---------------------------------------------------------------------------
-// Cartesian impedance — the task-frame anisotropic spring the keyed dock needs
+// Cartesian impedance — an anisotropic spring expressed in the task frame
 // (stiff along the insertion axis, soft laterally, so the connector's lead-in
 // mechanically funnels the part instead of the servo jamming it).
 //

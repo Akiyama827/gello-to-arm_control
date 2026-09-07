@@ -120,7 +120,7 @@ public:
       // choice is which frame it arrives in. Base frame wins because it is
       // the frame EVERYTHING else here already lives in: zeroJacobian is
       // base-frame, the servo's Cartesian task frame is fixed in the base
-      // (a dock's insertion axis does not move with the wrist), and the PC
+      // (an insertion axis does not move with the wrist), and the PC
       // reads the wrench off the wire without a pose to rotate it by. The
       // stiffness frame K would need the live EE orientation applied at
       // every consumer — one more place to get a convention wrong, for no

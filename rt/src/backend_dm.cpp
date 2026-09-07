@@ -1,10 +1,7 @@
-// DM-motor FDCAN backend over SocketCAN — the modular BASE's joints.
+// DM-motor FDCAN backend over SocketCAN.
 //
-// Topology (fixed 2026-08-03): the RT box owns the dmcan USB2FDCAN, which
-// enumerates as candleLight/gs_usb -> kernel `can0`; this backend runs in a
-// SECOND arm_rt_server instance (`--backend dm`, ports 47810/47811) sharing
-// that one bus with dock_bridge via DISJOINT kernel CAN filters (motors
-// reply on their Master ID, docks on 0xF0-0xFF). Motors run MIT mode as
+// Each backend instance owns a SocketCAN socket. Exact Master-ID filters
+// isolate motor replies from other devices sharing the bus. Motors run MIT mode as
 // PURE TORQUE devices: every control frame carries kp=kd=0, q_des=v_des=0 —
 // the on-motor PD is bypassed and rt_loop's servo law (which already
 // computed PD + ff) is the single authority. Gains ride the UDP
@@ -14,10 +11,9 @@
 //   "can0;1:4340,2:4340"        iface ; comma list of id:type[:mst]
 // id   = motor CAN id, 1..15 (replies carry it in the payload LOW nibble),
 // type = 4310 | 4310p | 4340 | 4340p (per-type encode limits below, ported
-//        verbatim from arm_control/hardware/dm_backend.py),
+//        verbatim from arm_control/plants/dm/backend.py),
 // mst  = the CAN id the motor's firmware REPLIES on (Master ID). Default 0 —
-//        the DM factory default ("反馈帧ID…默认为0", DM-J4310 manual) and
-//        this project's motors (hardware.yaml: master_id null throughout).
+//        the DM factory default ("反馈帧ID…默认为0", DM-J4310 manual).
 //        Replies are routed by the payload nibble exactly like the Python
 //        backend, so a shared mst collides nowhere; a motor flashed with a
 //        different Master ID is a spec edit, not a code change.
@@ -236,8 +232,8 @@ public:
            std::strerror(errno));
       return;
     }
-    // Only the motors' reply ids reach this socket — dock traffic
-    // (0xD0-0xFF bands) and dock_bridge's own TX loopback never do.
+    // Only the configured motors' reply ids reach this socket; unrelated
+    // device traffic on a shared bus is excluded by exact-id filters.
     std::vector<can_filter> filters;
     for (const Motor& m : motors_) {
       bool dup = false;

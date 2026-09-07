@@ -2,7 +2,7 @@
 
 One static C++ binary (`arm_rt_server`) that owns the arm's 1 kHz torque loop
 on a realtime Linux box, speaking a small UDP/TCP protocol to the PC's Dora
-graph. The PC-side counterpart is `arm_control/hardware/rt_backend.py` behind
+graph. The PC-side counterpart is `arm_control/plants/remote_rt/client.py` behind
 `nodes/rt_interface.py` — the same plant-node contract every other bridge
 speaks, so graphs move an arm onto the RT machine by swapping one node path.
 
@@ -16,17 +16,22 @@ no daemon, no Python, no graph lifecycle owning the arm.
 
 | Path | What |
 |------|------|
-| `include/arm_rt/protocol.hpp` | Wire structs — hand-mirrored in `arm_control/rt_protocol.py`, parity enforced (below) |
+| `include/arm_rt/protocol.hpp` | Wire structs — hand-mirrored in `arm_control/plants/remote_rt/protocol.py`, parity enforced (below) |
 | `include/arm_rt/servo_law.hpp` | THE torque law, header-only: PD + ff, clamp, slew vs the robot's own `tau_J_d` echo. Shared by the RT loop and the sim binding |
 | `include/arm_rt/seqlock.hpp` | The non-RT↔RT seam (single-writer seqlock, latest-wins) |
 | `src/rt_loop.cpp` | The servo thread: backend read → staleness policy → law → write. Constructs the backend ON this thread (libfranka requirement) |
 | `src/udp_link.cpp` | Commands in (latest-wins), state out (paced) |
 | `src/control_session.cpp` | TCP: arm/disarm/ping + STATUS/FAULT events |
 | `src/backend_fake.cpp` | Damped-integrator loopback plant — the PERMANENT test double (see below) |
-| `src/backend_franka.cpp` | FR3 over libfranka ActiveControl. Compiles (`-DWITH_FRANKA=ON`), **unvalidated on hardware** |
-| `src/backend_dm.cpp` | DM FDCAN loop — skeleton, lands after the FR3 loop is proven |
+| `src/backend_franka.cpp` | FR3 over libfranka ActiveControl (`-DWITH_FRANKA=ON`), **unvalidated on hardware** |
+| `src/backend_dm.cpp` | DM FDCAN backend with exact reply-ID filters and MIT wire-format self-check |
+| `src/hand_bridge.cpp` | Generic Franka Hand TCP bridge; built with libfranka |
 | `bindings/` | Optional pybind module `arm_rt_servo` so the MuJoCo twin closes the same compiled law |
-| `systemd/` | The appliance unit |
+
+Concrete service units and device-specific bridges belong to the consuming
+project's deployment tree, not this reusable core. Moving those files does
+not alter an installed RT host. The bring-up notes below record existing
+engineering checks; they are not certification of a particular deployment.
 
 ## Build
 
@@ -47,10 +52,10 @@ command. TCP control channel, fixed 128-byte frames: HELLO (n + backend
 name), ARM, DISARM, PING/PONG, STATUS, FAULT. Clocks are NOT assumed synced —
 freshness is arrival-time based, timestamps are diagnostics.
 
-Parity between `protocol.hpp` and `rt_protocol.py` is enforced, not hoped
-for: `./build/protocol_selfcheck` and `python -m arm_control.rt_protocol
+Parity between `protocol.hpp` and the Python protocol is enforced, not hoped
+for: `./build/protocol_selfcheck` and `python -m arm_control.plants.remote_rt.protocol
 --hex` must print identical golden lines, and `python -m
-arm_control.hardware.rt_backend` diffs them automatically before its live
+arm_control.plants.remote_rt.client` diffs them automatically before its loopback
 test. Any layout change edits both files in one commit and bumps `VERSION`.
 
 ## Safety semantics (the part to re-read before bench day)
@@ -106,20 +111,20 @@ review-caught, all in the stale-authority class):
 ## Bring-up ladder
 
 0. **Loopback on the PC** (no hardware): `python -m
-   arm_control.hardware.rt_backend` — protocol parity, tracking through the
+   arm_control.plants.remote_rt.client` — protocol parity, tracking through the
    compiled law, staleness→hold, fault latch, refused ARM, DISARM/ARM
    recovery. GREEN 2026-07-27; keep it green.
 1. **Fake on the RT box**: same demo with `rt.host` pointed at the box.
    Proves the link, the kernel, and the service unit. Quantify with
-   `python scripts/bench/rt_timing_bench.py --host <box>` — it listens to the
+   `python tools/bench/rt/timing.py --host <box>` — it listens to the
    disarmed state stream (states only, sends one zero-gain packet) and
    reports the servo's per-tick wakeup jitter from the tick stamps.
 2. **FR3 gravity-float, then impedance-hold** — first hardware validation of
    `backend_franka`, zero PC-side commands, driven by
-   `python scripts/bench/rt_handguide.py` (arms, logs, disarms — it cannot
-   send motion). Run the server manually in the foreground for this rung,
+   a deployment-owned hand-guidance tool (explicitly arms, logs, and disarms).
+   Run the server manually in the foreground for this rung,
    `--fault-ms 3600000` (armed-with-no-commander is the test's steady
-   state; see rt_handguide docstring), operator on the stop:
+   state), operator on the stop:
    - `--hold-kp 0 --hold-kd 0` → zero torque on top of the robot's own
      gravity compensation; push the arm around by hand.
    - `--hold-kp 30 --hold-kd 2` → the arm springs back around the pose
@@ -137,7 +142,7 @@ review-caught, all in the stale-authority class):
 3. **FR3 tracking**: slow sine from the PC graph via `rt_interface`;
    compare `q_cmd` vs `q` in the state stream against the sim twin.
 4. **Graph integration**: the real motion graph with `plant_interface` →
-   `nodes/rt_interface.py`; then the pick ladder.
+   `nodes/rt_interface.py`; then the project's task-specific validation.
 
 ## RT host checklist (rung 1 prerequisite)
 
