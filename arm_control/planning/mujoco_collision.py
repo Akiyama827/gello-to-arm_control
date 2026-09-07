@@ -283,7 +283,7 @@ class MuJoCoCollisionWorld:
         lower, upper = [], []
         for name in planned_joints:
             joint = self.model.joint(str(name))
-            if joint.qposadr.size != 1 or self.model.jnt_type[joint.id] not in (
+            if joint.qposadr.size != 1 or int(self.model.jnt_type[joint.id]) not in (
                 mujoco.mjtJoint.mjJNT_HINGE,
                 mujoco.mjtJoint.mjJNT_SLIDE,
             ):
@@ -395,7 +395,7 @@ class MuJoCoCollisionWorld:
         for name, value in positions.items():
             joint = self.model.joint(str(name))
             value = float(value)
-            if joint.qposadr.size != 1 or self.model.jnt_type[joint.id] not in (
+            if joint.qposadr.size != 1 or int(self.model.jnt_type[joint.id]) not in (
                 mujoco.mjtJoint.mjJNT_HINGE,
                 mujoco.mjtJoint.mjJNT_SLIDE,
             ) or not np.isfinite(value):
@@ -510,3 +510,37 @@ class MuJoCoCollisionWorld:
     def preview(self, times: np.ndarray, positions: np.ndarray) -> None:
         """Transition stub (the old meshcat animation seam) — Rerun PreviewScene
         owns trajectory animation now; nothing to do at the world layer."""
+
+
+def _self_check() -> None:
+    """Accept scalar joints without weakening held-joint validation."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        urdf = root / 'two_joints.urdf'
+        link = '<inertial><mass value="1"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/></inertial>'
+        urdf.write_text(
+            '<robot name="scalar"><link name="base"/>'
+            f'<link name="a">{link}</link><link name="b">{link}</link>'
+            '<joint name="hinge" type="revolute"><parent link="base"/><child link="a"/>'
+            '<axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="1" velocity="1"/></joint>'
+            '<joint name="slide" type="prismatic"><parent link="a"/><child link="b"/>'
+            '<axis xyz="1 0 0"/><limit lower="-1" upper="1" effort="1" velocity="1"/></joint></robot>'
+        )
+        for planned, held in (('hinge', 'slide'), ('slide', 'hinge')):
+            world = MuJoCoCollisionWorld(urdf, [planned], cache_dir=root / 'cache', held_positions={held: 0.25})
+            address = int(world.model.joint(held).qposadr[0])
+            assert world._held_qpos[address] == 0.25
+            for bad in ({planned: 0.0}, {held: float('nan')}, {held: float('inf')}):
+                try:
+                    world.set_held_positions(bad)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f'accepted invalid held joints: {bad}')
+    print('mujoco_collision: scalar joint guards OK')
+
+
+if __name__ == '__main__':
+    _self_check()

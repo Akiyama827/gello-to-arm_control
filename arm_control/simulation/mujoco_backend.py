@@ -584,7 +584,8 @@ def _transfer_state(old_m, old_d, new_m, new_d) -> None:
         old_id = mujoco.mj_name2id(old_m, mujoco.mjtObj.mjOBJ_JOINT, name)
         if old_id < 0 or old_m.jnt_type[old_id] != new_m.jnt_type[jid]:
             continue
-        jtype = new_m.jnt_type[jid]
+        # MuJoCo 3.12 enum-side equality rejects NumPy scalars in dict lookups.
+        jtype = int(new_m.jnt_type[jid])
         nq = _QPOS_WIDTH.get(jtype, 1)
         nv = _DOF_WIDTH.get(jtype, 1)
         src, dst = old_m.jnt_qposadr[old_id], new_m.jnt_qposadr[jid]
@@ -1053,7 +1054,7 @@ class MuJoCoBackend:
                 joint = self.model.joint(jid)
                 if joint.name in driven:
                     continue
-                if joint.name.startswith(prefixes) and self.model.jnt_type[jid] in (
+                if joint.name.startswith(prefixes) and int(self.model.jnt_type[jid]) in (
                     mujoco.mjtJoint.mjJNT_HINGE,
                     mujoco.mjtJoint.mjJNT_SLIDE,
                 ):
@@ -2364,6 +2365,41 @@ def _check_mate_is_the_callers() -> None:
     print("mujoco_backend: mate policy OK")
 
 
+def _check_state_transfer() -> None:
+    """Every joint width survives recompilation, including free and ball joints."""
+    bodies = [
+        f'<body name="b_{kind}" pos="0 0 {i}"><joint name="{kind}" type="{kind}"/>'
+        '<geom type="sphere" size="0.1"/></body>'
+        for i, kind in enumerate(('free', 'ball', 'hinge', 'slide'))
+    ]
+    models = [
+        mujoco.MjModel.from_xml_string(
+            '<mujoco><worldbody>' + ''.join(order) + '</worldbody>'
+            '<actuator><motor name="motor" joint="hinge"/></actuator>'
+            '<equality><weld name="fixture" body1="b_free"/></equality></mujoco>'
+        )
+        for order in (bodies, list(reversed(bodies)))
+    ]
+    old_m, new_m = models
+    old_d, new_d = (mujoco.MjData(model) for model in models)
+    old_d.qvel[:] = np.linspace(0.1, 1.0, old_m.nv)
+    mujoco.mj_integratePos(old_m, old_d.qpos, old_d.qvel, 0.3)
+    old_d.ctrl[:] = 0.42
+    old_d.eq_active[:] = 0
+    old_d.time = 1.25
+    _transfer_state(old_m, old_d, new_m, new_d)
+    for name, nq, nv in (('free', 7, 6), ('ball', 4, 3), ('hinge', 1, 1), ('slide', 1, 1)):
+        old_j, new_j = old_m.joint(name), new_m.joint(name)
+        oq, nqadr = int(old_j.qposadr[0]), int(new_j.qposadr[0])
+        ov, nvadr = int(old_j.dofadr[0]), int(new_j.dofadr[0])
+        assert np.array_equal(old_d.qpos[oq:oq+nq], new_d.qpos[nqadr:nqadr+nq]), name
+        assert np.array_equal(old_d.qvel[ov:ov+nv], new_d.qvel[nvadr:nvadr+nv]), name
+    assert np.array_equal(old_d.ctrl, new_d.ctrl)
+    assert np.array_equal(old_d.eq_active, new_d.eq_active)
+    assert new_d.time == old_d.time
+    print('mujoco_backend: named state transfer OK')
+
+
 if __name__ == "__main__":
     import sys
 
@@ -2372,6 +2408,7 @@ if __name__ == "__main__":
     elif "--scene-demo" in sys.argv:
         _scene_demo()
     elif "--self-check" in sys.argv:
+        _check_state_transfer()
         _check_contact_policy()
         _check_scene_requirements()
         _check_mate_is_the_callers()
