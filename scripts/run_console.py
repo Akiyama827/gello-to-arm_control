@@ -172,17 +172,28 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    def _stop(signum=None, _frame=None):
-        _terminate_graph(proc)
-        if signum is not None:
-            raise SystemExit(128 + int(signum))
+    stopped_by: list[int] = []
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    def _stop(signum, _frame):
+        # Signal only; never wait here. The handler runs on the main thread,
+        # which is blocked in proc.wait() holding Popen's _waitpid_lock, so a
+        # handler that waits re-enters that lock on the same thread and hangs.
+        # Signalling dora is enough -- it reaps its nodes, wait() returns, and
+        # the real teardown runs in `finally`, off the handler.
+        stopped_by.append(int(signum))
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _stop)
     try:
         return proc.wait()
     finally:
         _terminate_graph(proc)
+        if stopped_by:
+            raise SystemExit(128 + stopped_by[0])
 
 
 def _port_holder(config) -> int | None:
@@ -214,7 +225,7 @@ def _port_holder(config) -> int | None:
         probe.close()
 
 
-def _terminate_graph(proc, grace_s: float = 5.0) -> None:
+def _terminate_graph(proc, grace_s: float = 8.0) -> None:
     """Stop the graph and every node it spawned. Safe to call twice.
 
     dora puts each node in its OWN process group inside the graph's session,
