@@ -60,6 +60,8 @@ Intentional public compatibility aliases remain:
 | `arm_control.messages` | `arm_control.contracts` | Existing independent consumers use the codecs |
 | `arm_control.planning.trajectory` | `arm_control.motion` and `planning.retiming` | Preserve trajectory imports while values change ownership |
 | `arm_control.rt_protocol` | `arm_control.plants.remote_rt.protocol` | Preserve protocol imports and `python -m ... --hex` |
+| `arm_control.simulation.mujoco_backend` | `arm_control.plants.mujoco.backend` | Preserve class/helper identities and module CLI |
+| `arm_control.simulation.scene_backend` | `arm_control.plants.mujoco.composer` | Independent simulated perception consumes the injected builder |
 
 These are package-level re-exports, not node-source APIs. Removing them requires
 an explicit consumer migration, not a directory-cleanup sweep.
@@ -102,7 +104,11 @@ verify those behaviors; the consuming project owns its integration rehearsal.
   Current motion graphs use `arm_controller`. Migrating that old caller needs
   a separate control-contract and safety review; do not delete the executor
   class or treat the legacy process as the template for new graphs.
-- `simulation/scene_backend.py` still contains project-shaped scene adaptation.
-  The generic/project MuJoCo extraction is pending; `plants/mujoco/adapter.py`
-  is already the installed process implementation, not proof that all underlying
-  simulation logic has completed that separation.
+- Project-shaped scene construction has moved to the consumer. The graph
+  selects `SCENE_BACKEND_FACTORY` or `WORKCELL_BACKEND_FACTORY` through the
+  existing entry-point resolver. `plants/mujoco/composer.py` otherwise consumes
+  a generic `SceneSpec`; it does not inspect project deployment roles.
+- `plants/mujoco/backend.py` retains coupled legacy fixture-release/mating
+  behavior, body-name contact exclusions, and tuned gripper/object parameters.
+  Moving that core preserved physics; extracting these policies would require
+  separate behavior validation. It is not yet a fully domain-free backend.

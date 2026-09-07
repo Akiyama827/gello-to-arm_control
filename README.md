@@ -21,7 +21,7 @@ records; they are not current operating instructions.
 | `arm_control/plants/` | Plant protocol; DM, Franka, remote RT, MuJoCo adapters |
 | `arm_control/end_effectors/` | Generic grasp and Hand behavior |
 | `arm_control/ui/`, `arm_control/viz/` | Operator adapters, packaged web assets, telemetry |
-| `arm_control/simulation/` | Existing MuJoCo implementation; remaining boundary work is documented |
+| `arm_control/simulation/` | Compatibility imports, generic convex decomposition and scene mirroring |
 | `nodes/` | Dora executable wrappers; package modules contain implementations |
 | `examples/` | Standalone console application, example configs, reusable mode profiles |
 | `tools/` | Generic DM/RT diagnostics and asset staging |
@@ -44,6 +44,6 @@ simulation pass or hardware-readiness check. Installation and optional
 dependencies are declared in `pyproject.toml`; see the runbook before launching.
 
 Two migration limits remain explicit: the legacy trajectory-executor process
-still has a consuming calibration caller, and the MuJoCo scene adapter has
-remaining project-specific interpretation. Neither is silently retired or
-claimed fully generic by this documentation update.
+still has a consuming calibration caller, and the relocated MuJoCo backend
+retains coupled legacy fixture/contact policy. Project scene construction now
+belongs to the consumer; this does not make the physics core fully generic.

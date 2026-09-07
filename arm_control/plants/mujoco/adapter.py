@@ -13,7 +13,7 @@ Drop-in successor to the removed ``drake_interface``; identical Dora contract:
 - Per-arm idle decay (no command within ``idle_timeout_sec``) zeros that
   arm's gains; arms that never commanded keep the startup spawn hold.
 
-Engine differences live in ``arm_control.simulation.mujoco_backend``: welds
+Engine differences live in ``arm_control.plants.mujoco.backend``: welds
 are physical (module rides the gripper, snaps into the dock basin) and the
 optional viewer is MuJoCo's own (``sim_launch_viewer``, desk sessions).
 """
@@ -46,8 +46,8 @@ from arm_control.node_utils import (
     install_signal_handlers,
     scene_injections,
 )
-from arm_control.simulation.mujoco_backend import MuJoCoBackend
-from arm_control.simulation.scene_backend import (
+from arm_control.plants.mujoco.backend import MuJoCoBackend
+from arm_control.plants.mujoco.composer import (
     _resolve,
     build_scene_backend,
     build_workcell_backend,
