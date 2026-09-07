@@ -603,10 +603,16 @@ def main() -> None:
         ident=ident,
         extra_buttons=tuple(f"{_GAIN_PREFIX}{n}" for n in gain_presets),
     )
+    # The legend, stated once, the same on the page and in Rerun. It used to
+    # read "solid robot = target, green ghost = live arm, orange = plan",
+    # which inverts all three against what both surfaces actually draw
+    # (app.js target 0xd99a24 orange / plan 0x55aa7a green; PreviewScene's
+    # docstring carries the same spec). A wrong legend printed at startup is
+    # worse than no legend -- it is the first thing an operator reads.
     print(
         f"[arm_console] control panel at http://{bind}:{panel.port} "
-        f"[{ident}] — visuals in Rerun: solid robot = target, green ghost = "
-        "live arm, orange = plan",
+        f"[{ident}] — page and Rerun share one colour legend: "
+        "REAL STL = the live arm, ORANGE = your target, GREEN = planned motion",
         flush=True,
     )
     node = Node()

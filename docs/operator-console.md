@@ -4,6 +4,9 @@ One page that drives one arm: set a target and plan to it, jog it by hand,
 switch the control law, arm and disarm. `nodes/arm_console.py` serves it at
 `console.http_port` from the robot config.
 
+> **Driving it is [console-manual.md](console-manual.md).** This page is the
+> design: what the console is *allowed* to make the arm do, and why.
+
 Try it without a robot — this repo ships one runnable entry config:
 
 ```bash

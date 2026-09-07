@@ -110,9 +110,11 @@ python scripts/run_console.py            # console on http://127.0.0.1:7500
 python scripts/run_console.py --dual     # two arms at once, :7500 and :7510
 ```
 
-See `docs/operator-console.md` — in particular the jog envelope (stroke limit,
-floor, joint limits, singularity, self-collision, all checked per step) and the
-two independent deadmen that stop the arm when the page goes away.
+`docs/console-manual.md` is how to drive it — the deadman, plan/review/execute,
+the jog pad, what each refusal means. `docs/operator-console.md` is why it is
+built this way: the jog envelope (stroke limit, floor, joint limits,
+singularity, self-collision, all checked per step) and the two independent
+deadmen that stop the arm when the page goes away.
 
 Graphs need a config: point `ARM_CONTROL_CONFIG` at an entry YAML (there is no
 default robot) and run e.g. `dora run dataflows/sim_motion.yml`.
