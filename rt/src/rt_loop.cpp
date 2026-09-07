@@ -28,6 +28,7 @@
 #include <cstring>
 
 #include "arm_rt/servo_law.hpp"
+#include "arm_rt/pose_hold.hpp"
 #include "server.hpp"
 
 namespace arm_rt {
@@ -90,6 +91,7 @@ void rt_loop(ServerCtx& ctx) {
   ctx.active_mask.store(backend->active_mask());
   ctx.requested_active_mask.store(backend->active_mask());
   std::snprintf(ctx.backend_name, sizeof(ctx.backend_name), "%s", backend->name());
+  ctx.supports_pose_hold.store(backend->supports_pose_hold());
   ctx.backend_ready.store(true);
   elevate(ctx.cfg);
   std::printf("[rt] %s backend up: %d joints, tick %.1f ms, slew %.2f N.m/tick\n",
@@ -99,7 +101,10 @@ void rt_loop(ServerCtx& ctx) {
   const double fault_ns = ctx.cfg.fault_ms * 1e6;
 
   PlantState ps;
-  CommandPacket cmd = {};
+  PoseHoldCommandPacket incoming = {};
+  const CommandPacket& cmd=incoming.command;
+  PoseHold pose_hold;
+  double pose_tau[MAX_JOINTS]{};
   StatePacket out = {};
   bool prev_armed = false;
   bool holding = false;
@@ -175,8 +180,11 @@ void rt_loop(ServerCtx& ctx) {
     const bool armed = ctx.armed.load(std::memory_order_acquire);
     bool faulted = ctx.fault.load(std::memory_order_acquire);
 
-    const uint64_t cmd_v_raw = ctx.cmd_in.read(cmd);
-    if (cmd_v_raw != 0) cmd_v_seen = cmd_v_raw;  // collision -> keep previous
+    // A failed seqlock retry can have copied a partial payload; only publish
+    // a successful read to the cached command used for this servo tick.
+    PoseHoldCommandPacket candidate{};
+    const uint64_t cmd_v_raw = ctx.cmd_in.read(candidate);
+    if (cmd_v_raw != 0) { incoming=candidate; cmd_v_seen = cmd_v_raw; }
     const uint64_t cmd_v = cmd_v_seen;
     const uint64_t rx_ns = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
     // SIGNED, clamped age. rx_ns is stamped by udp_rx (or the ARM handler)
@@ -210,8 +218,19 @@ void rt_loop(ServerCtx& ctx) {
       plant_ok = true;         // ARM = explicit plant retry
       have_cmd_gains = false;  // fresh epoch: hold gains until the task speaks
       holding = false;         // re-capture the hold pose in this epoch
+      pose_hold.reset();
+    }
+    if(armed) {
+      for(int j=0;j<n;++j) {
+        if(!std::isfinite(ps.q[j]) || !std::isfinite(ps.dq[j]) || !std::isfinite(ps.tau_ref[j])) {
+          ctx.latch(FAULT_PLANT,"non-finite measured joint state; torque writes suppressed");
+          plant_ok=false;
+          break;
+        }
+      }
     }
     if (armed && !plant_ok) {
+      pose_hold.reset();
       holding = false;  // nothing is held — the robot's own safety has it
       std::memset(tau_out, 0, sizeof(tau_out));
     } else if (armed) {
@@ -226,7 +245,19 @@ void rt_loop(ServerCtx& ctx) {
         tau_ff = cmd.tau_ff;
         kp = cmd_kp;
         kd = cmd_kd;
-      } else {
+        if(cmd.version==POSE_HOLD_VERSION) {
+          if(!backend->supports_pose_hold() || !ps.pose_valid || !ps.jacobian_valid ||
+             !pose_hold.torque(n,ps.q,ps.dq,ps.jacobian,ps.pose,ps.coriolis,
+                               incoming.pose_hold,backend->tick_s(),pose_tau)) {
+            ctx.latch(FAULT_PLANT,"pose hold requires valid measured pose/J/model state");
+            faulted=true;
+          } else {
+            q_des=ps.q; qd_des=zeros; tau_ff=pose_tau; kp=zeros; kd=zeros;
+          }
+        } else pose_hold.reset();
+      }
+      if(faulted || !fresh) {
+        pose_hold.reset();
         if (!holding) {
           holding = true;
           std::memcpy(q_hold, ps.q, sizeof(double) * size_t(n));
@@ -236,6 +267,7 @@ void rt_loop(ServerCtx& ctx) {
           faulted = true;
         }
         q_des = q_hold;
+        qd_des=zeros; tau_ff=zeros; kp=hold_kp; kd=hold_kd;
         if (have_cmd_gains) {  // hold with the authority the task last chose
           kp = cmd_kp;         // the SNAPSHOT — never the live buffer
           kd = cmd_kd;
@@ -248,6 +280,7 @@ void rt_loop(ServerCtx& ctx) {
         plant_ok = false;
       }
     } else {
+      pose_hold.reset();
       if (prev_armed) backend->stop();
       holding = false;
       std::memset(tau_out, 0, sizeof(tau_out));

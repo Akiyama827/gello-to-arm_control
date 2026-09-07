@@ -58,6 +58,23 @@ for: `./build/protocol_selfcheck` and `python -m arm_control.plants.remote_rt.pr
 arm_control.plants.remote_rt.client` diffs them automatically before its loopback
 test. Any layout change edits both files in one commit and bumps `VERSION`.
 
+Cartesian Soft adds a separate 784-byte command version 2: the unchanged
+664-byte joint-command prefix, followed by 15 doubles
+`[id, kc[6], dc[6], nullspace_kp, nullspace_kd]`. State/control and ordinary
+joint commands remain version 1. Only Franka advertises `pose_hold=2` in HELLO;
+the client rejects Soft without that capability and rejects legacy Cartesian
+tails. Unsupported versions, invalid gains and replayed sequences do not renew
+the command deadman.
+
+`PoseHold` captures measured EE pose and nullspace joint posture on each new
+nonzero id. The shared compiled law uses local pose/Jacobian/Coriolis, ramps
+gains over 0.5 s and projects nullspace spring/damping before the existing
+torque clamp/slew. Franka adds gravity itself. Staleness or fault resets Soft
+and enters measured joint hold using the last accepted joint fallback gains.
+The gain ceilings are validation bounds, not hardware safety certification.
+Offline checks: `pose_hold_selfcheck` includes Eigen's no-allocation guard;
+`rt/bindings/pose_hold_check.py` checks the compiled Python API and encoder.
+
 ## Safety semantics (the part to re-read before bench day)
 
 Authority ladder while ARMED, most-alive first:

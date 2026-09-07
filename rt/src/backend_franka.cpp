@@ -45,6 +45,8 @@
 
 #ifdef ARM_RT_WITH_FRANKA
 
+#include <Eigen/Geometry>
+
 #include <franka/active_control.h>
 #include <franka/exception.h>
 #include <franka/model.h>
@@ -102,6 +104,7 @@ public:
   int n() const override { return FR3_N; }
   double tick_s() const override { return 0.001; }
   const double* tau_limit() const override { return FR3_TAU_LIMIT; }
+  bool supports_pose_hold() const override { return true; }
 
   bool read(PlantState& out) override {
     try {
@@ -136,6 +139,14 @@ public:
       for (int r = 0; r < 6; ++r)
         for (int c = 0; c < FR3_N; ++c) out.jacobian[r * FR3_N + c] = jac[c * 6 + r];
       out.jacobian_valid = true;
+      const Eigen::Map<const Eigen::Matrix4d> transform(state.O_T_EE.data());
+      const Eigen::Quaterniond orientation(transform.block<3,3>(0,0));
+      for(int i=0;i<3;++i) out.pose[i]=transform(i,3);
+      out.pose[3]=orientation.w(); out.pose[4]=orientation.x();
+      out.pose[5]=orientation.y(); out.pose[6]=orientation.z();
+      const auto coriolis=model_.coriolis(state);
+      for(int j=0;j<FR3_N;++j) out.coriolis[j]=coriolis[j];
+      out.pose_valid = true;
       return true;
     } catch (const franka::Exception& exc) {
       fail(exc);

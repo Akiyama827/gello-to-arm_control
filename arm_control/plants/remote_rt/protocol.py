@@ -11,12 +11,14 @@ Dora-graph Arrow contract, this is the PC<->RT-machine UDP/TCP contract.
 from __future__ import annotations
 
 import struct
+import math
 from dataclasses import dataclass, field
 
 MAGIC_CMD = 0x444D4341  # bytes "ACMD" on the wire
 MAGIC_STATE = 0x41545341  # "ASTA"
 MAGIC_CTL = 0x4C544341  # "ACTL"
 VERSION = 1
+POSE_HOLD_VERSION = 2
 MAX_JOINTS = 16
 
 FLAG_ARMED = 1 << 0
@@ -44,6 +46,7 @@ _STATE_FMT = "<IHHIIQII" + "88d"  # header 32 + (5*16 + 6 + 2) doubles = 736
 _CTL_FMT = "<IHHIIQ104s"  # header 24 + text 104 = 128
 
 CMD_SIZE = struct.calcsize(_CMD_FMT)
+POSE_HOLD_CMD_SIZE = CMD_SIZE + 15 * 8
 STATE_SIZE = struct.calcsize(_STATE_FMT)
 CTL_SIZE = struct.calcsize(_CTL_FMT)
 assert (CMD_SIZE, STATE_SIZE, CTL_SIZE) == (664, 736, 128)
@@ -67,22 +70,30 @@ def _padded(values, n_total: int = MAX_JOINTS) -> list[float]:
 
 
 def pack_command(
-    *, n: int, seq: int, t_mono_ns: int, q_des, qd_des, tau_ff, kp, kd
+    *, n: int, seq: int, t_mono_ns: int, q_des, qd_des, tau_ff, kp, kd, pose_hold=None
 ) -> bytes:
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= MAX_JOINTS:
+        raise ValueError("command n must be an integer in 1..16")
+    arrays = [[float(v) for v in a] for a in (q_des, qd_des, tau_ff, kp, kd)]
+    if any(len(a) != n or not all(math.isfinite(v) for v in a) for a in arrays):
+        raise ValueError("command arrays must be finite and length n")
+    if any(v < 0 for a in arrays[3:] for v in a):
+        raise ValueError("command gains must be nonnegative")
+    tail = b""
+    if pose_hold is not None:
+        from arm_control.contracts.impedance import pose_hold_values
+
+        tail = struct.pack("<15d", *pose_hold_values(pose_hold))
     return struct.pack(
         _CMD_FMT,
         MAGIC_CMD,
-        VERSION,
+        POSE_HOLD_VERSION if pose_hold is not None else VERSION,
         n,
         seq & 0xFFFFFFFF,
         0,
         t_mono_ns,
-        *_padded(q_des),
-        *_padded(qd_des),
-        *_padded(tau_ff),
-        *_padded(kp),
-        *_padded(kd),
-    )
+        *(v for a in arrays for v in _padded(a)),
+    ) + tail
 
 
 @dataclass
@@ -213,11 +224,17 @@ def golden_lines() -> list[str]:
         *([0.0] * 8),  # wrench + reserved
     )
     ctl = pack_control(ctl_type=CTL_STATUS, seq=7, arg=1, t_mono_ns=_GOLDEN_T, text="ok")
+    soft = bytearray(cmd)
+    struct.pack_into("<H", soft, 4, POSE_HOLD_VERSION)
+    soft += struct.pack("<15d", 3, *([100.0] * 3 + [10.0] * 3),
+                        *([20.0] * 3 + [2.0] * 3), 1.0, 3.0)
     return [
         f"CMD {cmd.hex()}",
         f"STATE {state.hex()}",
         f"CTL {ctl.hex()}",
         f"SIZES {CMD_SIZE} {STATE_SIZE} {CTL_SIZE}",
+        f"POSE_HOLD {soft.hex()}",
+        f"POSE_HOLD_SIZE {POSE_HOLD_CMD_SIZE}",
     ]
 
 

@@ -33,7 +33,8 @@ set_target_properties(arm_rt_server PROPERTIES
 target_link_options(arm_rt_server PRIVATE -Wl,--disable-new-dtags)
 target_include_directories(arm_rt_server PRIVATE include)
 find_package(Threads REQUIRED)
-target_link_libraries(arm_rt_server PRIVATE Threads::Threads)
+find_package(Eigen3 REQUIRED)
+target_link_libraries(arm_rt_server PRIVATE Threads::Threads Eigen3::Eigen)
 
 if(WITH_FRANKA)
   find_package(Franka REQUIRED)
@@ -53,3 +54,9 @@ endif()
 
 add_executable(protocol_selfcheck src/selfcheck.cpp)
 target_include_directories(protocol_selfcheck PRIVATE include)
+
+add_executable(pose_hold_selfcheck src/pose_hold_selfcheck.cpp)
+target_include_directories(pose_hold_selfcheck PRIVATE include)
+target_link_libraries(pose_hold_selfcheck PRIVATE Eigen3::Eigen)
+# Assertions and Eigen's allocation guard must survive release builds.
+target_compile_options(pose_hold_selfcheck PRIVATE -UNDEBUG)

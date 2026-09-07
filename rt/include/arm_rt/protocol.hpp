@@ -21,6 +21,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
+#include <cmath>
+#include <cstring>
 
 namespace arm_rt {
 
@@ -28,6 +31,7 @@ constexpr uint32_t MAGIC_CMD = 0x444D4341;   // bytes "ACMD" on the wire
 constexpr uint32_t MAGIC_STATE = 0x41545341; // bytes "ASTA"
 constexpr uint32_t MAGIC_CTL = 0x4C544341;   // bytes "ACTL"
 constexpr uint16_t VERSION = 1;
+constexpr uint16_t POSE_HOLD_VERSION = 2;
 constexpr int MAX_JOINTS = 16;
 
 // StatePacket.flags bits
@@ -76,6 +80,11 @@ struct CommandPacket {
   double kd[MAX_JOINTS];
 };
 
+struct PoseHoldCommandPacket {
+  CommandPacket command;
+  double pose_hold[15];
+};
+
 // RT -> PC, UDP, streamed at --state-hz.
 struct StatePacket {
   uint32_t magic;        // MAGIC_STATE
@@ -110,7 +119,36 @@ struct ControlPacket {
 
 static_assert(sizeof(CommandPacket) == 24 + 5 * 8 * MAX_JOINTS, "cmd layout");
 static_assert(sizeof(CommandPacket) == 664, "cmd size");
+static_assert(sizeof(PoseHoldCommandPacket) == 784, "pose hold cmd size");
 static_assert(sizeof(StatePacket) == 736, "state size");
 static_assert(sizeof(ControlPacket) == 128, "ctl size");
+
+inline bool valid_pose_hold_spec(const double* s) {
+  for (int i=0; i<15; ++i) if (!std::isfinite(s[i])) return false;
+  if (s[0]<1 || s[0]>4294967295.0 || std::floor(s[0])!=s[0]) return false;
+  for (int i=0; i<6; ++i)
+    if (s[1+i]<0 || s[1+i]>(i<3 ? 1000 : 100) ||
+        s[7+i]<0 || s[7+i]>(i<3 ? 200 : 50)) return false;
+  return s[13]>=0 && s[13]<=20 && s[14]>=0 && s[14]<=10;
+}
+
+// Validate before granting flow ownership or refreshing the command deadman.
+inline bool decode_command(const void* bytes, size_t size, bool supports_pose_hold,
+                           PoseHoldCommandPacket& out) {
+  if(size!=sizeof(CommandPacket) && size!=sizeof(PoseHoldCommandPacket)) return false;
+  out={}; std::memcpy(&out,bytes,size);
+  const auto& cmd=out.command;
+  if(cmd.magic!=MAGIC_CMD || cmd.n<1 || cmd.n>MAX_JOINTS) return false;
+  if(cmd.version==VERSION) { if(size!=sizeof(CommandPacket)) return false; }
+  else if(cmd.version==POSE_HOLD_VERSION) {
+    if(size!=sizeof(PoseHoldCommandPacket) || !supports_pose_hold ||
+       !valid_pose_hold_spec(out.pose_hold)) return false;
+  } else return false;
+  for(int j=0;j<cmd.n;++j)
+    if(!std::isfinite(cmd.q_des[j]) || !std::isfinite(cmd.qd_des[j]) ||
+       !std::isfinite(cmd.tau_ff[j]) || !std::isfinite(cmd.kp[j]) ||
+       !std::isfinite(cmd.kd[j]) || cmd.kp[j]<0 || cmd.kd[j]<0) return false;
+  return true;
+}
 
 } // namespace arm_rt

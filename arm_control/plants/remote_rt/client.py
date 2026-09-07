@@ -90,6 +90,7 @@ class RtBackend:
         self._link_rx_t = 0.0  # ANY state arrival (vs _state_rx_t = new content)
         self._send_lock = threading.Lock()  # node thread + _ctl_loop PONG
         self._active_mask = 0
+        self.supports_pose_hold = False
 
     @classmethod
     def from_config(cls, cfg) -> "RtBackend":
@@ -128,7 +129,8 @@ class RtBackend:
         flags = dict(
             p.split("=", 1) for p in parts[1:] if "=" in p
         )
-        self._active_mask = int(flags.get("active", (1 << self.n) - 1), 0)
+        self.supports_pose_hold = flags.get("pose_hold") == str(rtp.POSE_HOLD_VERSION)
+        self._active_mask = int(flags.get("active", str((1 << self.n) - 1)), 0)
         fault_ms = float(flags.get("fault_ms", 0) or 0)
         if self.config.max_fault_ms > 0 and fault_ms > self.config.max_fault_ms:
             raise RtLinkError(
@@ -232,6 +234,11 @@ class RtBackend:
     def apply_command(self, command: dict[str, Any]) -> None:
         """Stream one joint-servo word (the full bridge contract — the server
         applies torque clamp + slew; nothing is dropped on this side)."""
+        if command.get("cartesian") is not None:
+            raise RtLinkError("RT backend does not support the legacy cartesian command tail")
+        pose_hold = command.get("pose_hold")
+        if pose_hold is not None and not self.supports_pose_hold:
+            raise RtLinkError("RT backend does not advertise pose_hold=2")
         if self._udp is None:
             return
         self._send_command_raw(
@@ -240,9 +247,10 @@ class RtBackend:
             np.asarray(command.get("torque", np.zeros(self.n)), dtype=float),
             np.asarray(command.get("kp", np.zeros(self.n)), dtype=float),
             np.asarray(command.get("kd", np.zeros(self.n)), dtype=float),
+            pose_hold=pose_hold,
         )
 
-    def _send_command_raw(self, q, qd, tau, kp, kd) -> None:
+    def _send_command_raw(self, q, qd, tau, kp, kd, pose_hold=None) -> None:
         self._cmd_seq += 1
         pkt = rtp.pack_command(
             n=self.n,
@@ -253,6 +261,7 @@ class RtBackend:
             tau_ff=tau[: self.n],
             kp=kp[: self.n],
             kd=kd[: self.n],
+            pose_hold=pose_hold,
         )
         now = time.monotonic()
         if self._last_send_t and now - self._last_send_t > 0.3:
@@ -324,6 +333,7 @@ class RtBackend:
             "any_fault": bool(fault) or bool(state and state.faulted),
             "holding": bool(state and state.holding),
             "backend": self.backend_name,
+            "supports_pose_hold": self.supports_pose_hold,
             "state_age_s": age if rx_t > 0 else -1.0,
             "last_cmd_seq": state.last_cmd_seq if state else 0,
             "sent_cmd_seq": self._cmd_seq,
@@ -491,6 +501,7 @@ def _demo() -> None:
         time.sleep(0.3)
         backend.open()
         assert backend.backend_name == "fake"
+        assert not backend.supports_pose_hold
         backend.set_active_mask(0b011)
         backend.enable_all()
         backend.set_active_mask(0b111)
@@ -517,9 +528,22 @@ def _demo() -> None:
         assert err < 0.05, f"fake plant not tracking (err {err:.3f} rad)"
 
         # Staleness -> HOLD (stop commanding past hold-ms, before fault-ms).
-        time.sleep(0.3)
+        # Unsupported v2, oversized v1 and replayed sequences must neither
+        # change the accepted command nor refresh its deadman.
+        replay = rtp.pack_command(n=3, seq=backend._cmd_seq,
+            t_mono_ns=time.monotonic_ns(), q_des=target, qd_des=np.zeros(3),
+            tau_ff=np.zeros(3), kp=kp, kd=kd)
+        unsupported = rtp.pack_command(n=3, seq=backend._cmd_seq + 1,
+            t_mono_ns=time.monotonic_ns(), q_des=target, qd_des=np.zeros(3),
+            tau_ff=np.zeros(3), kp=kp, kd=kd,
+            pose_hold=dict(id=1, kc=[100.]*6, dc=[10.]*6,
+                           nullspace_kp=0., nullspace_kd=3.))
+        for i in range(30):
+            backend._udp.send((replay, replay + b"invalid", unsupported)[i % 3])
+            time.sleep(.01)
         state, _ = backend.latest_state()
         assert state.holding and not state.faulted, backend.motor_health()
+        assert state.last_cmd_seq == backend._cmd_seq
         held = np.asarray(state.q)
 
         # Resume -> tracking again.

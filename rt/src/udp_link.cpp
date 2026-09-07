@@ -36,19 +36,21 @@ void udp_rx_thread(ServerCtx& ctx) {
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ctx.udp_fd.store(fd);
 
-  CommandPacket pkt;
+  PoseHoldCommandPacket received{}, decoded{};
   sockaddr_in src = {};
   socklen_t srclen = sizeof(src);
   uint32_t dropped_ip = 0;
   uint16_t dropped_port = 0;
   uint16_t warned_n = 0;
-  uint64_t last_bad_warn_ns = 0;
+  uint64_t seq_epoch = 0;
+  uint32_t seq_ip = 0, last_seq = 0;
+  uint16_t seq_port = 0;
+  bool have_seq = false;
   while (!ctx.shutdown.load()) {
-    const ssize_t got = recvfrom(fd, &pkt, sizeof(pkt), 0,
+    const ssize_t got = recvfrom(fd, &received, sizeof(received), MSG_TRUNC,
                                  reinterpret_cast<sockaddr*>(&src), &srclen);
-    if (got != ssize_t(sizeof(pkt))) continue;  // timeout, runt, or junk
-    if (pkt.magic != MAGIC_CMD || pkt.version != VERSION) continue;
-    if (pkt.n == 0 || pkt.n > MAX_JOINTS) continue;
+    if(got<0 || !decode_command(&received,size_t(got),ctx.supports_pose_hold.load(),decoded)) continue;
+    const auto& pkt=decoded.command;
     // Wrong joint count is dropped HERE, before the rx-stamp: the servo
     // rejects such packets on its own n-check, but if they refresh
     // last_cmd_rx_ns the CMD_LOST deadman never fires and the arm parks
@@ -96,31 +98,12 @@ void udp_rx_thread(ServerCtx& ctx) {
         continue;
       }
     }
-    // NaN passes every clamp comparison, and a negative kp inverts the servo
-    // spring into positive feedback — stop both here, on the non-RT thread.
-    // Only the n slots the servo will read are validated (junk in unused
-    // trailing slots must not kill a healthy stream).
-    const int nn = int(pkt.n);
-    const auto all_finite = [nn](const double* a) {
-      for (int j = 0; j < nn; ++j)
-        if (!std::isfinite(a[j])) return false;
-      return true;
-    };
-    const auto gains_ok = [nn](const double* a) {
-      for (int j = 0; j < nn; ++j)
-        if (!(a[j] >= 0.0)) return false;  // NaN fails too
-      return true;
-    };
-    if (!(all_finite(pkt.q_des) && all_finite(pkt.qd_des) &&
-          all_finite(pkt.tau_ff) && gains_ok(pkt.kp) && gains_ok(pkt.kd))) {
-      const uint64_t nw = mono_ns();
-      if (nw - last_bad_warn_ns > 1'000'000'000ull) {  // 1/s, not once-ever
-        last_bad_warn_ns = nw;
-        std::fprintf(stderr, "[rt] dropping non-finite/negative-gain command "
-                             "(seq %u)\n", pkt.seq);
-      }
-      continue;
-    }
+    const uint64_t epoch=ctx.arm_gen.load(std::memory_order_acquire);
+    if(epoch!=seq_epoch || src.sin_addr.s_addr!=seq_ip || src.sin_port!=seq_port)
+      have_seq=false;
+    if(have_seq && (pkt.seq-last_seq==0 || pkt.seq-last_seq>=0x80000000u)) continue;
+    seq_epoch=epoch; seq_ip=src.sin_addr.s_addr; seq_port=src.sin_port;
+    last_seq=pkt.seq; have_seq=true;
     {
       std::lock_guard<std::mutex> lock(ctx.peer_mu);
       ctx.peer = src;
@@ -131,7 +114,7 @@ void udp_rx_thread(ServerCtx& ctx) {
     if (prev != 0 && rx - prev > 300'000'000ull)
       std::fprintf(stderr, "[rt] cmd accept gap %.2fs (seq %u)\n",
                    double(rx - prev) / 1e9, pkt.seq);
-    ctx.cmd_in.write(pkt);
+    ctx.cmd_in.write(decoded);
     ctx.last_cmd_rx_ns.store(rx, std::memory_order_release);
   }
   ctx.udp_fd.store(-1);  // unpublish before close: state_tx must not race a

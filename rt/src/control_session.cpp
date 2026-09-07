@@ -73,9 +73,9 @@ void serve_client(ServerCtx& ctx, int fd) {
   // against that server has no staleness reflex at all (audit 2026-07-29).
   char hello[96];
   std::snprintf(hello, sizeof(hello),
-                "%s hold_ms=%.0f fault_ms=%.0f active=0x%X",
+                "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s",
                 ctx.backend_name, ctx.cfg.hold_ms, ctx.cfg.fault_ms,
-                ctx.active_mask.load());
+                ctx.active_mask.load(), ctx.supports_pose_hold.load() ? " pose_hold=2" : "");
   send_frame(fd, make(CTL_HELLO, uint32_t(ctx.backend_n.load()), hello));
 
   // Session deadman: the client answers CTL_PING with CTL_PONG, so a healthy

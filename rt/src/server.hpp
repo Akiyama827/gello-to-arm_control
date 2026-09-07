@@ -67,7 +67,7 @@ struct ServerConfig {
 struct ServerCtx {
   ServerConfig cfg;
 
-  SeqLock<CommandPacket> cmd_in;
+  SeqLock<PoseHoldCommandPacket> cmd_in;
   SeqLock<StatePacket> state_out;
 
   std::atomic<uint64_t> last_cmd_rx_ns{0};
@@ -107,6 +107,7 @@ struct ServerCtx {
                                      // so systemd's Restart=on-failure retries
                                      // (a port race must not look like success)
   std::atomic<bool> backend_ready{false};
+  std::atomic<bool> supports_pose_hold{false};
   std::atomic<int> backend_n{0};
   std::atomic<uint32_t> online_mask{0};
   std::atomic<uint32_t> active_mask{0};

@@ -70,5 +70,15 @@ int main() {
 
   std::printf("SIZES %zu %zu %zu\n", sizeof(CommandPacket), sizeof(StatePacket),
               sizeof(ControlPacket));
+  PoseHoldCommandPacket soft{};
+  soft.command=cmd; soft.command.version=POSE_HOLD_VERSION;
+  soft.pose_hold[0]=3;
+  for(int i=0;i<6;++i) {
+    soft.pose_hold[1+i]=i<3 ? 100 : 10;
+    soft.pose_hold[7+i]=i<3 ? 20 : 2;
+  }
+  soft.pose_hold[13]=1; soft.pose_hold[14]=3;
+  print_hex("POSE_HOLD", &soft, sizeof(soft));
+  std::printf("POSE_HOLD_SIZE %zu\n",sizeof(soft));
   return 0;
 }

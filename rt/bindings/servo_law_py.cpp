@@ -10,6 +10,7 @@
 #include <string>
 
 #include "arm_rt/servo_law.hpp"
+#include "arm_rt/pose_hold.hpp"
 
 namespace py = pybind11;
 
@@ -63,6 +64,21 @@ Arr cartesian_torque_py(Arr tau_ff, Arr J, Arr R_task, Arr x, Arr quat, Arr x_de
 
 PYBIND11_MODULE(arm_rt_servo, m) {
   m.doc() = "The RT servo law, compiled once, shared by sim and the RT loop";
+  py::class_<arm_rt::PoseHold>(m, "PoseHold")
+      .def(py::init<>())
+      .def("reset", &arm_rt::PoseHold::reset)
+      .def("torque", [](arm_rt::PoseHold& hold, Arr q, Arr dq, Arr J,
+                         Arr pose, Arr bias, Arr spec, double dt) {
+        const int n=int(q.size());
+        if(q.ndim()!=1 || dq.ndim()!=1 || bias.ndim()!=1 || pose.ndim()!=1 ||
+           spec.ndim()!=1 || J.ndim()!=2 || J.shape(0)!=6 || J.shape(1)!=n)
+          throw std::invalid_argument("PoseHold: expected vectors and J shape (6,n)");
+        want(dq,n,"dq"); want(bias,n,"bias"); want(pose,7,"pose"); want(spec,15,"spec");
+        Arr out(n);
+        if(!hold.torque(n,q.data(),dq.data(),J.data(),pose.data(),bias.data(),spec.data(),dt,out.mutable_data()))
+          throw std::invalid_argument("PoseHold: invalid state, id, gains, joint count or dt");
+        return out;
+      },py::arg("q"),py::arg("dq"),py::arg("J"),py::arg("pose"),py::arg("bias"),py::arg("spec"),py::arg("dt"));
   m.def("servo_torque", &servo_torque_py, py::arg("q"), py::arg("dq"),
         py::arg("q_des"), py::arg("qd_des"), py::arg("tau_ff"), py::arg("kp"),
         py::arg("kd"), py::arg("tau_ref"), py::arg("tau_limit"),

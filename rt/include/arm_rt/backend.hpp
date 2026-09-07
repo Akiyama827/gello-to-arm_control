@@ -33,6 +33,9 @@ struct PlantState {
   // be handed to the law with no repack. Slots past 6*n are unused.
   double jacobian[6 * MAX_JOINTS] = {};
   bool jacobian_valid = false;
+  double pose[7] = {};  // measured EE pose: xyz,wxyz, base frame
+  double coriolis[MAX_JOINTS] = {};  // robot supplies gravity internally
+  bool pose_valid = false;
 };
 
 class Backend {
@@ -42,6 +45,7 @@ public:
   virtual int n() const = 0;
   virtual double tick_s() const = 0;                 // nominal servo period
   virtual const double* tau_limit() const = 0;       // per-joint, length n
+  virtual bool supports_pose_hold() const { return false; }
 
   // Fixed slots are configured once. A backend may report a subset online
   // and activate a subset for torque; conventional arms keep all slots live.
