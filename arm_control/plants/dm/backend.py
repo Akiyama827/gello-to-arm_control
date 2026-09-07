@@ -10,7 +10,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from arm_control.config import RobotConfig
-from arm_control.hardware.gains import validate_hardware_gains
+from arm_control.control.gains import validate_hardware_gains
 
 from arm_control import CONTROL_ROOT, REPO_ROOT
 
@@ -412,7 +412,7 @@ class DmHardwareBackend:
             real_backend = str(raw.get("real_backend", "") or raw.get("socketcan_interface", ""))
             if real_backend and not real_backend.startswith("dm_"):
                 # SocketCAN path
-                from arm_control.hardware.socketcan_transport import SocketCanTransport
+                from arm_control.plants.dm.socketcan import SocketCanTransport
                 transport = SocketCanTransport(interface=real_backend)
                 bus = DmCanBusConfig()
             else:

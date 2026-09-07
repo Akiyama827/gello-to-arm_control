@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from arm_control.bridge.grasp_gate import GraspGate, GraspStatus
+from arm_control.end_effectors.grasp import GraspGate, GraspStatus
 
 
 class GraspController:

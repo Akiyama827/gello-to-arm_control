@@ -37,7 +37,7 @@ from arm_control.messages import (
     pack_grasp_result,
     unpack_grasp_request,
 )
-from arm_control.hardware.franka_backend import (
+from arm_control.plants.franka.backend import (
     FrankaBackendUnavailableError,
     FrankaHardwareBackend,
 )

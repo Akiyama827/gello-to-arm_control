@@ -7,10 +7,8 @@ import numpy as np
 
 from arm_control.frames import T_to_pose_xyzquat, pose_xyzquat_to_T
 from arm_control.planning.ik import PinocchioIK
-from arm_control.planning.trajectory import (
-    JointTrajectory,
-    time_parameterize_blended,
-)
+from arm_control.motion import JointTrajectory
+from arm_control.planning.retiming import time_parameterize_blended
 
 if TYPE_CHECKING:
     from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld

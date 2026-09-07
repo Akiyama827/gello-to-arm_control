@@ -32,7 +32,7 @@ import argparse
 import socket
 import time
 
-from arm_control import rt_protocol as rtp
+from arm_control.plants.remote_rt import protocol as rtp
 
 TICK_NS = 1_000_000  # servo tick, all backends run 1 kHz
 

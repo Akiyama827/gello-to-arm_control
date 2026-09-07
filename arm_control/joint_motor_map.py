@@ -124,13 +124,13 @@ def unpack_motor_state_to_joint(
 
     Arm motors map 1:1 to the first ``n_arm`` URDF joints; the gripper motor (the
     slot after the arm) maps to finger metres via ``gripper_motor_to_finger``.
-    ``JointState`` is imported lazily so callers that only need the mimic (e.g. the
-    visualizer) do not pull in Pinocchio.
+    ``JointState`` is a neutral motion value, imported lazily for callers that
+    only need the mimic (e.g. the visualizer).
 
     ``mimic_cfg=None`` (gripper is not a motor on this bus — e.g. the FR3's
     Franka Hand) returns ``finger_m=None``; there is no gripper slot to read.
     """
-    from arm_control.execution import JointState
+    from arm_control.motion import JointState
 
     state = unpack_motor_state(motor_state, n_motors)
     arm = JointState(

@@ -19,17 +19,17 @@ from typing import Any
 
 from arm_control import frames
 from arm_control.config import CONTROL_ROOT, arm_joints, ee_frame, gripper_joints
-from arm_control.execution.factory import (
+from arm_control.control.factory import (
     arm_urdf,
     build_executor,
     gain_vector,
     gripper_command_cfg,
 )
-from arm_control.execution.trajectory_executor import JointTrajectoryExecutor
+from arm_control.control.trajectory_executor import JointTrajectoryExecutor
 from arm_control.planning.high_level import ArmPlanner, build_collision_stack
 # Scene-derived obstacles. NOTE: preview_rerun imports `rerun` AT MODULE
 # LEVEL, so importing this module requires the optional [viz] extra. That
-# is why the executor factory lives in arm_control.execution.factory and
+# is why the executor factory lives in arm_control.control.factory and
 # not here -- a controller host must not need a visualiser to servo.
 from arm_control.planning.preview_rerun import scene_obstacle_geoms
 from arm_control.planning.ik import PinocchioIK

@@ -34,11 +34,7 @@ import time
 
 import numpy as np
 
-from arm_control.execution.trajectory_executor import (
-    JointServoCommand,
-    JointState,
-)
-from arm_control.planning.trajectory import JointTrajectory
+from arm_control.motion import JointServoCommand, JointState, JointTrajectory
 from arm_control.joint_motor_map import (
     pack_arm_gripper_command,
     unpack_motor_state_to_joint,

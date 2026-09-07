@@ -46,7 +46,7 @@ from pathlib import Path
 
 from dora import Node
 
-from arm_control.bridge.hand_grasp import GRASP_TIMEOUT_S, HandGraspFsm
+from arm_control.end_effectors.franka_hand import GRASP_TIMEOUT_S, HandGraspFsm
 from arm_control.config import load_robot_config
 from arm_control.messages import (
     pack_grasp_result,

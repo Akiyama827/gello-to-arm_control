@@ -11,8 +11,8 @@ without a display. (The comment on that import in ``stack.py`` claimed the
 opposite; it was wrong, and it is corrected there.)
 
 Nothing here may pull in ``rerun`` or the planning stack.
-``arm_control.planning.trajectory`` DOES come along -- the executor retimes --
-and that is fine: it is a pure retimer, with no visualiser and no solver.
+The executor consumes neutral ``arm_control.motion`` values; retiming belongs
+to the planning side and is not imported by this factory.
 ``_self_check`` asserts the boundary rather than trusting it.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ import numpy as np
 
 from arm_control.config import CONTROL_ROOT, _arm_block, arm_joints, ee_frame
 from arm_control.dynamics import PinocchioDynamics
-from arm_control.execution.trajectory_executor import JointTrajectoryExecutor
+from arm_control.control.trajectory_executor import JointTrajectoryExecutor
 
 __all__ = ["arm_urdf", "gain_vector", "gripper_command_cfg", "build_executor"]
 
@@ -161,6 +161,9 @@ def _self_check() -> None:
     # SUCCEEDING is itself the proof that none was needed. The banned list then
     # catches the heavy planning modules, which are what drag rerun in.
     banned = (
+        "arm_control.planning",
+        "arm_control.scene",
+        "arm_control.data",
         "arm_control.planning.stack",
         "arm_control.planning.high_level",
         "arm_control.planning.preview_rerun",
@@ -170,7 +173,7 @@ def _self_check() -> None:
     probe = (
         "import sys, importlib;"
         "sys.modules['rerun'] = None;"
-        "importlib.import_module('arm_control.execution.factory');"
+        "importlib.import_module('arm_control.control.factory');"
         f"leaked = [m for m in {banned!r} if m in sys.modules];"
         "assert not leaked, leaked;"
         "print('clean')"
@@ -191,7 +194,7 @@ def _self_check() -> None:
             pass
         else:
             raise AssertionError(f"{bad} must not yield a gain vector")
-    print("execution.factory: OK")
+    print("control.factory: OK")
 
 
 if __name__ == "__main__":

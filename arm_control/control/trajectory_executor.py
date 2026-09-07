@@ -1,28 +1,12 @@
 """Joint trajectory executor producing servo commands."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
 
 from arm_control.dynamics import PinocchioDynamics
-from arm_control.planning.trajectory import JointTrajectory
-
-
-@dataclass(frozen=True)
-class JointState:
-    position: np.ndarray
-    velocity: np.ndarray
-
-
-@dataclass(frozen=True)
-class JointServoCommand:
-    q_des: np.ndarray
-    qd_des: np.ndarray
-    tau_ff: np.ndarray
-    kp: np.ndarray
-    kd: np.ndarray
+from arm_control.motion import JointServoCommand, JointState, JointTrajectory
 
 
 class JointTrajectoryExecutor:

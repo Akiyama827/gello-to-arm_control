@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from arm_control.hardware.dm_backend import DmMotorLimits
+    from arm_control.plants.dm.backend import DmMotorLimits
 
 
 def validate_hardware_gains(

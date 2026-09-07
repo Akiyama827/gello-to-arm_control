@@ -33,7 +33,7 @@ from typing import Any
 
 import numpy as np
 
-from arm_control import rt_protocol as rtp
+from arm_control.plants.remote_rt import protocol as rtp
 
 
 class RtLinkError(RuntimeError):
@@ -451,7 +451,7 @@ def _demo() -> None:
     # ARM_RT_DEMO_HOST points the SAME sequence at a remote server (rung 1:
     # the RT box running --backend fake --n 3) instead of spawning one here.
     remote = os.environ.get("ARM_RT_DEMO_HOST")
-    repo = Path(__file__).resolve().parents[2]
+    repo = Path(__file__).resolve().parents[3]
     binary = os.environ.get("ARM_RT_SERVER_BIN") or str(repo / "rt" / "build" / "arm_rt_server")
     selfcheck = str(Path(binary).parent / "protocol_selfcheck")
     if remote is None and not Path(binary).exists():
@@ -467,7 +467,7 @@ def _demo() -> None:
         theirs = subprocess.run(
             [selfcheck], capture_output=True, text=True, check=True
         ).stdout.strip().splitlines()
-        from arm_control.rt_protocol import golden_lines
+        from arm_control.plants.remote_rt.protocol import golden_lines
 
         assert theirs == golden_lines(), "C++/Python protocol drift — fix both, bump VERSION"
         print("rt_backend: protocol parity ok")

@@ -29,7 +29,8 @@ from dora import Node
 
 from arm_control.config import _arm_block, arm_joints, load_robot_config
 from arm_control.dynamics import PinocchioDynamics
-from arm_control.execution.trajectory_executor import JointState, JointTrajectoryExecutor
+from arm_control.motion import JointState
+from arm_control.control.trajectory_executor import JointTrajectoryExecutor
 from arm_control.joint_motor_map import gripper_finger_to_motor
 from arm_control.messages import (
     pack_motor_command,
@@ -37,7 +38,7 @@ from arm_control.messages import (
     unpack_motor_state,
     unpack_trajectory,
 )
-from arm_control.planning.trajectory import JointTrajectory
+from arm_control.motion import JointTrajectory
 from arm_control.node_utils import _load_mode_config, resolve_gains
 
 

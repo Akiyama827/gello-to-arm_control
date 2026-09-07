@@ -1,9 +1,9 @@
 """Dora node: the BOUNDED half of the arm stack — servo, hold, report.
 
 A thin adapter. Everything real lives in
-``arm_control.execution.arm_controller.ArmController``; this file owns the Dora
+``arm_control.control.arm_controller.ArmController``; this file owns the Dora
 seam and builds the one thing the controller needs: an executor, via
-``build_executor`` from ``arm_control.execution.factory`` — NOT from
+``build_executor`` from ``arm_control.control.factory`` — NOT from
 ``planning.stack``, which would drag in the IK, the OMPL instance, the
 collision world, and (through ``preview_rerun``) a hard ``rerun`` import that
 this node has no display for. The factory exists so a headless install without
@@ -24,8 +24,8 @@ from dora import Node
 
 
 from arm_control.config import arm_joints, load_robot_config
-from arm_control.execution.arm_controller import ArmController
-from arm_control.execution.factory import build_executor, gripper_command_cfg
+from arm_control.control.arm_controller import ArmController
+from arm_control.control.factory import build_executor, gripper_command_cfg
 from arm_control.node_utils import _load_mode_config, resolve_gains
 
 

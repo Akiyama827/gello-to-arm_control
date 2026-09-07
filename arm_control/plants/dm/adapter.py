@@ -9,13 +9,15 @@ import numpy as np
 from dora import Node
 
 
-from arm_control.bridge import GraspController, GraspGate, SafetyController
+from arm_control.end_effectors.torque_gripper import GraspController
+from arm_control.end_effectors.grasp import GraspGate
+from arm_control.control.safety import SafetyController
 from arm_control.config import load_robot_config
 from arm_control.messages import (
     pack_grasp_result,
     unpack_grasp_request,
 )
-from arm_control.hardware.dm_backend import DmBackendUnavailableError, DmHardwareBackend
+from arm_control.plants.dm.backend import DmBackendUnavailableError, DmHardwareBackend
 from arm_control.messages import (
     pack_json_message,
     pack_motor_state,

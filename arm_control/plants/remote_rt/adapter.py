@@ -23,7 +23,7 @@ import time
 from dora import Node
 
 from arm_control.config import arm_joints, ee_frame, load_robot_config
-from arm_control.hardware.rt_backend import RtBackend, RtLinkError
+from arm_control.plants.remote_rt.client import RtBackend, RtLinkError
 from arm_control.messages import (
     pack_json_message,
     pack_motor_state_dict as _pack,

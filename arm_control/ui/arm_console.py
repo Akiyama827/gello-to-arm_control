@@ -55,10 +55,8 @@ from arm_control.planning.high_level import build_collision_stack
 from arm_control.planning.jog import JogLimits, check_step
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.planning.ompl_planner import OMPLPlanner
-from arm_control.planning.trajectory import (
-    JointTrajectory,
-    time_parameterize_blended,
-)
+from arm_control.motion import JointTrajectory
+from arm_control.planning.retiming import time_parameterize_blended
 from arm_control.node_utils import (
     _load_mode_config,
     expand_named_values,
@@ -1080,7 +1078,7 @@ def _check_graphs() -> None:
     import yaml
 
     root = REPO_ROOT
-    controller = (root / "arm_control" / "execution" / "arm_controller.py").read_text()
+    controller = (root / "arm_control" / "control" / "arm_controller.py").read_text()
     handled = set(re.findall(r'"(\w+)": self\.on_', controller))
 
     checked = 0
