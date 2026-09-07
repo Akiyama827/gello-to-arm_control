@@ -22,6 +22,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +50,55 @@ def assets_ready() -> tuple[bool, str]:
         f"(`python scripts/setup_fr3_assets.py --check` reports status and\n"
         f"changes nothing.)"
     )
+
+
+def ensure_rerun_viewer(port: int = 9876) -> None:
+    """Start ONE persistent viewer if none is listening; nodes only connect.
+
+    Every Rerun producer in this repo uses `spawn=False` + `connect_grpc()` --
+    visualizer, the scene mirror, the plan preview -- so nothing here starts a
+    viewer. Without one the connect succeeds and the data goes NOWHERE, which
+    is the worst failure shape: no error, no visuals, nothing to search for.
+
+    Detached on purpose: a viewer spawned as a child of the graph dies with
+    every restart, and the window you are looking at ends up belonging to a
+    previous run. (Control's own `view.py` does the same thing for the project
+    graphs; this is the standalone launcher's copy, which is why the demo can
+    run from a fresh clone with no project around it.)
+    """
+    import socket
+
+    def listening() -> bool:
+        probe = socket.socket()
+        probe.settimeout(0.3)
+        try:
+            probe.connect(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
+    if listening():
+        print("[run_console] rerun viewer already up — reusing it", flush=True)
+        return
+    try:
+        subprocess.Popen(
+            ["rerun"], start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        print("[run_console] no `rerun` on PATH — the console still works, "
+              "visuals are just disabled (pip install rerun-sdk)", flush=True)
+        return
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        if listening():
+            print("[run_console] rerun viewer up (persistent — survives restarts)",
+                  flush=True)
+            return
+        time.sleep(0.3)
+    print("[run_console] rerun viewer did not come up — visuals may lag", flush=True)
 
 
 def main() -> int:
@@ -86,12 +136,13 @@ def main() -> int:
         [str(REPO_ROOT), env.get("PYTHONPATH", "")]
     ).strip(os.pathsep)
 
-    print(f"[run_console] {config.name} -> {graph.name}")
+    ensure_rerun_viewer()
+    print(f"[run_console] {config.name} -> {graph.name}", flush=True)
     if args.dual:
-        print("[run_console] consoles on http://127.0.0.1:7500 and :7510")
+        print("[run_console] consoles on http://127.0.0.1:7500 and :7510", flush=True)
     else:
-        print("[run_console] console on http://127.0.0.1:7500")
-    print("[run_console] the arm comes up DISARMED — press ARM on the page")
+        print("[run_console] console on http://127.0.0.1:7500", flush=True)
+    print("[run_console] the arm comes up DISARMED — press ARM on the page", flush=True)
     try:
         return subprocess.call(["dora", "run", str(graph)], env=env, cwd=REPO_ROOT)
     except FileNotFoundError:

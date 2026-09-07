@@ -17,6 +17,13 @@ python scripts/run_console.py
 
 Then open **http://127.0.0.1:7500**.
 
+**You do not launch Rerun yourself.** Both launchers probe port 9876 and start
+one detached viewer if none is listening — detached on purpose, so it survives
+graph restarts instead of leaving you looking at a previous run's window. With
+no `rerun` on PATH the console still works; you just get no visuals, and the
+launcher says so. Every node in this repo only ever *connects* (`spawn=False`),
+so nothing starts a viewer of its own.
+
 `python scripts/run_console.py --check` reports what is staged and launches
 nothing. `--dual` runs two arms on :7500 and :7510. `--config <path>` points at
 your own entry config.
