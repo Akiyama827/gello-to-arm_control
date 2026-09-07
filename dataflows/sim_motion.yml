@@ -8,8 +8,8 @@
 # runs only when an `execute` names that same id -- so a plan superseded by a
 # re-plan can never run.
 #
-#   ARM_CONTROL_CONFIG=configs/sim_assembler.yaml dora run dataflows/sim_motion.yml
-#   (or, from the deployment: python scripts/view.py sim motion)
+#   ARM_CONTROL_CONFIG=configs/entries/sim_assembler.yaml dora run dataflows/sim_motion.yml
+#   (or, from the deployment: python tools/run.py sim motion)
 nodes:
   - id: arm_console
     path: ../nodes/arm_console.py

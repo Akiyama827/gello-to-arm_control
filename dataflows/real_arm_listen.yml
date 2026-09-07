@@ -2,7 +2,7 @@
 # sending commands to motors.
 #
 # Run with:
-#   ARM_CONTROL_CONFIG=configs/real/assembler.yaml dora run dataflows/real_arm_listen.yml
+#   ARM_CONTROL_CONFIG=configs/entries/real_assembler.yaml dora run dataflows/real_arm_listen.yml
 #
 # Motors: DM4340P (0x01), DM4340 ×2 (0x02–0x03), DM4310 ×3 (0x04–0x06)
 

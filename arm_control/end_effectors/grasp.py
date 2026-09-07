@@ -26,7 +26,7 @@ range, so it never relies on the silent downstream clip (carry-forward from the
 Task-2 gripper map).
 
 Endpoints and the clamp range come from the calibrated gripper mimic
-(the caller's ``configs/real/assembler.yaml`` ``joint_mimics``) through the Task-2
+(the caller's ``configs/entries/real_assembler.yaml`` ``joint_mimics``) through the Task-2
 ``gripper_finger_to_motor`` map — see ``from_config``.  Nothing is hardcoded and
 every threshold/gain is bench-tunable.
 """

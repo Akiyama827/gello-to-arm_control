@@ -1,7 +1,7 @@
 # Real assembler gripper calibration log.
 #
 # Run with:
-#   python scripts/view.py real gripper-log
+#   python tools/run.py real gripper-log
 
 nodes:
   - id: plant_interface

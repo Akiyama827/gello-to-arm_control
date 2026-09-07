@@ -12,7 +12,7 @@
 # it. That is a deliberate change: the float node enabled motors the moment it
 # opened, with no gate and no deadman, on an arm nobody had told to move yet.
 #
-#   python scripts/view.py real float
+#   python tools/run.py real float
 nodes:
   - id: plant_interface
     path: ../nodes/hardware_interface.py

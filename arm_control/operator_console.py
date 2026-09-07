@@ -3,7 +3,7 @@
 Nothing here knows what an arm is FOR. It shows an ordered list of phases, which
 one is current, which are done, what is held for review, and why something
 failed -- all injected as an :class:`OperatorWorkspace` by whoever does know
-(``assembly/operator_view.py`` in Control, the way ``GraspEditorWorkspace`` feeds
+(``assembly/ui/operator_view.py`` in Control, the way ``GraspEditorWorkspace`` feeds
 ``GraspEditorPanel``). There is no Row Module, no dock, no stack and no bench in
 this file, and there must not be.
 

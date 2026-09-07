@@ -12,7 +12,7 @@ robot follows. One gripper slider (finger metres, published on the
 ``gripper`` output in 2-finger ``motor_command_gripper`` format — wired
 straight to the sim plant, or into the executor's gripper hold slot on the
 real arm). Joint sliders survive behind a debug toggle. Design + calibration
-end-goal: ``docs/cartesian-teleop.md``. Rerun previews still stream
+end-goal: ``docs/history/cartesian-teleop.md``. Rerun previews still stream
 (plan_t timeline etc.). Buttons:
 
     Sync target to robot   copy the measured pose into the sliders

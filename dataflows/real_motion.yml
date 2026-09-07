@@ -14,8 +14,8 @@
 # happens only on Execute, which is refused visibly while disarmed. The 0.1s
 # deadman + fault reflex are live the whole time.
 #
-#   ARM_CONTROL_CONFIG=configs/real/assembler.yaml dora run dataflows/real_motion.yml
-#   (or: python scripts/view.py real motion)
+#   ARM_CONTROL_CONFIG=configs/entries/real_assembler.yaml dora run dataflows/real_motion.yml
+#   (or: python tools/run.py real motion)
 nodes:
   - id: arm_console
     path: ../nodes/arm_console.py

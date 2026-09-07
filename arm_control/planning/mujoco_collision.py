@@ -88,7 +88,7 @@ def build_planning_model(
     # would fail the compile with "no decoder found for mesh file". Fall back to
     # collision-only geometry — the engine convex-hulls it, which is what the DM
     # arm already relies on. (For the FR3 this no longer triggers:
-    # scripts/setup_fr3_assets.py converts Franka's .dae visuals to .stl at
+    # tools/assets/setup_fr3.py converts Franka's .dae visuals to .stl at
     # staging time, because Rerun cannot read COLLADA either.)
     if keep_visual:
         undecodable = sorted(

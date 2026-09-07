@@ -10,12 +10,12 @@
 #
 # Assets: this repo vendors no meshes. Stage the FR3 description once --
 #
-#     python scripts/setup_fr3_assets.py --source <franka_description checkout>
+#     python tools/assets/setup_fr3.py --source <franka_description checkout>
 #     # git clone https://github.com/frankarobotics/franka_description
 #
 # then run it:
 #
-#     python scripts/run_console.py
+#     python examples/run_console.py
 #
 # A neutral standalone example: origin at zero, no deployed bench collision
 # table. The previous concrete bench example is preserved by the consuming
@@ -30,7 +30,7 @@ include:
 # `sim_backend: mujoco`, `listen_mode: true`. Nothing in this graph read any
 # of them, and `real_backend` is worse than inert: on a HARDWARE graph it
 # names the SocketCAN interface to open, so "mujoco" was an instruction to
-# open a CAN device by that name. `scripts/run_console.py --self-check` now
+# open a CAN device by that name. `examples/run_console.py --self-check` now
 # refuses an entry key no code reads.)
 sim_model_path: franka/urdf/fr3.urdf
 sim_update_rate_hz: 100

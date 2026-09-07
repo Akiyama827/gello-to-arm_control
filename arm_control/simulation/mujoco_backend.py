@@ -73,7 +73,7 @@ class MuJoCoUnavailableError(RuntimeError):
 # ponytail: J_rotor is still the 4340 base motors' measured 1.8e-5 -- DM
 # datasheets do not publish it and no module motor has been on the bus yet.
 # A 4310's rotor is smaller, so this is an upper bound; read the real value
-# with libs/arm_control/scripts/bench/dm_read_params.py when one is reachable.
+# with libs/arm_control/tools/bench/dm/read_params.py when one is reachable.
 MODULE_ARMATURE = 10.0**2 * 1.8e-5  # 0.0018
 
 # Reflected rotor inertia (kg.m^2) for the ARM's joints. Franka's own published
@@ -645,7 +645,7 @@ class MuJoCoBackend:
     # in the scene config; the RULES that read them -- quantize to four
     # quarter-turns, gate on gap and axis angle -- stayed here until now.
     # Required only for a scene with objects; a plain arm never needs one.
-    # See Control's assembly/mate.py for the reference implementation.
+    # See Control's assembly/model/mate.py for the reference implementation.
     mate_policy: object = None
     # REQUIRED in scene mode (validated in load()); irrelevant in single-model
     # mode. No robot-shaped defaults: these are model facts the scene config
@@ -691,7 +691,7 @@ class MuJoCoBackend:
     # model. Required only for a scene WITH inventory modules; a plain arm or a
     # object-free scene never needs one. The returned object must offer
     # ``attach``, ``modules``, ``slots``, ``tip_port``, ``root_port`` and
-    # ``state`` -- see Control's assembly/chain.py for the reference one.
+    # ``state`` -- see Control's assembly/model/chain.py for the reference one.
     # Those member names, and ``attach``'s ``module_id``/``clocking`` keywords,
     # are the CALLER's words for its own model. This file passes them through
     # and reads ``.clocking`` as an OPAQUE integer: it no longer knows that a

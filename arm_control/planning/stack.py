@@ -3,7 +3,7 @@
 Pure interface: IK, collision world, OMPL, retiming planner, Rerun preview.
 Nothing here knows about phases, grasps, or
 scenarios — the pick-and-dock coordinator wraps this in its own policy layer
-(``assembly.build``). Servo construction lives in ``control.factory``.
+(``assembly.runtime.build``). Servo construction lives in ``control.factory``.
 
 Every identity comes from the config's ``arm:`` block (``arm.joints``,
 ``arm.ee_frame``, ``arm.urdf``, ``arm.kp``…): a new robot is a new YAML,

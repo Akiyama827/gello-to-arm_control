@@ -38,7 +38,7 @@ controller:
   # base calibration carries kd = 0 (no host loop over the real arm), and in
   # SIM the MuJoCo plant closes an explicit PD law where kd = 0 means NO
   # damping — kp = 1200 rings forever (measured: ~10 Hz constant-amplitude
-  # oscillation on joints 1-3). configs/sim/franka.yaml overrides arm.kd.
+  # oscillation on joints 1-3). configs/entries/sim_franka.yaml overrides arm.kd.
   # Bounds the executor's tau_ff (sim-only on this arm). Kept truthful to
   # the datasheet so the numbers still mean something.
   torque_limits:

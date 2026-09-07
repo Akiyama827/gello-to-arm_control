@@ -461,7 +461,7 @@ def _log_motor_state_metrics(state: dict[str, np.ndarray], *, rerun_module=rr) -
 def _init_rerun(app_id: str, *, rerun_module=rr) -> None:
     # CONNECT, never spawn: a viewer child per graph run dies with the graph,
     # piles dead windows on the desk, and splits streams across viewers. The
-    # launcher (scripts/view.py) guarantees one persistent viewer beforehand.
+    # launcher (tools/run.py) guarantees one persistent viewer beforehand.
     rerun_module.init(app_id, spawn=False)
     rerun_module.connect_grpc()
 

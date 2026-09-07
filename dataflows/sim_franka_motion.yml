@@ -8,9 +8,9 @@
 # the DM gain table is keyed by Joint1..Joint6 and expands to ZERO gains for
 # fr3_* joints (the executor now refuses that outright).
 #
-#   python scripts/setup_fr3_assets.py --check   # meshes must be staged
-#   ARM_CONTROL_CONFIG=configs/sim/franka.yaml dora run dataflows/sim_franka_motion.yml
-#   (or: python scripts/view.py sim franka motion)
+#   python tools/assets/setup_fr3.py --check   # meshes must be staged
+#   ARM_CONTROL_CONFIG=configs/entries/sim_franka.yaml dora run dataflows/sim_franka_motion.yml
+#   (or: python tools/run.py sim franka motion)
 nodes:
   - id: arm_console
     path: ../nodes/arm_console.py

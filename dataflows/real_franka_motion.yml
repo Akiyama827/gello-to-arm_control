@@ -20,11 +20,11 @@
 # aborts on >0.35 rad tracking error; the server holds on staleness and
 # latches on faults.
 #
-#   python scripts/view.py real franka motion        # canonical launcher
+#   python tools/run.py real franka motion        # canonical launcher
 #   (raw dora run needs BOTH roots exported — dora rebases node cwd to this
 #   directory, so a bare relative ARM_CONTROL_CONFIG resolves against the
 #   arm_control checkout instead of the project deployment root:
-#   ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/real/franka.yaml \
+#   ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
 #     dora run libs/arm_control/dataflows/real_franka_motion.yml)
 nodes:
   - id: arm_console
