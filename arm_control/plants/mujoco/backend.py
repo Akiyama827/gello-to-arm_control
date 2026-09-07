@@ -34,6 +34,7 @@ import numpy as np
 
 from arm_control.planning.mujoco_collision import _rpy_to_quat
 from arm_control.scene import SceneSpec, SceneState
+from arm_control.contracts.impedance import pose_hold_values
 from arm_control.simulation.convex_decomp import replace_with_decomposition
 
 # THE law, compiled once (rt/include/arm_rt/servo_law.hpp via rt/bindings).
@@ -846,6 +847,9 @@ class MuJoCoBackend:
             spec = mujoco.MjSpec.from_string(path.read_text())
         else:
             spec = _load_model_spec(path)
+        if self.ee_body:
+            # Preserve the selected fixed TCP body for pose/Jacobian queries.
+            spec.compiler.fusestatic = False
         spec.option.timestep = float(self.timestep)
         for actuator in list(spec.actuators):
             spec.delete(actuator)
@@ -1497,6 +1501,15 @@ class MuJoCoBackend:
     # -- motor I/O --------------------------------------------------------
     def apply_motor_command(self, command: dict[str, np.ndarray]) -> None:
         self.load()
+        soft = command.get("pose_hold")
+        if soft is not None:
+            pose_hold_values(soft)
+            if not self.supports_pose_hold:
+                raise ValueError("Soft needs a single-model EE and updated arm_rt_servo bindings")
+            if getattr(self, "_pose_hold_law", None) is None:
+                self._pose_hold_law = _servo.PoseHold()
+        elif getattr(self, "_pose_hold_law", None) is not None:
+            self._pose_hold_law.reset()
         n = self.num_motors
         self._last_command = {
             key: np.asarray(command.get(key, np.zeros(n)), dtype=np.float64)
@@ -1507,6 +1520,13 @@ class MuJoCoBackend:
         # Optional Cartesian-impedance block (messages.unpack_motor_command).
         # None = every graph that does not send one behaves exactly as before.
         self._last_command["cartesian"] = command.get("cartesian")
+        self._last_command["pose_hold"] = soft
+
+    @property
+    def supports_pose_hold(self) -> bool:
+        return (self.scene is None and self.workcell_scene is None
+                and getattr(self, "_ee_bid", -1) >= 0
+                and _servo is not None and hasattr(_servo, "PoseHold"))
 
     def _cartesian_tau_ff(self, tau_ff: np.ndarray, cart: dict) -> np.ndarray:
         """Fold the task-frame Cartesian impedance into tau_ff.
@@ -1557,6 +1577,19 @@ class MuJoCoBackend:
         q = self.data.qpos[self._qadr]
         v = self.data.qvel[self._vadr]
         tau_ff = cmd["torque"]
+        kp, kd = cmd["kp"], cmd["kd"]
+        soft = cmd.get("pose_hold")
+        if soft is not None:
+            mujoco.mj_jacBody(self.model, self.data, self._jacp, self._jacr, self._ee_bid)
+            jac = np.vstack((self._jacp[:, self._vadr], self._jacr[:, self._vadr]))
+            body = self.data.body(self._ee_bid)
+            tau_ff = self._pose_hold_law.torque(
+                q=q, dq=v, J=jac, pose=np.r_[body.xpos, body.xquat],
+                # MuJoCo's body gravcomp is already applied by the plant.
+                bias=(self.data.qfrc_bias - self.data.qfrc_gravcomp)[self._vadr],
+                spec=pose_hold_values(soft), dt=float(self.model.opt.timestep),
+            )
+            kp, kd = np.zeros(self.num_motors), np.zeros(self.num_motors)
         cart = cmd.get("cartesian")
         if cart is not None:
             tau_ff = self._cartesian_tau_ff(tau_ff, cart)
@@ -1585,8 +1618,8 @@ class MuJoCoBackend:
             q_des=cmd["position"],
             qd_des=cmd["velocity"],
             tau_ff=tau_ff,
-            kp=cmd["kp"],
-            kd=cmd["kd"],
+            kp=kp,
+            kd=kd,
             tau_ref=tau_ref,
             tau_limit=self._tau_limit,
             slew_per_tick=float(self.slew_per_tick),

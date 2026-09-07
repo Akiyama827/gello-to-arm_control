@@ -48,7 +48,6 @@
   font-size: .74rem; color: var(--muted); margin-bottom: .4rem;
 }
 
-.deadman { width: 100%; }
 .wide { width: 100%; margin-top: auto; }
 
 /* Jog: a compact −/+ pair per axis. Big enough to hit without aiming, because

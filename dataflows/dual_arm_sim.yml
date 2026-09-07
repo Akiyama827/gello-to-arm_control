@@ -30,6 +30,9 @@ nodes:
       ARM_ID: left
     inputs:
       motor_state: left_plant/motor_state
+      controller_arm: left_controller/arm
+      controller_event: left_controller/controller_event
+      plant_capabilities: left_plant/model_revision
     outputs: [plan, control, jog, gripper]
 
   - id: left_controller
@@ -44,6 +47,7 @@ nodes:
       plan:        left_console/plan
       control:     left_console/control
       jog:         left_console/jog
+      plant_capabilities: left_plant/model_revision
       gripper:     left_console/gripper
     outputs: [motor_command, arm, controller_event]
 
@@ -54,6 +58,7 @@ nodes:
       ARM_ID: left
     inputs:
       motor_command: left_controller/motor_command
+      arm: left_controller/arm
     outputs: [motor_state, sim_qpos, gripper_state, topology_state, model_revision]
 
   - id: left_viz
@@ -73,6 +78,9 @@ nodes:
       ARM_ID: right
     inputs:
       motor_state: right_plant/motor_state
+      controller_arm: right_controller/arm
+      controller_event: right_controller/controller_event
+      plant_capabilities: right_plant/model_revision
     outputs: [plan, control, jog, gripper]
 
   - id: right_controller
@@ -87,6 +95,7 @@ nodes:
       plan:        right_console/plan
       control:     right_console/control
       jog:         right_console/jog
+      plant_capabilities: right_plant/model_revision
       gripper:     right_console/gripper
     outputs: [motor_command, arm, controller_event]
 
@@ -97,6 +106,7 @@ nodes:
       ARM_ID: right
     inputs:
       motor_command: right_controller/motor_command
+      arm: right_controller/arm
     outputs: [motor_state, sim_qpos, gripper_state, topology_state, model_revision]
 
   - id: right_viz

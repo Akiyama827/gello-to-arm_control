@@ -80,3 +80,17 @@ replay:
 # than coincidental: a sim rehearsal and the real arm are DIFFERENT entry
 # configs, so they no longer have to remember to pick different numbers
 # for a browser tab to be unable to reattach across them.
+
+# Soft requires a pose_hold=2 capable RT server. These are initial example
+# settings, not a validated deployment tuning or hardware-safety certification.
+gain_presets:
+  float:
+    kp: 0.0
+    kd: 5.0
+  soft:
+    pose_hold:
+      kc: [300, 300, 300, 30, 30, 30]
+      dc: [35, 35, 35, 8, 8, 8]
+      nullspace_kp: 0.5
+      nullspace_kd: 2.0
+  track: {}

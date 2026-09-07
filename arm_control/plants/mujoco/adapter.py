@@ -28,7 +28,7 @@ import numpy as np
 from dora import Node
 
 
-from arm_control.config import gripper_joints, load_robot_config
+from arm_control.config import ee_frame, gripper_joints, load_robot_config
 from arm_control.messages import (
     pack_json_message,
     pack_motor_state,
@@ -37,6 +37,7 @@ from arm_control.messages import (
     scene_state_from_payload,
     scene_state_payload,
     unpack_motor_command,
+    unpack_json_message,
     unpack_scene_command,
 )
 from arm_control.node_utils import (
@@ -167,6 +168,7 @@ def main() -> None:
             # From the arm's OWN config (`arm.gripper_joints`) — a new robot is a
             # new YAML, never an edit here.
             gripper_joints=tuple(gripper_joints(cfg)),
+            ee_body=ee_frame(cfg),
             # Spawn pose. The block below argues the plant must DECLARE its
             # starting state and then only did so for the jaws: the arm itself
             # was left at MuJoCo's implicit zero, which for the FR3 is not even
@@ -276,6 +278,8 @@ def main() -> None:
     _sim_steps = [0]
     _wall_t0 = [0.0]
     model_revision_sent = False
+    last_single_command = 0.0
+    single_armed: bool | None = None  # None: legacy graphs do not wire authority.
     _stall = [0.0]   # seconds this node spent NOT listening, since last step
 
     def _credit_stall(seconds: float) -> None:
@@ -308,6 +312,7 @@ def main() -> None:
         # while kp/kd go to zero is the worst of both: a limp arm still being
         # pulled toward a target nobody is refreshing.
         command["cartesian"] = None
+        command["pose_hold"] = None
 
     try:
         while not shutdown.stop_requested:
@@ -316,7 +321,14 @@ def main() -> None:
                 etype = event["type"]
                 eid = event.get("id", "")
 
-                if etype == "INPUT" and eid == "motor_command_gripper":
+                if etype == "INPUT" and eid == "arm" and not arm_slices:
+                    single_armed = bool(unpack_json_message(event["value"]).get("armed", False))
+                    if not single_armed:
+                        command["pose_hold"] = None
+                        command["cartesian"] = None
+                        for key in ("kp", "kd", "torque", "velocity"):
+                            command[key] = np.zeros(n)
+                elif etype == "INPUT" and eid == "motor_command_gripper":
                     # Finger servo targets (not an arm slice): drive the
                     # scene's gripper joints so closing is physical. A nonzero
                     # TORQUE slot means grasp(force) instead of move(width):
@@ -390,7 +402,10 @@ def main() -> None:
                         # one arm ever sends one.
                         command["cartesian"] = sub["cartesian"]
                 elif etype == "INPUT" and not arm_slices and eid == "motor_command":
+                    if single_armed is False:
+                        continue
                     command = unpack_motor_command(event["value"], n)
+                    last_single_command = time.monotonic()
                     _warn_undamped(command)
                 elif etype == "STOP":
                     break
@@ -438,6 +453,12 @@ def main() -> None:
                 elif last_cmd_time[arm] > 0.0:
                     idle_warned[arm] = False
 
+            if (not arm_slices and command.get("pose_hold") is not None
+                    and now - last_single_command > idle_timeout):
+                # A stopped commander cannot leave an unrefreshed Soft mode.
+                command["pose_hold"] = None
+                command["position"] = backend.data.qpos[backend._qadr].copy()
+                command["velocity"] = np.zeros(n)
             state = backend.step(command)
             # The PLANT's own view of its steady error, straight from the
             # servo's inputs: no bridge, no decimation, no orchestrator. If
@@ -674,6 +695,7 @@ def main() -> None:
                             "model_path": str(backend.model_path),
                             "joint_names": list(backend.joint_names),
                             "num_motors": n,
+                            "supports_pose_hold": backend.supports_pose_hold,
                         },
                     ),
                 )

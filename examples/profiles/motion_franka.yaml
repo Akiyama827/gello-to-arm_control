@@ -88,6 +88,9 @@ gain_presets:
     kp: 0.0            # gravity + payload feedforward only, which IS float
     kd: 5.0            # not 0: MuJoCo's PD is the only damping in this plant
   soft:
-    kp: 120.0          # a tenth of the tracking table
-    kd: 12.0
+    pose_hold:
+      kc: [300, 300, 300, 30, 30, 30]  # N/m, Nm/rad; not hardware-certified
+      dc: [35, 35, 35, 8, 8, 8]       # Ns/m, Nms/rad
+      nullspace_kp: 0.5               # weak posture spring, Nm/rad
+      nullspace_kd: 2.0               # independent damping, Nms/rad
   track: {}            # empty = the controller.kp/kd above

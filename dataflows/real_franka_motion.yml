@@ -35,6 +35,7 @@ nodes:
       motor_state: plant_interface/motor_state_viz
       # Armed badge + Execute gating + gate visibility on the panel.
       motor_health: plant_interface/motor_health
+      controller_event: arm_controller/controller_event
       # Live Hand width -> the measured ghost's fingers track reality.
       gripper_state: franka_gripper/gripper_state
     outputs:

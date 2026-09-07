@@ -32,6 +32,8 @@ nodes:
       ARM_CONTROL_MODE_CONFIG: examples/profiles/float.yaml
     inputs:
       motor_state: plant_interface/motor_state
+      controller_arm: arm_controller/arm
+      controller_event: arm_controller/controller_event
     outputs:
       - plan
       - control

@@ -5,6 +5,7 @@ import numpy as np
 import pyarrow as pa
 
 from ._arrow import _pack, _unpack, _check_length
+from .impedance import POSE_HOLD_SIZE, pose_hold_values, unpack_pose_hold_values
 
 _MS = 8  # pos, vel, pos_cmd, vel_cmd, tor_cmd, kp, kd, tor_fb
 _MC = 5
@@ -86,13 +87,15 @@ def pack_cartesian_block(pose, task_R, kc, dc) -> np.ndarray:
     return out
 
 
-def pack_motor_command(pos, vel, tor, kp, kd, cartesian=None) -> pa.Array:
+def pack_motor_command(pos, vel, tor, kp, kd, cartesian=None, *, pose_hold=None) -> pa.Array:
     """Interleaved 5-float-per-motor command, plus an OPTIONAL Cartesian tail.
 
     ``cartesian`` is the 28-float block from :func:`pack_cartesian_block` (or
     None). Omitting it produces exactly the array this function has always
     produced — that is what makes the block optional for graphs that never
-    send one.
+    send one. Alternatively, ``pose_hold`` is a validated 15-float spec
+    (id, kc[6], dc[6], nullspace kp/kd) whose target the plant captures.
+    Both tails together are invalid.
     """
     n = len(pos)
     buf = np.empty(n * _MC, dtype=np.float64)
@@ -101,6 +104,10 @@ def pack_motor_command(pos, vel, tor, kp, kd, cartesian=None) -> pa.Array:
     buf[2::_MC] = tor
     buf[3::_MC] = kp
     buf[4::_MC] = kd
+    if pose_hold is not None:
+        if cartesian is not None:
+            raise ValueError("pose hold and trajectory Cartesian impedance are exclusive")
+        return _pack(np.concatenate([buf, pose_hold_values(pose_hold)]))
     if cartesian is None:
         return _pack(buf)
     tail = np.asarray(cartesian, dtype=float).ravel()
@@ -116,7 +123,7 @@ def unpack_motor_command(arrow: pa.Array, n: int) -> dict:
     Anything else is a layout bug and raises, same as before.
     """
     flat_raw = _unpack(arrow)
-    if flat_raw.size not in (n * _MC, n * _MC + _CART):
+    if flat_raw.size not in (n * _MC, n * _MC + _CART, n * _MC + POSE_HOLD_SIZE):
         _check_length("unpack_motor_command", flat_raw, n * _MC)
     flat = flat_raw[: n * _MC].reshape(n, _MC)
     tail = flat_raw[n * _MC :]
@@ -127,11 +134,12 @@ def unpack_motor_command(arrow: pa.Array, n: int) -> dict:
         "kp": flat[:, 3],
         "kd": flat[:, 4],
         "cartesian": None
-        if tail.size == 0
+        if tail.size != _CART
         else {
             "pose": tail[:7],
             "task_R": tail[7:16].reshape(3, 3),
             "kc": tail[16:22],
             "dc": tail[22:28],
         },
+        "pose_hold": unpack_pose_hold_values(tail) if tail.size == POSE_HOLD_SIZE else None,
     }

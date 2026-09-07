@@ -72,6 +72,7 @@ def pack_arm_gripper_command(
     gripper_gains: Sequence[float],
     mimic_cfg: dict | None,
     cartesian: dict | None = None,
+    pose_hold: dict | None = None,
 ) -> pa.Array:
     """Pack the 7-motor command: 6 arm joints 1:1 + 1 gripper motor.
 
@@ -103,6 +104,7 @@ def pack_arm_gripper_command(
             np.asarray(arm_kp, dtype=float),
             np.asarray(arm_kd, dtype=float),
             tail,
+            pose_hold=pose_hold,
         )
     motor_rad = gripper_finger_to_motor(float(gripper_finger_m), mimic_cfg)
     g_kp, g_kd = float(gripper_gains[0]), float(gripper_gains[1])
@@ -111,7 +113,7 @@ def pack_arm_gripper_command(
     tor = np.concatenate([np.asarray(arm_tau, dtype=float), [0.0]])
     kp = np.concatenate([np.asarray(arm_kp, dtype=float), [g_kp]])
     kd = np.concatenate([np.asarray(arm_kd, dtype=float), [g_kd]])
-    return pack_motor_command(pos, vel, tor, kp, kd, tail)
+    return pack_motor_command(pos, vel, tor, kp, kd, tail, pose_hold=pose_hold)
 
 
 def unpack_motor_state_to_joint(

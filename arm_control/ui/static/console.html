@@ -56,27 +56,26 @@
         </div>
       </div>
 
-      <button id="deadman" class="deadman" type="button">
-        <span>Hold to allow motion</span>
-        <small id="authority-text">Deadman released — hold and disarm requested</small>
-      </button>
-
       <div class="rail-section">
         <div class="rail-head">Move</div>
+        <p>Plan → Preview → ARM → Execute. Runs until complete or stopped.</p>
         <div id="buttons" class="command-stack"></div>
       </div>
 
       <div class="rail-section">
         <div class="rail-head">Jog <small id="jog-note" class="jog-note"></small></div>
+        <p id="jog-speed"></p>
         <div id="jog-pad" class="jog-pad"></div>
         <details id="jog-joints-wrap" hidden>
           <summary>Joint jog — the way out of a singularity</summary>
+          <p id="jog-joint-speed"></p>
           <div id="jog-joints" class="jog-pad"></div>
         </details>
       </div>
 
       <details id="gains-wrap" class="rail-section" hidden>
         <summary>Control law</summary>
+        <p id="control-mode"></p>
         <div id="gains" class="command-stack"></div>
       </details>
 

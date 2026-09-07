@@ -18,6 +18,9 @@ nodes:
       ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
     inputs:
       motor_state: plant_interface/motor_state
+      controller_arm: arm_controller/arm
+      controller_event: arm_controller/controller_event
+      plant_capabilities: plant_interface/model_revision
     outputs:
       - plan
       - control
@@ -49,6 +52,7 @@ nodes:
       plan:     arm_console/plan
       control:  arm_console/control
       jog:      arm_console/jog
+      plant_capabilities: plant_interface/model_revision
       # Aliased inputs: dora maps one producer per input, so a second
       # motion source reaches the same handlers under its own names.
       plan_replay:    trajectory_replay/plan
@@ -62,6 +66,7 @@ nodes:
     path: ../nodes/mujoco_interface.py
     inputs:
       motor_command: arm_controller/motor_command
+      arm: arm_controller/arm
       # Teleop gripper slider drives the scene's finger servos directly (the
       # 6-motor sim config has no gripper motor slot). No-op if the scene has
       # no gripper.

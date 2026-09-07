@@ -26,6 +26,7 @@ nodes:
       # Lets the panel gate Execute while DISARMED (visible refusal instead
       # of a silent bridge drop + executor abort 2 s later).
       motor_health: plant_interface/motor_health
+      controller_event: arm_controller/controller_event
     outputs:
       - plan
       - control

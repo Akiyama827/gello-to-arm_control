@@ -33,6 +33,7 @@ import math
 import time
 
 import numpy as np
+from arm_control.contracts.impedance import pose_hold_values, unpack_pose_hold_values
 
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
 from arm_control.joint_motor_map import (
@@ -67,6 +68,10 @@ class ArmController:
     ) -> None:
         self.node = node
         self.executor = executor
+        # Soft's stale-stream fallback must remain a real joint hold, even
+        # when the preceding operator mode was Float (zero joint stiffness).
+        self._track_kp = executor.kp.copy()
+        self._track_kd = executor.kd.copy()
         self.arm_id = str(arm_id)
         self.gripper = dict(gripper)
         self.n_arm = executor.n_joints
@@ -123,11 +128,14 @@ class ArmController:
             raise ValueError("jog_timeout_s must be positive")
 
         self.last_state = JointState(np.zeros(self.n_arm), np.zeros(self.n_arm))
+        self._last_state_at: float | None = None
         self.last_command: JointServoCommand | None = None
         self._hold_anchor: JointServoCommand | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
         self._cartesian_poses: np.ndarray | None = None
         self._last_cartesian_pose: np.ndarray | None = None
+        self._pose_hold: dict | None = None
+        self.supports_pose_hold = False
 
         self.armed = False
         # Does this plant have a safety bridge that ACKs the arm? A bridge
@@ -159,6 +167,11 @@ class ArmController:
     def on_plan(self, value) -> None:
         """Load one leg. Refused if another is mid-flight (never swapped)."""
         plan = unpack_plan(value)
+        if self._pose_hold is not None:
+            self.node.send_output("controller_event", pack_controller_event(
+                kind="leg_result", plan_id=plan["plan_id"], ok=False,
+                reason="Soft pose hold active; select Track before planning"))
+            return
         if self.stopped or self.frozen:
             return
         if self._running:
@@ -196,6 +209,8 @@ class ArmController:
             self._release(str(fields["execute"]))
         if "gains" in fields:
             self._set_gains(fields["gains"] or {})
+        if "pose_hold" in fields:
+            self._set_pose_hold(fields["pose_hold"])
         if fields.get("cancel"):
             self._cancel(str(fields.get("reason") or "cancelled"))
         if fields.get("hold"):
@@ -217,7 +232,7 @@ class ArmController:
         or is cancelled, and a jog arriving underneath it would fight the
         trajectory for the same joints.
         """
-        if self.stopped or self.frozen or not self.armed or not self.ready_sent:
+        if self.stopped or self.frozen or not self.armed or not self.ready_sent or self._pose_hold is not None:
             return
         if self._running:
             return
@@ -260,6 +275,7 @@ class ArmController:
 
     def on_motor_health(self, value) -> None:
         payload = unpack_json_message(value)
+        self.supports_pose_hold = bool(payload.get("supports_pose_hold", False))
         armed = bool(payload.get("armed", False))
         if armed and not self.bridge_armed:
             self.bridge_armed = True
@@ -267,6 +283,7 @@ class ArmController:
             self._fault("plant reported disarmed")
 
     def on_motor_state(self, value) -> None:
+        self._last_state_at = self._clock()
         if self.stopped:
             return
         if self._state_period is not None:
@@ -359,6 +376,33 @@ class ArmController:
             flush=True,
         )
 
+    def on_plant_capabilities(self, value) -> None:
+        self.supports_pose_hold = bool(unpack_json_message(value).get("supports_pose_hold", False))
+
+    def _set_pose_hold(self, spec: dict) -> None:
+        try:
+            spec = unpack_pose_hold_values(pose_hold_values(spec))
+            if (not self.supports_pose_hold or not self.armed or not self.ready_sent
+                    or self.stopped or self.frozen):
+                raise ValueError("Soft needs an armed, ready, capable plant")
+            if (self._last_state_at is None or self._clock() - self._last_state_at > 1.0
+                    or not np.isfinite(self.last_state.position).all()
+                    or not np.isfinite(self.last_state.velocity).all()):
+                raise ValueError("Soft needs fresh, finite measured state")
+            if self._running or self._jog_q is not None or np.max(np.abs(self.last_state.velocity)) > 0.05:
+                raise ValueError("Stop and settle before selecting Soft")
+        except (TypeError, ValueError) as exc:
+            self.node.send_output("controller_event", pack_controller_event(
+                kind="mode", ok=False, reason=str(exc)))
+            return
+        self._cancel("entering Soft")
+        self.executor.set_gains(kp=self._track_kp.copy(), kd=self._track_kd.copy())
+        self.last_command = None
+        self._cartesian_now = None
+        self._last_cartesian_pose = None
+        self._pose_hold = spec
+        self.node.send_output("controller_event", pack_controller_event(kind="mode", reason="soft"))
+
     def _set_gains(self, gains: dict) -> None:
         """Change the control law under an operator's hand.
 
@@ -372,6 +416,9 @@ class ArmController:
         kd = gains.get("kd")
         if kp is None and kd is None:
             return
+        if self._pose_hold is not None:
+            self._cancel("leaving Soft")
+            self.last_command = None
         if self._running:
             self._cancel("gains changed mid-leg")
         self.executor.set_gains(
@@ -381,6 +428,7 @@ class ArmController:
         # The anchor was built at the OLD stiffness; a softer law holding a
         # stiffer law's target is how an arm sags at a gate.
         self._hold_anchor = None
+        self.node.send_output("controller_event", pack_controller_event(kind="mode", reason="joint"))
         print(
             f"[arm_controller] gains set: kp={None if kp is None else np.round(kp, 2)} "
             f"kd={None if kd is None else np.round(kd, 2)}",
@@ -403,6 +451,10 @@ class ArmController:
         ``_anchored_hold`` falls through to a static hold at the MEASURED
         pose -- which is where the arm actually is when the button is pressed.
         """
+        if self._pose_hold is not None:
+            self._pose_hold = None
+            self.last_command = None
+            self.node.send_output("controller_event", pack_controller_event(kind="mode", reason="joint"))
         if self._running:
             self._finish_leg(ok=False, reason=reason)
         self._plan = None
@@ -537,6 +589,7 @@ class ArmController:
                 self.gripper["gains"],
                 self.gripper["mimic"],
                 cartesian=cartesian,
+                pose_hold=self._pose_hold,
             ),
         )
 
@@ -570,6 +623,7 @@ class ArmController:
         self._hold_anchor = None
         self._jog_q = None
         self.last_command = None
+        self._pose_hold = None
 
     def _fault(self, reason: str) -> None:
         if self._running:
@@ -593,6 +647,7 @@ class ArmController:
         handlers = {
             "motor_state": self.on_motor_state,
             "motor_health": self.on_motor_health,
+            "plant_capabilities": self.on_plant_capabilities,
             "plan": self.on_plan,
             "control": self.on_control,
             "gripper": self.on_gripper,

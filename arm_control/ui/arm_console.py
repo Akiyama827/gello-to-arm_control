@@ -39,8 +39,8 @@ from dora import Node
 
 from arm_control import CONTROL_ROOT, REPO_ROOT
 
-from arm_control.calibration_console import ConsoleAuthority
 from arm_control.config import arm_joints, ee_frame, gripper_joints, load_robot_config
+from arm_control.contracts.impedance import pose_hold_values
 from arm_control.grasp_visual import VisualFK
 from arm_control.joint_motor_map import gripper_motor_to_finger
 from arm_control.messages import (
@@ -70,8 +70,8 @@ _BUTTONS = ("Sync target to robot", "Plan + preview", "Execute", "Stop (hold)")
 #: lists, so a control law the operator can switch mid-session costs no page
 #: code at all. Named at runtime from the mode config's `gain_presets`.
 _GAIN_PREFIX = "Gains: "
-# The operator gate, when this node OWNS it (real motion graphs wire our `arm`
-# output straight into the bridge — one page, one producer). Rendered as a
+# The operator requests authority; arm_controller owns the arm output.
+# Rendered as a
 # separate styled row with the armed badge, never mixed into the generic
 # button strip: DISARM is the authority drop and must be findable instantly.
 _GATE_BUTTONS = ("ARM", "DISARM")
@@ -101,6 +101,8 @@ class ControlPanel:
         bind: str = "127.0.0.1",
         ident: str = "",
         extra_buttons: tuple[str, ...] = (),
+        jog_speed_m_s: float = 0.01,
+        jog_joint_speed_rad_s: float = 0.15,
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
         # arm config (gripper_range_m) or its joint_mimics entry — never a
@@ -121,6 +123,8 @@ class ControlPanel:
         self._jog: tuple[str, int] | None = None
         self._jog_at = 0.0
         self._jog_note = ""
+        self._jog_speed_m_s = float(jog_speed_m_s)
+        self._jog_joint_speed_rad_s = float(jog_joint_speed_rad_s)
         self._plan: dict = {"version": 0, "times": [], "frames": []}
         self._grip_lo, self._grip_hi = float(grip_range[0]), float(grip_range[1])
         self._grip = self._grip_hi               # start open
@@ -130,14 +134,14 @@ class ControlPanel:
         self._buttons = tuple(_BUTTONS) + tuple(extra_buttons)
         self._clicks = {name: 0 for name in self._buttons + _GATE_BUTTONS}
         self._seen = {name: 0 for name in self._buttons + _GATE_BUTTONS}
-        self._armed: bool | None = None  # None = no health wire (sim: no gate)
+        self._armed: bool | None = None  # Unknown until authority is reported.
         self._fault = ""  # server latched-fault text; badge shows FAULTED
+        self._supports_pose_hold = False
+        self._control_mode = "joint"
         self._measured_grip: float | None = None  # live finger m (Franka Hand)
         self._log: deque[str] = deque(maxlen=200)  # page shows [-8:]; a stuck
         # gizmo drag logged at loop rate once grew this without bound
         self._ident = ident
-        self._authority = ConsoleAuthority(("robot",), deadman_timeout_s=0.3)
-        self._authority.select("robot", now=time.monotonic())
 
         # Loopback by REFUSAL, not merely by default. This inherited
         # `require_loopback=False` from motion_teleop, whose page could only
@@ -191,8 +195,6 @@ class ControlPanel:
             self.set_gripper(payload.get("value"), dirty=True)
         elif route == "jog":
             self.set_jog(payload.get("axis"), payload.get("dir"), payload.get("held"))
-        elif route == "deadman":
-            self.set_deadman(bool(payload.get("held")))
         elif route == "click":
             self._click(str(payload.get("button", "")))
         else:
@@ -200,7 +202,6 @@ class ControlPanel:
         return {"ok": True}
 
     def _state(self) -> dict:
-        self.expire_deadman()
         with self._lock:
             values = list(self._values)
             measured = None if self._measured is None else list(self._measured)
@@ -223,6 +224,8 @@ class ControlPanel:
                 "buttons": list(self._buttons),
                 "armed": self._armed,
                 "fault": self._fault,
+                "supports_pose_hold": self._supports_pose_hold,
+                "control_mode": self._control_mode,
                 "log": list(self._log)[-8:],  # deque: copy THEN slice
                 "plan_version": self._plan["version"],
                 "ident": self._ident,
@@ -231,10 +234,9 @@ class ControlPanel:
                     "joints": len(self._names),
                     "held": None if self._jog is None else list(self._jog),
                     "note": self._jog_note,
+                    "speed_m_s": self._jog_speed_m_s,
+                    "joint_speed_rad_s": self._jog_joint_speed_rad_s,
                 },
-                "deadman": self._authority.may_move(
-                    "robot", now=time.monotonic()
-                ),
             }
         target_fk = self._vfk.poses(values, grip)   # vfk has its own lock
         payload["target_geoms"] = target_fk["geoms"]
@@ -246,24 +248,25 @@ class ControlPanel:
 
     def _click(self, button: str) -> None:
         with self._lock:
-            if button == "Execute" and not self._authority.may_move(
-                "robot", now=time.monotonic()
-            ):
-                self._log.append("REFUSED: hold the deadman before Execute")
+            if button in ("Plan + preview", "Execute") and self._control_mode == "soft":
+                self._log.append("REFUSED: select Track before planning or executing")
                 return
+            if button == "Execute" and (self._armed is not True or self._fault):
+                self._log.append("REFUSED: Execute requires confirmed ARM and no fault")
+                return
+            if button in ("Stop (hold)", "DISARM"):
+                self._jog = None
             if button in self._clicks:
                 self._clicks[button] += 1
-
-    def _authority_actions(self, actions: list[tuple[str, str]]) -> None:
-        for action, _actor in actions:
-            button = "Stop (hold)" if action == "hold" else "DISARM"
-            self._clicks[button] += 1
 
     def set_jog(self, axis, direction, held) -> None:
         """Hold or release one jog direction. Unknown axes are refused loudly."""
         with self._lock:
             if not held:
                 self._jog = None
+                return
+            if self._control_mode == "soft":
+                self._jog_note = "jog refused — select Track before jogging"
                 return
             axis = str(axis or "")
             if axis not in _JOG_AXES and not (
@@ -277,15 +280,8 @@ class ControlPanel:
     def jog_held(self) -> tuple[str, int] | None:
         """The held direction, while the page keeps saying it is still held.
 
-        Deliberately NOT gated on ``ConsoleAuthority``. That deadman drops
-        authority on release -- it synthesises a Stop AND a DISARM -- which is
-        right for the gizmo/Execute path but wrong here: an operator nudging a
-        part into place would have to re-ARM between every press, and an arm
-        that disarms twenty times a minute is one whose gate stops meaning
-        anything.
-
-        A held jog button IS a deadman with the same properties, so it gets its
-        own: the page re-asserts every 100 ms and this goes stale in
+        The held jog button IS the deadman: the page re-asserts every 100 ms
+        and this goes stale in
         JOG_STALE_S. Releasing stops the motion and leaves the arm armed and
         holding. The controller's own expiry is the second, independent stop --
         this one cannot save an arm from a console that has itself wedged.
@@ -304,17 +300,6 @@ class ControlPanel:
                 self._jog_note = note
                 if note:
                     self._log.append(note)
-
-    def set_deadman(self, held: bool) -> None:
-        with self._lock:
-            actions = self._authority.set_deadman(held, now=time.monotonic())
-            self._authority_actions(actions)
-
-    def expire_deadman(self) -> None:
-        with self._lock:
-            self._authority_actions(
-                self._authority.expire(now=time.monotonic())
-            )
 
     def set_sliders(self, values) -> None:
         with self._lock:
@@ -356,6 +341,16 @@ class ControlPanel:
         with self._lock:
             self._armed = armed
             self._fault = fault
+            if armed is False:
+                self._control_mode = "joint"
+
+    def set_control_mode(self, mode: str) -> None:
+        with self._lock:
+            self._control_mode = mode
+
+    def set_pose_hold_capability(self, supported: bool) -> None:
+        with self._lock:
+            self._supports_pose_hold = bool(supported)
 
     def set_measured_grip(self, finger_m: float) -> None:
         with self._lock:
@@ -391,10 +386,8 @@ class ControlPanel:
         except (TypeError, ValueError):
             return
         with self._lock:
-            if dirty and not self._authority.may_move(
-                "robot", now=time.monotonic()
-            ):
-                self._log.append("REFUSED: hold the deadman to move the Hand")
+            if dirty and (self._armed is not True or self._fault):
+                self._log.append("REFUSED: Hand motion requires confirmed ARM and no fault")
                 return
             self._grip = float(np.clip(value, self._grip_lo, self._grip_hi))
             self._grip_dirty = self._grip_dirty or dirty
@@ -512,8 +505,12 @@ def main() -> None:
     jog_joint_speed = float(jog_cfg.get("joint_speed_rad_s", 0.15))
 
     gain_presets: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    pose_hold_presets: dict[str, dict] = {}
     for preset_name, spec in (mode_cfg.get("gain_presets") or {}).items():
         spec = dict(spec or {})
+        if "pose_hold" in spec:
+            pose_hold_values(dict(spec["pose_hold"], id=1))
+            pose_hold_presets[str(preset_name)] = dict(spec["pose_hold"])
         gain_presets[str(preset_name)] = (
             plan_kp if spec.get("kp") is None
             else expand_named_values(spec["kp"], names=planned, default=0.0),
@@ -601,6 +598,8 @@ def main() -> None:
         bind=bind,
         ident=ident,
         extra_buttons=tuple(f"{_GAIN_PREFIX}{n}" for n in gain_presets),
+        jog_speed_m_s=jog_limits.speed_m_s,
+        jog_joint_speed_rad_s=jog_joint_speed,
     )
     # The legend, stated once, the same on the page and in Rerun. It used to
     # read "solid robot = target, green ghost = live arm, orange = plan",
@@ -616,10 +615,8 @@ def main() -> None:
     )
     node = Node()
     measured: np.ndarray | None = None
-    # None = this graph wires no motor_health (sim: no arm gate) -> allow.
-    # False = a health stream says DISARMED -> Execute is refused VISIBLY on
-    # the panel (the bridge would swallow the commands and the executor would
-    # abort 2 s later with only a terminal line — a silent no-op at the page).
+    # Hardware reports plant health; bare sim graphs report controller authority.
+    # Neither an absent topic nor an ARM click is confirmation.
     armed: bool | None = None
     fault = ""
     pending: JointTrajectory | None = None
@@ -644,6 +641,8 @@ def main() -> None:
     last_ghost = 0.0
     last_health_t = 0.0
     health_stale_shown = False
+    control_mode = "joint"
+    supports_pose_hold = False
     mgrip_f = 0.0     # live measured finger metres (gripper_state topic)
     shown_grip: float | None = None
     # Planning runs on a WORKER thread: the 2.5 s OMPL solve used to run
@@ -655,7 +654,6 @@ def main() -> None:
     while True:
         event = next_event_gil_friendly(node, idle_sleep=0.05)
         now = time.monotonic()
-        panel.expire_deadman()
         if event is not None:
             if event["type"] == "INPUT" and event["id"] == "motor_state":
                 pos = unpack_motor_state(event["value"], n)["position"]
@@ -691,11 +689,33 @@ def main() -> None:
                     # Width changes with the arm parked still animate the ghost.
                     last_ghost = now
                     ghost.update(np.append(measured, np.full(len(gj), mgrip_f)))
+            elif event["type"] == "INPUT" and event["id"] == "plant_capabilities":
+                supports_pose_hold = bool(unpack_json_message(event["value"]).get("supports_pose_hold", False))
+                panel.set_pose_hold_capability(supports_pose_hold)
+            elif event["type"] == "INPUT" and event["id"] == "controller_arm":
+                armed = bool(unpack_json_message(event["value"]).get("armed", False))
+                panel.set_armed(armed, fault)
+                if not armed:
+                    control_mode = "joint"
+                panel.log("Controller ARMED" if armed else "Controller DISARMED")
+            elif event["type"] == "INPUT" and event["id"] == "controller_event":
+                result = unpack_json_message(event["value"])
+                if result["kind"] == "fault":
+                    fault = str(result.get("reason") or "controller fault")
+                    panel.set_armed(armed, fault)
+                elif result["kind"] == "mode" and result["ok"]:
+                    control_mode = str(result["reason"])
+                    panel.set_control_mode(control_mode)
+                panel.log(f"Controller {result['kind']}: {result.get('reason') or ''}")
             elif event["type"] == "INPUT" and event["id"] == "motor_health":
                 health = unpack_json_message(event["value"])
+                supports_pose_hold = bool(health.get("supports_pose_hold", False))
+                panel.set_pose_hold_capability(supports_pose_hold)
                 last_health_t = now
                 was, was_fault = armed, fault
                 armed = bool(health.get("armed", False))
+                if not armed:
+                    control_mode = "joint"
                 # A fault-holding server keeps its ARMED flag on purpose — the
                 # latched fault is a SEPARATE dimension and the badge must
                 # show it, or Execute looks legitimate while the server is
@@ -877,7 +897,7 @@ def main() -> None:
                     f"REFUSED: server fault latched ({fault}) — press DISARM "
                     "then ARM to recover, then Execute"
                 )
-            elif armed is False:
+            elif armed is not True:
                 # Keep the plan: after arming, Execute again without replanning.
                 panel.log("REFUSED: DISARMED — press ARM above, then Execute")
             else:
@@ -955,6 +975,22 @@ def main() -> None:
 
         for preset_name, (preset_kp, preset_kd) in gain_presets.items():
             if not panel.clicked(f"{_GAIN_PREFIX}{preset_name}"):
+                continue
+            if preset_name in pose_hold_presets:
+                if armed is not True or fault or health_stale_shown or not supports_pose_hold:
+                    panel.log("REFUSED: Soft requires confirmed ARM and a Cartesian-capable plant")
+                    continue
+                if plan_thread is not None:
+                    panel.log("REFUSED: wait for planning to finish before selecting Soft")
+                    continue
+                ident = uuid.uuid4().int & 0xFFFFFFFF or 1
+                node.send_output("control", pack_control_update(
+                    pose_hold=dict(pose_hold_presets[preset_name], id=ident)))
+                panel.set_jog(None, None, False)
+                pending = None
+                pending_id = ""
+                panel.clear_plan()
+                panel.log("Soft requested — capture measured EE pose, compliant nullspace")
                 continue
             # The controller cancels any running leg before applying these --
             # a plan reviewed at one stiffness must not finish at another.
@@ -1084,6 +1120,13 @@ def _check_graphs() -> None:
     checked = 0
     for graph in sorted((root / "dataflows").glob("*.yml")):
         spec = yaml.safe_load(graph.read_text()) or {}
+        for console in spec.get("nodes", []):
+            if str(console.get("path", "")).endswith("arm_console.py"):
+                inputs = console.get("inputs") or {}
+                assert ("motor_health" in inputs) != ("controller_arm" in inputs), (
+                    f"{graph.name}/{console['id']}: console needs exactly one "
+                    "authority feedback source, never an optimistic ARM badge"
+                )
         for node in spec.get("nodes", []):
             if not str(node.get("path", "")).endswith("arm_controller.py"):
                 continue

@@ -24,68 +24,6 @@ let planIndex = 0;
 let planVersion = -1;
 let lastGizmoSend = 0;
 
-// -- deadman -----------------------------------------------------------------
-// Held authority for REVIEWED motion. Releasing it drops authority: Stop AND
-// DISARM -- which is why jog does NOT use it (see below).
-//
-// Lives here, not in core.js: the grasp editor has a deadman BUTTON but it
-// is disabled and posts nothing, so a shared implementation put /deadman
-// calls in a page whose panel answers 404.
-let deadmanHeld = false;
-let deadmanTimer = null;
-let deadmanButton = null;
-let authorityText = null;
-
-const sendDeadman = () => post("/deadman", { held: deadmanHeld }).catch(() => {
-  deadmanHeld = false;
-  if (deadmanButton) deadmanButton.classList.remove("held");
-});
-
-function holdDeadman(event) {
-  if (event) event.preventDefault();
-  if (deadmanHeld || !deadmanButton || deadmanButton.disabled) return;
-  deadmanHeld = true;
-  deadmanButton.classList.add("held");
-  if (authorityText) authorityText.textContent = "Deadman held — selected actor may move";
-  sendDeadman();
-  deadmanTimer = setInterval(sendDeadman, 100);
-}
-
-function releaseDeadman() {
-  if (!deadmanHeld) return;
-  deadmanHeld = false;
-  clearInterval(deadmanTimer);
-  deadmanTimer = null;
-  if (deadmanButton) deadmanButton.classList.remove("held");
-  if (authorityText) authorityText.textContent = "Deadman released — hold and disarm requested";
-  sendDeadman();
-}
-
-const initDeadman = () => {
-  deadmanButton = $("deadman");
-  authorityText = $("authority-text");
-  if (!deadmanButton) return null;
-  deadmanButton.addEventListener("pointerdown", holdDeadman);
-  addEventListener("pointerup", releaseDeadman);
-  addEventListener("pointercancel", releaseDeadman);
-  addEventListener("blur", releaseDeadman);
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) releaseDeadman();
-  });
-  addEventListener("keydown", (event) => {
-    if (event.code === "Space" && !event.repeat && event.target === document.body) {
-      holdDeadman(event);
-    }
-  });
-  addEventListener("keyup", (event) => {
-    if (event.code === "Space") releaseDeadman();
-  });
-  return deadmanButton;
-};
-
-
-const deadmanButton = initDeadman();
-
 // -- gizmo: drag the target, one axis at a time ------------------------------
 gizmo.addEventListener("objectChange", () => {
   const axis = gizmo.axis;
@@ -96,13 +34,13 @@ gizmo.addEventListener("objectChange", () => {
     if (now - lastGizmoSend < 50) return;
     lastGizmoSend = now;
     post("/cart", { axis: index, value: gizmoTarget.position.getComponent(index) })
-      .catch(releaseDeadman);
+      .catch(console.error);
     return;
   }
   const delta = takeRotationDelta(index);
   if (delta === null || now - lastGizmoSend < 50) return;
   lastGizmoSend = now;
-  post("/cart", { axis: index + 3, delta }).catch(releaseDeadman);
+  post("/cart", { axis: index + 3, delta }).catch(console.error);
 });
 
 // -- jog ---------------------------------------------------------------------
@@ -138,8 +76,6 @@ const buildJogPad = (jog) => {
   pad.replaceChildren();
   const holdJog = (axis, dir) => (event) => {
     if (event) event.preventDefault();
-    // NOT holdDeadman(): that deadman drops authority on release (Stop AND
-    // DISARM), which would disarm the arm between every nudge.
     jogAxis = { axis, dir };
     sendJog();
     if (jogTimer) clearInterval(jogTimer);
@@ -170,6 +106,10 @@ const buildJogPad = (jog) => {
     addRow(joints, `J${j + 1}`, [["−", `j${j}`, -1], ["+", `j${j}`, 1]]);
   }
   $("jog-joints-wrap").hidden = jog.joints === 0;
+  $("jog-speed").textContent =
+    `Hold − / + for negative / positive direction · ${Number(jog.speed_m_s * 1000).toFixed(1)} mm/s · robot base XYZ`;
+  $("jog-joint-speed").textContent =
+    `Joint target speed: ${Number(jog.joint_speed_rad_s).toFixed(3)} rad/s (${Number(jog.joint_speed_rad_s * 180 / Math.PI).toFixed(1)}°/s)`;
 };
 
 // -- first paint -------------------------------------------------------------
@@ -190,7 +130,7 @@ const build = async (state) => {
   if (state.gripper.max > state.gripper.min) {
     gripperSlider = addSlider($("grip"), state.gripper, 3, (value) => {
       $("grip-readout").value = `${value.toFixed(3)} m`;
-      post("/gripper", { value }).catch(releaseDeadman);
+      post("/gripper", { value }).catch(console.error);
     });
   } else {
     $("grip").textContent = "No Hand configured";
@@ -205,7 +145,10 @@ const build = async (state) => {
   for (const name of state.buttons) {
     const button = document.createElement("button");
     button.textContent = name.startsWith("Gains: ") ? name.slice(7) : name;
-    button.onclick = () => post("/click", { button: name }).catch(releaseDeadman);
+    button.onclick = () => {
+      if (name === "Stop (hold)") releaseJog();
+      post("/click", { button: name }).catch(console.error);
+    };
     // Gain presets are a different KIND of action from plan/execute: they
     // change the control law under whatever is running. Own row, own heading.
     (name.startsWith("Gains: ") ? gains : strip).appendChild(button);
@@ -218,10 +161,6 @@ const build = async (state) => {
 
 const updateGate = (state) => {
   const gate = $("gate");
-  if (state.armed === null || state.armed === undefined) {
-    gate.hidden = true;
-    return;
-  }
   gate.hidden = false;
   const badge = $("gatebadge");
   badge.className = "status";
@@ -229,6 +168,9 @@ const updateGate = (state) => {
     badge.textContent = "Faulted";
     badge.classList.add("fault");
     badge.title = state.fault;
+  } else if (state.armed === null || state.armed === undefined) {
+    badge.textContent = "Unknown";
+    badge.classList.add("neutral");
   } else if (state.armed) {
     badge.textContent = "Armed";
     badge.classList.add("live");
@@ -273,10 +215,13 @@ const poll = async () => {
       ? `${state.sliders.length} joints / ${state.measured_geoms ? "valid" : "waiting"}`
       : "No joints";
     $("log").textContent = state.log.join("\n");
+    $("control-mode").textContent = state.control_mode === "soft"
+      ? "Soft: EE position + orientation hold; compliant nullspace. Select Track before jogging or planning."
+      : "Joint control · Soft requires a Cartesian-capable plant";
     updateGate(state);
   } catch (error) {
     setConnected(false);
-    releaseDeadman();
+    releaseJog();
     console.error(error);
   }
 };
@@ -284,9 +229,12 @@ setInterval(poll, 150);
 poll();
 
 $("arm-btn").onclick = () => post("/click", { button: "ARM" });
-$("disarm-btn").onclick = () => post("/click", { button: "DISARM" });
+$("disarm-btn").onclick = () => {
+  releaseJog();
+  post("/click", { button: "DISARM" }).catch(console.error);
+};
 $("hold-disarm").onclick = async () => {
-  releaseDeadman();
+  releaseJog();
   await post("/click", { button: "Stop (hold)" }).catch(() => {});
   await post("/click", { button: "DISARM" }).catch(() => {});
 };

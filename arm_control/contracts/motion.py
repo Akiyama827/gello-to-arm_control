@@ -150,7 +150,7 @@ def unpack_plan(payload: pa.Array) -> dict:
 
 def pack_control_update(**fields) -> pa.Array:
     """Control-plane updates that are not a leg: arm, payload, execute, cancel,
-    gains, hold, stop.
+    gains, pose_hold, hold, stop.
 
     NOT ``rt_protocol.pack_control``, which is the RT server's binary link
     frame (ctl_type / seq / t_mono_ns) and has nothing to do with this. Same
@@ -165,7 +165,7 @@ def pack_control_update(**fields) -> pa.Array:
     # `cancel`, `hold` and `stop` are three DIFFERENT things and the names are
     # worth keeping apart: cancel aborts a leg and stays armed (an operator's
     # Stop button), hold freezes at a milestone forever, stop is terminal.
-    known = {"arm", "payload", "execute", "cancel", "gains", "hold", "stop", "reason"}
+    known = {"arm", "payload", "execute", "cancel", "gains", "hold", "stop", "reason", "pose_hold"}
     unknown = set(fields) - known
     if unknown:
         raise ValueError(f"pack_control_update: unknown field(s) {sorted(unknown)}")
@@ -187,11 +187,12 @@ def pack_controller_event(
                    measured pose, which is where the sequence must start from.
     ``leg_result`` ``plan_id`` finished (``ok``) or gave up (``reason``).
     ``fault``      the controller stopped driving; nothing else will move.
+    ``mode``       accepted ``soft``/``joint`` in reason, or ok=False refusal.
 
     Every result carries its ``plan_id`` so a late reply from a superseded plan
     is dropped rather than credited to the current one.
     """
-    if kind not in {"ready", "leg_result", "fault"}:
+    if kind not in {"ready", "leg_result", "fault", "mode"}:
         raise ValueError(f"pack_controller_event: unknown kind {kind!r}")
     return pack_json_message(
         "controller_event",

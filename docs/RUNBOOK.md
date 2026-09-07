@@ -66,15 +66,76 @@ PYTHONPATH=. python -B examples/run_console.py --dual
 
 Use one launch command at a time. The console defaults to loopback port 7500;
 the dual example adds 7510. For a reviewed move, sync the target, plan, inspect
-the preview, then use the existing ARM/deadman/Execute controls. Jog has its
-own expiring command stream and limits; it is not permission to bypass gating.
+the preview, press ARM, wait for the armed indication, then click Execute once.
+The arm console uses this policy for both sim and hardware: there is no separate
+hold-to-enable button or Spacebar deadman. A reviewed trajectory runs until it
+finishes, faults, or is stopped; closing the browser does not cancel it.
+
+Jog is press-and-hold on the negative/positive direction button. Release,
+window focus loss, or expired jog updates stop jogging and hold without
+disarming. The console displays configured Cartesian target speed in mm/s
+(robot-base XYZ) and joint target speed in rad/s and degrees/s, not measured
+velocity. These speeds are set in the mode profile's `jog` section.
+Hand commands also require confirmed ARM and no fault.
+
+Stop (hold) cancels motion but leaves authority enabled; DISARM cancels the
+plan and drops authority. Plant command watchdogs, fault handling, and any
+hardware enabling devices remain independent of this browser interaction.
+The browser is not an emergency-stop device.
 Keep HTTP loopback-bound. Stop/hold and disarm have distinct semantics; follow
 the selected plant's safety policy rather than assuming process exit is safe.
+
+Console policy checks (no hardware):
+
+```bash
+PYTHONPATH=. python tools/bench/check_console_authority.py
+PYTHONPATH=. python nodes/arm_console.py --self-check
+PYTHONPATH=. python -m arm_control.control.arm_controller
+node --input-type=module --check < arm_control/ui/static/console.js
+```
 
 `--config /absolute/path/to/entry.yaml` selects a different example entry.
 Concrete deployments should use their own launcher and asset-root composition.
 The older manuals are retained in [history](history/README.md) for engineering
 context, not as instructions to run retired commands.
+
+### Franka control modes
+
+`float` retains gravity compensation and joint damping. `track` uses the
+configured joint gains for planned moves. `soft` captures the measured EE
+position AND orientation at the plant and holds them with Cartesian impedance,
+plus a weak joint-posture spring and independent damping projected into the
+Jacobian nullspace. It is compliant, not an exact geometric constraint: external
+loads can deflect the EE. Gains ramp in over 0.5 seconds.
+
+ARM, stop/settle, then select Soft. Select Track before planning or jogging.
+Stop (hold) exits Soft into a measured joint hold; DISARM removes authority.
+Neither exit pulls toward the joint posture from before Soft. Lost command
+updates fall back to joint hold using configured Track gains, even if Float
+preceded Soft. Hardware watchdog/fault behavior remains independent of the UI.
+
+Soft requires the updated compiled binding in the same environment as Dora:
+
+```bash
+python -m pip install --no-deps -e rt/bindings
+PYTHONPATH=. python rt/bindings/pose_hold_check.py
+PYTHONPATH=. python tools/bench/check_pose_hold_contract.py
+PYTHONPATH=. python tools/bench/check_pose_hold_controller.py
+PYTHONPATH=. python tools/bench/check_pose_hold_sim.py
+```
+
+The single-model simulator advertises support only with an explicit EE body and
+the updated binding. Composed workcells do not advertise Soft. Remote Franka
+requires an updated server advertising `pose_hold=2`; older servers and DM
+backends refuse this command before transmission. The DM example's existing
+joint-gain preset is not Cartesian impedance. No new dependency on project
+assembly or perception is introduced.
+
+The real controller uses libfranka's configured EE pose/Jacobian and Coriolis;
+Franka supplies gravity compensation. Verify the configured physical EE frame
+and payload before bring-up. Example gains and sim checks are not hardware
+certification. Deploying the server and validating control-loop timing, joint
+limits, collision response and compliance on hardware are separate work.
 
 ## Reusable RT build and protocol
 
