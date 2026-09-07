@@ -1,10 +1,9 @@
-"""One arm's planning + execution stack, wired from its config.
+"""One arm's planning stack, wired from its config.
 
-Pure interface: IK, collision world, OMPL, retiming planner, dynamics,
-executor, Rerun preview. Nothing here knows about phases, grasps, or
+Pure interface: IK, collision world, OMPL, retiming planner, Rerun preview.
+Nothing here knows about phases, grasps, or
 scenarios — the pick-and-dock coordinator wraps this in its own policy layer
-(``assembly.build``), and the teleop/executor nodes use it directly. One
-recipe instead of three hand-rolled copies.
+(``assembly.build``). Servo construction lives in ``control.factory``.
 
 Every identity comes from the config's ``arm:`` block (``arm.joints``,
 ``arm.ee_frame``, ``arm.urdf``, ``arm.kp``…): a new robot is a new YAML,
@@ -21,11 +20,9 @@ from arm_control import frames
 from arm_control.config import CONTROL_ROOT, arm_joints, ee_frame, gripper_joints
 from arm_control.control.factory import (
     arm_urdf,
-    build_executor,
     gain_vector,
     gripper_command_cfg,
 )
-from arm_control.control.trajectory_executor import JointTrajectoryExecutor
 from arm_control.planning.high_level import ArmPlanner, build_collision_stack
 # Scene-derived obstacles. NOTE: preview_rerun imports `rerun` AT MODULE
 # LEVEL, so importing this module requires the optional [viz] extra. That
@@ -35,10 +32,10 @@ from arm_control.planning.preview_rerun import scene_obstacle_geoms
 from arm_control.planning.ik import PinocchioIK
 
 __all__ = [
-    "build_executor",
-    "PlanningStack",
+    "PlannerStack",
     "arm_urdf",
-    "build_planning_stack",
+    "build_planner",
+    "build_preview",
     "gain_vector",
     "gripper_command_cfg",
     "arm_joints",
@@ -47,7 +44,7 @@ __all__ = [
 ]
 
 
-def _build_preview(cfg, world, ik, urdf: str, joints: list[str], grip: list[str]):
+def build_preview(cfg, world, ik, urdf: str, joints: list[str], grip: list[str]):
     """(PreviewScene, MeasuredGhost) for Rerun, or (None, None) when unconfigured."""
     preview_cfg = dict(cfg.get("planner") or {}).get("preview")
     if not preview_cfg or world is None:
@@ -87,13 +84,12 @@ def _build_preview(cfg, world, ik, urdf: str, joints: list[str], grip: list[str]
 
 
 @dataclass
-class PlanningStack:
+class PlannerStack:
     """One arm's wired interface stack — no task policy attached."""
 
     arm_id: str
     ik: PinocchioIK
     planner: ArmPlanner
-    executor: JointTrajectoryExecutor
     joints: list[str]
     gripper_joints: list[str]
     urdf: str
@@ -106,10 +102,10 @@ class PlanningStack:
         return len(self.joints)
 
 
-def build_planning_stack(
+def build_planner(
     cfg, *, arm_id: str = "arm", collision_world=None
-) -> PlanningStack:
-    """IK + collision world + OMPL + planner + executor (+ preview) from config."""
+) -> PlannerStack:
+    """IK + collision world + OMPL + planner (+ preview) from config."""
     urdf = arm_urdf(cfg)
     joints = arm_joints(cfg)
     grip_joints = gripper_joints(cfg)
@@ -144,7 +140,7 @@ def build_planning_stack(
             + scene_obstacle_geoms(cfg),
         )
 
-    preview, ghost = _build_preview(cfg, world, ik, urdf, joints, grip_joints)
+    preview, ghost = build_preview(cfg, world, ik, urdf, joints, grip_joints)
 
     planner = ArmPlanner(
         arm_id=arm_id,
@@ -154,13 +150,11 @@ def build_planning_stack(
         max_acc=gain_vector(cfg, "max_acc", n),
         world=world,
     )
-    executor = build_executor(cfg, arm_id=arm_id)
 
-    return PlanningStack(
+    return PlannerStack(
         arm_id=arm_id,
         ik=ik,
         planner=planner,
-        executor=executor,
         joints=joints,
         gripper_joints=grip_joints,
         urdf=urdf,
