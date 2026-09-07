@@ -17,6 +17,7 @@ of its identity fails loudly by key name.
 | `arm_control/planning/` | Pinocchio IK, OMPL, retiming, MuJoCo collision oracle, Rerun preview, `jog.py` (the jog safety envelope), `stack.py` (one-arm stack builder) |
 | `arm_control/simulation/` | MuJoCo backend, composed-scene builder, Rerun mirror, convex decomposition |
 | `nodes/` | Thin Dora node adapters, one per process (launched by path from a dataflow). `arm_console.py` is the operator page; `arm_controller.py` is the only producer of `motor_command` |
+| `nodes/console/` | Three pages over one server: `console.html` drives an arm, `editor.html` edits a grasp profile, `operator.html` is the ARM/DISARM gate. `core.js` is shared; the page modules are not |
 | `dataflows/` | Dora graph YAMLs for motion / view / float / listen |
 | `configs/` | `modes/` (controller modes) + `real/<arm>/{hardware,calibration}.yaml` (per-robot fragments) |
 | `scripts/` | `run_console.py` (the demo launcher), `bench_ramp.py` (DM gain ladder), `setup_fr3_assets.py`, DM bench probes |
@@ -94,7 +95,8 @@ python -m arm_control.execution.arm_controller     # cancel vs hold vs stop, jog
 python -m arm_control.console_server               # loopback / CSRF / body cap
 python scripts/setup_fr3_assets.py --self-check    # asset staging asserts
 
-python nodes/arm_console.py --self-check           # page routes + graphs can stream
+python -m arm_control.console_assets               # page ids + the JS module graph
+python nodes/arm_console.py --self-check           # page routes vs their own panel
 python nodes/visualizer.py --self-check            # no entity path bypasses ARM_ID
 python scripts/run_console.py --check              # assets, config, graph
 ```
