@@ -94,9 +94,21 @@ jog j2 refused — stroke limit: 20.1 cm from the jog origin on z, limit 20 cm
 
 σ_min is computed with Pinocchio, not read from a vendor API. libfranka exposes
 a Jacobian, but this package drives more than one arm, and on the FR3 the motion
-path lives on the RT machine while this host is read-only. The threshold is
-arm-specific: the assembler measures ~0.049 fully extended and ~0.18 with the
-joints bent, so the 0.02 default stops well short of a real collapse.
+path lives on the RT machine while this host is read-only.
+
+**The threshold is arm-specific and must not be inherited.** Measure it, per
+arm, the same way — sample σ_min of the translational Jacobian over the joint
+limits and take a low percentile:
+
+| Arm | Extended | Bent | Median | p1 | Threshold |
+|---|---|---|---|---|---|
+| DM assembler | ~0.049 | ~0.18 | — | — | 0.02 (code default) |
+| FR3 | 0.128 | 0.35 | 0.217 | 0.030 | 0.03 (`motion_franka.yaml`) |
+
+The same 0.02 means very different things on those two arms — a third of the
+assembler's extended reading, a sixth of the FR3's. The FR3 number is the 1st
+percentile of 6000 sampled poses: it refuses the worst ~1% of the workspace
+and leaves the useful envelope open.
 
 ### Two independent deadmen
 
@@ -114,12 +126,25 @@ gizmo and Execute use). That one drops authority on release — Stop **and**
 DISARM — which is right for a reviewed move and wrong for jogging: an operator
 nudging a part into place would re-ARM between every press.
 
-### Jog is loopback
+### Jog is loopback, by refusal
 
-`console.http_bind` defaults to `127.0.0.1` and should stay there on any graph
-with jog enabled. Every endpoint on this page can move a torque-controlled arm,
-unauthenticated; a LAN bind is a robot anyone on the LAN can drive. Reach it
-from another desk over an SSH tunnel.
+`console.http_bind` must be a loopback address: a non-loopback value raises at
+startup rather than binding. Every endpoint on this page can move a
+torque-controlled arm, unauthenticated, and jog does it without review — a LAN
+bind is a robot anyone on the subnet can drive. The kernel does the real
+enforcing (a socket bound to `127.0.0.1` never sees a packet off the wire);
+the check just refuses to bind anywhere else.
+
+This tightened on 2026-09-07. The panel inherited `require_loopback=False`
+from `motion_teleop`, whose page could only *plan* — a move an operator
+approves before it runs. Adding jog changed what a LAN bind costs.
+
+Reach it from another desk over an SSH tunnel, which puts the authentication
+in sshd where it belongs:
+
+```bash
+ssh -L 7500:127.0.0.1:7500 <arm-host>    # then open http://127.0.0.1:7500
+```
 
 ## What a consuming project must supply
 

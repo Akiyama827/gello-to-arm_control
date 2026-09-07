@@ -214,8 +214,9 @@ def _self_check() -> None:
             assert "test panel" in str(exc), exc
         else:
             raise AssertionError(f"bound to {bad!r}")
-    # ...and one that opts out does not. (The teleop panel's LAN bind is an
-    # explicit config decision; the operator gate's refusal is not negotiable.)
+    # ...and one that opts out does not. Nothing shipped here opts out any
+    # more -- the control panel gained jog and took the refusal (2026-09-07) --
+    # but the flag stays for a consumer whose page cannot command motion.
     open_server = ConsoleServer(
         name="open", bind="0.0.0.0", port=0, require_loopback=False
     )

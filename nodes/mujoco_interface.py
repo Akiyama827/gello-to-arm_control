@@ -154,6 +154,28 @@ def main() -> None:
             # From the arm's OWN config (`arm.gripper_joints`) — a new robot is a
             # new YAML, never an edit here.
             gripper_joints=tuple(gripper_joints(cfg)),
+            # Spawn pose. The block below argues the plant must DECLARE its
+            # starting state and then only did so for the jaws: the arm itself
+            # was left at MuJoCo's implicit zero, which for the FR3 is not even
+            # inside the joint limits (joint4's range is [-3.077, -0.117], so
+            # zero is 0.117 rad outside it). Measured: the demo spawned there,
+            # sagged onto the joint4/joint6 stops within seconds, and the first
+            # Cartesian jog was refused with "no IK solution" — from a pose no
+            # operator chose. Same key and same values the scenario configs
+            # already use.
+            default_joint_positions={
+                str(k): float(v)
+                for k, v in (cfg.get("sim_default_joint_positions") or {}).items()
+            },
+            # A twin that lets the arm fall is the one telling the lie: the
+            # FR3's control box runs its own gravity compensation whether or
+            # not a host is streaming, so a DISARMED arm holds its pose on the
+            # bench. Scene mode has always modelled that (gravcomp_prefixes);
+            # single-model mode did not, which is why an unarmed demo slumped.
+            # The empty prefix matches every body — in this mode the model IS
+            # the arm. Opt-in, because a single model that is NOT a
+            # self-supporting robot should still fall.
+            gravcomp_prefixes=("",) if cfg.get("sim_gravcomp", False) else (),
         )
         print(f"[mujoco_interface] single model: {backend.model_path}", flush=True)
     backend.load()

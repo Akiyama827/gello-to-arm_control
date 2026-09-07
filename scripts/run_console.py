@@ -116,9 +116,48 @@ def _self_check() -> None:
         "the two demo arms must not share a console port -- that collision is "
         "the exact thing per-instance config exists to prevent"
     )
+    _check_entry_keys()
     ready, hint = assets_ready()
     assert ready or "franka_description" in hint, hint
     print(f"run_console: ok (assets {'staged' if ready else 'not staged'})")
+
+
+def _check_entry_keys() -> None:
+    """Every key the entry configs state must be read by somebody.
+
+    A config key nothing consumes is worse than a missing one: it reads as a
+    setting, documents itself in a comment, and does nothing. Caught in the
+    wild -- `sim_damping_ratio: 0.025` sat in sim_demo.yaml with a paragraph
+    explaining why the sim plant needs damping, and no code ever looked it up,
+    so the demo shipped kp 1200 against kd 0 (the config's own measurements
+    call that "unusable"). A missing key would have failed loudly; this one
+    just quietly meant nothing.
+
+    Top-level keys only, and only those the entry file states ITSELF --
+    inherited keys are the included fragment's business.
+    """
+    import re
+
+    sources = "\n".join(
+        path.read_text()
+        for directory in ("arm_control", "nodes", "scripts")
+        for path in sorted((REPO_ROOT / directory).rglob("*.py"))
+    )
+    for entry in sorted((REPO_ROOT / "configs" / "entry").glob("*.yaml")):
+        # The file's own top-level keys, read as text: parsing the tree back
+        # would hand us the merged result and lose exactly this distinction.
+        own = [
+            m.group(1)
+            for m in re.finditer(r"^([a-z_][a-z0-9_]*):", entry.read_text(), re.M)
+        ]
+        for key in own:
+            if key in ("include", "arm"):
+                continue  # structural: the loader's own, and the shared table
+            assert f'"{key}"' in sources or f"'{key}'" in sources, (
+                f"{entry.name} sets {key!r}, which no code in arm_control/, "
+                f"nodes/ or scripts/ ever reads -- a key that does nothing "
+                f"still reads like a setting"
+            )
 
 
 if __name__ == "__main__":

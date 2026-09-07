@@ -141,11 +141,21 @@ class ControlPanel:
         self._authority = ConsoleAuthority(("robot",), deadman_timeout_s=0.3)
         self._authority.select("robot", now=time.monotonic())
 
-        # Loopback by DEFAULT but not by refusal: unlike the operator gate,
-        # LAN exposure here is an explicit config decision (teleop.http_bind).
+        # Loopback by REFUSAL, not merely by default. This inherited
+        # `require_loopback=False` from motion_teleop, whose page could only
+        # plan -- a reviewed move an operator approves before it runs. This
+        # page can JOG: unreviewed motion, unauthenticated, at the press of a
+        # button. `http_bind` alone is one config typo away from a robot the
+        # whole subnet can drive, so the bind address is now VALIDATED: a
+        # non-loopback `http_bind` raises at startup instead of quietly
+        # working. (The kernel does the actual enforcing -- a socket bound to
+        # 127.0.0.1 never sees a packet off the wire; this just refuses to
+        # bind anywhere else.)
+        # Remote access is an explicit SSH tunnel:
+        #     ssh -L 7500:127.0.0.1:7500 <host>
         self._server = ConsoleServer(
             name="control panel", bind=str(bind), port=int(port),
-            get=self._get, post=self._post, require_loopback=False,
+            get=self._get, post=self._post, require_loopback=True,
         )
         self.port = self._server.port
 

@@ -63,3 +63,31 @@ planner:
 
 # See motion.yaml: the panel address moved to the robot config's
 # `console.http_port`, which is what actually keeps two arms apart.
+
+# --- Jog envelope -----------------------------------------------------------
+# Everything not stated here takes the conservative code default in
+# `arm_control/planning/jog.py` (1 cm/s, 20 cm stroke, floor at z=0).
+jog:
+  # sigma_min is ARM-SPECIFIC and must not be inherited. Measured on this
+  # URDF (6000 poses sampled uniformly over the joint limits, translational
+  # rows only): median 0.217, p1 0.030, p0.1 0.008, worst 0.003. Named poses:
+  # 0.29 at the demo spawn, 0.35 elbow-bent, 0.13 fully extended. 0.03 is the
+  # 1st percentile -- it refuses the worst ~1% of the workspace and leaves the
+  # whole useful envelope open. (The DM assembler's 0.02 is NOT this number:
+  # that arm reads ~0.049 extended, so the same threshold means something far
+  # tighter there. Re-measure per arm; do not copy.)
+  sigma_min: 0.03
+
+# --- Gain presets -----------------------------------------------------------
+# Buttons on the console, named at runtime. Applying one CANCELS a running leg
+# (a plan reviewed at one stiffness must not finish at another).
+# Sim-only: the real FR3 runs motion_franka_rt.yaml, where our servo law on the
+# RT box consumes these -- it deliberately has no presets.
+gain_presets:
+  float:
+    kp: 0.0            # gravity + payload feedforward only, which IS float
+    kd: 5.0            # not 0: MuJoCo's PD is the only damping in this plant
+  soft:
+    kp: 120.0          # a tenth of the tracking table
+    kd: 12.0
+  track: {}            # empty = the controller.kp/kd above

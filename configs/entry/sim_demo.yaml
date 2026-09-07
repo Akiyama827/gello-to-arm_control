@@ -24,10 +24,15 @@ include:
   - ../real/franka/hardware.yaml
   - ../real/franka/calibration.yaml
 
-# --- Plant override: MuJoCo, no libfranka, no FCI, no RT box ----------------
-real_backend: mujoco
-listen_mode: true
-sim_backend: mujoco
+# --- Plant: MuJoCo, no libfranka, no FCI, no RT box -------------------------
+# WHICH plant runs is the GRAPH's choice, not a key here: sim_franka_motion.yml
+# names nodes/mujoco_interface.py, and that is the whole switch. (Three keys
+# used to sit here pretending otherwise -- `real_backend: mujoco`,
+# `sim_backend: mujoco`, `listen_mode: true`. Nothing in this graph read any
+# of them, and `real_backend` is worse than inert: on a HARDWARE graph it
+# names the SocketCAN interface to open, so "mujoco" was an instruction to
+# open a CAN device by that name. `scripts/run_console.py --self-check` now
+# refuses an entry key no code reads.)
 sim_model_path: franka/urdf/fr3.urdf
 sim_update_rate_hz: 100
 sim_timestep: 0.001
@@ -35,11 +40,44 @@ sim_launch_viewer: false
 sim_self_collision: true
 update_rate_hz: 100
 
-# The MuJoCo plant closes an explicit PD law every 1 ms, where kd=0 means NO
+# --- Damping: the sim plant needs what the real arm never reads -------------
+# The MuJoCo plant closes an explicit PD law every 1 ms, where kd = 0 means NO
 # damping and the arm never settles. The real FR3's calibration carries kd
 # zeros because no host process closes a loop over it (torque control lives on
-# the RT machine), so the sim plant has to supply its own.
-sim_damping_ratio: 0.025      # kd = kp/40
+# the RT machine), so the sim plant has to supply its own -- and calibration.yaml
+# says so in as many words: "kd 0 rings forever in sim ... that override and
+# this line are a pair."
+#
+# MEASURED on this model (hold at the home pose with gravity feedforward,
+# settled max |qd| over the last 40% of a 4 s run):
+#
+#   kd            settled max|qd|   pos err
+#   0                83.8 rad/s     0.734 rad   <- unusable
+#   kp/20             0.87           0.0136
+#   kp/30..kp/60      0.0000         0.00098    <- flat, settled plateau
+#   kp/16             0.93           0.0230     <- MORE damping is WORSE here
+#
+# kp/40 sits mid-plateau. Past ~kp/20 extra damping degrades settling, so do
+# not "add more kd" if the sim looks lively -- re-run the sweep.
+#
+# Deep merge: only `kd` is overridden; the rest of `arm:` inherits.
+arm:
+  kd: [30, 30, 30, 30, 20, 15, 10]
+
+# --- Spawn state ------------------------------------------------------------
+# The Franka ready pose, the same one the scenario configs spawn at. Without
+# it the plant starts at MuJoCo's implicit zero, which is OUTSIDE joint4's
+# limit, and the arm settles onto its stops before anyone presses ARM.
+sim_default_joint_positions:
+  fr3_joint2: -0.785
+  fr3_joint4: -2.356
+  fr3_joint6: 1.571
+  fr3_joint7: 0.785
+
+# The FR3's control box holds the arm up whether or not a host is streaming.
+# Without this the demo comes up DISARMED (by design — nothing moves without
+# an operator) and quietly sags out of the pose above while you read the page.
+sim_gravcomp: true
 
 rerun_app_id: arm_control_sim_demo
 motor_log_path: /tmp/arm_control_sim_demo.csv
