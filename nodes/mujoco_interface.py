@@ -98,7 +98,7 @@ def main() -> None:
     # inside the `if scene_path:` branch below, so the composed-scene path
     # could inject nothing -- and once a chain_factory became mandatory for a
     # scene with objects (2026-09-03) that path raised at startup on every
-    # run. `view.py sim pick` and `sim bench` were dead from that day.
+    # run. Every composed-scene scenario was dead from that day.
     injections = scene_injections()
 
     scene_path = os.environ.get("WORKCELL_SCENE")

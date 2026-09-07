@@ -165,7 +165,7 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | N
         # Caught the hard way: wiring arm_controller to this function (Part 2)
         # made it raise "expected 0 values, got 7" on every assembly scenario
         # -- `expand_named_values` against an empty name list -- and killed the
-        # node at startup on `view.py sim pick` and `sim bench`.
+        # node at startup on every assembly scenario (`view.py sim bench`).
         return None
 
     controller_cfg = dict(mode_cfg.get("controller") or {})
