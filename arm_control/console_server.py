@@ -19,6 +19,7 @@ callers pass two functions and get a running server.
 
     server = ConsoleServer(
         name="operator panel", bind="127.0.0.1", port=7503,
+        index="operator.html",
         get=lambda route: panel.state() if route == "state" else None,
         post=lambda route, body: panel.act(body) if route == "action" else None,
     )
@@ -86,7 +87,7 @@ class ConsoleServer:
         port: int,
         get: Callable[[str], object] | None = None,
         post: Callable[[str, dict], object] | None = None,
-        index: str = "index.html",
+        index: str,
         require_loopback: bool = True,
         max_body: int = DEFAULT_MAX_BODY,
     ) -> None:
@@ -99,10 +100,12 @@ class ConsoleServer:
                 raise ValueError(f"{name} bind must be a loopback address")
         self._get = get
         self._post = post
-        # Which page ``/`` means. NOT a constant: two consoles share this
-        # allowlist and this server, and CONSOLE_ASSETS[""] is the grasp
-        # editor's index -- the operator panel serving that on / would hand an
-        # operator the wrong page under the right URL.
+        # Which page ``/`` means. REQUIRED, with no default: three consoles
+        # share this allowlist and this server, and a default is exactly how
+        # the arm console ended up serving the grasp editor's page -- the
+        # right URL, the wrong application, for months. A console that does not
+        # name its page gets a TypeError at construction, not a wrong page at
+        # runtime.
         self._index = index
         server = self
 
@@ -209,7 +212,8 @@ def _self_check() -> None:
     # 1. A console that requires loopback refuses anything else, by name.
     for bad in ("0.0.0.0", "10.1.1.50", "not-an-address"):
         try:
-            ConsoleServer(name="test panel", bind=bad, port=0)
+            ConsoleServer(name="test panel", bind=bad, port=0,
+                          index="console.html")
         except ValueError as exc:
             assert "test panel" in str(exc), exc
         else:
@@ -218,7 +222,8 @@ def _self_check() -> None:
     # more -- the control panel gained jog and took the refusal (2026-09-07) --
     # but the flag stays for a consumer whose page cannot command motion.
     open_server = ConsoleServer(
-        name="open", bind="0.0.0.0", port=0, require_loopback=False
+        name="open", bind="0.0.0.0", port=0, require_loopback=False,
+        index="console.html",
     )
     open_server.close()
 
@@ -239,7 +244,8 @@ def _self_check() -> None:
         posted.append((route, body))
         return {"ok": True}
 
-    server = ConsoleServer(name="t", bind="127.0.0.1", port=0, get=get, post=post)
+    server = ConsoleServer(name="t", bind="127.0.0.1", port=0, get=get, post=post,
+                           index="console.html")
     base = f"http://127.0.0.1:{server.port}"
     try:
         def fetch(path, *, headers=None, data=None, expect=200):
@@ -299,10 +305,11 @@ def _self_check() -> None:
     finally:
         server.close()
 
-    # 8. `/` is the console's OWN index. Two consoles share this allowlist, so
-    #    a server that hardcoded CONSOLE_ASSETS[""] would serve the grasp
-    #    editor's page from the operator panel's port.
-    for index in ("index.html", "operator.html"):
+    # 8. `/` is the console's OWN index, for all THREE pages. This is the
+    #    regression that shipped: the arm console and the grasp editor shared
+    #    one page, so driving a robot rendered the editor's Calibration rack
+    #    with every control 404ing. Each page must answer only on its own port.
+    for index in ("console.html", "editor.html", "operator.html"):
         server = ConsoleServer(name="t", bind="127.0.0.1", port=0, index=index)
         try:
             root = urllib.request.urlopen(
@@ -314,6 +321,13 @@ def _self_check() -> None:
             assert root == named, index
         finally:
             server.close()
+    # 9. A console that names no page is a TypeError, never a wrong page.
+    try:
+        ConsoleServer(name="t", bind="127.0.0.1", port=0)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("ConsoleServer built without an index page")
     print("console_server self-check ok")
 
 

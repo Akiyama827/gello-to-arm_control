@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arm console</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/console.css">
+  <script type="importmap">
+  {"imports": {
+    "three": "/static/vendor/three.module.js",
+    "three/addons/": "/static/vendor/"
+  }}
+  </script>
+</head>
+<body>
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">Operator console</p>
+      <h1>Arm control</h1>
+    </div>
+    <div class="session">
+      <span id="ident">Waiting for configuration</span>
+      <span id="connection" class="status neutral">Connecting</span>
+    </div>
+  </header>
+
+  <main class="console-shell">
+    <section class="viewport" aria-label="Arm scene">
+      <div id="view"></div>
+      <div class="view-tools">
+        <strong>Target</strong>
+        <div class="mode-row">
+          <button id="mode-t" class="selected">Move</button>
+          <button id="mode-r">Rotate</button>
+        </div>
+      </div>
+      <div class="view-labels">
+        <span><i class="live-key"></i>live arm</span>
+        <span><i class="target-key"></i>your target</span>
+        <span><i class="plan-key"></i>planned motion</span>
+      </div>
+    </section>
+
+    <div class="gutter" data-side="right" role="separator" aria-orientation="vertical"></div>
+
+    <aside id="rail" class="rail">
+      <!-- Gate first: DISARM must be findable without reading anything. -->
+      <div id="gate" class="gate" hidden>
+        <div class="gate-head">
+          <span>Safety gate</span><span id="gatebadge" class="status neutral">—</span>
+        </div>
+        <div class="button-pair">
+          <button id="arm-btn" class="arm">ARM</button>
+          <button id="disarm-btn" class="danger">DISARM</button>
+        </div>
+      </div>
+
+      <button id="deadman" class="deadman" type="button">
+        <span>Hold to allow motion</span>
+        <small id="authority-text">Deadman released — hold and disarm requested</small>
+      </button>
+
+      <div class="rail-section">
+        <div class="rail-head">Move</div>
+        <div id="buttons" class="command-stack"></div>
+      </div>
+
+      <div class="rail-section">
+        <div class="rail-head">Jog <small id="jog-note" class="jog-note"></small></div>
+        <div id="jog-pad" class="jog-pad"></div>
+        <details id="jog-joints-wrap" hidden>
+          <summary>Joint jog — the way out of a singularity</summary>
+          <div id="jog-joints" class="jog-pad"></div>
+        </details>
+      </div>
+
+      <details id="gains-wrap" class="rail-section" hidden>
+        <summary>Control law</summary>
+        <div id="gains" class="command-stack"></div>
+      </details>
+
+      <details id="grip-wrap" class="rail-section">
+        <summary>Gripper <output id="grip-readout"></output></summary>
+        <div id="grip"></div>
+      </details>
+
+      <details class="rail-section">
+        <summary>Telemetry</summary>
+        <dl class="telemetry-list">
+          <div><dt>Joints</dt><dd id="joint-summary">No samples</dd></div>
+          <div><dt>Plan</dt><dd id="plan-summary">None</dd></div>
+        </dl>
+        <pre id="log" aria-live="polite"></pre>
+      </details>
+
+      <details class="rail-section">
+        <summary>Joint sliders (debug)</summary>
+        <div id="debug"></div>
+      </details>
+
+      <button id="hold-disarm" class="danger wide" type="button">Stop and disarm</button>
+    </aside>
+  </main>
+
+  <script type="module" src="/static/console.js"></script>
+</body>
+</html>

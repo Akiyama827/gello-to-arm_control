@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Workcell calibration console</title>
+  <title>Grasp profile editor</title>
   <link rel="stylesheet" href="/static/style.css">
   <script type="importmap">
   {"imports": {
@@ -15,8 +15,8 @@
 <body>
   <header class="masthead">
     <div>
-      <p class="eyebrow">Local workcell / calibration authority</p>
-      <h1>Control desk</h1>
+      <p class="eyebrow">Grasp profile editor</p>
+      <h1>Grasp editor</h1>
     </div>
     <div class="session">
       <span id="ident">Waiting for configuration</span>
@@ -35,14 +35,6 @@
         </select>
       </label>
 
-      <div id="gate" class="authority" hidden>
-        <span id="gatebadge" class="status neutral">Unknown</span>
-        <div class="button-pair">
-          <button id="arm-btn" class="arm">Arm</button>
-          <button id="disarm-btn" class="danger">Disarm</button>
-        </div>
-      </div>
-
       <button id="deadman" class="deadman" type="button">
         <span>Hold to move</span>
         <small>Space bar or pointer</small>
@@ -53,22 +45,12 @@
         <button id="mode-r">Rotate</button>
       </div>
       <div id="buttons" class="command-stack"></div>
-      <!-- Jog. Hidden until the node reports a jog envelope, so a graph
-           without one shows no controls rather than dead buttons. -->
-      <div id="jog-panel" hidden>
-        <div class="subhead"><span>Jog</span><output id="jog-note">—</output></div>
-        <div id="jog-pad" class="command-stack"></div>
-      </div>
-
       <div class="subsection">
         <div class="subhead"><span>Hand</span><output id="grip-readout">—</output></div>
         <div id="grip"><div id="finger-opening"></div></div>
       </div>
 
-      <details class="subsection">
-        <summary>Joint target editor</summary>
-        <div id="debug"></div>
-      </details>
+
     </section>
 
     <div class="gutter" data-side="left" role="separator" aria-orientation="vertical"
@@ -115,10 +97,12 @@
           <label>Context<select id="context-select"></select></label>
           <label class="checkbox"><input id="show-arm" type="checkbox" checked> Show arm</label>
         </div>
+        <!-- Tare F/T, Capture pose and Edit grasp used to sit here. No JS
+             ever referenced the first two, and the third was only ever
+             enabled -- it had no handler. Three buttons that looked like
+             features. Editing happens through the gizmo and the pose fields;
+             Save draft is the only action. -->
         <div class="cal-actions">
-          <button id="tare-wrench" disabled title="Requires a valid wrench stream">Tare F/T</button>
-          <button id="capture-pose" disabled title="Requires a selected actor state">Capture pose</button>
-          <button id="edit-grasp" disabled title="Requires a loaded module profile">Edit grasp</button>
           <button id="save-grasp" disabled>Save draft</button>
         </div>
         <div id="grasp-fields" class="grasp-fields" hidden>
@@ -143,11 +127,11 @@
     </aside>
   </main>
 
-  <footer class="safety-spine">
-    <div><strong>Command authority</strong><span id="authority-text">Deadman released</span></div>
-    <button id="hold-disarm" class="hard-stop">Hold + disarm</button>
-  </footer>
+  <!-- No safety spine here. This page edits a stored profile and commands
+       nothing: the deadman is disabled with "Visualization only", and a
+       "Hold + disarm" button that posts to a route this panel does not serve
+       is a promise it cannot keep. The arm console has the real one. -->
 
-  <script type="module" src="/static/app.js"></script>
+  <script type="module" src="/static/editor.js"></script>
 </body>
 </html>

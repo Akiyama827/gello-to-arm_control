@@ -1,0 +1,64 @@
+/* Operator console layout: the scene takes the room, one rail holds the
+   controls, and everything that is not needed to move the arm is one
+   disclosure away. The grasp editor keeps the old three-rack grid -- these are
+   two pages now, and they are allowed to look different. */
+.console-shell {
+  --rail-w: 300px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 6px var(--rail-w);
+  height: calc(100% - 3.1rem);
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: .55rem;
+  padding: .75rem;
+  overflow-y: auto;
+  background: var(--panel);
+  border-top: 4px solid var(--blue);
+}
+
+.rail-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-family: Bahnschrift, "Arial Narrow", sans-serif;
+  font-size: .82rem;
+  margin-bottom: .4rem;
+}
+
+.rail-section { border-top: 1px solid var(--rule); padding-top: .6rem; }
+.rail-section > summary {
+  font-family: Bahnschrift, "Arial Narrow", sans-serif;
+  font-size: .82rem;
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  justify-content: space-between;
+}
+.rail-section > summary::before { content: "▸ "; color: var(--muted); }
+.rail-section[open] > summary::before { content: "▾ "; }
+.rail-section > summary::-webkit-details-marker { display: none; }
+.rail-section > *:not(summary) { margin-top: .5rem; }
+
+.gate { border: 1px solid var(--rule); background: #fff; padding: .55rem; }
+.gate-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: .74rem; color: var(--muted); margin-bottom: .4rem;
+}
+
+.deadman { width: 100%; }
+.wide { width: 100%; margin-top: auto; }
+
+/* Jog: a compact −/+ pair per axis. Big enough to hit without aiming, because
+   letting go IS the stop and a mis-click should not be a fight. */
+.jog-pad { display: grid; gap: .3rem; }
+.jog-row { display: grid; grid-template-columns: 2.4rem 1fr 1fr; gap: .3rem; align-items: center; }
+.jog-row span { font: .72rem ui-monospace, monospace; color: var(--muted); }
+.jog-row button { padding: .3rem 0; font-size: .9rem; line-height: 1; }
+.jog-note { font: .66rem ui-monospace, monospace; color: var(--muted); font-weight: 400; }
+.jog-note.refused { color: var(--red); }
+
+#log { max-height: 9rem; overflow: auto; }
+.telemetry-list { margin: 0 0 .4rem; }

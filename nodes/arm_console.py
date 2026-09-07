@@ -156,6 +156,7 @@ class ControlPanel:
         self._server = ConsoleServer(
             name="control panel", bind=str(bind), port=int(port),
             get=self._get, post=self._post, require_loopback=True,
+            index="console.html",
         )
         self.port = self._server.port
 
@@ -1016,13 +1017,17 @@ def main() -> None:
 def _check_routes() -> None:
     """Every route the page calls must be handled by one of the two panels.
 
-    The page (``nodes/console/app.js``) is shared: it drives the teleop panel
-    AND the grasp editor, which are separate Python classes on separate ports.
-    Nothing but this check ties the two sides together, and the dispatch used
-    to be ``self.path.endswith(name)`` -- which matched loosely enough that a
-    renamed or mistyped route could still land somewhere. It is exact now, so a
-    drift between the JS and either table is a 404 at the operator's fingertip
-    rather than a failure here. This is that failure, moved earlier.
+    Each page is checked against ITS OWN panel: console.js against
+    ControlPanel, editor.js against GraspEditorPanel. Nothing but this ties the
+    JS and the Python together, and the dispatch used to be
+    ``self.path.endswith(name)`` -- loose enough that a renamed route could
+    still land somewhere. It is exact now, so drift is a 404 at the operator's
+    fingertip rather than a failure here. This is that failure, moved earlier.
+
+    Per-page, not against the union of both tables: the two pages were ONE
+    file until 2026-09-07, and a union check is precisely what let the arm
+    console ship markup calling five grasp-editor routes that its own panel
+    answers with 404.
     """
     import inspect
     import re
@@ -1033,27 +1038,40 @@ def _check_routes() -> None:
     except ModuleNotFoundError:
         from calibration_console import GraspEditorPanel
 
-    handled: set[str] = set()
-    for panel in (ControlPanel, GraspEditorPanel):
+    def handles(panel) -> set[str]:
+        found: set[str] = set()
         for method in ("_get", "_post"):
             source = inspect.getsource(getattr(panel, method))
-            handled |= set(re.findall(r'route(?:\[len\()?[^\n]*?[=.]=?\s*"([^"]+)"', source))
-            handled |= set(re.findall(r'startswith\("([^"]+)"\)', source))
+            found |= set(re.findall(r'route(?:\[len\()?[^\n]*?[=.]=?\s*"([^"]+)"', source))
+            found |= set(re.findall(r'startswith\("([^"]+)"\)', source))
+        return found
 
     asset_dir = Path(__file__).resolve().parent / "console"
-    called: set[str] = set()
-    for page in ("app.js", "operator.js"):
-        text = (asset_dir / page).read_text()
-        called |= {m.lstrip("/") for m in re.findall(r'fetch\("(/[^"]*)"', text)}
-        called |= {m.lstrip("/") for m in re.findall(r'post\("(/[^"]*)"', text)}
-    # The operator gate is its own class in the package, with its own two
-    # routes and its own self-check; it shares only the asset directory.
-    called -= {"state", "action"}
 
-    missing = sorted(r for r in called if r not in handled)
-    assert not missing, f"page calls routes no panel handles: {missing}"
-    assert "mesh/" in handled, "the mesh prefix route vanished"
-    print(f"arm_console: {len(called)} page routes all handled")
+    def calls(*scripts: str) -> set[str]:
+        found: set[str] = set()
+        for script in scripts:
+            text = (asset_dir / script).read_text()
+            for pattern in (r'fetch\("(/[^"]*)"', r'post\("(/[^"]*)"',
+                            r'getJSON\("(/[^"]*)"'):
+                found |= {m.lstrip("/") for m in re.findall(pattern, text)}
+        return found
+
+    total = 0
+    for panel, scripts in (
+        (ControlPanel, ("console.js", "core.js")),
+        (GraspEditorPanel, ("editor.js", "core.js")),
+    ):
+        handled = handles(panel)
+        called = calls(*scripts)
+        missing = sorted(r for r in called if r not in handled)
+        assert not missing, (
+            f"{scripts[0]} calls routes {panel.__name__} does not handle: "
+            f"{missing}"
+        )
+        total += len(called)
+    assert "mesh/" in handles(ControlPanel), "the mesh prefix route vanished"
+    print(f"arm_console: {total} page routes all handled by their own panel")
 
 
 def _check_graphs() -> None:

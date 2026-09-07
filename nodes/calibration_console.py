@@ -130,7 +130,7 @@ class GraspEditorPanel:
 
         self._server = ConsoleServer(
             name="grasp editor", bind=bind, port=port,
-            get=self._get, post=self._post,
+            get=self._get, post=self._post, index="editor.html",
         )
         self.server = self._server.server
         self.port = self._server.port

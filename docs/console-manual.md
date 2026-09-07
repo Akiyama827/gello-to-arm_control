@@ -36,11 +36,26 @@ your own entry config.
 
 ## 2. What you are looking at
 
-| Region | What it is |
+The scene takes the room; one rail on the right holds the controls, top to
+bottom in the order you use them:
+
+| Rail, in order | What it is |
 |---|---|
-| **Control** (left) | Deadman, ARM/DISARM, the button strip, the jog pad, the gripper slider |
-| **Scene** (middle) | The 3D robot. Drag to orbit, scroll to zoom |
-| **Telemetry** (right) | Joint summary, wrench, plan status, and the last 8 log lines |
+| **Safety gate** | ARM / DISARM and the armed badge. Hidden on a graph with no health wire |
+| **Hold to allow motion** | The deadman. Button, or Spacebar |
+| **Move** | Sync target, Plan + preview, Execute, Stop (hold) |
+| **Jog** | −/+ per world axis, with the last refusal beneath. Joint jog is one disclosure down |
+| ▸ **Control law** | The gain presets |
+| ▸ **Gripper**, ▸ **Telemetry**, ▸ **Joint sliders** | Collapsed by default |
+| **Stop and disarm** | Pinned to the bottom |
+
+Anything not needed to move the arm is one disclosure away. The 3D scene is on
+the left: drag to orbit, scroll to zoom, drag the gizmo to set a target.
+
+This page is **only** the arm console. Editing a stored grasp profile is a
+different page (`editor.html`, served by `calibration_console`) — until
+2026-09-07 they were one file, so the arm console rendered a Calibration rack
+whose every control answered 404.
 
 **One colour legend, on the page and in Rerun:**
 
@@ -255,6 +270,8 @@ translational Jacobian across the joint limits and take the 1st percentile.
 ```bash
 python -m arm_control.planning.jog             # the five gates, each on its own case
 python -m arm_control.execution.arm_controller # cancel vs hold vs stop, jog expiry
-python nodes/arm_console.py --self-check       # page routes + every graph can stream
+python -m arm_control.console_assets           # page ids + the JS module graph
+python -m arm_control.console_server           # loopback / CSRF / per-console index
+python nodes/arm_console.py --self-check       # each page's routes vs its own panel
 python scripts/run_console.py --check          # assets, config, graph
 ```
