@@ -90,6 +90,7 @@ class ConsoleServer:
         index: str,
         require_loopback: bool = True,
         max_body: int = DEFAULT_MAX_BODY,
+        extra_assets: dict[str, tuple[str, str, str]] | None = None,
     ) -> None:
         if require_loopback:
             try:
@@ -107,6 +108,22 @@ class ConsoleServer:
         # name its page gets a TypeError at construction, not a wrong page at
         # runtime.
         self._index = index
+        # A CONSUMER's own page, served through this server without its files
+        # living here. Same shape as every other injection in this package: the
+        # project supplies the thing that is its own. The allowlist is still the
+        # boundary -- these entries are absolute paths the caller vouched for,
+        # and nothing outside the merged map can be read.
+        self._assets = dict(CONSOLE_ASSETS)
+        for route, entry in (extra_assets or {}).items():
+            content_type, path, cache = entry
+            if not Path(path).is_absolute():
+                raise ValueError(
+                    f"extra asset {route!r} must give an absolute path, got {path!r} "
+                    "-- a relative one would resolve against this package"
+                )
+            if not Path(path).is_file():
+                raise FileNotFoundError(f"extra asset {route!r}: no file at {path}")
+            self._assets[route] = (content_type, path, cache)
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -156,8 +173,12 @@ class ConsoleServer:
             # -- methods ------------------------------------------------------
             def do_GET(self) -> None:
                 route = self._route() or server._index
-                if route in CONSOLE_ASSETS:
-                    content_type, body, cache = console_asset(route)
+                if route in server._assets:
+                    content_type, path, cache = server._assets[route]
+                    body = (
+                        Path(path).read_bytes() if Path(path).is_absolute()
+                        else console_asset(route)[1]
+                    )
                     self._reply(Asset(content_type, body, cache))
                     return
                 if server._get is None:
@@ -305,11 +326,11 @@ def _self_check() -> None:
     finally:
         server.close()
 
-    # 8. `/` is the console's OWN index, for all THREE pages. This is the
-    #    regression that shipped: the arm console and the grasp editor shared
-    #    one page, so driving a robot rendered the editor's Calibration rack
-    #    with every control 404ing. Each page must answer only on its own port.
-    for index in ("console.html", "editor.html", "operator.html"):
+    # 8. `/` is the console's OWN index. This is the regression that shipped:
+    #    the arm console and the grasp editor shared one page, so driving a
+    #    robot rendered the editor's Calibration rack with every control
+    #    404ing. Each page must answer only on its own port.
+    for index in ("console.html", "operator.html"):
         server = ConsoleServer(name="t", bind="127.0.0.1", port=0, index=index)
         try:
             root = urllib.request.urlopen(
@@ -321,7 +342,44 @@ def _self_check() -> None:
             assert root == named, index
         finally:
             server.close()
-    # 9. A console that names no page is a TypeError, never a wrong page.
+    # 9. A consumer's own page, registered rather than vendored -- how the
+    #    grasp editor keeps its page beside its node in the project that owns
+    #    it, without this package shipping the assembly task's UI.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        page = Path(tmp) / "mine.html"
+        page.write_text("<!doctype html><title>mine</title>")
+        server = ConsoleServer(
+            name="t", bind="127.0.0.1", port=0, index="mine.html",
+            extra_assets={
+                "mine.html": ("text/html; charset=utf-8", str(page), "no-store")
+            },
+        )
+        try:
+            body = urllib.request.urlopen(
+                f"http://127.0.0.1:{server.port}/", timeout=5
+            ).read()
+            assert b"<title>mine</title>" in body, body
+            shared = urllib.request.urlopen(
+                f"http://127.0.0.1:{server.port}/static/core.js", timeout=5
+            ).read()
+            assert b"export" in shared, "core.js did not come through"
+        finally:
+            server.close()
+    # A relative extra asset would resolve against THIS package's directory,
+    # which is the one thing the caller cannot have meant.
+    for bad in ({"x.html": ("text/html", "relative.html", "no-store")},
+                {"x.html": ("text/html", "/nonexistent/page.html", "no-store")}):
+        try:
+            ConsoleServer(name="t", bind="127.0.0.1", port=0, index="console.html",
+                          extra_assets=bad)
+        except (ValueError, FileNotFoundError):
+            pass
+        else:
+            raise AssertionError(f"accepted {bad}")
+
+    # 10. A console that names no page is a TypeError, never a wrong page.
     try:
         ConsoleServer(name="t", bind="127.0.0.1", port=0)
     except TypeError:

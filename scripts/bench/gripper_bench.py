@@ -20,7 +20,7 @@ no dora graph, no arm, no FCI session. Deliberately gripper-only: benching
 the jaws must not require the whole motion stack to be up.
 
 Usage:
-    python scripts/gripper_bench.py --config configs/real/franka.yaml
+    python scripts/bench/gripper_bench.py --config configs/real/franka.yaml
         [--host 172.16.1.2] [--port 47802]
 
 Commands:

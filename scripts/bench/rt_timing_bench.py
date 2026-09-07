@@ -13,7 +13,7 @@ server reports ARMED.
 
 Usage (rung 1 has the service on the box, rung 0 a local server):
 
-    python scripts/rt_timing_bench.py --host 172.16.1.2 --seconds 60
+    python scripts/bench/rt_timing_bench.py --host 172.16.1.2 --seconds 60
 """
 from __future__ import annotations
 

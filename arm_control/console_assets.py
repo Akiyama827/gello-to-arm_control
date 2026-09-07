@@ -29,13 +29,13 @@ CONSOLE_ASSETS: dict[str, tuple[str, str, str]] = {
     # under a tab titled "Workcell calibration console". Each console now names
     # its own page through ConsoleServer(index=...).
     #
-    # `console.js` and `editor.js` are page modules; `core.js` is what they
-    # share (scene, meshes, gizmo, sliders, deadman) and belongs to neither.
+    # `console.js` is this package's page module; `core.js` is the part any
+    # page can share (scene, meshes, gizmo, sliders). The grasp EDITOR's page
+    # left with its node on 2026-09-07 -- it edits the assembly project's
+    # profiles -- and comes back through ConsoleServer(extra_assets=...).
     "console.html": ("text/html; charset=utf-8", "console.html", _NO_STORE),
     "static/console.js": ("text/javascript", "console.js", _NO_STORE),
     "static/console.css": ("text/css; charset=utf-8", "console.css", _NO_STORE),
-    "editor.html": ("text/html; charset=utf-8", "editor.html", _NO_STORE),
-    "static/editor.js": ("text/javascript", "editor.js", _NO_STORE),
     "static/core.js": ("text/javascript", "core.js", _NO_STORE),
     "static/style.css": ("text/css; charset=utf-8", "style.css", _NO_STORE),
     # The operator GATE (the caller's ``nodes/operator_console.py``): a third,
@@ -94,7 +94,7 @@ def _check_pages() -> None:
         return set(re.findall(r'\$\("([^"]+)"\)', src))
 
     shared = ids_used("core.js")
-    for page, script in (("console.html", "console.js"), ("editor.html", "editor.js")):
+    for page, script in (("console.html", "console.js"),):
         have = ids_in(page)
         want = ids_used(script) | shared
         missing = sorted(want - have)
@@ -111,7 +111,7 @@ def _check_pages() -> None:
         for group in re.findall(r"export \{([^}]+)\}", core_src)
         for name in group.split(",")
     }
-    for script in ("console.js", "editor.js"):
+    for script in ("console.js",):
         src = (CONSOLE_DIR / script).read_text()
         match = re.search(r'import \{([^}]+)\} from "\./core\.js"', src, re.S)
         assert match, f"{script} does not import from core.js"
@@ -124,10 +124,6 @@ def _check_pages() -> None:
             if not re.search(rf"(?<![\w$]){re.escape(n)}(?![\w$])", body)
         )
         assert not unused, f"{script} imports but never uses: {unused}"
-
-    # The dynamic ones, stated explicitly because the regex cannot see them.
-    for dynamic in ("storage-ik", "dock-ik"):
-        assert dynamic in ids_in("editor.html"), dynamic
 
     # No page may serve as another's index, and every asset must exist.
     for route, (_ctype, relative, _cache) in CONSOLE_ASSETS.items():

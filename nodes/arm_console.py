@@ -1024,19 +1024,15 @@ def _check_routes() -> None:
     still land somewhere. It is exact now, so drift is a 404 at the operator's
     fingertip rather than a failure here. This is that failure, moved earlier.
 
-    Per-page, not against the union of both tables: the two pages were ONE
-    file until 2026-09-07, and a union check is precisely what let the arm
-    console ship markup calling five grasp-editor routes that its own panel
-    answers with 404.
+    One page, one panel. The two pages were ONE file until 2026-09-07, and
+    checking against the union of both route tables is precisely what let the
+    arm console ship markup calling five grasp-editor routes that its own panel
+    answers with 404. The editor's own check went with it to the project that
+    owns it.
     """
     import inspect
     import re
     from pathlib import Path
-
-    try:
-        from nodes.calibration_console import GraspEditorPanel
-    except ModuleNotFoundError:
-        from calibration_console import GraspEditorPanel
 
     def handles(panel) -> set[str]:
         found: set[str] = set()
@@ -1057,21 +1053,14 @@ def _check_routes() -> None:
                 found |= {m.lstrip("/") for m in re.findall(pattern, text)}
         return found
 
-    total = 0
-    for panel, scripts in (
-        (ControlPanel, ("console.js", "core.js")),
-        (GraspEditorPanel, ("editor.js", "core.js")),
-    ):
-        handled = handles(panel)
-        called = calls(*scripts)
-        missing = sorted(r for r in called if r not in handled)
-        assert not missing, (
-            f"{scripts[0]} calls routes {panel.__name__} does not handle: "
-            f"{missing}"
-        )
-        total += len(called)
-    assert "mesh/" in handles(ControlPanel), "the mesh prefix route vanished"
-    print(f"arm_console: {total} page routes all handled by their own panel")
+    handled = handles(ControlPanel)
+    called = calls("console.js", "core.js")
+    missing = sorted(r for r in called if r not in handled)
+    assert not missing, (
+        f"console.js calls routes ControlPanel does not handle: {missing}"
+    )
+    assert "mesh/" in handled, "the mesh prefix route vanished"
+    print(f"arm_console: {len(called)} page routes all handled by ControlPanel")
 
 
 def _check_graphs() -> None:

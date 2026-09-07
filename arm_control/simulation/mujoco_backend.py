@@ -73,7 +73,7 @@ class MuJoCoUnavailableError(RuntimeError):
 # ponytail: J_rotor is still the 4340 base motors' measured 1.8e-5 -- DM
 # datasheets do not publish it and no module motor has been on the bus yet.
 # A 4310's rotor is smaller, so this is an upper bound; read the real value
-# with libs/arm_control/scripts/dm_read_params.py when one is reachable.
+# with libs/arm_control/scripts/bench/dm_read_params.py when one is reachable.
 MODULE_ARMATURE = 10.0**2 * 1.8e-5  # 0.0018
 
 # Reflected rotor inertia (kg.m^2) for the ARM's joints. Franka's own published
