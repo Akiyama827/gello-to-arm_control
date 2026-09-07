@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-CONSOLE_DIR = Path(__file__).resolve().parents[1] / "nodes" / "console"
+CONSOLE_DIR = Path(__file__).resolve().parent / "ui" / "static"
 
 _IMMUTABLE = "public, max-age=31536000, immutable"  # vendored, content-addressed
 _NO_STORE = "no-store"  # our own pages: always revalidate, they change per build

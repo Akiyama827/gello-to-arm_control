@@ -76,5 +76,8 @@ mesh = ["trimesh", "coacd"]
 # implicit namespace package under the sys.path bootstrap).
 include = ["arm_control*"]
 
+[tool.setuptools.package-data]
+arm_control = ["ui/static/*", "ui/static/vendor/*"]
+
 # ruff needs no config: repo follows ruff defaults, whose line-length is
 # already 88. `ruff check .` from the repo root is the whole lint story.
