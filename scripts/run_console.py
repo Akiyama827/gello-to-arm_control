@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -126,6 +127,18 @@ def main() -> int:
         print(f"entry config not found: {config}", file=sys.stderr)
         return 1
 
+    busy = _port_holder(config)
+    if busy:
+        print(
+            f"[run_console] console port {busy} is already in use — another "
+            f"graph from this checkout is probably still running.\n"
+            f"  Find it:  ss -ltnp | grep {busy}\n"
+            f"  A launch now would come up half-working and you would be "
+            f"driving the OLD console on that port.",
+            file=sys.stderr,
+        )
+        return 1
+
     env = dict(os.environ)
     # Both roots, because a bare `dora run` rebases each node's cwd to the
     # dataflow's directory: a relative ARM_CONTROL_CONFIG would then resolve
@@ -144,11 +157,89 @@ def main() -> int:
         print("[run_console] console on http://127.0.0.1:7500", flush=True)
     print("[run_console] the arm comes up DISARMED — press ARM on the page", flush=True)
     try:
-        return subprocess.call(["dora", "run", str(graph)], env=env, cwd=REPO_ROOT)
+        # start_new_session: the graph gets its OWN session, so teardown can
+        # reach every node at once. `subprocess.call` here left orphans --
+        # dora reaps its nodes correctly when it is signalled, but nothing was
+        # signalling it, so killing the launcher (or any single node) left the
+        # whole graph running: a controller still streaming motor_command and a
+        # console still holding its port, which the NEXT launch then talks to.
+        proc = subprocess.Popen(
+            ["dora", "run", str(graph)], env=env, cwd=REPO_ROOT,
+            start_new_session=True,
+        )
     except FileNotFoundError:
         print("`dora` is not on PATH — is the dora-rs CLI installed?",
               file=sys.stderr)
         return 1
+
+    def _stop(signum=None, _frame=None):
+        _terminate_graph(proc)
+        if signum is not None:
+            raise SystemExit(128 + int(signum))
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, _stop)
+    try:
+        return proc.wait()
+    finally:
+        _terminate_graph(proc)
+
+
+def _port_holder(config) -> int | None:
+    """The console port from ``config``, if something is already listening.
+
+    Cheap preflight for the failure that wastes the most time: a stale graph
+    still holding the port, so the new run's console never binds and every
+    click you make lands on the PREVIOUS process. Nothing about that looks
+    wrong on screen.
+    """
+    import socket
+
+    try:
+        from arm_control.config import load_config_tree
+
+        port = int(load_config_tree(config).get("console", {}).get("http_port", 0))
+    except Exception:
+        return None                      # not our problem; the graph will say
+    if not port:
+        return None
+    probe = socket.socket()
+    probe.settimeout(0.2)
+    try:
+        probe.connect(("127.0.0.1", port))
+        return port
+    except OSError:
+        return None
+    finally:
+        probe.close()
+
+
+def _terminate_graph(proc, grace_s: float = 5.0) -> None:
+    """Stop the graph and every node it spawned. Safe to call twice.
+
+    dora puts each node in its OWN process group inside the graph's session,
+    so neither `kill <launcher>` nor a kill of dora's process group reaches
+    them. Two things do, and this uses both: a SIGTERM to dora, which reaps its
+    nodes properly (measured -- a graceful TERM cleared every node in 6 s), and
+    then a session-wide kill for anything that ignored it.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=grace_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    print("[run_console] graph did not stop in "
+          f"{grace_s:.0f}s — killing the session", flush=True)
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def _self_check() -> None:

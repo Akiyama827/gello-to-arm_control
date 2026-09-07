@@ -166,7 +166,8 @@ gain_presets:
 | `jog … refused — collision: …` | The next step would put the arm through itself | Jog the other way, or plan around it |
 | Arm oscillates and never settles | kd is 0 against a non-zero kp | Set `arm.kd` in the sim config. See the sweep in `configs/entry/sim_demo.yaml` |
 | Console will not start: `bind must be a loopback address` | `console.http_bind` is not `127.0.0.1` | Keep it loopback and use an SSH tunnel (§8) |
-| Port already in use | Another console holds it | `ss -ltnp \| grep 7500`, then kill that pid |
+| `console port 7500 is already in use` | A previous graph is still running | `ss -ltnp \| grep 7500` for the pid. `run_console.py` refuses to start rather than let you drive the old console |
+| Nodes still alive after you stop the graph | Something killed a node instead of the graph | Signal the `dora run` process — dora reaps its own nodes. `run_console.py` does this for you on exit |
 
 ---
 
