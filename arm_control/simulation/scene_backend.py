@@ -7,6 +7,12 @@ steps.
 
 Scene slots are ROLES — ``arm`` / ``base`` / ``module``; which robot fills a
 slot is config data (``model_path`` + ``prefix``), never a name in this code.
+
+This module is the ADAPTER, and the one place where the caller's vocabulary
+meets the library's. A scenario config says ``dock_site``, ``module_id``,
+``inventory`` — correct words for the project that owns the docks — and the
+objects built here say ``root_port``, ``type_id``, ``objects``. Task words are
+allowed to arrive; they are not allowed past this file.
 """
 from __future__ import annotations
 
@@ -14,7 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from arm_control.simulation.mujoco_backend import (
-    ModuleSlot,
+    ObjectSlot,
     MuJoCoBackend,
     MuJoCoSceneSpec,
     SceneModelSpec,
@@ -41,7 +47,7 @@ def _model_spec(scene_cfg: dict, key: str) -> SceneModelSpec:
     )
 
 
-def _module_slots(scene_cfg: dict) -> tuple[ModuleSlot, ...]:
+def _module_slots(scene_cfg: dict) -> tuple[ObjectSlot, ...]:
     """Inventory modules from either scene schema.
 
     ``scene.inventory`` is the plural form: one entry per physical module in
@@ -93,9 +99,9 @@ def _module_slots(scene_cfg: dict) -> tuple[ModuleSlot, ...]:
                 raise ValueError(f"scene inventory entry {i}: missing {key!r}")
         prefix = str(entry.get("prefix") or f"{entry['slot']}_")
         out.append(
-            ModuleSlot(
+            ObjectSlot(
                 slot=str(entry["slot"]),
-                module_id=str(entry["module_id"]),
+                type_id=str(entry["module_id"]),
                 spec=SceneModelSpec(
                     model_path=_resolve(str(entry["model_path"])),
                     name=str(entry["slot"]),
@@ -121,12 +127,15 @@ def build_scene_backend(
     control_period: float,
     launch_viewer: bool = False,
     enable_self_collision: bool = False,
+    *,
+    chain_factory: Callable | None = None,
+    mate_policy: object = None,
 ) -> tuple[MuJoCoBackend, dict, list[str], int]:
     modules = _module_slots(scene_cfg)
     spec = MuJoCoSceneSpec(
         arm=_model_spec(scene_cfg, "arm"),
         base=_model_spec(scene_cfg, "base"),
-        modules=modules,
+        objects=modules,
         timestep=float(scene_cfg.get("timestep", 0.001)),
     )
     # Actuated joints are PREFIXED in the composed model (mjSpec really renames,
@@ -177,12 +186,18 @@ def build_scene_backend(
             for k, v in (scene_cfg.get("default_joint_positions") or {}).items()
         },
         ee_body=str(weld_cfg["ee_body"]),
-        dock_site=str(weld_cfg["dock_site"]),
-        # No fallback: the mate's lead-in is the caller's hardware fact. A
-        # missing key fails by name in MuJoCoSceneSpec.load() rather than
-        # silently seating against a number this package invented.
-        dock_capture_m=float(weld_cfg["dock_capture_m"]),
-        dock_capture_deg=float(weld_cfg["dock_capture_deg"]),
+        # The config still says `dock_site`, because a scenario file belongs to
+        # the project that HAS docks. The library parameter does not: this is
+        # the root port of whatever gets assembled here. The mapping is one
+        # line, and it is the whole boundary.
+        root_port=str(weld_cfg["dock_site"]),
+        # The mate RULE arrives whole, from the caller. The seat tolerances
+        # used to be two floats in this config (`dock_capture_m/deg`) read by
+        # rules hardcoded in mujoco_backend -- quantize to four quarter turns,
+        # gate on gap then axis angle. The numbers were the caller's; the
+        # rules that consumed them were not, and now neither is.
+        chain_factory=chain_factory,
+        mate_policy=mate_policy,
         gripper_joints=tuple(str(j) for j in (scene_cfg.get("gripper_joints") or [])),
         finger_body_match=tuple(
             str(m) for m in (scene_cfg.get("finger_body_match") or [])

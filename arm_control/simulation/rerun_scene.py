@@ -140,6 +140,14 @@ def start_mirror_thread(
         period = 1.0 / max(1.0, float(hz))
         while True:
             model, data_now = source()
+            if model is None or data_now is None:
+                # Teardown: the plant drops its model on SIGTERM and this
+                # daemon thread outlives it by one tick, so `model.ngeom`
+                # raised AttributeError into every shutdown log. Noise that
+                # looks exactly like a crash is worse than no log at all --
+                # it cost real time reading a clean run as a failed one.
+                time.sleep(period)
+                continue
             if bound != (id(model), id(data_now)):
                 bound = (id(model), id(data_now))
                 mirror = RerunSceneMirror(

@@ -1,12 +1,21 @@
 """MuJoCo backend that mirrors the hardware command/state contract.
 
-The backend owns an mjSpec-composed scene (assembler + 2-DOF base + free
-module over a ground plane), exposes a PD-with-feedforward actuator interface
-keyed on joint names, and implements grasp/dock as **weld equalities** that
-are pre-declared inactive and toggled at runtime — the module physically rides
-the gripper after a grasp, and the keyed dock mate engages on a release with
-the connector actually AT the seat (mm lead-in gate; no magnets). (The Drake
-predecessor could only bookkeep: no post-Finalize welds.)
+The backend owns an mjSpec-composed scene (an arm, a base, and free objects
+over a ground plane), exposes a PD-with-feedforward actuator interface keyed
+on joint names, and implements pick and mate as **weld equalities** that are
+pre-declared inactive and toggled at runtime — a grasped object physically
+rides the gripper, and on release it is re-grafted into the kinematic chain if
+the caller's ``mate_policy`` says it landed seated. (The Drake predecessor
+could only bookkeep: no post-Finalize welds.)
+
+What this file does NOT decide: what counts as seated, how many discrete mates
+a connector admits, or what rotation each one is. Those are the caller's
+printed hardware and arrive as ``mate_policy``; what an assembly topology IS
+arrives as ``chain_factory``. This package disclaims the assembly task in its
+README, and until 2026-09-07 it quietly held that task's seat tolerance and
+quarter-turn key geometry anyway. The vocabulary that remains here is the
+CALLER's, passed through: the chain protocol's ``.clocking`` is read as an
+opaque integer.
 
 Physical torque truth lives in the MJCF joints' ``actuatorfrcrange``
 (±10/±4 N·m arm, ±22 N·m base) — the programmatically added ``motor``
@@ -112,7 +121,7 @@ class SceneModelSpec:
 
 
 @dataclass(frozen=True)
-class ModuleSlot:
+class ObjectSlot:
     """One inventory module: a model, a nest to sit in, and its port names.
 
     ``slot`` is the instance id everywhere — the composed-model prefix, the
@@ -123,7 +132,7 @@ class ModuleSlot:
     """
 
     slot: str
-    module_id: str                       # TYPE id; indexes module_grasps
+    type_id: str                         # TYPE id; the caller's model key
     spec: SceneModelSpec                 # model + nest pose
     body: str                            # root body name INSIDE the model
     joints: tuple[str, ...] = ()         # driven once docked, unprefixed
@@ -167,7 +176,7 @@ class ModuleSlot:
 class MuJoCoSceneSpec:
     arm: SceneModelSpec
     base: SceneModelSpec
-    modules: tuple[ModuleSlot, ...]
+    objects: tuple[ObjectSlot, ...]
     timestep: float = 0.001
 
 
@@ -191,38 +200,43 @@ def _site_body(spec: mujoco.MjSpec, site_name: str) -> str:
     raise MuJoCoUnavailableError(f"no body carries site {site_name!r}")
 
 
-def _clocking_frame(site, clocking: int) -> tuple[list, list]:
-    """Mate frame in the port's parent body: the port, rolled by the key.
+def _mate_frame(site, key: int, policy) -> tuple[list, list]:
+    """Mate frame in the port's parent body: the port, rotated by the key.
 
-    ``clocking`` counts quarter turns about the port's own z (the mating
-    axis), so the roll multiplies on the RIGHT of the site's orientation.
-    This is the only place the discrete key becomes geometry — everywhere
-    else it travels as the integer the dock's one-hot sensor reports.
+    ``key`` is an OPAQUE integer here. What it means -- how many discrete
+    mates a port admits, and what rotation each one is -- is the caller's
+    hardware, so ``policy.rotation(key)`` supplies the matrix and this
+    function only multiplies it onto the site's orientation (on the RIGHT:
+    the rotation is about the port's own mate axis, not the world's).
+
+    Until 2026-09-07 this file hardcoded ``key * pi/2`` about z, which made
+    a generic arm library the source of truth for how many keys THIS
+    project's printed connector happens to have.
     """
-    angle = float(clocking) * np.pi / 2.0
-    cos, sin = np.cos(angle), np.sin(angle)
-    roll = np.array([[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]])
     return [float(v) for v in site.pos], [
-        float(v) for v in _quat(_mat(site.quat) @ roll)
+        float(v) for v in _quat(_mat(site.quat) @ np.asarray(
+            policy.rotation(int(key)), dtype=float
+        ))
     ]
 
 
-def _graft_module(
+def _graft_object(
     spec: mujoco.MjSpec,
-    slot: "ModuleSlot",
+    slot: "ObjectSlot",
     parent_body: str,
     port_site: str,
-    clocking: int,
+    key: int,
+    policy,
 ) -> None:
-    """Attach ``slot``'s model into the chain, mated at ``port_site``.
+    """Attach ``slot``'s model into the assembly, mated at ``port_site``.
 
-    The module's PASSIVE port is placed on the mate frame, which is what the
-    keyed connector does mechanically. Its freejoint is dropped: a docked
-    module is a LINK, not a loose body held by a constraint, and that is the
+    The object's PASSIVE port is placed on the mate frame, which is what a
+    keyed connector does mechanically. Its freejoint is dropped: a mated
+    object is a LINK, not a loose body held by a constraint, and that is the
     whole difference between a soft weld chain (which sags and drifts — the
     failure mode BrickSim demonstrates) and a real kinematic chain.
     """
-    pos, quat = _clocking_frame(spec.site(port_site), clocking)
+    pos, quat = _mate_frame(spec.site(port_site), key, policy)
     frame = spec.body(parent_body).add_frame(pos=pos, quat=quat)
     child = _load_model_spec(slot.spec.model_path)
     root = child.body(slot.body)
@@ -458,6 +472,7 @@ def compose_scene(
     ground_z: float | None = 0.0,
     static_boxes: list[dict] | None = None,
     chain=None,
+    mate_policy=None,
 ) -> mujoco.MjSpec:
     """mjSpec world: ground plane + arm + base + every inventory module.
 
@@ -510,15 +525,15 @@ def compose_scene(
             pos=[float(v) for v in box["pos"]],
             rgba=[0.5, 0.42, 0.35, 1.0],
         )
-    docked = {m.slot: m.clocking for m in (chain.modules if chain else ())}
+    mated = {m.slot: m.clocking for m in (chain.modules if chain else ())}
     for model in (spec_cfg.arm, spec_cfg.base):
         child = _load_model_spec(model.model_path)
         frame = spec.worldbody.add_frame(
             pos=list(model.world_pos), quat=list(_rpy_to_quat(*model.world_rpy))
         )
         spec.attach(child, prefix=f"{model.prefix}", frame=frame)
-    for slot in spec_cfg.modules:
-        if slot.slot in docked:
+    for slot in spec_cfg.objects:
+        if slot.slot in mated:
             continue
         child = _load_model_spec(slot.spec.model_path)
         frame = spec.worldbody.add_frame(
@@ -529,11 +544,14 @@ def compose_scene(
     # Docked modules go on IN CHAIN ORDER: each mates onto a port that only
     # exists once the module before it has been attached.
     if chain is not None and chain.modules:
-        by_slot = {s.slot: s for s in spec_cfg.modules}
+        by_slot = {s.slot: s for s in spec_cfg.objects}
         port = chain.root_port
         for module in chain.modules:
             slot = by_slot[module.slot]
-            _graft_module(spec, slot, _site_body(spec, port), port, module.clocking)
+            _graft_object(
+                spec, slot, _site_body(spec, port), port,
+                module.clocking, mate_policy,
+            )
             port = slot.active_name
     for actuator in list(spec.actuators):
         spec.delete(actuator)
@@ -607,17 +625,27 @@ class MuJoCoBackend:
     enable_self_collision: bool = False
     default_joint_positions: dict[str, float] = field(default_factory=dict)
     static_boxes: list = field(default_factory=list)
-    # Seat gate for the dock weld: NO magnets — the weld models a keyed
-    # mechanical mate, which only engages within its lead-in chamfer (bench
-    # rung 14a measures the real lead-in). How tight that chamfer is, is a
-    # fact about the CALLER's hardware and not about MuJoCo, so this package
-    # holds no number for it: the scene config states both and load() refuses
-    # scene mode without them. (They used to default to a SEAT_TOL_* pair
-    # defined in this file, which made the arm library the source of truth for
-    # an assembly-task tolerance — the consuming project imported it back out
-    # for its own dock verify.)
-    dock_capture_m: float | None = None
-    dock_capture_deg: float | None = None
+    # The MATE RULE, injected. This plant enforces a seat gate it does not
+    # define: no magnets, so a keyed mechanical mate engages only within its
+    # lead-in chamfer, and how tight that chamfer is (and how many discrete
+    # keys the connector has, and what rotation each key is) are facts about
+    # the CALLER's printed hardware. Two methods, duck-typed:
+    #
+    #   rotation(key: int) -> 3x3     the mate rotation for a discrete key,
+    #                                 about the port's own mate axis
+    #   seat(port_p, port_R, obj_p, obj_R) -> (key | None, why)
+    #                                 (key, "") if the object is seated on the
+    #                                 port; (None, reason) if it is not
+    #
+    # History: this file once defined SEAT_TOL_M/SEAT_TOL_DEG and the
+    # consuming project imported them BACK OUT for its own dock verify, which
+    # made a generic arm library the source of truth for an assembly-task
+    # tolerance. Those moved to the caller (2026-09-03), leaving the numbers
+    # in the scene config; the RULES that read them -- quantize to four
+    # quarter-turns, gate on gap and axis angle -- stayed here until now.
+    # Required only for a scene with objects; a plain arm never needs one.
+    # See Control's assembly/mate.py for the reference implementation.
+    mate_policy: object = None
     # REQUIRED in scene mode (validated in load()); irrelevant in single-model
     # mode. No robot-shaped defaults: these are model facts the scene config
     # states (scene.welds.*).
@@ -625,7 +653,7 @@ class MuJoCoBackend:
     # The BASE's own port — the root of the assembly chain. The mate target
     # for the next module is ``chain.tip_port``, which walks out to the tip as
     # modules are added; this never moves.
-    dock_site: str | None = None
+    root_port: str | None = None
     # Scene-mode gripper: the fingers are position-servoed (the bridge maps
     # the 7th motor slot onto them). Grip contact runs on the finger MESHES
     # as SDF geoms (2026-07-22 experiment): the true printed geometry —
@@ -660,9 +688,14 @@ class MuJoCoBackend:
     # joint really does sag, so those must keep falling.
     # callable(root_port: str) -> chain, supplied by whoever owns the assembly
     # model. Required only for a scene WITH inventory modules; a plain arm or a
-    # module-free scene never needs one. The returned object must offer
+    # object-free scene never needs one. The returned object must offer
     # ``attach``, ``modules``, ``slots``, ``tip_port``, ``root_port`` and
     # ``state`` -- see Control's assembly/chain.py for the reference one.
+    # Those member names, and ``attach``'s ``module_id``/``clocking`` keywords,
+    # are the CALLER's words for its own model. This file passes them through
+    # and reads ``.clocking`` as an OPAQUE integer: it no longer knows that a
+    # clocking is one of four quarter-turns (see ``mate_policy``), so the name
+    # is the only thing task-shaped left about it.
     chain_factory: object = None
     gravcomp_prefixes: tuple = ()
     # Substrings naming this scene's grip-finger BODIES (scene.finger_body_match):
@@ -693,7 +726,7 @@ class MuJoCoBackend:
     # tree and deletes its free joint, so "has a free joint" stops identifying
     # it -- which is exactly how a docked module silently lost its grip bits.
     # Body NAMES survive a recompile; body ids and roots do not.
-    _module_bodies: frozenset = field(default=frozenset(), init=False, repr=False)
+    _object_bodies: frozenset = field(default=frozenset(), init=False, repr=False)
     _held: Any = field(default=None, init=False, repr=False)
     _driven: np.ndarray | None = field(default=None, init=False, repr=False)
     _applied_attachments: dict = field(default_factory=dict, init=False, repr=False)
@@ -744,18 +777,18 @@ class MuJoCoBackend:
 
     @property
     def staged_slots(self) -> list:
-        """Inventory modules not yet docked, in plan order."""
+        """Scene objects not yet mated into the chain, in plan order."""
         if self.scene is None:
             return []
-        docked = set(self.chain.slots) if self.chain is not None else set()
-        return [s for s in self.scene.modules if s.slot not in docked]
+        mated = set(self.chain.slots) if self.chain is not None else set()
+        return [s for s in self.scene.objects if s.slot not in mated]
 
     @property
     def active_slot(self):
-        """The module the telemetry is ABOUT: the held one, else the next one.
+        """The object the telemetry is ABOUT: the held one, else the next one.
 
         Replaces the old single ``module_body``/``module_site`` config fields.
-        Falling back to the next staged module keeps the pre-grasp prints and
+        Falling back to the next staged object keeps the pre-grasp prints and
         the in-hand probe pointed at something real before the first pick.
         """
         if self._held is not None:
@@ -764,19 +797,19 @@ class MuJoCoBackend:
         return staged[0] if staged else None
 
     @property
-    def module_body(self) -> str | None:
+    def active_body(self) -> str | None:
         slot = self.active_slot
         return slot.body_name if slot is not None else None
 
     @property
-    def module_site(self) -> str | None:
+    def active_port(self) -> str | None:
         slot = self.active_slot
         return slot.passive_name if slot is not None else None
 
     @property
-    def dock_target_site(self) -> str:
+    def open_port(self) -> str:
         """Where the NEXT module mates — the base port, or the chain's tip."""
-        return self.chain.tip_port if self.chain is not None else str(self.dock_site)
+        return self.chain.tip_port if self.chain is not None else str(self.root_port)
 
     @property
     def model_path(self) -> str:
@@ -795,7 +828,8 @@ class MuJoCoBackend:
             )
         if self.scene is not None:
             return compose_scene(
-                self.scene, self.ground_z, self.static_boxes, chain=self.chain
+                self.scene, self.ground_z, self.static_boxes, chain=self.chain,
+                mate_policy=self.mate_policy,
             )
         if self.single_model_path is None:
             raise MuJoCoUnavailableError("need either a scene or single_model_path")
@@ -822,38 +856,47 @@ class MuJoCoBackend:
         if self.scene is not None:
             missing = [
                 k
-                for k in ("ee_body", "dock_site", "dock_capture_m", "dock_capture_deg")
+                for k in ("ee_body", "root_port")
                 if getattr(self, k) is None or getattr(self, k) == ""
             ]
             if missing:
                 raise ValueError(
                     f"scene mode requires {missing} (scene.welds.* in the "
-                    "caller's scenario config — model and mate facts, and this "
-                    "package holds no default for either)"
+                    "caller's scenario config — model facts, and this package "
+                    "holds no default for them)"
                 )
-            if not self.scene.modules:
+            if not self.scene.objects:
                 raise ValueError(
-                    "scene mode needs at least one inventory module "
+                    "scene mode needs at least one object "
                     "(scene.module or scene.inventory)"
                 )
             # The topology graph is the ground truth this plant derives its
-            # model from; ``dock_site`` names the base's own port, the root.
+            # model from; ``root_port`` names the base's own port, the root.
             #
             # INJECTED, not constructed: what an assembly chain IS belongs to
-            # the project that has modules, not to a generic arm plant. This
-            # backend knows how to graft a body into a spec and how to read a
-            # seated clocking; it does not know what a chain is.
+            # the project that has one, not to a generic arm plant. This
+            # backend knows how to graft a body into a spec and how to ASK
+            # whether it landed seated; it does not know what a chain is, nor
+            # what makes a mate a mate.
             if self.chain_factory is None:
                 raise ValueError(
-                    "a workcell scene with inventory modules needs a "
-                    "chain_factory: callable(root_port) -> chain. The plant "
-                    "grafts modules but does not define the assembly model "
+                    "a scene with objects needs a chain_factory: "
+                    "callable(root_port) -> chain. The plant grafts bodies but "
+                    "does not define the assembly model "
                     "(see Control's assembly/chain.py)."
                 )
-            self.chain = self.chain_factory(str(self.dock_site))
-            self._slots = {s.slot: s for s in self.scene.modules}
+            if self.mate_policy is None:
+                raise ValueError(
+                    "a scene with objects needs a mate_policy offering "
+                    "rotation(key) and seat(port_p, port_R, obj_p, obj_R). "
+                    "The plant enforces the seat gate; what COUNTS as seated "
+                    "is the caller's connector geometry "
+                    "(see Control's assembly/mate.py)."
+                )
+            self.chain = self.chain_factory(str(self.root_port))
+            self._slots = {s.slot: s for s in self.scene.objects}
             self._joint_slot = {
-                name: slot for slot in self.scene.modules for name in slot.joint_names
+                name: slot for slot in self.scene.objects for name in slot.joint_names
             }
         self._compile()
         if self.scene is not None:
@@ -862,7 +905,7 @@ class MuJoCoBackend:
             # tried and always drifts/leans — the module's collision hull has a
             # rounded bottom; a real fixture's whole job is that the module does
             # not move.
-            for slot in self.scene.modules:
+            for slot in self.scene.objects:
                 self._activate_body_weld(slot.fixture_eq, "world", slot.body_name)
         if self.launch_viewer:
             try:
@@ -940,7 +983,7 @@ class MuJoCoBackend:
             # seated module is re-grafted as a real link (see _graft), so there
             # is no constraint left to hold the mate — which is the point, an
             # equality-held chain sags and drifts under its own weight.
-            for slot in self.scene.modules:
+            for slot in self.scene.objects:
                 if slot.slot in set(self.chain.slots):
                     continue
                 spec.add_equality(
@@ -964,7 +1007,7 @@ class MuJoCoBackend:
                 for mdl in (
                     self.scene.arm,
                     self.scene.base,
-                    *(s.spec for s in self.scene.modules),
+                    *(s.spec for s in self.scene.objects),
                 )
             ]
             # Fingers fine (0.02 — the grip slots ARE the contact feature);
@@ -976,7 +1019,7 @@ class MuJoCoBackend:
                     cache_dir=cache, mesh_search_dirs=dirs, threshold=0.02,
                 )
             replace_with_decomposition(
-                spec, bodies_containing=[s.prefix for s in self.scene.modules],
+                spec, bodies_containing=[s.prefix for s in self.scene.objects],
                 cache_dir=cache, mesh_search_dirs=dirs, threshold=0.06,
             )
         if self.gravcomp_prefixes:
@@ -1005,7 +1048,7 @@ class MuJoCoBackend:
             # modular arm's own servo, and 5 N·m of stiction there would fight
             # every commanded motion of the assembled robot.
             driven = set(self._actuated_joints(spec))
-            prefixes = tuple(s.prefix for s in self.scene.modules)
+            prefixes = tuple(s.prefix for s in self.scene.objects)
             for jid in range(self.model.njnt):
                 joint = self.model.joint(jid)
                 if joint.name in driven:
@@ -1145,7 +1188,7 @@ class MuJoCoBackend:
         ``_cache_indices``.
         """
         present = {joint.name for joint in spec.joints}
-        docked = set(self.chain.slots) if self.chain is not None else set()
+        mated = set(self.chain.slots) if self.chain is not None else set()
         attached = (
             set(self.scene_state.attachments)
             if self.workcell_scene is not None and self.scene_state is not None
@@ -1154,7 +1197,7 @@ class MuJoCoBackend:
         out = []
         for name in self.joint_names:
             slot = self._joint_slot.get(name)
-            if slot is not None and slot.slot not in docked:
+            if slot is not None and slot.slot not in mated:
                 continue
             object_name = self._joint_object.get(name)
             if object_name is not None and object_name not in attached:
@@ -1274,25 +1317,25 @@ class MuJoCoBackend:
         rest in its rack at all). Ask ``may_collide()`` instead; it reads the
         bits off the compiled model rather than off this paragraph.
         """
-        module_prefixes = (
-            tuple(s.prefix for s in self.scene.modules)
+        object_prefixes = (
+            tuple(s.prefix for s in self.scene.objects)
             if self.scene is not None
             else ()
         )
-        module_roots = {
+        object_roots = {
             self.model.body(name).id
             for name in self._object_free_roots
             if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name) >= 0
         }
-        if not self._module_bodies and module_roots:
+        if not self._object_bodies and object_roots:
             # First compile, while the modules are still free: remember which
             # bodies ARE modules. After a graft they are welded into the base's
-            # tree and their free joint is gone, so module_roots no longer finds
+            # tree and their free joint is gone, so object_roots no longer finds
             # them -- and they would fall through to the generic-robot branch.
-            object.__setattr__(self, "_module_bodies", frozenset(
+            object.__setattr__(self, "_object_bodies", frozenset(
                 self.model.body(b).name or ""
                 for b in range(self.model.nbody)
-                if self.model.body_rootid[b] in module_roots
+                if self.model.body_rootid[b] in object_roots
             ))
         for i in range(self.model.ngeom):
             geom = self.model.geom(i)
@@ -1321,12 +1364,12 @@ class MuJoCoBackend:
                 geom.contype[:] = 1
                 geom.conaffinity[:] = 2
             elif (
-                (module_prefixes and body.startswith(module_prefixes))
-                or self.model.body_rootid[self.model.geom_bodyid[i]] in module_roots
-                or body in self._module_bodies
+                (object_prefixes and body.startswith(object_prefixes))
+                or self.model.body_rootid[self.model.geom_bodyid[i]] in object_roots
+                or body in self._object_bodies
             ):
                 free = (
-                    self.model.body_rootid[self.model.geom_bodyid[i]] in module_roots
+                    self.model.body_rootid[self.model.geom_bodyid[i]] in object_roots
                 )
                 # A FREE module is its own island (8/4): it may touch the
                 # fingers and the world and nothing else. A DOCKED one is part
@@ -1668,9 +1711,9 @@ class MuJoCoBackend:
                 > 0.25
             ):
                 slot = self._held
-                seated, why = self._dock_within_capture(slot)
-                if seated:
-                    self._commit_dock(slot)
+                key, why = self._mate_seat(slot)
+                if key is not None:
+                    self._commit_mate(slot, key)
                 else:
                     # Hand open with the connector NOT seated: no magnets to
                     # forgive it — the module leaves the pads under plain
@@ -1882,48 +1925,43 @@ class MuJoCoBackend:
     def _set_weld_active(self, name: str, active: bool) -> None:
         self.data.eq_active[self._eq_id(name)] = 1 if active else 0
 
-    def _commit_dock(self, slot) -> None:
-        """Commit the mate: record the edge, then rebuild the robot around it.
+    def _mate_seat(self, slot) -> tuple[int | None, str]:
+        """Ask the policy whether ``slot`` is seated on the open port.
 
-        The clocking is READ from the seated pose rather than assumed — the
-        arm placed the module, so which of the four keys it actually landed on
-        is a measurement. Snapping to the nearest key is BrickSim's move: the
-        continuous pose is discarded the moment it has told us which discrete
-        mate it is, so nothing downstream can accumulate drift.
+        Both halves of the question -- is it close enough, and which discrete
+        key did it land on -- belong to the caller's connector, so they are
+        one call. The key is a MEASUREMENT, not an assumption: the arm placed
+        the object, so which key it actually reached is read back from the
+        pose. Snapping to a key is BrickSim's move -- the continuous pose is
+        discarded the moment it has said which discrete mate it is, so nothing
+        downstream can accumulate drift.
         """
-        clocking = self._seated_clocking(slot)
-        port = self.dock_target_site
+        port = self.data.site(self.open_port)
+        obj = self.data.site(slot.passive_name)
+        return self.mate_policy.seat(
+            port.xpos.copy(), port.xmat.reshape(3, 3).copy(),
+            obj.xpos.copy(), obj.xmat.reshape(3, 3).copy(),
+        )
+
+    def _commit_mate(self, slot, key: int) -> None:
+        """Record the edge, then rebuild the robot around it."""
+        port = self.open_port
         self.chain.attach(
             slot=slot.slot,
-            module_id=slot.module_id,
-            clocking=clocking,
+            module_id=slot.type_id,
+            clocking=key,
             active_port=slot.active_name,
         )
         self._held = None
         self.model_revision += 1
         self._compile()
         print(
-            f"[mujoco_backend] docked {slot.slot} ({slot.module_id}) onto "
-            f"{port} at clocking {clocking} ({clocking * 90}°) — chain is now "
-            f"{'+'.join(self.chain.slots)}, next port {self.dock_target_site}, "
+            f"[mujoco_backend] mated {slot.slot} ({slot.type_id}) onto "
+            f"{port} at key {key} — chain is now "
+            f"{'+'.join(self.chain.slots)}, next port {self.open_port}, "
             f"rev {self.model_revision}",
             flush=True,
         )
-
-    def _seated_clocking(self, slot) -> int:
-        """Nearest keyed clocking of the module as currently presented.
-
-        Roll about the mate axis, port x-axis to module x-axis, quantized to
-        the four keys. On the bench this integer comes from the dock MCU's
-        one-hot sensor word instead (Control's ``assembly.chain``) — same
-        quantity, so sim and bench topology are directly comparable.
-        """
-        port = self.data.site(self.dock_target_site)
-        mod = self.data.site(slot.passive_name)
-        p_R = port.xmat.reshape(3, 3)
-        m_R = mod.xmat.reshape(3, 3)
-        angle = float(np.arctan2(m_R[:, 0] @ p_R[:, 1], m_R[:, 0] @ p_R[:, 0]))
-        return int(round(angle / (np.pi / 2))) % 4
 
     def _body_T(self, name: str) -> tuple[np.ndarray, np.ndarray]:
         body = self.data.body(name)
@@ -1957,79 +1995,15 @@ class MuJoCoBackend:
         camera's end-cap tag re-read supplies the same measurement. None in
         single-model mode (no module in the world).
         """
-        if self.scene is None or self.data is None or self.module_body is None:
+        if self.scene is None or self.data is None or self.active_body is None:
             return None
         p_ee, R_ee = self._body_T(self.ee_body)
-        p_mod, R_mod = self._body_T(self.module_body)
+        p_mod, R_mod = self._body_T(self.active_body)
         rel_R = R_ee.T @ R_mod
         rel_p = R_ee.T @ (p_mod - p_ee)
         quat = np.empty(4)
         mujoco.mju_mat2Quat(quat, rel_R.ravel())
         return [float(v) for v in (*rel_p, *quat)]
-
-    def connector_in_ee(self) -> list | None:
-        """Carried module's PASSIVE port pose in the EE frame, [xyz, wxyz].
-
-        The quantity that turns a dock port into an EE target: the arm must
-        put THIS frame on the port. Sim reads it from the twin; the bench
-        reads the same transform from the wrist camera's end-cap tag, so the
-        dock leg is derived identically on both.
-        """
-        if self.data is None or self._held is None:
-            return None
-        p_ee, R_ee = self._body_T(self.ee_body)
-        site = self.data.site(self._held.passive_name)
-        rel_R = R_ee.T @ site.xmat.reshape(3, 3)
-        rel_p = R_ee.T @ (site.xpos - p_ee)
-        quat = np.empty(4)
-        mujoco.mju_mat2Quat(quat, rel_R.ravel())
-        return [float(v) for v in (*rel_p, *quat)]
-
-    def dock_port_body(self) -> str | None:
-        """Body carrying the chain's open port — the dock request's parent.
-
-        Walks out to the tip with the chain, which is why it cannot stay the
-        scenario constant it used to be.
-        """
-        if self.model is None or self.chain is None:
-            return None
-        sid = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_SITE, self.dock_target_site
-        )
-        if sid < 0:
-            return None
-        return self.model.body(int(self.model.site_bodyid[sid])).name
-
-    def module_pose_world(self, slot: str) -> list | None:
-        """World pose of an inventory module's root body, [xyz, wxyz].
-
-        The pick derives from THIS, never from the config nest pose: a module
-        MJCF's root body carries its own offset (the row module's is
-        pos="0 0 0.05"), so the configured world_pos is where the attachment
-        FRAME goes, not where the body lands — 50 mm apart in the bench scene.
-        It is also the same quantity perception publishes, so the sim and
-        bench pick paths stay identical.
-        """
-        entry = self._slots.get(str(slot))
-        if entry is None or self.data is None:
-            return None
-        pos, rot = self._body_T(entry.body_name)
-        quat = np.empty(4)
-        mujoco.mju_mat2Quat(quat, rot.ravel())
-        return [float(v) for v in (*pos, *quat)]
-
-    def dock_port_world(self) -> list | None:
-        """World pose of the chain's OPEN port, [xyz, wxyz].
-
-        Where the next module mates. Walks out to the tip as the arm grows,
-        which is what replaces the scenario's fixed dock waypoints.
-        """
-        if self.data is None or self.chain is None:
-            return None
-        site = self.data.site(self.dock_target_site)
-        quat = np.empty(4)
-        mujoco.mju_mat2Quat(quat, site.xmat.reshape(3, 3).ravel())
-        return [float(v) for v in (*site.xpos, *quat)]
 
     def _conn_in_ee_mm(self) -> list:
         """Carried connector position in the EE frame (mm) — pad-slip probe.
@@ -2037,31 +2011,11 @@ class MuJoCoBackend:
         Nominal carry is ~[0, 45, 120]; the +y term is ALONG the module axis,
         the direction the pads cannot positively lock.
         """
-        if self.module_site is None:
+        if self.active_port is None:
             return []
         p_ee, R_ee = self._body_T(self.ee_body)
-        conn = self.data.site(self.module_site).xpos
+        conn = self.data.site(self.active_port).xpos
         return np.round(R_ee.T @ (conn - p_ee) * 1e3, 1).tolist()
-
-    def _dock_within_capture(self, slot) -> tuple[bool, str]:
-        """Seat test against the chain's CURRENT open port, not a fixed dock."""
-        dock = self.data.site(self.dock_target_site)
-        mod = self.data.site(slot.passive_name)
-        dist = float(np.linalg.norm(dock.xpos - mod.xpos))
-        if dist > float(self.dock_capture_m):
-            delta = (mod.xpos - dock.xpos) * 1e3
-            return False, (
-                f"dock gap {dist*1e3:.2f} mm > seat {self.dock_capture_m*1e3:.2f} mm "
-                f"(connector - dock = [{delta[0]:.1f}, {delta[1]:.1f}, {delta[2]:.1f}] mm)"
-            )
-        z_dock = dock.xmat.reshape(3, 3)[:, 2]
-        z_mod = mod.xmat.reshape(3, 3)[:, 2]
-        # Signed alignment — a connector pointing AWAY from the dock must not
-        # count as capturable, so no abs() here.
-        angle = float(np.degrees(np.arccos(np.clip(z_dock @ z_mod, -1.0, 1.0))))
-        if angle > float(self.dock_capture_deg):
-            return False, f"dock axis off {angle:.2f}° > {self.dock_capture_deg:.2f}°"
-        return True, ""
 
     def _pad_forces(self, slot) -> dict[str, float]:
         """Per-pad normal force (N) against ONE module."""
@@ -2078,8 +2032,8 @@ class MuJoCoBackend:
                 for g in (g1, g2)
             }
             is_finger = any(any(m in b for m in self.finger_body_match) for b in bodies)
-            is_module = any(b.startswith(prefix) for b in bodies)
-            if not (is_finger and is_module):
+            is_object = any(b.startswith(prefix) for b in bodies)
+            if not (is_finger and is_object):
                 continue
             key = next(b for b in bodies if any(m in b for m in self.finger_body_match))
             mujoco.mj_contactForce(self.model, self.data, c, wrench)
@@ -2098,7 +2052,7 @@ class MuJoCoBackend:
             "schema": "topology_state",
             "revision": self.model_revision,
             "chain": state,
-            "next_port": self.dock_target_site,
+            "next_port": self.open_port,
             "staged_slots": [s.slot for s in self.staged_slots],
             "held_slot": self._held.slot if self._held is not None else None,
         }
@@ -2294,15 +2248,15 @@ def _check_contact_policy() -> None:
     # A DOCKED module: generic robot bits PLUS the grip bit. It must keep
     # feeling the fingers -- the jaws are still shut on it when the dock
     # latches -- while gaining nothing else.
-    docked = (2, 1 | 4)
-    assert pair(finger, docked), (
-        "a docked module the jaws are still holding must stay solid to them, "
+    mated = (2, 1 | 4)
+    assert pair(finger, mated), (
+        "a mated module the jaws are still holding must stay solid to them, "
         "or they close through it: measured 59.6 -> 4.5 mm at 3.45 m/s"
     )
-    assert pair(docked, world), "a docked module would fall through the floor"
-    assert not pair(docked, arm), "docked module vs arm links must stay filtered"
-    assert not pair(docked, module), "a docked module must not jostle the rack"
-    assert not pair(docked, docked), "two docked modules must not self-collide"
+    assert pair(mated, world), "a mated module would fall through the floor"
+    assert not pair(mated, arm), "mated module vs arm links must stay filtered"
+    assert not pair(mated, module), "a mated module must not jostle the rack"
+    assert not pair(mated, mated), "two mated modules must not self-collide"
 
     # The arithmetic that has now been got wrong THREE times by eye, pinned:
     # 2 & 1 == 0, which is why the generic 2/1 pair is self-collision-free and
@@ -2318,26 +2272,23 @@ def _check_contact_policy() -> None:
 
 
 def _check_scene_requirements() -> None:
-    """Scene mode must refuse to load without the caller's mate facts.
+    """Scene mode must refuse to load without the caller's model and mate.
 
-    These four used to be two: ``ee_body``/``dock_site`` were required, while
-    the seat tolerances defaulted to a ``SEAT_TOL_*`` pair defined in this file.
-    That default was the arm library deciding an assembly-task number, and the
-    consuming project imported it back out for its own dock verify. Now the
-    scenario config states all four, and a config that forgets one fails HERE,
-    by key name, instead of seating against a number nobody chose.
+    History, because the shape of this check is the point. It began as two
+    required keys (``ee_body``/``dock_site``) with the seat tolerances
+    defaulting to a ``SEAT_TOL_*`` pair defined in THIS file -- the arm library
+    deciding an assembly-task number, which the consuming project then imported
+    back out for its own dock verify. Those numbers moved to the caller's
+    config. The RULES that read them did not: this file still quantized a
+    seated pose to four quarter-turns and gated a mate on gap-then-axis. Now
+    the rules travel with the numbers, as ``mate_policy``.
     """
     model = SceneModelSpec(model_path="unused.xml", name="arm", prefix="asm_")
-    scene = MuJoCoSceneSpec(arm=model, base=model, modules=())
-    full = {
-        "ee_body": "asm_Link6",
-        "dock_site": "base_dock_port",
-        "dock_capture_m": 0.001,
-        "dock_capture_deg": 1.0,
-    }
-    for dropped in full:
-        kwargs = {k: v for k, v in full.items() if k != dropped}
-        backend = MuJoCoBackend(joint_names=["Joint1"], scene=scene, **kwargs)
+    empty = MuJoCoSceneSpec(arm=model, base=model, objects=())
+    for dropped in ("ee_body", "root_port"):
+        kwargs = {"ee_body": "asm_Link6", "root_port": "base_dock_port"}
+        kwargs.pop(dropped)
+        backend = MuJoCoBackend(joint_names=["Joint1"], scene=empty, **kwargs)
         try:
             backend.load()
         except ValueError as exc:
@@ -2345,18 +2296,72 @@ def _check_scene_requirements() -> None:
         else:
             raise AssertionError(f"scene mode loaded without {dropped}")
 
-    # A zero tolerance is a CHOICE (nothing will ever seat), not a missing key:
-    # `not 0.0` is True, so a naive falsiness check would reject it as absent
-    # and send the reader hunting for a key that is right there in the config.
-    backend = MuJoCoBackend(
-        joint_names=["Joint1"], scene=scene,
-        **{**full, "dock_capture_m": 0.0, "dock_capture_deg": 0.0},
+    # A scene WITH objects needs both injections, and each failure names
+    # itself: "it did not move" is not a diagnosis anyone can act on.
+    slot = ObjectSlot(
+        slot="s0", type_id="row_module", spec=model, body="Passive_Side",
     )
-    try:
-        backend.load()
-    except ValueError as exc:
-        assert "dock_capture" not in str(exc), f"0.0 read as a missing key: {exc}"
+    peopled = MuJoCoSceneSpec(arm=model, base=model, objects=(slot,))
+    for missing, needle in (
+        ({}, "chain_factory"),
+        ({"chain_factory": lambda root_port: None}, "mate_policy"),
+    ):
+        backend = MuJoCoBackend(
+            joint_names=["Joint1"], scene=peopled,
+            ee_body="asm_Link6", root_port="base_dock_port", **missing,
+        )
+        try:
+            backend.load()
+        except ValueError as exc:
+            assert needle in str(exc), (needle, str(exc))
+        else:
+            raise AssertionError(f"scene with objects loaded without {needle}")
     print("mujoco_backend: scene requirements OK")
+
+
+def _check_mate_is_the_callers() -> None:
+    """The mate geometry must come from the policy, not from this file.
+
+    The regression this exists to catch: ``_mate_frame`` used to hardcode
+    ``key * pi/2`` about z, so a connector with three keys at 120 degrees --
+    or any mate that is not a quarter-turn roll -- was silently ground into
+    this project's four-key dock. A policy whose rotation cannot be expressed
+    as a multiple of 90 degrees is the cheapest possible proof that the number
+    is no longer ours.
+    """
+    class ThreeKeyMate:
+        """120-degree keys, and a roll axis that is NOT the port's z."""
+
+        def rotation(self, key: int) -> np.ndarray:
+            angle = float(key) * 2.0 * np.pi / 3.0
+            cos, sin = np.cos(angle), np.sin(angle)
+            # About x, deliberately: a policy is free to mate about any axis.
+            return np.array([[1.0, 0.0, 0.0], [0.0, cos, -sin], [0.0, sin, cos]])
+
+        def seat(self, port_p, port_R, obj_p, obj_R):
+            return (1, "") if np.linalg.norm(obj_p - port_p) < 0.01 else (None, "far")
+
+    class _Site:
+        pos = [0.0, 0.0, 0.0]
+        quat = [1.0, 0.0, 0.0, 0.0]
+
+    policy = ThreeKeyMate()
+    _, quat = _mate_frame(_Site(), 1, policy)
+    assert np.allclose(_mat(quat), policy.rotation(1), atol=1e-9), _mat(quat)
+    # 120 degrees about x is not any multiple of 90 about z, so the old
+    # hardcoded roll could not have produced this.
+    for k in range(4):
+        angle = k * np.pi / 2.0
+        cos, sin = np.cos(angle), np.sin(angle)
+        old = np.array([[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]])
+        assert not np.allclose(_mat(quat), old, atol=1e-6), f"key {k} still hardcoded"
+
+    # And the seat verdict is the policy's, both ways round.
+    key, why = policy.seat(np.zeros(3), np.eye(3), np.zeros(3), np.eye(3))
+    assert key == 1 and why == "", (key, why)
+    key, why = policy.seat(np.zeros(3), np.eye(3), np.array([1.0, 0, 0]), np.eye(3))
+    assert key is None and why, (key, why)
+    print("mujoco_backend: mate policy OK")
 
 
 if __name__ == "__main__":
@@ -2369,5 +2374,6 @@ if __name__ == "__main__":
     elif "--self-check" in sys.argv:
         _check_contact_policy()
         _check_scene_requirements()
+        _check_mate_is_the_callers()
     else:
         print(__doc__)

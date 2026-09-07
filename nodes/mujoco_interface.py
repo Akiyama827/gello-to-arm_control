@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import time
 import os
-import importlib
 
 import numpy as np
 from dora import Node
@@ -40,7 +39,13 @@ from arm_control.messages import (
     unpack_motor_command,
     unpack_scene_command,
 )
-from arm_control.node_utils import ShutdownFlag, _zeros, install_signal_handlers
+from arm_control.node_utils import (
+    ShutdownFlag,
+    _zeros,
+    entry_point,
+    install_signal_handlers,
+    scene_injections,
+)
 from arm_control.simulation.mujoco_backend import MuJoCoBackend
 from arm_control.simulation.scene_backend import (
     _resolve,
@@ -89,54 +94,62 @@ def main() -> None:
     period = 1.0 / rate_hz
     idle_timeout = float(cfg.get("idle_timeout_sec", 0.1))
 
+    # Injected by the GRAPH, resolved for BOTH scene paths. This used to sit
+    # inside the `if scene_path:` branch below, so the composed-scene path
+    # could inject nothing -- and once a chain_factory became mandatory for a
+    # scene with objects (2026-09-03) that path raised at startup on every
+    # run. `view.py sim pick` and `sim bench` were dead from that day.
+    injections = scene_injections()
+
     scene_path = os.environ.get("WORKCELL_SCENE")
     scene_cfg = cfg.get("scene")
     if scene_path:
-        def _entry_point(env_var: str):
-            """Resolve a ``module:name`` env var into the object it names.
-
-            The seam that lets a PROJECT inject its own types into this generic
-            node without this package importing that project -- WORKCELL_LOADER
-            has always worked this way, and CHAIN_FACTORY joins it.
-            """
-            spec = os.environ.get(env_var)
-            if not spec:
-                return None
-            module_name, attribute = spec.split(":", 1)
-            return getattr(importlib.import_module(module_name), attribute)
-
-        loader = _entry_point("WORKCELL_LOADER")
+        loader = entry_point("WORKCELL_LOADER")
         # What an assembly chain IS belongs to the project with modules; this
-        # plant grafts bodies and reads seated clockings but defines no
-        # topology. A module-free scene never needs one.
-        chain_cls = _entry_point("CHAIN_FACTORY")
+        # plant grafts bodies and asks whether they landed seated, but defines
+        # neither the topology nor the mate. An object-free scene needs neither.
         backend, arm_slices, joint_names, n = build_workcell_backend(
             scene_path,
             control_period=period,
             launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
             enable_self_collision=bool(cfg.get("sim_self_collision", False)),
             loader=loader,
-            chain_factory=(
-                None if chain_cls is None
-                else (lambda root_port: chain_cls(root_port=root_port))
-            ),
+            chain_factory=injections["chain_factory"],
         )
         print(
             f"[mujoco_interface] generic workcell: {n} actuators, slices={arm_slices}",
             flush=True,
         )
-    elif scene_cfg:
+    elif scene_cfg and scene_cfg.get("arm"):
+        # `scene.arm` is what makes a scene block a COMPOSED PLANT scene, and
+        # the truthiness of `scene:` alone is not: a real-arm config carries a
+        # partial `scene:` describing the docking base as a static fixture for
+        # the visualizer and the planner's obstacle set, while its plant is one
+        # model. Branching on `scene_cfg` alone sent that config down this path
+        # and died with `KeyError: 'arm'` inside _model_spec -- which is how
+        # `view.py sim franka motion` was broken.
         backend, arm_slices, joint_names, n = build_scene_backend(
             scene_cfg,
             control_period=period,
             launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
             enable_self_collision=bool(cfg.get("sim_self_collision", False)),
+            **injections,
         )
         print(
             f"[mujoco_interface] composed scene: {n} actuators, slices={arm_slices}",
             flush=True,
         )
     else:
+        if scene_cfg:
+            # Say so out loud. A partial scene block is legitimate (see above)
+            # but "the plant ignored part of your config" must never be silent.
+            print(
+                f"[mujoco_interface] scene block present but names no `arm` "
+                f"({sorted(scene_cfg)}) — running SINGLE-MODEL. That block is "
+                f"for other consumers (visualizer, planner obstacles); a "
+                f"composed plant scene needs scene.arm.",
+                flush=True,
+            )
         # Single-model mode (view/motion graphs): one MJCF/URDF, plain
         # ``motor_command`` in / ``motor_state`` out, no welds, no ground.
         joint_names = list(cfg.joint_names)

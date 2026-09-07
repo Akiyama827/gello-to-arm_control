@@ -126,8 +126,12 @@ __all__ = [
 ]
 
 
-def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict:
+def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | None:
     """Per-motor kp / kd / torque_limits: mode config first, arm table second.
+
+    Returns None when ``names`` is empty -- see below; callers that need the
+    vectors should pass that None straight to ``build_executor(gains=...)``,
+    which falls back to the arm table.
 
     Shared by every node that has to state gains -- the trajectory executor
     servos with them, and the console must now ship them WITH each plan
@@ -149,6 +153,20 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict:
     import numpy as np
 
     from arm_control.config import _arm_block
+
+    if not names:
+        # No motor-name vector at the top level of this config. That is a
+        # legitimate shape, not an error: a composed-SCENE config names its
+        # joints in `scene.arm.joint_names` and the plant prefixes them, so
+        # the arm table is the only gain source and build_executor already
+        # reads it. Returning None hands the caller back to exactly the path
+        # every assembly graph used before this function existed.
+        #
+        # Caught the hard way: wiring arm_controller to this function (Part 2)
+        # made it raise "expected 0 values, got 7" on every assembly scenario
+        # -- `expand_named_values` against an empty name list -- and killed the
+        # node at startup on `view.py sim pick` and `sim bench`.
+        return None
 
     controller_cfg = dict(mode_cfg.get("controller") or {})
     clamps = {
@@ -182,3 +200,83 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict:
             "the dataflow), or drop it to inherit arm.kp from the arm config."
         )
     return out
+
+
+def entry_point(env_var: str):
+    """Resolve a ``module:name`` env var into the object it names, or None.
+
+    The seam that lets a PROJECT inject its own types into a generic node
+    without this package importing that project. WORKCELL_LOADER has always
+    worked this way; CHAIN_FACTORY and MATE_POLICY joined it.
+    """
+    import importlib
+    import os
+
+    spec = os.environ.get(env_var)
+    if not spec:
+        return None
+    module_name, attribute = spec.split(":", 1)
+    return getattr(importlib.import_module(module_name), attribute)
+
+
+def scene_injections() -> dict:
+    """``chain_factory`` and ``mate_policy`` for a composed scene, from env.
+
+    Shared because a scene has more than one consumer: the plant steps it and
+    the simulated perception samples truth from the SAME composition. Two
+    copies of this resolution would be two chances for the twin the cloud
+    tracks to differ from the twin the physics runs.
+    """
+    chain_cls = entry_point("CHAIN_FACTORY")
+    policy_cls = entry_point("MATE_POLICY")
+    return {
+        "chain_factory": (
+            None if chain_cls is None
+            else (lambda root_port: chain_cls(root_port=root_port))
+        ),
+        "mate_policy": None if policy_cls is None else policy_cls(),
+    }
+
+
+def _check_resolve_gains() -> None:
+    """The three config shapes that reach resolve_gains, including the empty one.
+
+    The last case is a regression guard. Wiring ``nodes/arm_controller.py`` to
+    this function assumed every arm config names its motors at the top level.
+    A composed-SCENE config does not -- its joints live under
+    ``scene.arm.joint_names`` and the plant prefixes them -- so ``names`` came
+    through empty, ``expand_named_values`` raised "expected 0 values, got 7",
+    and the controller died at startup on every assembly scenario.
+    """
+    import numpy as np
+
+    cfg = {"arm": {"kp": [10.0, 11.0], "kd": [1.0, 1.1], "max_tau": [5.0, 5.0]}}
+    names = ["j1", "j2"]
+
+    # 1. Mode config wins over the arm table.
+    mode = {"controller": {"kp": {"j1": 20.0, "j2": 21.0}}}
+    out = resolve_gains(cfg, mode, names, 2)
+    assert np.allclose(out["kp"], [20.0, 21.0]), out["kp"]
+    assert np.allclose(out["kd"], [1.0, 1.1]), out["kd"]   # falls back
+
+    # 2. No mode config at all: the arm table, exactly as before this existed.
+    out = resolve_gains(cfg, {}, names, 2)
+    assert np.allclose(out["kp"], [10.0, 11.0]), out["kp"]
+
+    # 3. No motor names: None, not a raise. The caller falls back to the arm
+    #    table via build_executor(gains=None).
+    assert resolve_gains(cfg, {}, [], 0) is None
+    assert resolve_gains(cfg, mode, [], 2) is None
+
+    # 4. An all-zero arm stiffness is still loud -- a limp arm holds nothing.
+    try:
+        resolve_gains({"arm": {"kp": [0.0, 0.0]}}, {}, names, 2)
+    except ValueError as exc:
+        assert "all zeros" in str(exc), exc
+    else:
+        raise AssertionError("all-zero kp resolved silently")
+    print("node_utils: resolve_gains OK")
+
+
+if __name__ == "__main__":
+    _check_resolve_gains()
