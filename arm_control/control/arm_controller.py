@@ -643,7 +643,7 @@ class ArmController:
         print(f"[arm_controller] stopped: {reason}", flush=True)
 
     # -- run loop ------------------------------------------------------------
-    def run(self) -> None:
+    def run(self, *, shutdown=None) -> None:
         handlers = {
             "motor_state": self.on_motor_state,
             "motor_health": self.on_motor_health,
@@ -660,7 +660,12 @@ class ArmController:
             "control_replay": self.on_control,
         }
         seen_unknown: set[str] = set()
-        for event in self.node:
+        while shutdown is None or not shutdown.stop_requested:
+            event = self.node.next(timeout=0.05)
+            if shutdown is not None and shutdown.stop_requested:
+                break
+            if event is None:
+                continue
             if event["type"] == "STOP":
                 break
             if event["type"] != "INPUT":

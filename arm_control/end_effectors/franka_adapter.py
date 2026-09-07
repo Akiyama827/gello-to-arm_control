@@ -42,6 +42,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 from dora import Node
@@ -53,6 +54,11 @@ from arm_control.messages import (
     pack_json_message,
     unpack_grasp_request,
     unpack_motor_command,
+)
+from arm_control.node_utils import (
+    ShutdownFlag,
+    install_signal_handlers,
+    next_event_gil_friendly,
 )
 
 import os
@@ -94,78 +100,96 @@ class BridgeClient(threading.Thread):
     def send_line(self, line: str) -> None:
         self.lines.append(line)
 
+    def close(self) -> None:
+        self.stop_flag.set()
+        # Connection establishment is bounded by 2 s; recv by 0.2 s.
+        self.join(timeout=2.5)
+
     def run(self) -> None:
-        sent: float | None = None
-        seen: float | None = None
-        stable_t = 0.0
-        buf = b""
         sock: socket.socket | None = None
-        warned = False
-        while not self.stop_flag.is_set():
-            if sock is None:
+        try:
+            sent: float | None = None
+            seen: float | None = None
+            stable_t = 0.0
+            buf = b""
+            warned = False
+            while not self.stop_flag.is_set():
+                if sock is None:
+                    try:
+                        sock = socket.create_connection(self.addr, timeout=2.0)
+                        sock.settimeout(0.2)
+                        print(f"[franka_gripper] hand_bridge at {self.addr[0]}:"
+                              f"{self.addr[1]} connected", flush=True)
+                        warned = False
+                        sent = None  # re-send the current target on a fresh session
+                    except OSError as exc:
+                        if not warned:
+                            warned = True
+                            print(f"[franka_gripper] hand_bridge unreachable "
+                                  f"({exc}) — retrying; is it running on the RT "
+                                  "box?", flush=True)
+                        self.stop_flag.wait(2.0)
+                        continue
+                if self.stop_flag.is_set():
+                    break
                 try:
-                    sock = socket.create_connection(self.addr, timeout=2.0)
-                    sock.settimeout(0.2)
-                    print(f"[franka_gripper] hand_bridge at {self.addr[0]}:"
-                          f"{self.addr[1]} connected", flush=True)
-                    warned = False
-                    sent = None  # re-send the current target on a fresh session
+                    w = self.target
+                    if w != seen:  # slider still moving — restart the settle clock
+                        seen = w
+                        stable_t = time.monotonic()
+                    if (
+                        w is not None
+                        and time.monotonic() - stable_t >= SETTLE_S
+                        and (sent is None or abs(w - sent) >= DEADBAND_M)
+                    ):
+                        sent = w
+                        sock.sendall(f"MOVE {w:.5f} {MOVE_SPEED:.3f}\n".encode())
+                    if self.want_home:
+                        self.want_home = False
+                        sock.sendall(b"HOME\n")
+                    while self.lines and not self.stop_flag.is_set():
+                        sock.sendall((self.lines.pop(0) + "\n").encode())
+                    try:
+                        data = sock.recv(256)
+                        if not data:
+                            raise OSError("bridge closed the connection")
+                        buf += data
+                    except socket.timeout:
+                        continue
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        parts = line.decode(errors="replace").split()
+                        if len(parts) == 3 and parts[0] == "STATE":
+                            self.state = {
+                                "width": float(parts[1]),
+                                "is_grasped": parts[2] == "1",
+                            }
+                        elif len(parts) == 2 and parts[0] == "GDONE":
+                            self.gdone_ok = parts[1] == "1"
+                            self.gdone_count += 1
                 except OSError as exc:
-                    if not warned:
-                        warned = True
-                        print(f"[franka_gripper] hand_bridge unreachable "
-                              f"({exc}) — retrying; is it running on the RT "
-                              "box?", flush=True)
+                    print(f"[franka_gripper] bridge link lost ({exc}) — "
+                          "reconnecting", flush=True)
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
+                    buf = b""
                     self.stop_flag.wait(2.0)
-                    continue
-            try:
-                w = self.target
-                if w != seen:  # slider still moving — restart the settle clock
-                    seen = w
-                    stable_t = time.monotonic()
-                if (
-                    w is not None
-                    and time.monotonic() - stable_t >= SETTLE_S
-                    and (sent is None or abs(w - sent) >= DEADBAND_M)
-                ):
-                    sent = w
-                    sock.sendall(f"MOVE {w:.5f} {MOVE_SPEED:.3f}\n".encode())
-                if self.want_home:
-                    self.want_home = False
-                    sock.sendall(b"HOME\n")
-                while self.lines:
-                    sock.sendall((self.lines.pop(0) + "\n").encode())
-                try:
-                    data = sock.recv(256)
-                    if not data:
-                        raise OSError("bridge closed the connection")
-                    buf += data
-                except socket.timeout:
-                    continue
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    parts = line.decode(errors="replace").split()
-                    if len(parts) == 3 and parts[0] == "STATE":
-                        self.state = {
-                            "width": float(parts[1]),
-                            "is_grasped": parts[2] == "1",
-                        }
-                    elif len(parts) == 2 and parts[0] == "GDONE":
-                        self.gdone_ok = parts[1] == "1"
-                        self.gdone_count += 1
-            except OSError as exc:
-                print(f"[franka_gripper] bridge link lost ({exc}) — "
-                      "reconnecting", flush=True)
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-                sock = None
-                buf = b""
-                self.stop_flag.wait(2.0)
+        finally:
+            if sock is not None:
+                sock.close()
 
 
 def main() -> None:
+    shutdown = ShutdownFlag()
+    install_signal_handlers(shutdown)
+    with ExitStack() as cleanup:
+        _run(shutdown, cleanup)
+
+
+def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
     cfg = load_robot_config()
     rt = dict(cfg.get("rt") or {})
     client = BridgeClient(
@@ -173,13 +197,16 @@ def main() -> None:
     )
     grasp_fsm = HandGraspFsm(dict((cfg.get("franka") or {}).get("gripper") or {}))
     client.start()
+    cleanup.callback(client.close)
     HOME_FILE.unlink(missing_ok=True)
     node = Node()
     print("[franka_gripper] up — finger slider drives width; "
           f"touch {HOME_FILE} to home", flush=True)
     last_pub = 0.0
-    while True:
-        event = node.next(timeout=0.1)
+    while not shutdown.stop_requested:
+        event = next_event_gil_friendly(node)
+        if shutdown.stop_requested:
+            break
         if event is not None:
             if event["type"] == "STOP":
                 break
@@ -215,7 +242,6 @@ def main() -> None:
             node.send_output(
                 "gripper_state", pack_json_message("gripper_state", state)
             )
-    client.stop_flag.set()
 
 
 def _demo() -> None:

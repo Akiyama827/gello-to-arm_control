@@ -26,10 +26,17 @@ from dora import Node
 from arm_control.config import arm_joints, load_robot_config
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.factory import build_executor, gripper_command_cfg
-from arm_control.node_utils import _load_mode_config, resolve_gains
+from arm_control.node_utils import (
+    ShutdownFlag,
+    _load_mode_config,
+    install_signal_handlers,
+    resolve_gains,
+)
 
 
 def main() -> None:
+    shutdown = ShutdownFlag()
+    install_signal_handlers(shutdown)
     cfg = load_robot_config()
     mode_cfg = _load_mode_config()
     # Gains span two config styles: an assembly config states `arm.kp`, a
@@ -70,7 +77,7 @@ def main() -> None:
         "arms (nothing moves without an operator)",
         flush=True,
     )
-    controller.run()
+    controller.run(shutdown=shutdown)
 
 
 def cli() -> None:

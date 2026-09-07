@@ -14,6 +14,7 @@ import numpy as np
 
 from arm_control.config import load_robot_config_dict
 from arm_control.messages import unpack_motor_command, unpack_motor_state
+from arm_control.node_utils import ShutdownFlag, install_signal_handlers
 
 
 def _load_cfg() -> dict:
@@ -33,6 +34,8 @@ def _row(
 
 
 def main() -> None:
+    shutdown = ShutdownFlag()
+    install_signal_handlers(shutdown)
     cfg = _load_cfg()
     n = int(cfg.get("num_motors", 7))
     motor_names = list(cfg.get("motor_names") or [f"motor_{i}" for i in range(n)])
@@ -58,7 +61,12 @@ def main() -> None:
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        for event in node:
+        while not shutdown.stop_requested:
+            event = node.next(timeout=0.05)
+            if shutdown.stop_requested:
+                break
+            if event is None:
+                continue
             if event["type"] == "STOP":
                 break
             if event["type"] != "INPUT":

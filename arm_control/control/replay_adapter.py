@@ -36,7 +36,12 @@ from arm_control.messages import (
     unpack_json_message,
     unpack_motor_state,
 )
-from arm_control.node_utils import _load_mode_config, resolve_gains
+from arm_control.node_utils import (
+    ShutdownFlag,
+    _load_mode_config,
+    install_signal_handlers,
+    resolve_gains,
+)
 
 # Trigger files live in the user-private runtime dir (mode 0700), NOT /tmp:
 # a world-writable trigger is motion authority for ANY local process/user,
@@ -113,6 +118,8 @@ def build_replay(
 
 
 def main() -> None:
+    shutdown = ShutdownFlag()
+    install_signal_handlers(shutdown)
     cfg = load_robot_config()
     mode_cfg = _load_mode_config()
     rp = dict(mode_cfg.get("replay") or {})
@@ -134,8 +141,10 @@ def main() -> None:
         f"touch {STOP_FILE} to stop",
         flush=True,
     )
-    while True:
+    while not shutdown.stop_requested:
         event = node.next(timeout=0.2)
+        if shutdown.stop_requested:
+            break
         if event is not None:
             if event["type"] == "STOP":
                 break
@@ -193,6 +202,8 @@ def main() -> None:
         except (ValueError, IndexError) as exc:
             print(f"[trajectory_replay] REFUSED: {exc}", flush=True)
             continue
+        if shutdown.stop_requested:
+            break
         # gated=False: the trigger file IS the operator's press. A gated plan
         # would wait for an `execute` that nothing here ever sends.
         node.send_output(

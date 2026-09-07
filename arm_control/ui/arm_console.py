@@ -33,6 +33,7 @@ import threading
 import uuid
 import time
 from collections import deque
+from contextlib import ExitStack
 
 import numpy as np
 from dora import Node
@@ -58,8 +59,10 @@ from arm_control.planning.ompl_planner import OMPLPlanner
 from arm_control.motion import JointTrajectory
 from arm_control.planning.retiming import time_parameterize_blended
 from arm_control.node_utils import (
+    ShutdownFlag,
     _load_mode_config,
     expand_named_values,
+    install_signal_handlers,
     next_event_gil_friendly,
     resolve_gains,
 )
@@ -411,7 +414,7 @@ class ControlPanel:
             self._log.append(message)
 
     def close(self) -> None:
-        self._server.shutdown()
+        self._server.close()
 
 
 def plan_trajectory(
@@ -448,7 +451,15 @@ def plan_trajectory(
 
 
 def main() -> None:
+    shutdown = ShutdownFlag()
+    install_signal_handlers(shutdown)
+    with ExitStack() as cleanup:
+        _run(shutdown, cleanup)
+
+
+def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
     import pinocchio as pin
+    import rerun as rr
 
     from arm_control.planning.ik import PinocchioIK
     from arm_control.planning.preview_rerun import (
@@ -532,6 +543,9 @@ def main() -> None:
         # through it.
         environment=list(cfg.get("environment") or []) + scene_obstacle_geoms(cfg),
     )
+    # Detach the sink before interpreter shutdown; an absent viewer must not
+    # leave Rerun's implicit final flush waiting after Dora has stopped.
+    cleanup.callback(rr.disconnect)
     init_preview_stream(teleop_cfg.get("preview"))
     ee_link = ee_frame(cfg)
     vfk = VisualFK(cfg.urdf_path, planned, ee_link, gripper_joints(cfg))
@@ -601,6 +615,7 @@ def main() -> None:
         jog_speed_m_s=jog_limits.speed_m_s,
         jog_joint_speed_rad_s=jog_joint_speed,
     )
+    cleanup.callback(panel.close)
     # The legend, stated once, the same on the page and in Rerun. It used to
     # read "solid robot = target, green ghost = live arm, orange = plan",
     # which inverts all three against what both surfaces actually draw
@@ -651,8 +666,10 @@ def main() -> None:
     plan_thread: threading.Thread | None = None
     plan_box: list = []  # worker appends ("ok", traj, goal_q) | ("err", msg)
 
-    while True:
+    while not shutdown.stop_requested:
         event = next_event_gil_friendly(node, idle_sleep=0.05)
+        if shutdown.stop_requested:
+            break
         now = time.monotonic()
         if event is not None:
             if event["type"] == "INPUT" and event["id"] == "motor_state":
