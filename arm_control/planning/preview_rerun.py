@@ -344,30 +344,35 @@ class DeferredPreview:
     twin's ground-truth mirror; the difference is only that the preview is
     PUSHED, so it needs a queue rather than its own poll loop.
 
-    The queue is bounded and drops the OLDEST frame when full. Visualization is
-    expendable and the newest pose is the interesting one; the sequence is not
-    expendable, and must never wait on a viewer nobody opened.
+    Pending calls coalesce by method and named entity. Repeated pose/finger
+    updates replace their own stale frames, never a one-off path or target.
+    Distinct pending entries are bounded; the sequence never waits for I/O.
     """
 
     def __init__(self, inner, maxsize: int = 64) -> None:
-        import queue
+        from collections import OrderedDict
         import threading
 
+        if maxsize < 1:
+            raise ValueError("preview maxsize must be positive")
         self._inner = inner
-        self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._pending = OrderedDict()
+        self._ready = threading.Condition()
+        self._maxsize = maxsize
         self._dropped = 0
-        self._q = queue
 
         def _drain() -> None:
+            errors = 0
             while True:
-                name, args, kwargs = self._queue.get()
+                with self._ready:
+                    self._ready.wait_for(lambda: bool(self._pending))
+                    _, (name, args, kwargs) = self._pending.popitem(last=False)
                 try:
                     getattr(self._inner, name)(*args, **kwargs)
-                except Exception:
-                    # A dead viewer, a torn pose, a renamed entity -- none of
-                    # it may propagate into the planner, which is not even on
-                    # this thread any more.
-                    pass
+                except Exception as exc:
+                    errors += 1
+                    if errors in (1, 100, 1000):
+                        print(f"[preview] {name} failed: {exc} ({errors} errors)", flush=True)
 
         threading.Thread(target=_drain, daemon=True, name="rerun-preview").start()
 
@@ -378,22 +383,16 @@ class DeferredPreview:
         getattr(self._inner, name)
 
         def _call(*args, **kwargs) -> None:
-            try:
-                self._queue.put_nowait((name, args, kwargs))
-            except self._q.Full:
-                try:
-                    self._queue.get_nowait()          # drop the oldest frame
-                    self._queue.put_nowait((name, args, kwargs))
-                except (self._q.Empty, self._q.Full):
-                    return
-                self._dropped += 1
-                if self._dropped in (1, 100, 1000):
-                    print(
-                        f"[preview] no viewer draining Rerun — dropped "
-                        f"{self._dropped} preview frames (the sequence is "
-                        "unaffected; run `rerun` to watch)",
-                        flush=True,
-                    )
+            entity = args[0] if args and isinstance(args[0], str) else kwargs.get("name")
+            key = (name, entity)
+            with self._ready:
+                if key in self._pending:
+                    self._dropped += 1
+                elif len(self._pending) >= self._maxsize:
+                    self._pending.popitem(last=False)
+                    self._dropped += 1
+                self._pending[key] = (name, args, kwargs)
+                self._ready.notify()
 
         return _call
 
@@ -621,30 +620,49 @@ def _self_check() -> None:
 
         def __init__(self) -> None:
             self.released = threading.Event()
+            self.entered = threading.Event()
+            self.path_delivered = threading.Event()
+            self.finished = threading.Event()
             self.calls: list[tuple] = []
 
         def show_plan_pose(self, q) -> None:
+            self.entered.set()
             self.released.wait(timeout=5.0)
             self.calls.append(("show_plan_pose", q))
 
+        def show_ee_path(self, name, positions) -> None:
+            self.calls.append((name, positions))
+            self.path_delivered.set()
+
         def update(self, q) -> None:
             self.calls.append(("update", q))
+            self.finished.set()
 
     inner = _Blocking()
     preview = DeferredPreview(inner, maxsize=4)
+    preview.show_plan_pose(-1)
+    assert inner.entered.wait(1.0)
+    preview.show_ee_path("planned_path", "old")
+    preview.show_ee_path("planned_path", "current")
+    preview.show_ee_path("another_path", "other")
 
     # The first call parks the drain thread inside the sink. Every later call
     # must still return promptly -- that is the whole property.
     start = time.monotonic()
     for i in range(50):
         preview.show_plan_pose(i)
+    preview.update(50)
     elapsed = time.monotonic() - start
     assert elapsed < 0.5, f"caller blocked for {elapsed:.2f}s behind a dead sink"
     assert preview._dropped > 0, "a full queue must drop, not grow without bound"
-    assert preview._queue.qsize() <= 4, preview._queue.qsize()
+    assert len(preview._pending) <= 4, len(preview._pending)
 
     inner.released.set()
-    time.sleep(0.2)
+    assert inner.path_delivered.wait(1.0), "pose flood erased the held plan's path"
+    assert ("planned_path", "current") in inner.calls
+    assert ("planned_path", "old") not in inner.calls
+    assert inner.finished.wait(1.0)
+    assert ("another_path", "other") in inner.calls
     assert inner.calls, "nothing was ever delivered once the sink unblocked"
 
     # A typo'd method fails at the call site, not silently on the thread.
