@@ -25,6 +25,155 @@ let planVersion = -1;
 let lastGizmoSend = 0;
 let handPosting = false;
 let handError = "";
+let currentPose = null;
+let poseDirty = false;
+let poseEdits = 0;
+let posePosting = false;
+let posePending = null;
+let poseError = "";
+let speedDirty = false;
+let speedPosting = false;
+let modeError = "";
+const poseAxes = ["x", "y", "z", "roll", "pitch", "yaw"];
+const poseInputs = poseAxes.map((axis) => $(`pose-${axis}`));
+const speedInputs = [$("jog-cart-speed"), $("jog-joint-input")];
+const poseValues = (pose) => [...pose.xyz_mm, ...pose.rpy_deg];
+const fillPose = (pose) => poseValues(pose).forEach((value, i) => {
+  poseInputs[i].value = Number(value.toFixed(6));
+});
+const updateMoveButtons = () => {
+  for (const button of $("buttons").children) {
+    if (/^(Plan|Execute)/i.test(button.textContent)) {
+      button.disabled = poseDirty || posePosting || Boolean(posePending);
+      button.title = button.disabled ? "Apply the desired pose successfully before planning or executing" : "";
+    }
+  }
+};
+for (const input of poseInputs) input.addEventListener("input", () => {
+  poseDirty = true;
+  poseEdits += 1;
+  poseError = "";
+  $("pose-status").textContent = "Unsaved desired pose · Apply target before Plan";
+  updateMoveButtons();
+});
+$("copy-current").onclick = () => {
+  if (!currentPose) return;
+  fillPose(currentPose);
+  poseDirty = true;
+  poseEdits += 1;
+  poseError = "";
+  $("pose-status").textContent = "Current pose copied to Desired · not applied";
+  updateMoveButtons();
+};
+$("apply-pose").onclick = async () => {
+  if (posePosting || posePending) return;
+  if (!poseInputs.every((input) => input.reportValidity())) {
+    poseError = "Enter all six finite pose values before applying";
+    $("pose-status").textContent = poseError;
+    return;
+  }
+  const values = poseInputs.map((input) => Number(input.value));
+  if (!values.every(Number.isFinite)) return;
+  const edits = poseEdits;
+  posePosting = true;
+  poseError = "";
+  $("apply-pose").disabled = true;
+  $("pose-status").textContent = "Applying target; robot does not move";
+  updateMoveButtons();
+  try {
+    const result = await post("/pose", { xyz_mm: values.slice(0, 3), rpy_deg: values.slice(3) });
+    posePending = { revision: result.revision, edits };
+  } catch (error) {
+    poseError = error.message;
+    $("pose-status").textContent = poseError;
+  } finally {
+    posePosting = false;
+    $("apply-pose").disabled = Boolean(posePending);
+    updateMoveButtons();
+  }
+};
+const updatePose = (pose) => {
+  currentPose = pose?.current || null;
+  const values = currentPose ? poseValues(currentPose) : [];
+  poseAxes.forEach((axis, i) => {
+    $(`current-${axis}`).textContent = currentPose ? values[i].toFixed(2) : "—";
+  });
+  $("current-status").textContent = currentPose ? "Current · FK estimate from measured joints" : "Current pose unavailable / stale";
+  $("copy-current").disabled = !currentPose;
+  if (posePending && pose && (pose.revision > posePending.revision ||
+      (pose.revision === posePending.revision && !pose.status.startsWith("Applying")))) {
+    if (pose.revision === posePending.revision && pose.status.startsWith("Target applied") && poseEdits === posePending.edits) {
+      poseDirty = false;
+    }
+    posePending = null;
+  }
+  if (pose?.target && !poseDirty && !posePosting && !posePending && !poseInputs.includes(document.activeElement)) {
+    fillPose(pose.target);
+  }
+  if (!posePosting) $("pose-status").textContent = poseError || [
+    poseDirty && !posePending ? "Desired is an unapplied draft" : "",
+    pose ? (pose.status || "Edit Desired, then Apply target") : "Target status unavailable",
+  ].filter(Boolean).join(" · ");
+  $("apply-pose").disabled = posePosting || Boolean(posePending);
+  updateMoveButtons();
+};
+
+for (const input of speedInputs) input.addEventListener("input", () => {
+  speedDirty = true;
+  input.setCustomValidity("");
+  $("speed-status").textContent = "Unsaved speeds · Save to apply on the next press";
+});
+$("save-speeds").onclick = async () => {
+  if (speedPosting) return;
+  for (const input of speedInputs) {
+    input.setCustomValidity(Number(input.value) > 0 ? "" : "Speed must be greater than zero");
+    if (!input.reportValidity()) {
+      $("speed-status").textContent = "Enter positive speeds at or below the displayed maximum";
+      return;
+    }
+  }
+  const draft = speedInputs.map((input) => input.value);
+  speedPosting = true;
+  $("save-speeds").disabled = true;
+  try {
+    await post("/jog_speed", {
+      speed_m_s: Number(draft[0]) / 1000,
+      joint_speed_rad_s: Number(draft[1]) * Math.PI / 180,
+    });
+    speedDirty = speedInputs.some((input, i) => input.value !== draft[i]);
+    $("speed-status").textContent = speedDirty ? "Saved; newer edits remain unsaved" : "Speeds saved · apply on the next press";
+  } catch (error) {
+    $("speed-status").textContent = error.message;
+  } finally {
+    speedPosting = false;
+    $("save-speeds").disabled = false;
+  }
+};
+const updateSpeeds = (jog) => {
+  // Truncate displayed limits: rounding up would advertise a forbidden speed.
+  const floorLimit = (value) => Math.floor(value * 1e9) / 1e9;
+  const maxima = [jog.max_speed_m_s * 1000, jog.max_joint_speed_rad_s * 180 / Math.PI].map(floorLimit);
+  const values = [jog.speed_m_s * 1000, jog.joint_speed_rad_s * 180 / Math.PI];
+  speedInputs.forEach((input, i) => {
+    input.max = maxima[i];
+    if (!speedDirty && !speedPosting && !speedInputs.includes(document.activeElement)) input.value = floorLimit(values[i]);
+  });
+  $("jog-speed").textContent = `Accepted ${values[0].toFixed(3)} mm/s · max ${maxima[0]} mm/s · hold − / + · robot base XYZ`;
+  $("jog-joint-speed").textContent = `Accepted ${values[1].toFixed(6)}°/s · max ${maxima[1]}°/s`;
+};
+const updateMode = (mode) => {
+  const selected = mode?.selected;
+  $("mode-selected").textContent = selected ? selected[0].toUpperCase() + selected.slice(1) : "Unknown";
+  for (const button of $("gains").children) {
+    const pressed = Boolean(selected && button.dataset.mode === selected);
+    button.classList.toggle("selected", pressed);
+    button.setAttribute("aria-pressed", String(pressed));
+  }
+  $("mode-status").textContent = modeError || [
+    mode?.pending ? `Pending: ${mode.pending}` : "",
+    mode?.reason || "",
+  ].filter(Boolean).join(" · ");
+};
 
 const updateHand = (hand) => {
   for (const id of ["hand-grasp", "hand-open"]) $(id).disabled = handPosting || !hand?.enabled;
@@ -141,10 +290,7 @@ const buildJogPad = (jog) => {
     addRow(joints, `J${j + 1}`, [["−", `j${j}`, -1], ["+", `j${j}`, 1]]);
   }
   $("jog-joints-wrap").hidden = jog.joints === 0;
-  $("jog-speed").textContent =
-    `Hold − / + for negative / positive direction · ${Number(jog.speed_m_s * 1000).toFixed(1)} mm/s · robot base XYZ`;
-  $("jog-joint-speed").textContent =
-    `Joint target speed: ${Number(jog.joint_speed_rad_s).toFixed(3)} rad/s (${Number(jog.joint_speed_rad_s * 180 / Math.PI).toFixed(1)}°/s)`;
+  updateSpeeds(jog);
 };
 
 // -- first paint -------------------------------------------------------------
@@ -192,9 +338,19 @@ const build = async (state) => {
   for (const name of state.buttons) {
     const button = document.createElement("button");
     button.textContent = name.startsWith("Gains: ") ? name.slice(7) : name;
+    if (name.startsWith("Gains: ")) {
+      button.dataset.mode = name.slice(7).toLowerCase();
+      button.setAttribute("aria-pressed", "false");
+    }
     button.onclick = () => {
       if (name === "Stop (hold)") releaseJog();
-      post("/click", { button: name }).catch(console.error);
+      if (button.dataset.mode) modeError = "";
+      post("/click", { button: name }).catch((error) => {
+        if (button.dataset.mode) {
+          modeError = error.message;
+          $("mode-status").textContent = modeError;
+        } else console.error(error);
+      });
     };
     // Gain presets are a different KIND of action from plan/execute: they
     // change the control law under whatever is running. Own row, own heading.
@@ -234,6 +390,7 @@ const poll = async () => {
     if (state.ident) document.title = `${state.ident} — arm console`;
     if (!built && !building) await build(state);
     if (state.jog) {
+      updateSpeeds(state.jog);
       const note = state.jog.note || (state.jog.held ? "jogging" : "");
       $("jog-note").textContent = note;
       $("jog-note").className = note.includes("refused") ? "jog-note refused" : "jog-note";
@@ -243,6 +400,8 @@ const poll = async () => {
       if (gripperSlider) syncSliders([gripperSlider], [state.gripper], 3);
     }
     updateHand(state.hand);
+    updatePose(state.pose);
+    updateMode(state.mode);
     setPoses(measuredRobot, state.measured_geoms);
     setPoses(targetRobot, state.target_geoms);
     if (!isDraggingGizmo() && state.ee) {
@@ -270,6 +429,8 @@ const poll = async () => {
   } catch (error) {
     setConnected(false);
     updateHand(null);
+    updatePose(null);
+    updateMode(null);
     releaseJog();
     console.error(error);
   }

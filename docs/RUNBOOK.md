@@ -75,8 +75,23 @@ Jog is press-and-hold on the negative/positive direction button. Release,
 window focus loss, or expired jog updates stop jogging and hold without
 disarming. The console displays configured Cartesian target speed in mm/s
 (robot-base XYZ) and joint target speed in rad/s and degrees/s, not measured
-velocity. These speeds are set in the mode profile's `jog` section.
+velocity. The mode profile's `jog` section sets immutable startup ceilings.
+Edit Cartesian mm/s or joint degrees/s and Save speeds to reduce them online;
+an accepted change takes effect on the next press, never halfway through a hold.
 Hand commands also require confirmed ARM and no fault.
+
+The Control law badge reports controller-confirmed Track, Float, Soft or Custom.
+It shows Unknown when feedback is unavailable or stale, and distinguishes pending
+requests from applied modes. Track is the default in the supplied motion profile;
+the badge reflects actual controller gains, not an assumed startup preset. This
+is controller feedback, not a separate acknowledgement from the remote RT plant.
+
+Move shows Current as an FK estimate from fresh measured joints, not an external
+pose measurement. Current and Desired use the robot base frame: XYZ in mm and
+fixed-axis roll/pitch/yaw in degrees, R = Rz(yaw) Ry(pitch) Rx(roll). Copy current
+fills Desired only. Apply target solves all six fields together without moving;
+failed IK leaves the previous target intact. Then Plan + preview, ARM and Execute.
+Edits invalidate older previews. Polling preserves unfinished input drafts.
 
 Stop (hold) cancels motion but leaves authority enabled; DISARM cancels the
 plan and drops authority. Plant command watchdogs, fault handling, and any
@@ -105,6 +120,9 @@ Console policy checks (no hardware):
 
 ```bash
 PYTHONPATH=. python tools/bench/check_console_authority.py
+PYTHONPATH=. python tools/inspect/check_console_controls.py
+PYTHONPATH=. python tools/inspect/check_console_page.py
+PYTHONPATH=. python tools/inspect/check_controller_mode_feedback.py
 PYTHONPATH=. python tools/bench/check_console_grasp.py
 PYTHONPATH=. python tools/bench/check_hand_grasp.py
 PYTHONPATH=. python -m arm_control.console_server

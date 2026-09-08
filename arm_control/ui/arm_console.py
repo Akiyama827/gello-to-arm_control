@@ -55,6 +55,7 @@ from arm_control.messages import (
     pack_plan,
     unpack_json_message,
     unpack_motor_state,
+    unpack_controller_event,
 )
 from arm_control.planning.high_level import build_collision_stack
 from arm_control.planning.jog import JogLimits, check_step
@@ -92,6 +93,43 @@ _JOG_AXES = ("x", "y", "z")
 #: browser->console half of the jog's two independent deadmen.
 JOG_STALE_S = 0.4
 HAND_STALE_S = 0.6
+FEEDBACK_STALE_S = 1.0
+
+
+def _finite_values(values, count):
+    if not isinstance(values, (list, tuple, np.ndarray)) or len(values) != count:
+        raise ValueError(f'expected {count} numeric values')
+    if any(isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, float, np.number)) for v in values):
+        raise ValueError('values must be numbers')
+    try:
+        result = np.asarray(values, dtype=float)
+    except OverflowError as exc:
+        raise ValueError('values must be finite floats') from exc
+    if result.shape != (count,) or not np.isfinite(result).all():
+        raise ValueError('values must be finite')
+    return result
+
+
+def pose_matrix(payload):
+    """Numeric base-frame pose to SE(3); fixed-axis RPY, millimetres/degrees."""
+    import pinocchio as pin
+
+    if not isinstance(payload, dict) or set(payload) != {'xyz_mm', 'rpy_deg'}:
+        raise ValueError('pose requires xyz_mm and rpy_deg only')
+    T = np.eye(4)
+    T[:3, 3] = _finite_values(payload['xyz_mm'], 3) / 1000
+    T[:3, :3] = pin.rpy.rpyToMatrix(np.deg2rad(_finite_values(payload['rpy_deg'], 3)))
+    return T
+
+
+def pose_fields(ee):
+    import pinocchio as pin
+
+    if ee is None:
+        return None
+    R = pin.Quaternion(np.asarray(ee['q'], dtype=float)).matrix()
+    return {'xyz_mm': (np.asarray(ee['p']) * 1000).tolist(),
+            'rpy_deg': np.rad2deg(pin.rpy.matrixToRpy(R)).tolist()}
 
 
 class ControlPanel:
@@ -112,6 +150,7 @@ class ControlPanel:
         jog_speed_m_s: float = 0.01,
         jog_joint_speed_rad_s: float = 0.15,
         gripper_cfg: dict | None = None,
+        gain_presets: dict | None = None,
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
         # arm config (gripper_range_m) or its joint_mimics entry — never a
@@ -123,6 +162,10 @@ class ControlPanel:
         self._upper = [float(v) for v in upper]
         self._values = [0.0] * len(names)
         self._measured: np.ndarray | None = None
+        self._measured_at = float('-inf')
+        self._target_revision = 0
+        self._pose_pending = None
+        self._pose_status = ''
         # (axis, abs_value|None, rot_delta|None); translation = latest wins,
         # rotation increments accumulate until the node loop consumes them.
         self._cart_pending: tuple[int, float | None, float | None] | None = None
@@ -134,6 +177,11 @@ class ControlPanel:
         self._jog_note = ""
         self._jog_speed_m_s = float(jog_speed_m_s)
         self._jog_joint_speed_rad_s = float(jog_joint_speed_rad_s)
+        self._jog_max = (self._jog_speed_m_s, self._jog_joint_speed_rad_s)
+        if not np.isfinite(self._jog_max).all() or min(self._jog_max) <= 0:
+            raise ValueError('configured jog speeds must be finite and positive')
+        self._jog_latched = self._jog_max
+        self._jog_epoch = 0
         self._plan: dict = {"version": 0, "times": [], "frames": []}
         self._grip_lo, self._grip_hi = float(grip_range[0]), float(grip_range[1])
         self._grip = self._grip_hi               # start open
@@ -159,6 +207,12 @@ class ControlPanel:
         self._fault = ""  # server latched-fault text; badge shows FAULTED
         self._supports_pose_hold = False
         self._control_mode = "joint"
+        self._gain_presets = dict(gain_presets or {})
+        self._mode_selected = None
+        self._mode_pending = None
+        self._mode_pending_at = float('-inf')
+        self._mode_at = float('-inf')
+        self._mode_reason = ''
         self._measured_grip: float | None = None  # live finger m (Franka Hand)
         self._log: deque[str] = deque(maxlen=200)  # page shows [-8:]; a stuck
         # gizmo drag logged at loop rate once grew this without bound
@@ -218,6 +272,11 @@ class ControlPanel:
             self.request_hand(payload)
         elif route == "jog":
             self.set_jog(payload.get("axis"), payload.get("dir"), payload.get("held"))
+        elif route == "jog_speed":
+            self.set_jog_speed(payload)
+        elif route == "pose":
+            revision = self.request_pose(payload)
+            return {'ok': True, 'revision': revision}
         elif route == "click":
             self._click(str(payload.get("button", "")))
         else:
@@ -228,6 +287,10 @@ class ControlPanel:
         with self._lock:
             values = list(self._values)
             measured = None if self._measured is None else list(self._measured)
+            measured_fresh = time.monotonic() - self._measured_at <= FEEDBACK_STALE_S
+            if self._mode_pending and time.monotonic() - self._mode_pending_at > FEEDBACK_STALE_S:
+                self._mode_pending = None
+                self._mode_reason = 'Mode request not confirmed'
             grip = self._grip
             # Unknown feedback must not borrow the commanded finger target.
             mgrip = self._measured_grip if self._measured_grip is not None else 0.0
@@ -251,6 +314,12 @@ class ControlPanel:
                 "fault": self._fault,
                 "supports_pose_hold": self._supports_pose_hold,
                 "control_mode": self._control_mode,
+                "mode": {
+                    "selected": self._mode_selected if time.monotonic() - self._mode_at <= FEEDBACK_STALE_S else None,
+                    "pending": self._mode_pending, "reason": self._mode_reason,
+                },
+                "pose": {'current': None, 'target': None, 'status': self._pose_status,
+                         'revision': self._target_revision},
                 "log": list(self._log)[-8:],  # deque: copy THEN slice
                 "plan_version": self._plan["version"],
                 "ident": self._ident,
@@ -261,14 +330,18 @@ class ControlPanel:
                     "note": self._jog_note,
                     "speed_m_s": self._jog_speed_m_s,
                     "joint_speed_rad_s": self._jog_joint_speed_rad_s,
+                    "max_speed_m_s": self._jog_max[0],
+                    "max_joint_speed_rad_s": self._jog_max[1],
                 },
             }
         target_fk = self._vfk.poses(values, grip)   # vfk has its own lock
         payload["target_geoms"] = target_fk["geoms"]
         payload["ee"] = target_fk["ee"]
-        payload["measured_geoms"] = (
-            None if measured is None else self._vfk.poses(measured, mgrip)["geoms"]
-        )
+        payload['pose']['target'] = pose_fields(target_fk['ee'])
+        live_fk = None if measured is None or not measured_fresh else self._vfk.poses(measured, mgrip)
+        payload['measured_geoms'] = None if live_fk is None else live_fk['geoms']
+        if live_fk is not None:
+            payload['pose']['current'] = pose_fields(live_fk['ee'])
         return payload
 
     def _click(self, button: str) -> None:
@@ -288,7 +361,23 @@ class ControlPanel:
                     self._hand_pending = None
                     self._hand_waiting = False
             if button in self._clicks:
+                if button in ('Stop (hold)', 'DISARM', 'Sync target to robot') or button.startswith(_GAIN_PREFIX):
+                    self._invalidate_target_locked()
+                    self._pose_pending = self._cart_pending = None
+                if button.startswith(_GAIN_PREFIX):
+                    self._mode_pending = button[len(_GAIN_PREFIX):]
+                    self._mode_pending_at = time.monotonic()
+                    self._mode_reason = ''
                 self._clicks[button] += 1
+
+    def set_jog_speed(self, payload):
+        if not isinstance(payload, dict) or set(payload) != {'speed_m_s', 'joint_speed_rad_s'}:
+            raise ValueError('provide Cartesian and joint jog speeds only')
+        values = _finite_values([payload['speed_m_s'], payload['joint_speed_rad_s']], 2)
+        if any(v <= 0 or v > hi for v, hi in zip(values, self._jog_max)):
+            raise ValueError('jog speeds must be positive and no higher than configured limits')
+        with self._lock:
+            self._jog_speed_m_s, self._jog_joint_speed_rad_s = map(float, values)
 
     def set_jog(self, axis, direction, held) -> None:
         """Hold or release one jog direction. Unknown axes are refused loudly."""
@@ -305,7 +394,11 @@ class ControlPanel:
                 and int(axis[1:]) < len(self._names)
             ):
                 raise ValueError(f"unknown jog axis {axis!r}")
-            self._jog = (axis, 1 if float(direction or 0) >= 0 else -1)
+            selected = (axis, 1 if float(direction or 0) >= 0 else -1)
+            if self._jog != selected or time.monotonic() - self._jog_at > JOG_STALE_S:
+                self._jog_latched = (self._jog_speed_m_s, self._jog_joint_speed_rad_s)
+                self._jog_epoch += 1
+            self._jog = selected
             self._jog_at = time.monotonic()
 
     def jog_held(self) -> tuple[str, int] | None:
@@ -317,13 +410,18 @@ class ControlPanel:
         holding. The controller's own expiry is the second, independent stop --
         this one cannot save an arm from a console that has itself wedged.
         """
+        command = self.jog_command()
+        return None if command is None else command[:2]
+
+    def jog_command(self):
+        """One atomic direction/speed/stroke snapshot for the console loop."""
         with self._lock:
             if self._jog is None:
                 return None
             if time.monotonic() - self._jog_at > JOG_STALE_S:
                 self._jog = None
                 return None
-            return self._jog
+            return (*self._jog, *self._jog_latched, self._jog_epoch)
 
     def set_jog_note(self, note: str) -> None:
         with self._lock:
@@ -332,12 +430,80 @@ class ControlPanel:
                 if note:
                     self._log.append(note)
 
-    def set_sliders(self, values) -> None:
+    def set_sliders(self, values, *, revision=None) -> bool:
         with self._lock:
+            if revision is not None and revision != self._target_revision:
+                return False
+            previous = list(self._values)
             for i, value in enumerate(values[: len(self._values)]):
                 self._values[i] = float(
                     np.clip(float(value), self._lower[i], self._upper[i])
                 )
+            if previous != self._values:
+                self._invalidate_target_locked()
+                self._pose_pending = self._cart_pending = None
+            return True
+
+    @property
+    def target_revision(self):
+        with self._lock:
+            return self._target_revision
+
+    def _invalidate_target_locked(self):
+        self._target_revision += 1
+        self._pose_status = ''
+        self._plan = {'version': self._plan['version'] + 1, 'times': [], 'frames': []}
+        self._seen['Execute'] = self._clicks['Execute']
+
+    def can_execute(self, revision):
+        with self._lock:
+            return revision == self._target_revision and self._pose_pending is None and self._cart_pending is None
+
+    def execute_if_current(self, revision, send):
+        """Serialize the control send with HTTP target invalidation; no IK here."""
+        with self._lock:
+            if revision != self._target_revision or self._pose_pending is not None or self._cart_pending is not None:
+                return False
+            send()
+            return True
+
+    def planning_target(self):
+        with self._lock:
+            if self._pose_pending is not None or self._cart_pending is not None:
+                return None
+            return np.asarray(self._values).copy(), self._target_revision
+
+    def request_pose(self, payload):
+        T = pose_matrix(payload)
+        with self._lock:
+            self._invalidate_target_locked()
+            self._pose_pending = (self._target_revision, T)
+            self._cart_pending = None
+            self._pose_status = 'Applying target; robot does not move'
+            return self._target_revision
+
+    def apply_pose(self, ik):
+        with self._lock:
+            pending, self._pose_pending = self._pose_pending, None
+            seed = np.asarray(self._values)
+        if pending is None:
+            return
+        revision, T = pending
+        try:
+            sol = ik.solve(T, seed)
+            if sol is None:
+                raise ValueError('Target unreachable from the current target')
+            sol = _finite_values(sol, len(seed))
+            if np.any(sol < self._lower) or np.any(sol > self._upper):
+                raise ValueError('IK target outside joint limits')
+            message = 'Target applied; Plan + preview before Execute'
+        except (ValueError, RuntimeError) as exc:
+            sol, message = None, str(exc)
+        with self._lock:
+            if revision == self._target_revision:
+                if sol is not None:
+                    self._values = sol.tolist()
+                self._pose_status = message
 
     def sliders(self) -> np.ndarray:
         with self._lock:
@@ -361,12 +527,14 @@ class ControlPanel:
                 and prev[2] is not None
             ):
                 delta += prev[2]  # never drop an unconsumed rotation increment
+            self._invalidate_target_locked()
+            self._pose_pending = None
             self._cart_pending = (axis, value, delta)
 
-    def pop_cart(self) -> tuple[int, float | None, float | None] | None:
+    def pop_cart(self):
         with self._lock:
             pending, self._cart_pending = self._cart_pending, None
-            return pending
+            return None if pending is None else (self._target_revision, *pending)
 
     def set_armed(self, armed: bool | None, fault: str = "") -> None:
         with self._lock:
@@ -384,6 +552,29 @@ class ControlPanel:
     def set_control_mode(self, mode: str) -> None:
         with self._lock:
             self._control_mode = mode
+
+    def accept_mode(self, event):
+        state = event.get('mode_state')
+        with self._lock:
+            if state is not None:
+                law = state['law']
+                selected = 'soft' if law == 'soft' else 'custom'
+                if law == 'joint':
+                    for name, (kp, kd) in self._gain_presets.items():
+                        if name == 'soft':
+                            continue
+                        if (np.shape(kp) == np.shape(state['kp']) and np.shape(kd) == np.shape(state['kd'])
+                                and np.allclose(kp, state['kp'], rtol=1e-9, atol=1e-9)
+                                and np.allclose(kd, state['kd'], rtol=1e-9, atol=1e-9)):
+                            selected = name
+                            break
+                self._control_mode = law
+                self._mode_selected, self._mode_at = selected, time.monotonic()
+                if self._mode_pending == selected:
+                    self._mode_pending, self._mode_reason = None, ''
+            if not event.get('ok', True):
+                self._mode_pending = None
+                self._mode_reason = str(event.get('reason') or 'Mode refused')
 
     def set_pose_hold_capability(self, supported: bool) -> None:
         with self._lock:
@@ -500,19 +691,28 @@ class ControlPanel:
 
     def set_measured(self, q) -> None:
         with self._lock:
-            self._measured = np.asarray(q, dtype=float).copy()
+            q = np.asarray(q, dtype=float)
+            if q.shape != (len(self._names),) or not np.isfinite(q).all():
+                self._measured = None
+                self._measured_at = float('-inf')
+                return
+            self._measured = q.copy()
+            self._measured_at = time.monotonic()
 
     def gripper_value(self) -> float:
         with self._lock:
             return self._grip
 
-    def set_plan(self, times, frames) -> None:
+    def set_plan(self, times, frames, *, revision=None) -> bool:
         with self._lock:
+            if revision is not None and revision != self._target_revision:
+                return False
             self._plan = {
                 "version": self._plan["version"] + 1,
                 "times": [float(t) for t in times],
                 "frames": frames,
             }
+            return True
 
     def clear_plan(self) -> None:
         with self._lock:
@@ -769,6 +969,7 @@ def _run(
         jog_speed_m_s=jog_limits.speed_m_s,
         jog_joint_speed_rad_s=jog_joint_speed,
         gripper_cfg=dict((cfg.get("franka") or {}).get("gripper") or {}),
+        gain_presets={name: gains for name, gains in gain_presets.items() if name not in pose_hold_presets},
     )
     cleanup.callback(panel.close)
     # The legend, stated once, the same on the page and in Rerun. It used to
@@ -792,12 +993,14 @@ def _run(
     pending: JointTrajectory | None = None
     # The id the controller knows this plan by; `execute` must name it.
     pending_id = ""
+    pending_revision = -1
     # Live jog state: the setpoint being walked, the EE position the stroke
     # limit is measured from, and the last tick's clock. All three clear on
     # release, so every press re-anchors.
     jog_q: np.ndarray | None = None
     jog_anchor: np.ndarray | None = None
     jog_t: float | None = None
+    jog_epoch = -1
     shown: np.ndarray | None = None
     # Cartesian drag reference: (position, rotation) latched when a drag streak
     # starts on an axis; the untouched axes are held to it so IK tolerance
@@ -879,14 +1082,19 @@ def _run(
                     control_mode = "joint"
                 panel.log("Controller ARMED" if armed else "Controller DISARMED")
             elif event["type"] == "INPUT" and event["id"] == "controller_event":
-                result = unpack_json_message(event["value"])
+                result = unpack_controller_event(event["value"])
                 if result["kind"] == "fault":
                     fault = str(result.get("reason") or "controller fault")
                     panel.set_armed(armed, fault)
-                elif result["kind"] == "mode" and result["ok"]:
-                    control_mode = str(result["reason"])
-                    panel.set_control_mode(control_mode)
-                panel.log(f"Controller {result['kind']}: {result.get('reason') or ''}")
+                elif result["kind"] == "mode":
+                    panel.accept_mode(result)
+                    if result.get('mode_state') is not None:
+                        control_mode = result['mode_state']['law']
+                    elif result['ok']:
+                        control_mode = str(result['reason'])
+                        panel.set_control_mode(control_mode)
+                if result['kind'] != 'mode' or not result['ok']:
+                    panel.log(f"Controller {result['kind']}: {result.get('reason') or ''}")
             elif event["type"] == "INPUT" and event["id"] == "motor_health":
                 health = unpack_json_message(event["value"])
                 supports_pose_hold = bool(health.get("supports_pose_hold", False))
@@ -942,10 +1150,11 @@ def _run(
         if panel.clicked("Sync target to robot") and measured is not None:
             panel.set_sliders(measured)
 
+        panel.apply_pose(ik)
         target = panel.sliders()
         cart_req = panel.pop_cart()
         if cart_req is not None:
-            axis, value, delta = cart_req
+            cart_revision, axis, value, delta = cart_req
             if (
                 cart_ref is None
                 or axis != cart_axis
@@ -970,8 +1179,7 @@ def _run(
             sol = ik.solve(goal_T, target)
             if sol is None:
                 panel.log(f"IK: {_CART_NAMES[axis]} drag unreachable from here")
-            else:
-                panel.set_sliders(sol)
+            elif panel.set_sliders(sol, revision=cart_revision):
                 cart_ref = (pos, rot)
                 cart_ref_q = panel.sliders()
                 target = cart_ref_q
@@ -1003,24 +1211,31 @@ def _run(
         if plan_thread is None and gj and grip_synced:
             world.set_held_positions({j: mgrip_f for j in gj})
 
+        if pending is not None and not panel.can_execute(pending_revision):
+            pending, pending_id = None, ''
+
         if panel.clicked("Plan + preview"):
+            snapshot = panel.planning_target()
             if measured is None:
                 panel.log("no motor state yet — cannot plan")
             elif plan_thread is not None:
                 panel.log("still planning — wait for the current plan")
+            elif snapshot is None:
+                panel.log('Target edit pending; wait before planning')
             else:
                 t_plan = time.monotonic()
-                m_snap, t_snap = measured.copy(), target.copy()
+                m_snap = measured.copy()
+                t_snap, revision = snapshot
 
-                def _plan_worker(m=m_snap, t=t_snap, t0=t_plan):
+                def _plan_worker(m=m_snap, t=t_snap, t0=t_plan, rev=revision):
                     try:
                         traj = plan_trajectory(
                             world, ompl, m, t, vmax, amax,
                             soft_speed_frac, soft_acc_floor,
                         )
-                        plan_box.append(("ok", traj, t, t0))
+                        plan_box.append(("ok", traj, t, t0, rev))
                     except ValueError as exc:
-                        plan_box.append(("err", str(exc), t, t0))
+                        plan_box.append(("err", str(exc), t, t0, rev))
 
                 plan_thread = threading.Thread(target=_plan_worker, daemon=True)
                 plan_thread.start()
@@ -1029,8 +1244,11 @@ def _run(
         if plan_thread is not None and plan_box:
             result = plan_box.pop()
             plan_thread = None
-            if result[0] == "ok":
-                _, pending, goal_q, t_plan = result
+            if not panel.can_execute(result[-1]):
+                pending, pending_id = None, ''
+                panel.log('Discarded plan for a superseded target; plan again')
+            elif result[0] == "ok":
+                _, pending, goal_q, t_plan, pending_revision = result
                 panel.log(
                     f"plan OK: {len(pending.times)} samples, "
                     f"{pending.duration_sec:.2f}s, planned in "
@@ -1045,10 +1263,14 @@ def _run(
                 idx = np.linspace(
                     0, len(pending.times) - 1, min(len(pending.times), 45)
                 ).astype(int)
-                panel.set_plan(
+                accepted = panel.set_plan(
                     [pending.times[i] for i in idx],
                     [vfk.poses(pending.positions[i], grip)["geoms"] for i in idx],
+                    revision=pending_revision,
                 )
+                if not accepted:
+                    pending, pending_id = None, ''
+                    continue
                 # Hand the controller the plan GATED and named. It loads it,
                 # keeps streaming its hold, and runs nothing until an `execute`
                 # names this exact id -- so a plan superseded by a re-plan can
@@ -1073,13 +1295,13 @@ def _run(
                 # preview it executes.
                 panel.clicked("Execute")
             else:
-                _, msg, _, _ = result
+                _, msg, _, _, _ = result
                 pending = None
                 panel.clear_plan()
                 panel.log(f"plan FAILED: {msg}")
 
         if panel.clicked("Execute"):
-            if pending is None:
+            if pending is None or not panel.can_execute(pending_revision):
                 panel.log("nothing to execute — plan first")
             elif fault:
                 panel.log(
@@ -1090,24 +1312,25 @@ def _run(
                 # Keep the plan: after arming, Execute again without replanning.
                 panel.log("REFUSED: DISARMED — press ARM above, then Execute")
             else:
-                node.send_output(
-                    "control", pack_control_update(execute=pending_id)
+                dispatched = panel.execute_if_current(
+                    pending_revision,
+                    lambda: node.send_output("control", pack_control_update(execute=pending_id)),
                 )
-                panel.log(f"executing {pending_id}")
+                panel.log(f"executing {pending_id}" if dispatched else "target changed — plan again")
                 pending = None
                 pending_id = ""
                 panel.clear_plan()
 
         # ---- jog: one small step per tick, five gates, then emit -----------
-        jog_held = panel.jog_held()
+        jog_held = panel.jog_command()
         if jog_held is None:
             jog_q = None          # released: the next press re-anchors
             jog_anchor = None
             jog_t = None
         elif measured is not None and plan_thread is None:
-            axis, direction = jog_held
+            axis, direction, speed_m_s, joint_speed_rad_s, epoch = jog_held
             now_t = time.monotonic()
-            if jog_q is None:
+            if jog_q is None or epoch != jog_epoch:
                 # Anchor on the PRESS, from the measured pose. The stroke limit
                 # is measured from here, so "20 cm" means 20 cm from where the
                 # operator started this jog -- not an unbounded walk made of
@@ -1115,6 +1338,7 @@ def _run(
                 jog_q = np.asarray(measured, dtype=float).copy()
                 jog_anchor = ik.fk(jog_q)[:3, 3].copy()
                 jog_t = now_t
+                jog_epoch = epoch
                 panel.set_jog_note(f"jog {axis}{'+' if direction > 0 else '-'} started")
             dt = min(max(now_t - jog_t, 0.0), 0.1)  # a stalled loop must not leap
             jog_t = now_t
@@ -1122,13 +1346,13 @@ def _run(
 
             if joint_jog:
                 q_next = jog_q.copy()
-                q_next[int(axis[1:])] += direction * jog_joint_speed * dt
+                q_next[int(axis[1:])] += direction * joint_speed_rad_s * dt
                 T_next = ik.fk(q_next)
                 p_next = T_next[:3, 3]
             else:
                 T = ik.fk(jog_q)
                 p_next = T[:3, 3].copy()
-                p_next["xyz".index(axis)] += direction * jog_limits.speed_m_s * dt
+                p_next["xyz".index(axis)] += direction * speed_m_s * dt
                 T_next = T.copy()
                 T_next[:3, 3] = p_next
                 q_next = ik.solve(T_next, q0=jog_q)
