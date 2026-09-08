@@ -65,8 +65,8 @@ h2 { margin: 0 0 .2rem; font-size: 1.05rem; }
 .detail td:last-child { font-variant-numeric: tabular-nums; }
 
 .authority { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid var(--rule); }
-.buttons { display: flex; gap: .5rem; margin-top: .5rem; }
-.buttons button { flex: 1; }
+.buttons { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .5rem; }
+.buttons button { flex: 1 0 5.5rem; }
 button.go   { border-color: var(--teal); color: var(--teal); font-weight: 600; }
 button.stop { border-color: var(--red);  color: var(--red); }
 

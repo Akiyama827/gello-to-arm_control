@@ -7,7 +7,7 @@ failed -- all injected as an :class:`OperatorWorkspace` by whoever does know
 ``GraspEditorPanel``). There is no Row Module, no dock, no stack and no bench in
 this file, and there must not be.
 
-The panel accepts exactly three operator actions -- GO, STOP, PLAN -- and turns
+The panel accepts four operator actions -- GO, STOP, PLAN, PLAY -- and turns
 them into ONE signal on ONE callback. It has no motor command, no trajectory and
 no plant handle to reach for. That is not an oversight to be fixed later when
 something needs to move faster: an operator gate that can also drive is not a
@@ -29,9 +29,10 @@ from arm_control.console_server import ConsoleServer
 
 #: The only actions the panel will accept. GO is the confirm/arm press (the
 #: same signal the terminal gate sends); STOP is the abort; PLAN re-plans the
-#: held phase without moving anything. Anything else is refused with a 400 --
+#: held phase without moving anything; PLAY previews the held trajectory.
+#: Anything else is refused with a 400 --
 #: an unknown action must never be silently read as one of these.
-ACTIONS = ("go", "stop", "plan")
+ACTIONS = ("go", "stop", "plan", "play")
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,7 @@ def _self_check() -> None:
     import urllib.error
     import urllib.request
 
+    assert "play" in ACTIONS, "held motion preview is not exposed"
     # 1. It refuses to listen anywhere a second machine could reach.
     for bad in ("0.0.0.0", "192.168.1.10", "not-an-address"):
         try:
@@ -192,7 +194,7 @@ def _self_check() -> None:
                 assert exc.code == expect, (exc.code, expect)
                 return json.loads(exc.read())
 
-        # 2. Exactly three actions, and an unknown one is refused -- not
+        # 2. Only the declared actions, and an unknown one is refused -- not
         #    silently treated as a GO, which is the failure that matters.
         for action in ACTIONS:
             assert post({"action": action}, 200)["action"] == action

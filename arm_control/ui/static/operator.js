@@ -1,6 +1,6 @@
 /* Operator gate page.
  *
- * Polls /state and posts one of three actions to /action. It deliberately
+ * Polls /state and posts an allowed action to /action. It deliberately
  * knows nothing about arms, phases or docks beyond the strings the server
  * sends: the meaning lives in the adapter that builds the workspace, and
  * duplicating any of it here would give the bench two places to disagree.
@@ -75,6 +75,8 @@ function renderGate(state) {
   // RE-PLAN only means something for a phase held at a gate; GO doubles as the
   // initial arm, so it stays live before the sequence starts.
   el("plan").disabled = !state.holding || state.stopped;
+  el("play").disabled = !state.holding || state.stopped
+    || !Number.isFinite(state.step?.duration_s);
   el("go").disabled = state.stopped;
   el("stop").disabled = state.stopped;
 
@@ -130,7 +132,7 @@ async function send(action) {
   poll();
 }
 
-for (const action of ["go", "plan", "stop"]) {
+for (const action of ["go", "plan", "play", "stop"]) {
   el(action).addEventListener("click", () => send(action));
 }
 poll();
