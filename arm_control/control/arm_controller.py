@@ -395,7 +395,7 @@ class ArmController:
             self.ready_sent = True
             self.node.send_output(
                 "controller_event",
-                pack_controller_event(kind="ready", q=arm.position),
+                pack_controller_event(kind="ready", q=arm.position, qd=arm.velocity),
             )
             # Fall through: the planner needs a hold streaming from right now,
             # because it is about to spend seconds planning the first leg.
@@ -909,14 +909,14 @@ def _controller(**kw) -> "ArmController":
     return c
 
 
-def _state(n: int = 7, vel: float = 0.0):
+def _state(n: int = 7, vel: float = 0.0, pos: float = 0.0):
     from arm_control.messages import pack_motor_state_dict
 
     return pack_motor_state_dict(
         {k: np.zeros(n) for k in
          ("position", "velocity", "position_cmd", "velocity_cmd",
           "torque_cmd", "kp", "kd", "torque")}
-        | {"velocity": np.full(n, vel)}
+        | {"position": np.full(n, pos), "velocity": np.full(n, vel)}
     )
 
 
@@ -973,7 +973,31 @@ def _check_clock_policies() -> None:
 
 
 def _self_check() -> None:
+    import inspect
     from arm_control.messages import pack_control_update, unpack_controller_event
+
+    assert 'qd' in inspect.signature(pack_controller_event).parameters, \
+        'ready event cannot report measured velocity'
+    old = unpack_controller_event(pack_controller_event(kind='ready', q=[.1, .2]))
+    assert 'qd' not in old and np.array_equal(old['q'], [.1, .2])
+    measured = unpack_controller_event(pack_controller_event(
+        kind='ready', q=[.1, .2], qd=[-.3, .4]))
+    assert np.array_equal(measured['qd'], [-.3, .4])
+    for q, qd in (([0., 0.], [np.nan, 0.]), ([0., 0.], [0., np.inf]),
+                  ([0., 0.], [0.]), ([0., 0.], [[0., 0.]]),
+                  ([0., 0.], 'invalid'), ([0.], 0.), ([], []),
+                  (None, [0.]), ([[0., 0.]], [0., 0.])):
+        for decode in (False, True):
+            try:
+                if decode:
+                    unpack_controller_event(pack_json_message('controller_event', dict(
+                        kind='ready', q=q, qd=qd)))
+                else:
+                    pack_controller_event(kind='ready', q=q, qd=qd)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f'invalid ready velocity accepted: q={q!r}, qd={qd!r}')
 
     # 1. A gated plan does NOT run until an execute names it -- and while it
     #    waits, the controller still streams. That stream is the whole point of
@@ -1041,13 +1065,16 @@ def _self_check() -> None:
     assert unpack_controller_event(node.sent[-1][1])["kind"] == "mode"
     c._set_arm(True)
     node.sent.clear()
-    c.on_motor_state(_state())
+    c.on_motor_state(_state(pos=-.4, vel=.7))
     assert node.topics() == [], "streamed before the plant ACKed the arm"
     c.bridge_armed = True
-    c.on_motor_state(_state())
+    c.on_motor_state(_state(pos=.2, vel=-.3))
     readies = [unpack_controller_event(a) for t, a in node.sent if t == "controller_event"]
     assert [e["kind"] for e in readies] == ["ready"], readies
-    assert readies[0]["q"] is not None
+    assert np.array_equal(readies[0]['q'], np.full(7, .2))
+    assert np.array_equal(readies[0]['qd'], np.full(7, -.3))
+    assert np.array_equal(readies[0]['q'], c.last_state.position)
+    assert np.array_equal(readies[0]['qd'], c.last_state.velocity)
     assert "motor_command" in node.topics(), "no hold streaming after ready"
 
     # 8. Disarming is a lifecycle reset, not a flag flip: the running leg fails

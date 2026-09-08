@@ -189,14 +189,23 @@ def _mode_state_body(state) -> dict:
     return {"law": state["law"], "kp": kp.tolist(), "kd": kd.tolist()}
 
 
+def _controller_velocity(q, qd) -> np.ndarray:
+    q, qd = np.asarray(q, dtype=float), np.asarray(qd, dtype=float)
+    if q.ndim != 1 or not q.size or qd.shape != q.shape or not np.isfinite(qd).all():
+        raise ValueError('controller event qd requires a finite velocity vector matching q')
+    return qd
+
+
 def pack_controller_event(
     *, kind: str, plan_id: str = "", ok: bool = True, reason: str = "", q=None,
-    mode_state=None,
+    qd=None, mode_state=None,
 ) -> pa.Array:
     """Controller -> planner. ``kind`` is one of:
 
     ``ready``      the plant is armed and reporting; ``q`` is the first fresh
                    measured pose, which is where the sequence must start from.
+                   Optional ``qd`` is measured joint velocity from that same
+                   sample; omission means unknown, not zero or settled.
     ``leg_result`` ``plan_id`` finished (``ok``) or gave up (``reason``).
     ``fault``      the controller stopped driving; nothing else will move.
     ``mode``       accepted ``soft``/``joint`` in reason, or ok=False refusal.
@@ -217,6 +226,7 @@ def pack_controller_event(
             "ok": bool(ok),
             "reason": str(reason),
             "q": None if q is None else np.asarray(q, dtype=float).ravel().tolist(),
+            **({} if qd is None else {"qd": _controller_velocity(q, qd).tolist()}),
             **({} if mode_state is None else {"mode_state": _mode_state_body(mode_state)}),
         },
     )
@@ -227,6 +237,8 @@ def unpack_controller_event(payload: pa.Array) -> dict:
     body.pop("schema", None)
     if body.get("q") is not None:
         body["q"] = np.asarray(body["q"], dtype=float)
+    if body.get("qd") is not None:
+        body["qd"] = _controller_velocity(body.get("q"), body["qd"])
     if "mode_state" in body:
         body["mode_state"] = _mode_state_body(body["mode_state"])
     return body
