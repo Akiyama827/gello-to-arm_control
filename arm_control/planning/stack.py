@@ -163,7 +163,11 @@ def build_planner(
             raise ValueError('refinement_world must be callable')
 
         def refiner(seed, vmax, amax):
-            return refine_trajectory(refinement_world(), seed, vmax, amax)
+            return refine_trajectory(
+                refinement_world(), seed, vmax, amax,
+                soft_clearance_exempt_pairs=planner_cfg.get('soft_clearance_exempt_pairs'),
+                arm_id=arm_id,
+            )
 
     preview, ghost = build_preview(cfg, world, ik, urdf, joints, grip_joints)
 

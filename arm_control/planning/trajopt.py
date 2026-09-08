@@ -12,6 +12,8 @@ qd is not the derivative of commanded q; continuous commanded qdd and jerk
 are NOT certified. Sampled collision checks are not continuous certification.
 """
 
+from time import perf_counter
+
 import numpy as np
 
 
@@ -46,21 +48,36 @@ def _states(program):
         for instruction in program]
 
 
-def _optimize(env, world, seed):
-    from tesseract_robotics import tesseract_command_language as command
+def _collision_profile(env, world, soft_clearance_exempt_pairs=None):
+    """Cost-only overrides resolved against this snapshot's named live pairs."""
     from tesseract_robotics import tesseract_motion_planners_trajopt as trajopt
     from tesseract_robotics.tesseract_common import CollisionMarginPairOverrideType
     from tesseract_robotics.tesseract_collision import CollisionEvaluatorType
-    from tesseract_robotics.tesseract_motion_planners import PlannerRequest
 
-    profiles = command.ProfileDictionary()
     composite = trajopt.TrajOptDefaultCompositeProfile()
-    composite.smooth_velocities = composite.smooth_accelerations = True
-    composite.smooth_jerks = False
-    composite.velocity_coeff = np.ones(seed.shape[1])
-    composite.acceleration_coeff = np.full(seed.shape[1], 10.)
     model = world.model
     live = [i for i in range(model.ngeom) if model.geom_contype[i] or model.geom_conaffinity[i]]
+    exemptions = set()
+    if soft_clearance_exempt_pairs is not None:
+        if not isinstance(soft_clearance_exempt_pairs, list):
+            raise ValueError('soft_clearance_exempt_pairs must be a list of named geom pairs')
+        active = set(env.getActiveLinkNames())
+        for names in soft_clearance_exempt_pairs:
+            if (not isinstance(names, (list, tuple)) or len(names) != 2
+                    or any(not isinstance(name, str) or not name for name in names)
+                    or names[0] == names[1]):
+                raise ValueError(f'invalid soft clearance geom pair: {names!r}')
+            try:
+                a, b = sorted(model.geom(name).id for name in names)
+            except KeyError as exc:
+                raise ValueError(f'unknown soft clearance geom pair: {names!r}') from exc
+            if (a, b) in exemptions:
+                raise ValueError(f'duplicate soft clearance geom pair: {names!r}')
+            if (a not in live or b not in live
+                    or not ({f'geom_{a}', f'geom_{b}'} & active)
+                    or env.getAllowedCollisionMatrix().isCollisionAllowed(f'geom_{a}', f'geom_{b}')):
+                raise ValueError(f'inactive soft clearance geom pair: {names!r}')
+            exemptions.add((a, b))
     for config, extra in ((composite.collision_cost_config, .005),
                           (composite.collision_constraint_config, 0.)):
         config.enabled = True
@@ -70,12 +87,30 @@ def _optimize(env, world, seed):
             for b in live[index + 1:]:
                 if world._env_geom[a] or world._env_geom[b]:
                     pairs.setCollisionMargin(f'geom_{a}', f'geom_{b}', extra)
+        if extra:
+            for a, b in exemptions:
+                hard_margin = 0. if world._env_geom[a] or world._env_geom[b] else world._pad
+                pairs.setCollisionMargin(f'geom_{a}', f'geom_{b}', hard_margin)
         config.contact_manager_config.pair_margin_data = pairs
         config.contact_manager_config.pair_margin_override_type = CollisionMarginPairOverrideType.REPLACE
         config.collision_margin_buffer = .01
         config.collision_coeff_data.setDefaultCollisionCoeff(20.)
         config.collision_check_config.type = CollisionEvaluatorType.LVS_DISCRETE
         config.collision_check_config.longest_valid_segment_length = .01
+    return composite
+
+
+def _optimize(env, world, seed, *, soft_clearance_exempt_pairs=None):
+    from tesseract_robotics import tesseract_command_language as command
+    from tesseract_robotics import tesseract_motion_planners_trajopt as trajopt
+    from tesseract_robotics.tesseract_motion_planners import PlannerRequest
+
+    profiles = command.ProfileDictionary()
+    composite = _collision_profile(env, world, soft_clearance_exempt_pairs)
+    composite.smooth_velocities = composite.smooth_accelerations = True
+    composite.smooth_jerks = False
+    composite.velocity_coeff = np.ones(seed.shape[1])
+    composite.acceleration_coeff = np.full(seed.shape[1], 10.)
     solver = trajopt.TrajOptOSQPSolverProfile()
     solver.opt_params.max_iter = 100
     solver.opt_params.max_time = 120.
@@ -193,14 +228,19 @@ def _validate_timing(world, positions, t, q, v, a, vmax, amax):
     return JointTrajectory(t, q, v)
 
 
-def refine_trajectory(world, seed_positions, vmax, amax):
+def refine_trajectory(world, seed_positions, vmax, amax, *,
+                      soft_clearance_exempt_pairs=None, arm_id='arm'):
     """Refine >=2 finite seed knots against a fresh canonical collision world.
 
     ``world`` is the raw MuJoCoCollisionWorld snapshot, not a callback/cache.
     Limits have one finite positive value per planned joint. Raises on failure.
     Two/three-knot seeds gain segment midpoints for native ISP's four-knot
     minimum; every original knot and the piecewise linear geometry are retained.
+    ``soft_clearance_exempt_pairs`` names exact active MuJoCo geom pairs whose
+    soft cost uses the canonical hard threshold (self: world._pad; environment:
+    zero). Hard constraints and canonical collision validation are unchanged.
     """
+    started = perf_counter()
     seed, vmax, amax = (np.asarray(value, dtype=float) for value in (seed_positions, vmax, amax))
     joints = len(world.joint_names)
     if joints == 0 or seed.ndim != 2 or seed.shape[1] != joints or len(seed) < 2 or not np.isfinite(seed).all():
@@ -215,21 +255,34 @@ def refine_trajectory(world, seed_positions, vmax, amax):
         seed = np.insert(seed, index + 1, (seed[index] + seed[index + 1]) / 2, axis=0)
     from arm_control.planning.projection import project_world
 
+    stage_started = perf_counter()
     env = project_world(world)
-    positions = _optimize(env, world, seed)
+    print(f'[trajopt:{arm_id}] stage=projection elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
+    stage_started = perf_counter()
+    positions = _optimize(env, world, seed, soft_clearance_exempt_pairs=soft_clearance_exempt_pairs)
+    print(f'[trajopt:{arm_id}] stage=optimization elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
     _check_positions(world, positions)
-    trajectory = _validate_timing(world, positions, *_native_timing(env, world, positions, vmax, amax), vmax, amax)
+    stage_started = perf_counter()
+    timing = _native_timing(env, world, positions, vmax, amax)
+    print(f'[trajopt:{arm_id}] stage=native_timing elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
+    stage_started = perf_counter()
+    trajectory = _validate_timing(world, positions, *timing, vmax, amax)
+    print(f'[trajopt:{arm_id}] stage=validation elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
+    print(f'[trajopt:{arm_id}] stage=total elapsed_s={perf_counter() - started:.6f}', flush=True)
     lengths = [float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()) for path in (seed, positions)]
-    print(f'[trajopt] PASS knots={len(positions)} path_rad={lengths[0]:.6f}->{lengths[1]:.6f} '
+    print(f'[trajopt:{arm_id}] PASS knots={len(positions)} path_rad={lengths[0]:.6f}->{lengths[1]:.6f} '
           f'duration_s={trajectory.duration_sec:.6f} fixed_endpoints=PASS '
           'cubic_limits=PASS command_segment_limits=PASS canonical_collision_0.001rad=PASS', flush=True)
     return trajectory
 
 
 def _self_check(native=False):
+    import inspect
     from types import SimpleNamespace
     from scipy.interpolate import CubicHermiteSpline
 
+    assert 'soft_clearance_exempt_pairs' in inspect.signature(refine_trajectory).parameters, \
+        'missing cost-only named-pair clearance override'
     world = SimpleNamespace(joint_names=['a', 'b'], lower=-np.ones(2),
                             upper=np.ones(2), in_collision=lambda q: False)
     q = np.column_stack((np.linspace(0, .3, 4), np.zeros(4)))
@@ -267,20 +320,96 @@ def _self_check(native=False):
         from arm_control.planning.projection import project_world
 
         world = MuJoCoCollisionWorld.__new__(MuJoCoCollisionWorld)
-        world.model = mujoco.MjModel.from_xml_string(
-            '<mujoco><worldbody><body pos="0 0 1">'
-            '<joint name="a" range="-90 90"/><geom type="capsule" size=".05 .2"/>'
+        xml = (
+            '<mujoco><worldbody><geom name="anchor" pos="0 0 1" size=".05"/>'
+            '<geom name="obstacle" pos="3 0 1" size=".05"/>'
+            '<body pos="0 0 1"><joint name="a" range="-90 90"/>'
+            '<geom name="near" pos=".101 0 0" size=".05"/>'
+            '<geom name="hidden" size=".01" contype="0" conaffinity="0"/>'
             '<body pos=".4 0 0"><joint name="b" range="-90 90"/>'
-            '<geom type="sphere" size=".05"/></body></body></worldbody></mujoco>')
+            '<geom name="tool" size=".05"/></body></body>'
+            '<body mocap="true" pos="-2 0 1"><geom name="parked" size=".05"/>'
+            '</body></worldbody></mujoco>')
+        world.model = mujoco.MjModel.from_xml_string(xml)
         world.data = mujoco.MjData(world.model)
         world.joint_names, world._qadr = ['a', 'b'], np.array([0, 1])
         world._held_qpos = world.model.qpos0.copy()
         world.lower, world.upper = world.model.jnt_range.T.copy()
         world._env_geom, world._pad = np.zeros(world.model.ngeom, dtype=bool), -.002
+        world._env_geom[world.model.geom('obstacle').id] = True
+        env = project_world(world)
+        pairs = [['anchor', 'near'], ['obstacle', 'near']]
+        allowed = env.getAllowedCollisionMatrix().getAllAllowedCollisions()
+        base = _collision_profile(env, world)
+        configured = _collision_profile(env, world, pairs)
+
+        def margin(config, keys):
+            value = config.pair_margin_data.getCollisionMargin(*keys)
+            return config.default_margin if value is None else value
+
+        hard = base.collision_constraint_config.contact_manager_config
+        configured_hard = configured.collision_constraint_config.contact_manager_config
+        assert hard.default_margin == configured_hard.default_margin
+        assert hard.pair_margin_data.getCollisionMargins() == configured_hard.pair_margin_data.getCollisionMargins()
+        assert env.getAllowedCollisionMatrix().getAllAllowedCollisions() == allowed
+        for names, hard_margin in ((pairs[0], world._pad), (pairs[1], 0.)):
+            keys = [f'geom_{world.model.geom(name).id}' for name in names]
+            for profile in (base, configured):
+                constraint = profile.collision_constraint_config.contact_manager_config
+                assert margin(constraint, keys) == hard_margin
+            cost = configured.collision_cost_config.contact_manager_config
+            assert margin(cost, keys) == hard_margin
+            cost = base.collision_cost_config.contact_manager_config
+            assert np.isclose(margin(cost, keys), hard_margin + .005)
+            assert not env.getAllowedCollisionMatrix().isCollisionAllowed(*keys), 'override changed ACM'
+        for invalid in ('anchor', {}, [None], [['anchor']], [['anchor', 1]],
+                        [['anchor', 'anchor']], [['', 'near']],
+                        [['anchor', 'missing']], [['anchor', 'hidden']],
+                        [['near', 'tool']], [['anchor', 'parked']], [pairs[0], pairs[0]],
+                        [pairs[0], pairs[0][::-1]]):
+            try:
+                _collision_profile(env, world, invalid)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'invalid clearance pair accepted: {invalid!r}')
+        # Recompilation inserts an earlier geom: the same names must resolve
+        # to the new IDs, never a cached pair from the previous model.
+        from copy import copy
+
+        shifted = copy(world)
+        shifted.model = mujoco.MjModel.from_xml_string(xml.replace(
+            '<worldbody>', '<worldbody><geom name="extra" pos="-3 0 1" size=".05"/>'))
+        shifted.data = mujoco.MjData(shifted.model)
+        shifted._env_geom = np.insert(world._env_geom, 0, False)
+        shifted_profile = _collision_profile(project_world(shifted), shifted, pairs[:1])
+        keys = [f'geom_{shifted.model.geom(name).id}' for name in pairs[0]]
+        assert keys != [f'geom_{world.model.geom(name).id}' for name in pairs[0]]
+        assert margin(shifted_profile.collision_cost_config.contact_manager_config, keys) == world._pad
         seed = np.linspace([0, 0], [.3, -.2], 8)
         trajectory = refine_trajectory(world, seed, np.ones(2), np.ones(2))
         assert trajectory.num_joints == 2
         assert np.array_equal(trajectory.positions[[0, -1]], seed[[0, -1]])
+        detour = seed.copy()
+        detour[:, 1] += .5 * np.sin(np.linspace(0, np.pi, len(seed)))
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        output = StringIO()
+        with redirect_stdout(output):
+            trajectory = refine_trajectory(world, detour, np.ones(2), np.ones(2),
+                                           soft_clearance_exempt_pairs=pairs[:1], arm_id='synthetic')
+        def length(path):
+            return np.linalg.norm(np.diff(path, axis=0), axis=1).sum()
+
+        assert length(trajectory.positions) < .8 * length(detour), 'native solver did not reduce the detour'
+        assert np.array_equal(trajectory.positions[[0, -1]], detour[[0, -1]])
+        for stage in ('projection', 'optimization', 'native_timing', 'validation', 'total'):
+            assert f'[trajopt:synthetic] stage={stage} elapsed_s=' in output.getvalue(), stage
+        print(output.getvalue(), end='')
+        # The selected pair still fails the canonical hard collision check.
+        shifted.model.geom_pos[shifted.model.geom('near').id, 0] = .09
+        assert shifted.in_collision(np.zeros(2)), 'cost exemption weakened canonical collision'
         for count in (2, 3):
             short_seed = np.linspace([0, 0], [.02, -.01], count)
             trajectory = refine_trajectory(world, short_seed, np.ones(2), np.ones(2))

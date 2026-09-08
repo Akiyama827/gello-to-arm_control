@@ -83,6 +83,18 @@ The consumer composes final entries from hardware identity, calibration, sensor
 roles, workcell facts, task policy, and simulation overrides. Existing
 `config.load_config_tree` include/deep-merge behavior remains unchanged.
 
+With `planner.refinement: trajopt`, optional
+`planner.soft_clearance_exempt_pairs: [[geom_name_a, geom_name_b]]` selects
+exact MuJoCo geometry names. Each refinement resolves them against the latest
+world supplied by `refinement_world()`. Missing, disabled, filtered, malformed,
+or duplicate pairs (including reversed duplicates) raise an error. Selected
+pairs lose only the extra 5 mm soft-cost clearance: their cost threshold becomes
+the canonical self padding, or zero for environment pairs. Hard constraints,
+collision exclusions, joint limits, and final canonical validation stay intact.
+Omitting the option preserves the default soft cost. IK, OMPL, seed retiming,
+and native refinement log completed-stage durations by arm using `perf_counter`;
+successful joint, Cartesian, and refinement calls also log their total duration.
+
 `REPO_ROOT` anchors files shipped in this checkout. `CONTROL_ROOT`, selected by
 `ARM_CONTROL_ROOT`, anchors a deployment's relative asset paths; standalone it
 defaults to the library checkout. Set the deployment root before importing

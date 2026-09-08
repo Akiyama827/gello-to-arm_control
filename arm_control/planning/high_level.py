@@ -1,6 +1,7 @@
 """High-level facade exposing plan_cartesian / plan_joint for orchestrator nodes."""
 from __future__ import annotations
 
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -137,6 +138,7 @@ class ArmPlanner:
         collision_check: bool = True,
         speed_scale: float = 1.0,
     ) -> JointTrajectory | None:
+        started = perf_counter()
         target_T = np.asarray(target_T, dtype=float)
         q_start = np.asarray(q_start, dtype=float).ravel()
         validate = None
@@ -148,6 +150,7 @@ class ArmPlanner:
                     f"plan world: q={np.round(q_start, 3).tolist()}",
                     flush=True,
                 )
+        stage_started = perf_counter()
         if self._ik_candidate_attempts:
             candidates = self._ik.solve_candidates(
                 target_T, q_start, validate=validate, attempts=self._ik_candidate_attempts
@@ -164,6 +167,7 @@ class ArmPlanner:
         else:
             q_goal = self._ik.solve(target_T, q_start, validate=validate)
             candidates = [] if q_goal is None else [q_goal]
+        print(f'[planner:{self.arm_id}] stage=IK elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
         if not candidates:
             print(
                 f"[planner:{self.arm_id}] IK found no"
@@ -187,6 +191,7 @@ class ArmPlanner:
                         f'q_goal={np.round(q_goal, 6).tolist()}',
                         flush=True,
                     )
+                print(f'[planner:{self.arm_id}] stage=cartesian_total elapsed_s={perf_counter() - started:.6f}', flush=True)
                 return trajectory
         return None
 
@@ -263,6 +268,7 @@ class ArmPlanner:
         collision_check: bool = True,
         speed_scale: float = 1.0,
     ) -> JointTrajectory | None:
+        started = perf_counter()
         # A parked/sagged arm can measure marginally OUTSIDE the joint limits
         # (gravity sag in sim, calibration offset on hardware); OMPL then
         # rejects the start state outright. Plan from the nearest in-bounds
@@ -282,25 +288,31 @@ class ArmPlanner:
             times = np.array([0.0, 0.1])
             positions = np.vstack([q_start, q_start])
             velocities = np.zeros_like(positions)
+            print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
             return JointTrajectory(times=times, positions=positions, velocities=velocities)
 
         if self._ompl is not None and collision_check:
+            stage_started = perf_counter()
             waypoints = self._ompl.plan(q_start, q_goal)
+            print(f'[planner:{self.arm_id}] stage=OMPL elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
             if waypoints is None:
                 return None
         else:
             waypoints = np.vstack([q_start, q_goal])
         # Blended retiming: continuous velocity along the whole path — the
         # per-segment trapezoids stopped at EVERY OMPL waypoint and crawled.
+        stage_started = perf_counter()
         seed = time_parameterize_blended(
             waypoints, self._max_vel * speed_scale, self._max_acc * speed_scale
         )
+        print(f'[planner:{self.arm_id}] stage=seed_retiming elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
         if self._trajectory_refiner is not None:
             # Keep the proven seed geometry/sampling; replace only its timing
             # after refinement. Exceptions propagate to the planner's hold path.
-            return self._trajectory_refiner(
+            seed = self._trajectory_refiner(
                 seed.positions, self._max_vel * speed_scale, self._max_acc * speed_scale
             )
+        print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
         return seed
 
 
@@ -365,7 +377,14 @@ def _self_check() -> None:
 
     hybrid = ArmPlanner('fake', _FakeIK(), _FakeOMPL(), np.ones(3),
                         np.full(3, 2.), trajectory_refiner=refine)
-    assert hybrid.plan_joint(np.ones(3), np.zeros(3), speed_scale=.5) is traj
+    from contextlib import redirect_stdout
+    from io import StringIO
+
+    output = StringIO()
+    with redirect_stdout(output):
+        assert hybrid.plan_cartesian(goal, np.zeros(3), speed_scale=.5) is traj
+    for stage in ('IK', 'OMPL', 'seed_retiming', 'joint_total', 'cartesian_total'):
+        assert f'[planner:fake] stage={stage} elapsed_s=' in output.getvalue(), stage
     assert len(calls) == 1 and np.all(calls[0][1] == .5) and np.all(calls[0][2] == 1.)
     hybrid.plan_linear(goal, np.zeros(3))
     assert len(calls) == 1, 'Cartesian line entered free-space refinement'
