@@ -132,6 +132,11 @@ width speed up to 0.10 m/s. These are Hand limits, not a recommended force for
 every object. Use the selected deployment's grasp defaults. Unsupported
 simulators disable force grasp with a reason and retain their position slider.
 
+Measured width has a separate 0.01 mm endpoint allowance: closed jaws were
+observed reporting about -0.002 mm. Measurements within that margin are
+normalized to 0 or 80 mm; larger excursions and nonfinite readings remain
+invalid. This is not a vendor accuracy claim and does not widen command limits.
+
 Only one Hand action is admitted at a time. Stale/disconnected commands are
 rejected, not queued for reconnection. Open acknowledgement is not completion:
 the UI waits for a fresh measured opening. DISARM blocks new Hand actions but

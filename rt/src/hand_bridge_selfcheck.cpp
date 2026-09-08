@@ -3,6 +3,7 @@
 #include "hand_bridge.cpp"
 #undef main
 #include <cassert>
+#include <limits>
 #include <string>
 
 int main() {
@@ -17,6 +18,31 @@ int main() {
   sample.time = franka::Duration(11);
   observe_state(sample);
   assert(sample_seq == first_seq + 1);
+  // Actual closed-Hand observation: -1.97 um is endpoint noise, not stale data.
+  uint64_t stamp = 12;
+  for (double width : {-1.97000008484e-6, -1e-5, .080002, .08001}) {
+    sample.width = width;
+    sample.time = franka::Duration(stamp++);
+    const auto seq = sample_seq;
+    observe_state(sample);
+    assert(have_real && sample_seq == seq + 1);
+    assert(real_w == (width < 0 ? 0 : .08));
+    observe_state(sample);
+    assert(sample_seq == seq + 1); // Normalization must not refresh duplicates.
+  }
+  for (double width : {-1.01e-5, .0800101,
+                       std::numeric_limits<double>::quiet_NaN(),
+                       std::numeric_limits<double>::infinity()}) {
+    sample.width = width;
+    sample.time = franka::Duration(stamp++);
+    const auto seq = sample_seq;
+    const auto observed_at = real_t;
+    observe_state(sample);
+    assert(!have_real && sample_seq == seq && real_t == observed_at);
+  }
+  HandAction command;
+  assert(!parse_hand_command("CMD 1 MOVE -0.000002 0.05", command));
+  assert(!parse_hand_command("CMD 1 MOVE 0.080002 0.05", command));
   int pair[2];
   assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
   {

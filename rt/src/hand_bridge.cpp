@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -84,11 +85,20 @@ double real_w = 0.0;
 bool real_grasped = false;
 double act_from = 0.0, act_goal = 0.0, act_speed = 0.0, act_t0 = 0.0;
 
+// Measurement-only endpoint allowance: real closed jaws report about -2 um.
+// This 10 um envelope is not a vendor accuracy rating or a command allowance.
+constexpr double width_measurement_tolerance_m = 1e-5;
+
 // Called under mx. Only a new device timestamp can refresh measured freshness.
 void observe_state(const franka::GripperState& st) {
   const auto stamp = st.time.toMSec();
   if (seen_robot_sample && stamp <= robot_sample_time) return;
-  if (!std::isfinite(st.width) || st.width < 0 || st.width > .08) {
+  if (!std::isfinite(st.width) || st.width < -width_measurement_tolerance_m ||
+      st.width > .08 + width_measurement_tolerance_m) {
+    if (have_real) {
+      std::printf("[hand] rejected measured width %.12g m at device time %llu ms\n",
+                  st.width, (unsigned long long)stamp);
+    }
     have_real = false;
     return;
   }
@@ -97,7 +107,7 @@ void observe_state(const franka::GripperState& st) {
   have_real = true;
   real_t = mono_s();
   ++sample_seq;
-  real_w = st.width;
+  real_w = std::clamp(st.width, 0.0, .08);
   real_grasped = st.is_grasped;
 }
 
