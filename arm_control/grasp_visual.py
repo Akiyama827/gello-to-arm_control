@@ -473,11 +473,13 @@ class VisualFK:
         self._static: list[tuple[Path, dict]] = []
         self._lock = threading.Lock()
 
-    def add_static_scene(self, cfg) -> None:
-        """Append the config's non-arm scene bodies as fixed page geometry."""
-        from arm_control.planning.preview_rerun import static_scene_geoms
+    def add_static_scene(self, cfg, *, geoms=None) -> None:
+        """Append supplied fixed meshes, or resolve them from config."""
+        if geoms is None:
+            from arm_control.planning.preview_rerun import static_scene_geoms
 
-        for _body, _name, mesh_path, T in static_scene_geoms(cfg):
+            geoms = static_scene_geoms(cfg)
+        for _body, _name, mesh_path, T in geoms:
             quat = self._pin.Quaternion(T[:3, :3].copy()).coeffs()  # x,y,z,w
             self._static.append(
                 (

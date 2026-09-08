@@ -12,6 +12,8 @@ MuJoCo twin can never disagree about what a mesh hulls to.
 from __future__ import annotations
 
 import re
+import hashlib
+import tempfile
 from pathlib import Path
 
 import mujoco
@@ -56,10 +58,11 @@ def build_planning_model(
     cache_dir = Path(cache_dir).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     suffix = "sim" if keep_visual else "planning"
-    out = cache_dir / f"{urdf_path.stem}_mj_{suffix}.urdf"
-    if out.exists() and out.stat().st_mtime >= urdf_path.stat().st_mtime:
-        return out
     text = urdf_path.read_text()
+    identity = hashlib.sha256((str(urdf_path) + '\0' + text).encode()).hexdigest()[:20]
+    out = cache_dir / f"{urdf_path.stem}_{identity}_mj_{suffix}.urdf"
+    if out.exists():
+        return out
     package_root = urdf_path.parent.parent
     mesh_refs = set(re.findall(r'filename="([^"]+\.(?:STL|stl|obj|OBJ))"', text))
     mesh_dirs = set()
@@ -116,7 +119,17 @@ def build_planning_model(
     m = re.search(r"<robot[^>]*>", text)
     if m is None:
         raise ValueError(f"{urdf_path}: no <robot> element")
-    out.write_text(text[: m.end()] + "\n  " + ext + text[m.end() :])
+    # Several planner/viewer processes may stage the same source at startup.
+    # Publish only a complete file; exists() must never expose a partial URDF.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=cache_dir, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text[: m.end()] + "\n  " + ext + text[m.end() :])
+        temporary.replace(out)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return out
 
 
@@ -380,6 +393,7 @@ class MuJoCoCollisionWorld:
                 for i in range(self.model.ngeom)
                 if self.model.geom_bodyid[i] > 0
                 and not self._planned_body[self.model.geom_bodyid[i]]
+                and (self.model.geom_contype[i] or self.model.geom_conaffinity[i])
             ],
             dtype=int,
         )

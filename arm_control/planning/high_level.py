@@ -38,6 +38,7 @@ def build_collision_stack(
     *,
     cache_dir,
     environment: list[dict] | None = None,
+    collision_world=None,
 ) -> tuple["MuJoCoCollisionWorld", "OMPLPlanner"]:
     """Construct the shared collision world + OMPL planner pair.
 
@@ -48,7 +49,7 @@ def build_collision_stack(
     from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
     from arm_control.planning.ompl_planner import OMPLPlanner
 
-    world = MuJoCoCollisionWorld(
+    world = collision_world if collision_world is not None else MuJoCoCollisionWorld(
         urdf_path,
         list(planned_joints),
         cache_dir=cache_dir,

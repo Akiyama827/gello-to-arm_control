@@ -18,6 +18,53 @@ import numpy as np
 import rerun as rr
 
 
+def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_dir):
+    """Export a composed snapshot for file-based viewers, in the given frame.
+
+    These are compiled mesh vertices (already scaled/recentered), so geom_xmat
+    and geom_xpos apply directly. Cache by content, not model-local mesh IDs.
+    No source CAD is rewritten and no simulation step is performed.
+    """
+    import hashlib
+    from pathlib import Path
+
+    import trimesh
+
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+    out = []
+    for i in range(model.ngeom):
+        name = model.geom(i).name or f"geom{i}"
+        body = model.body(model.geom_bodyid[i]).name
+        if any(body.startswith(p) or name.startswith(p) for p in exclude_prefixes):
+            continue
+        if model.geom_group[i] == 3:
+            continue
+        kind = model.geom_type[i]
+        if kind == mujoco.mjtGeom.mjGEOM_MESH:
+            mid = model.geom_dataid[i]
+            v, nv = model.mesh_vertadr[mid], model.mesh_vertnum[mid]
+            f, nf = model.mesh_faceadr[mid], model.mesh_facenum[mid]
+            mesh = trimesh.Trimesh(model.mesh_vert[v:v + nv], model.mesh_face[f:f + nf], process=False)
+        elif kind == mujoco.mjtGeom.mjGEOM_BOX:
+            mesh = trimesh.creation.box(extents=2 * model.geom_size[i])
+        elif kind == mujoco.mjtGeom.mjGEOM_PLANE:
+            # A finite visual patch represents the infinite collision plane.
+            mesh = trimesh.creation.box(extents=[8, 8, 0.002])
+            mesh.apply_translation([0, 0, -0.001])
+        else:
+            raise ValueError(f"static mesh export: unsupported geom {name!r} type {kind}")
+        content = mesh.export(file_type='stl')
+        path = cache / (hashlib.sha256(content).hexdigest() + '.stl')
+        if not path.exists():
+            path.write_bytes(content)
+        T = np.eye(4)
+        T[:3, :3] = data.geom_xmat[i].reshape(3, 3)
+        T[:3, 3] = data.geom_xpos[i]
+        out.append((name, f"mesh{i}", path, np.asarray(root_T_world) @ T))
+    return out
+
+
 class RerunSceneMirror:
     """Log static geometry once, then stream per-geom world transforms."""
 

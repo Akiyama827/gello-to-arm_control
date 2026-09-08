@@ -594,14 +594,20 @@ def plan_trajectory(
     )
 
 
-def main() -> None:
+def main(*, cfg=None, collision_world=None, static_geoms=None) -> None:
     shutdown = ShutdownFlag()
     install_signal_handlers(shutdown)
     with ExitStack() as cleanup:
-        _run(shutdown, cleanup)
+        _run(
+            shutdown, cleanup, cfg=cfg,
+            collision_world=collision_world, static_geoms=static_geoms,
+        )
 
 
-def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
+def _run(
+    shutdown: ShutdownFlag, cleanup: ExitStack, *,
+    cfg=None, collision_world=None, static_geoms=None,
+) -> None:
     import pinocchio as pin
     import rerun as rr
 
@@ -615,7 +621,7 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
         scene_obstacle_geoms,
     )
 
-    cfg = load_robot_config()
+    cfg = load_robot_config() if cfg is None else cfg
     mode_cfg = _load_mode_config()
     planner_cfg = dict(mode_cfg.get("planner") or {})
     teleop_cfg = dict(mode_cfg.get("teleop") or {})
@@ -685,7 +691,11 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
         # Scene bodies are obstacles, not scenery: the dock was drawn in every
         # viewer and invisible to the planner, which would route straight
         # through it.
-        environment=list(cfg.get("environment") or []) + scene_obstacle_geoms(cfg),
+        environment=(
+            list(cfg.get("environment") or []) + scene_obstacle_geoms(cfg)
+            if collision_world is None else None
+        ),
+        collision_world=collision_world,
     )
     # Detach the sink before interpreter shutdown; an absent viewer must not
     # leave Rerun's implicit final flush waiting after Dora has stopped.
@@ -696,8 +706,8 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
     # The dock/base on the teleop page AND in the preview recording — the
     # planner's `environment:` boxes are invisible, so without this the operator
     # judges reach against an empty table.
-    vfk.add_static_scene(cfg)
-    log_static_scene(cfg)
+    vfk.add_static_scene(cfg, geoms=static_geoms)
+    log_static_scene(cfg, geoms=static_geoms)
     # URDF-present finger joints (vfk already filtered them). The Rerun ghosts
     # carry them too: target fingers mirror the SLIDER, measured-ghost fingers
     # mirror the LIVE width — frozen URDF-default fingers on the live ghost
@@ -839,6 +849,8 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
                 if hand_state.get("width") is None or hand_state.get("available") is False:
                     continue
                 width = float(hand_state["width"])
+                if not np.isfinite(width):
+                    continue
                 mgrip_f = width / 2.0
                 panel.set_measured_grip(mgrip_f)
                 scene.set_finger_state(mgrip_f)
@@ -985,6 +997,12 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
         if hand_request is not None:
             node.send_output("grasp_request", pack_grasp_request(**hand_request))
 
+        # The collision world is shared with the planning worker. Update its
+        # held joints only while that worker is absent; jogging below follows
+        # the same rule. Rendered fingers alone are not collision geometry.
+        if plan_thread is None and gj and grip_synced:
+            world.set_held_positions({j: mgrip_f for j in gj})
+
         if panel.clicked("Plan + preview"):
             if measured is None:
                 panel.log("no motor state yet — cannot plan")
@@ -1086,7 +1104,7 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
             jog_q = None          # released: the next press re-anchors
             jog_anchor = None
             jog_t = None
-        elif measured is not None:
+        elif measured is not None and plan_thread is None:
             axis, direction = jog_held
             now_t = time.monotonic()
             if jog_q is None:

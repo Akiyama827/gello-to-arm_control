@@ -43,6 +43,15 @@ process implementations under `control/`, `plants/`, `ui/`, and `viz/`.
 Small files under `nodes/` remain Dora's executable path seam; directory depth
 is not an API. CLI-only repository bootstrapping is separate from this rule.
 
+The standalone application is also the application embedded by a deployment.
+Call `ui.arm_console.main(cfg=..., collision_world=..., static_geoms=...)` and
+`viz.visualizer.main(cfg=..., static_geoms=...)` from thin project wrappers;
+do not copy their planning, UI or controller logic. Omitted arguments preserve
+standalone config/scene loading. `static_geoms=[]` explicitly means no scenery.
+`simulation.rerun_scene.static_mesh_geoms` exports a generic composed snapshot
+for both web and Rerun views. Project scene roles and live revision policy stay
+in the consumer, never in these entry points.
+
 `plants/base.py` defines only the shared observable plant surface: motor count,
 state, and cleanup. Backend-specific arm/disarm and command validation stay
 explicit. Generic grasp semantics live in `end_effectors/`; moving these files

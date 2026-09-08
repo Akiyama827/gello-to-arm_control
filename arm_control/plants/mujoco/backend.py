@@ -266,10 +266,11 @@ def _load_model_spec(
         # the FR3's raw URDF fails on all three. keep_visual: this model feeds
         # the viewer/Rerun mirror too.
         from arm_control.planning.mujoco_collision import build_planning_model
+        from arm_control import CONTROL_ROOT
 
         path = build_planning_model(
             path,
-            path.parent / ".mj_cache" if cache_dir is None else cache_dir,
+            CONTROL_ROOT / ".cache" / "mujoco_models" if cache_dir is None else cache_dir,
             keep_visual=True,
         )
         return mujoco.MjSpec.from_string(path.read_text())
@@ -304,7 +305,7 @@ def _prune_unused_meshes(spec: mujoco.MjSpec) -> None:
             spec.delete(mesh)
 
 
-def _object_scalar_joints(scene: SceneSpec) -> dict[str, str]:
+def object_scalar_joints(scene: SceneSpec) -> dict[str, str]:
     """Return fixed command slots for hinge/slide joints in scene objects."""
     result = {}
     for obj in scene.objects:
@@ -744,7 +745,7 @@ class MuJoCoBackend:
     ) -> "MuJoCoBackend":
         """Build a plant from the policy-free workcell representation."""
         state = state or scene.state()
-        object_joints = _object_scalar_joints(scene)
+        object_joints = object_scalar_joints(scene)
         if object_joint_owner is not None and object_joint_owner not in scene.actor_names:
             raise KeyError(f"unknown object joint owner: {object_joint_owner}")
         joint_names = []

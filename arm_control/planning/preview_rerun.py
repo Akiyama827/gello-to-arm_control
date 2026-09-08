@@ -528,9 +528,10 @@ def static_scene_geoms(cfg) -> list:
     return out
 
 
-def log_static_scene(cfg) -> None:
-    """Draw the non-arm scene bodies into the current Rerun recording, static."""
-    geoms = static_scene_geoms(cfg)
+def log_static_scene(cfg, *, geoms=None) -> None:
+    """Draw supplied fixed meshes, or resolve them from config."""
+    if geoms is None:
+        geoms = static_scene_geoms(cfg)
     for body, mesh_name, mesh_path, T in geoms:
         entity = f"scene/{body}/{mesh_name}"
         rr.log(entity, rr.Asset3D(path=mesh_path), static=True)

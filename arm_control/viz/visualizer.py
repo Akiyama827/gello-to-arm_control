@@ -510,8 +510,8 @@ def _shutdown_from_signal(signum=None, frame=None, *, exit_func=os._exit) -> Non
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    cfg          = _load_cfg()
+def main(*, cfg=None, static_geoms=None) -> None:
+    cfg          = _load_cfg() if cfg is None else cfg
     n_motors     = int(cfg.get("num_motors", 7))
     motor_names  = list(cfg.get("motor_names") or [f"joint_{i}" for i in range(n_motors)])
     urdf_path    = str(cfg.get("urdf_path") or "")
@@ -540,7 +540,7 @@ def main() -> None:
     _setup_series_style(motor_names)
     if render_model is not None:
         _log_visual_assets(render_model[3])
-    log_static_scene(cfg)
+    log_static_scene(cfg, geoms=static_geoms)
     _setup_blueprint(motor_names, has_3d=(render_model is not None), time_ranges=time_ranges)
 
     print(f"[viz] Rerun '{app_id}' started — {n_motors} motors")

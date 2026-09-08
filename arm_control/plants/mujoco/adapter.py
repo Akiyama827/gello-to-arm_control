@@ -507,6 +507,11 @@ def main() -> None:
                                     backend.model.geom_bodyid[_d.contact[_c].geom2]).name,
                             )))
                             for _c in range(_d.ncon)
+                        }))
+                        + " geoms=" + str(sorted({
+                            tuple(sorted((backend.model.geom(c.geom1).name or f'geom{c.geom1}',
+                                          backend.model.geom(c.geom2).name or f'geom{c.geom2}')))
+                            for c in _d.contact
                         })),
                         flush=True,
                     )
