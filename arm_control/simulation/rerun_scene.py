@@ -66,7 +66,7 @@ def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_d
 
 
 class RerunSceneMirror:
-    """Log static geometry once, then stream per-geom world transforms."""
+    """Replace geometry once per model, then stream per-geom world transforms."""
 
     def __init__(
         self,
@@ -81,6 +81,10 @@ class RerunSceneMirror:
         self._data = data
         self._prefix = str(prefix).rstrip("/")
         self._geoms: list[tuple[int, str]] = []
+        # Geom IDs/names can change on recompile. Clear only our subtree, and
+        # log assets temporally: timeless assets would survive this clear and
+        # leave the old model floating beside its replacement.
+        rr.log(self._prefix, rr.Clear(recursive=True))
         for i in range(model.ngeom):
             name = model.geom(i).name or f"geom{i}"
             body = model.body(model.geom_bodyid[i]).name
@@ -111,13 +115,11 @@ class RerunSceneMirror:
                     triangle_indices=model.mesh_face[f0 : f0 + nf],
                     albedo_factor=color,
                 ),
-                static=True,
             )
         elif gtype == mujoco.mjtGeom.mjGEOM_BOX:
             rr.log(
                 entity,
                 rr.Boxes3D(half_sizes=[model.geom_size[i]], colors=[color], fill_mode="solid"),
-                static=True,
             )
         elif gtype == mujoco.mjtGeom.mjGEOM_PLANE:
             rr.log(
@@ -127,7 +129,6 @@ class RerunSceneMirror:
                     colors=[[90, 90, 90, 120]],
                     fill_mode="solid",
                 ),
-                static=True,
             )
         else:  # cylinders/spheres/capsules — none in the current scenes
             return False
@@ -156,7 +157,7 @@ def start_mirror_thread(
     mirror holding the originals keeps streaming the dead model -- the scene
     silently freezes at the graft and never shows the module docked, which is
     worse than showing nothing. Rebuilt on identity change, so the new
-    module's geometry is uploaded as static assets exactly once.
+    model replaces the previous geometry on the recording's live timeline.
 
     The gRPC sink BLOCKS the calling thread once its channel fills with no
     viewer attached -- on the sim's step thread that freezes the plant and
@@ -204,3 +205,42 @@ def start_mirror_thread(
             time.sleep(period)
 
     threading.Thread(target=_run, daemon=True, name="rerun-scene-mirror").start()
+
+
+def _self_check() -> None:
+    """Recompiled geometry replaces, rather than accumulates, the old scene."""
+    from unittest.mock import patch
+
+    def model(extra):
+        m = mujoco.MjModel.from_xml_string(
+            '<mujoco><worldbody>' + extra
+            + '<body name="object"><geom type="box" size=".1 .1 .1"/></body>'
+            + '</worldbody></mujoco>'
+        )
+        d = mujoco.MjData(m)
+        mujoco.mj_forward(m, d)
+        return m, d
+
+    before = model('<body name="fixture"><geom type="box" size=".1 .1 .1"/></body>')
+    after = model('')  # object/geom1 becomes object/geom0
+    snapshots = [pair[1].qpos.copy() for pair in (before, after)]
+    with patch.object(rr, "log") as log:
+        for pair in (before, after):
+            start = len(log.call_args_list)
+            mirror = RerunSceneMirror(*pair)
+            mirror.update()
+            calls = log.call_args_list[start:]
+            assert calls[0].args[0] == "sim" and isinstance(calls[0].args[1], rr.Clear), (
+                "recompile never clears the previous model's entities"
+            )
+            assert not any(call.kwargs.get("static", False) for call in calls), (
+                "static assets survive temporal clears"
+            )
+        assert mirror._geoms == [(0, "sim/object/geom0")]
+    for pair, snapshot in zip((before, after), snapshots):
+        np.testing.assert_array_equal(pair[1].qpos, snapshot)
+    print("rerun_scene self-check ok")
+
+
+if __name__ == "__main__":
+    _self_check()
