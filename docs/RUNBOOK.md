@@ -105,6 +105,9 @@ Console policy checks (no hardware):
 
 ```bash
 PYTHONPATH=. python tools/bench/check_console_authority.py
+PYTHONPATH=. python tools/bench/check_console_grasp.py
+PYTHONPATH=. python tools/bench/check_hand_grasp.py
+PYTHONPATH=. python -m arm_control.console_server
 PYTHONPATH=. python nodes/arm_console.py --self-check
 PYTHONPATH=. python -m arm_control.control.arm_controller
 node --input-type=module --check < arm_control/ui/static/console.js
@@ -114,6 +117,33 @@ node --input-type=module --check < arm_control/ui/static/console.js
 Concrete deployments should use their own launcher and asset-root composition.
 The older manuals are retained in [history](history/README.md) for engineering
 context, not as instructions to run retired commands.
+
+### Hand Grasp / Open
+
+The existing slider commands finger position. Immediately below it, Grasp sends
+an explicit target width (mm in the UI) and force (N); editing either input does
+not move the fingers. Open uses the configured opening width and speed. Both
+require confirmed ARM, no fault, and fresh measured feedback from a capable,
+idle Hand. Force is a command, not a measured force readout. Speed and grasp
+tolerances remain configuration values displayed beside the controls.
+
+The Franka Hand adapter accepts 30–70 N, 0–80 mm total width and positive total
+width speed up to 0.10 m/s. These are Hand limits, not a recommended force for
+every object. Use the selected deployment's grasp defaults. Unsupported
+simulators disable force grasp with a reason and retain their position slider.
+
+Only one Hand action is admitted at a time. Stale/disconnected commands are
+rejected, not queued for reconnection. Open acknowledgement is not completion:
+the UI waits for a fresh measured opening. DISARM blocks new Hand actions but
+does not open a held object or guarantee cancellation of an executing SDK call.
+
+**Coordinated deployment required:** the updated Python adapter and compiled
+`hand_bridge` use versioned command admission and observation metadata. An old
+bridge cannot enable the new client's actions; the new bridge refuses old
+unversioned actuator commands. Build against the target's installed libfranka
+and update both ends during a separately authorized maintenance window. These
+changes do not require an arm RT byte-protocol update. Local fake-peer/C++ checks
+are not hardware deployment or force-grasp validation.
 
 ### Franka control modes
 

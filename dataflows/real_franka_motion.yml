@@ -38,21 +38,25 @@ nodes:
       controller_event: arm_controller/controller_event
       # Live Hand width -> the measured ghost's fingers track reality.
       gripper_state: franka_gripper/gripper_state
+      grasp_result: franka_gripper/grasp_result
     outputs:
       - plan
       - control
       - jog
       - gripper
+      - grasp_request
 
   # The Franka Hand — gripper-ONLY bridge (the RT machine owns the arm's FCI
   # session; the Hand is its own TCP service and coexists). Teleop slider ->
-  # blocking move() on a worker thread; width published back at ~5 Hz.
+  # move()/grasp() on the existing worker; observations return at ~10 Hz.
   - id: franka_gripper
     path: ../nodes/franka_gripper.py
     inputs:
       gripper: arm_console/gripper
+      grasp_request: arm_console/grasp_request
     outputs:
       - gripper_state
+      - grasp_result
 
   - id: trajectory_replay
     path: ../nodes/trajectory_replay.py

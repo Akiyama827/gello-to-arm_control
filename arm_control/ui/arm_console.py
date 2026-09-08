@@ -42,6 +42,10 @@ from arm_control import CONTROL_ROOT, REPO_ROOT
 
 from arm_control.config import arm_joints, ee_frame, gripper_joints, load_robot_config
 from arm_control.contracts.impedance import pose_hold_values
+from arm_control.contracts.gripper import pack_grasp_request, unpack_grasp_result
+from arm_control.end_effectors.franka_hand import (
+    GRASP_TIMEOUT_S, MIN_FORCE_N, MAX_FORCE_N, resolve_grasp_parameters,
+)
 from arm_control.grasp_visual import VisualFK
 from arm_control.joint_motor_map import gripper_motor_to_finger
 from arm_control.messages import (
@@ -87,6 +91,7 @@ _JOG_AXES = ("x", "y", "z")
 #: every 100 ms, so this tolerates a few missed polls and no more -- it is the
 #: browser->console half of the jog's two independent deadmen.
 JOG_STALE_S = 0.4
+HAND_STALE_S = 0.6
 
 
 class ControlPanel:
@@ -106,6 +111,7 @@ class ControlPanel:
         extra_buttons: tuple[str, ...] = (),
         jog_speed_m_s: float = 0.01,
         jog_joint_speed_rad_s: float = 0.15,
+        gripper_cfg: dict | None = None,
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
         # arm config (gripper_range_m) or its joint_mimics entry — never a
@@ -132,6 +138,18 @@ class ControlPanel:
         self._grip_lo, self._grip_hi = float(grip_range[0]), float(grip_range[1])
         self._grip = self._grip_hi               # start open
         self._grip_dirty = False
+        self._hand_cfg = dict(gripper_cfg or {})
+        self._hand_defaults = resolve_grasp_parameters(self._hand_cfg, {}) if self._hand_cfg else None
+        self._hand_state: dict = {}
+        self._hand_seq = None
+        self._hand_sample_at = float("-inf")
+        self._hand_pending: dict | None = None
+        self._hand_request_id = ""
+        self._hand_waiting = False
+        self._hand_sent_at = 0.0
+        self._hand_submit_seq = None
+        self._hand_status = "Idle"
+        self._hand_disarm_requested = False
         # Gain presets (and anything else runtime-named) join the same strip:
         # the page renders `state.buttons`, so this costs no page code.
         self._buttons = tuple(_BUTTONS) + tuple(extra_buttons)
@@ -196,6 +214,8 @@ class ControlPanel:
             )
         elif route == "gripper":
             self.set_gripper(payload.get("value"), dirty=True)
+        elif route == "hand":
+            self.request_hand(payload)
         elif route == "jog":
             self.set_jog(payload.get("axis"), payload.get("dir"), payload.get("held"))
         elif route == "click":
@@ -209,7 +229,8 @@ class ControlPanel:
             values = list(self._values)
             measured = None if self._measured is None else list(self._measured)
             grip = self._grip
-            mgrip = self._measured_grip if self._measured_grip is not None else grip
+            # Unknown feedback must not borrow the commanded finger target.
+            mgrip = self._measured_grip if self._measured_grip is not None else 0.0
             payload = {
                 "sliders": [
                     {"name": n, "min": lo, "max": hi, "value": v}
@@ -224,6 +245,7 @@ class ControlPanel:
                     "step": 0.001,
                     "value": grip,
                 },
+                "hand": self._hand_snapshot(),
                 "buttons": list(self._buttons),
                 "armed": self._armed,
                 "fault": self._fault,
@@ -259,6 +281,12 @@ class ControlPanel:
                 return
             if button in ("Stop (hold)", "DISARM"):
                 self._jog = None
+            if button == "DISARM":
+                self._hand_disarm_requested = True
+                self._grip_dirty = False
+                if self._hand_pending is not None:
+                    self._hand_pending = None
+                    self._hand_waiting = False
             if button in self._clicks:
                 self._clicks[button] += 1
 
@@ -346,6 +374,12 @@ class ControlPanel:
             self._fault = fault
             if armed is False:
                 self._control_mode = "joint"
+                self._hand_disarm_requested = False
+            if armed is not True or fault:
+                self._grip_dirty = False
+                if self._hand_pending is not None:
+                    self._hand_pending = None
+                    self._hand_waiting = False
 
     def set_control_mode(self, mode: str) -> None:
         with self._lock:
@@ -358,6 +392,111 @@ class ControlPanel:
     def set_measured_grip(self, finger_m: float) -> None:
         with self._lock:
             self._measured_grip = finger_m
+
+    def set_hand_state(self, state: dict) -> None:
+        with self._lock:
+            if not state.get("available"):
+                self._hand_pending = None
+                self._hand_request_id = ""
+                self._hand_waiting = False
+                self._hand_status = "Unavailable: Hand disconnected"
+            self._hand_state = dict(state)
+            seq = state.get("sample_seq")
+            if seq is not None and seq != self._hand_seq and state.get("measured"):
+                self._hand_seq = seq
+                self._hand_sample_at = time.monotonic()
+
+    def _hand_refusal(self, *, consuming: bool = False) -> str:
+        """Called under the panel lock, both at HTTP admission and dispatch."""
+        if self._hand_defaults is None or not self._hand_state.get("force_grasp"):
+            return "Force grasp unavailable: plant or Hand bridge does not support it"
+        if not self._hand_state.get("available") or not self._hand_state.get("measured") or time.monotonic() - self._hand_sample_at > HAND_STALE_S:
+            return "Hand feedback unavailable or stale"
+        if self._armed is not True or self._fault or self._hand_disarm_requested:
+            return "Hand motion requires confirmed ARM and no fault"
+        if self._hand_state.get("busy"):
+            return "Hand busy: wait for the current action"
+        if not consuming and (self._hand_waiting or self._hand_submit_seq == self._hand_seq):
+            return "Hand action pending: wait for a fresh result and observation"
+        return ""
+
+    def _hand_busy(self) -> bool:
+        return (self._hand_waiting or bool(self._hand_state.get("busy"))
+                or (self._hand_submit_seq is not None and self._hand_submit_seq == self._hand_seq))
+
+    def _hand_snapshot(self) -> dict:
+        if self._hand_waiting and time.monotonic() - self._hand_sent_at > GRASP_TIMEOUT_S + 1:
+            self._hand_waiting = False
+            self._hand_pending = None
+            self._hand_request_id = ""
+            self._hand_status = "Unavailable: action result timed out"
+        reason = self._hand_refusal()
+        fresh = bool(self._hand_state.get("available")) and time.monotonic() - self._hand_sample_at <= HAND_STALE_S
+        width = self._hand_state.get("width")
+        if (self._hand_status.startswith("Open accepted") and fresh
+                and self._hand_state.get("measured") and not self._hand_state.get("busy")
+                and self._hand_seq != self._hand_submit_seq and width is not None
+                and abs(float(width) - self._hand_defaults["open_width_m"]) <= .002):
+            self._hand_status = "Open"
+        return {
+            "enabled": not reason,
+            "reason": reason,
+            "status": self._hand_status,
+            "busy": self._hand_busy(),
+            "defaults": self._hand_defaults,
+            "force_min_n": MIN_FORCE_N, "force_max_n": MAX_FORCE_N,
+            "width_max_mm": self._grip_hi * 2000,
+            "measured_width_mm": float(width) * 1000 if fresh and self._hand_state.get("measured") and width is not None else None,
+        }
+
+    def request_hand(self, payload: dict) -> None:
+        with self._lock:
+            if not isinstance(payload, dict) or set(payload) - {"mode", "width_m", "force_n"}:
+                raise ValueError("Hand action accepts mode, width_m and force_n only")
+            if payload.get("mode") == "release" and set(payload) != {"mode"}:
+                raise ValueError("Open uses the configured open width and speed")
+            reason = self._hand_refusal()
+            if reason:
+                raise ValueError(reason)
+            params = resolve_grasp_parameters(self._hand_cfg, payload)
+            self._hand_request_id = uuid.uuid4().hex
+            self._hand_pending = {
+                "request_id": self._hand_request_id, "target_id": "hand",
+                "mode": payload.get("mode", "close"),
+                "width_m": params["width_m"], "force_n": params["force_n"],
+            }
+            self._hand_submit_seq = self._hand_seq
+            self._hand_waiting = True
+            self._hand_sent_at = time.monotonic()
+            self._hand_status = "Grasp pending" if payload.get("mode", "close") == "close" else "Open pending"
+            self._grip_dirty = False
+
+    def pop_hand(self) -> dict | None:
+        with self._lock:
+            pending, self._hand_pending = self._hand_pending, None
+            if pending is None:
+                return None
+            reason = self._hand_refusal(consuming=True)
+            if time.monotonic() - self._hand_sent_at > HAND_STALE_S:
+                reason = "Hand request expired before dispatch"
+            if reason:
+                self._hand_waiting = False
+                self._hand_status = reason
+                self._log.append(f"REFUSED: {reason}")
+                return None
+            return pending
+
+    def set_hand_result(self, result: dict) -> None:
+        with self._lock:
+            if not self._hand_request_id or result.get("request_id") != self._hand_request_id:
+                return
+            self._hand_waiting = False
+            reason = str(result.get("reason", ""))
+            if result.get("ok"):
+                self._hand_status = "Open accepted; waiting for finger feedback" if reason == "released" else "Held"
+            else:
+                self._hand_status = "Lost" if reason == "object lost" else "Missed" if reason == "no object" else f"Unavailable: {reason}"
+            self._log.append(f"Hand: {self._hand_status}")
 
     def set_measured(self, q) -> None:
         with self._lock:
@@ -392,6 +531,9 @@ class ControlPanel:
             if dirty and (self._armed is not True or self._fault):
                 self._log.append("REFUSED: Hand motion requires confirmed ARM and no fault")
                 return
+            if dirty and (self._hand_busy() or self._hand_disarm_requested):
+                self._log.append("REFUSED: Hand action pending; wait before moving the slider")
+                return
             self._grip = float(np.clip(value, self._grip_lo, self._grip_hi))
             self._grip_dirty = self._grip_dirty or dirty
 
@@ -400,6 +542,8 @@ class ControlPanel:
             if not self._grip_dirty:
                 return None
             self._grip_dirty = False
+            if self._armed is not True or self._fault or self._hand_disarm_requested or self._hand_busy():
+                return None
             return self._grip
 
     def clicked(self, button: str) -> bool:
@@ -614,6 +758,7 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
         extra_buttons=tuple(f"{_GAIN_PREFIX}{n}" for n in gain_presets),
         jog_speed_m_s=jog_limits.speed_m_s,
         jog_joint_speed_rad_s=jog_joint_speed,
+        gripper_cfg=dict((cfg.get("franka") or {}).get("gripper") or {}),
     )
     cleanup.callback(panel.close)
     # The legend, stated once, the same on the page and in Rerun. It used to
@@ -689,7 +834,11 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
                     last_ghost = now
                     ghost.update(np.append(measured, np.full(len(gj), mgrip_f)))
             elif event["type"] == "INPUT" and event["id"] == "gripper_state":
-                width = float(unpack_json_message(event["value"]).get("width", 0.0))
+                hand_state = unpack_json_message(event["value"])
+                panel.set_hand_state(hand_state)
+                if hand_state.get("width") is None or hand_state.get("available") is False:
+                    continue
+                width = float(hand_state["width"])
                 mgrip_f = width / 2.0
                 panel.set_measured_grip(mgrip_f)
                 scene.set_finger_state(mgrip_f)
@@ -706,6 +855,8 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
                     # Width changes with the arm parked still animate the ghost.
                     last_ghost = now
                     ghost.update(np.append(measured, np.full(len(gj), mgrip_f)))
+            elif event["type"] == "INPUT" and event["id"] == "grasp_result":
+                panel.set_hand_result(unpack_grasp_result(event["value"]))
             elif event["type"] == "INPUT" and event["id"] == "plant_capabilities":
                 supports_pose_hold = bool(unpack_json_message(event["value"]).get("supports_pose_hold", False))
                 panel.set_pose_hold_capability(supports_pose_hold)
@@ -830,6 +981,9 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
                 "gripper",
                 pack_motor_command([grip, grip], zeros2, zeros2, zeros2, zeros2),
             )
+        hand_request = panel.pop_hand()
+        if hand_request is not None:
+            node.send_output("grasp_request", pack_grasp_request(**hand_request))
 
         if panel.clicked("Plan + preview"):
             if measured is None:

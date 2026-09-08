@@ -82,6 +82,17 @@
       <details id="grip-wrap" class="rail-section">
         <summary>Gripper <output id="grip-readout"></output></summary>
         <div id="grip"></div>
+        <div class="button-pair">
+          <button id="hand-grasp" disabled>Grasp</button>
+          <button id="hand-open" disabled>Open</button>
+        </div>
+        <div class="hand-fields">
+          <label>Force (N)<input id="hand-force" type="number" step="1" required></label>
+          <label>Grasp width (mm)<input id="hand-width" type="number" min="0" step="0.1" required></label>
+        </div>
+        <p id="hand-settings"></p>
+        <p id="hand-feedback" aria-live="polite">Hand feedback unavailable</p>
+        <p id="hand-status" aria-live="polite">Force grasp unavailable</p>
       </details>
 
       <details class="rail-section">

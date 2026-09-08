@@ -23,6 +23,41 @@ let planFrames = [];
 let planIndex = 0;
 let planVersion = -1;
 let lastGizmoSend = 0;
+let handPosting = false;
+let handError = "";
+
+const updateHand = (hand) => {
+  for (const id of ["hand-grasp", "hand-open"]) $(id).disabled = handPosting || !hand?.enabled;
+  if (gripperSlider) gripperSlider[0].disabled = handPosting || Boolean(hand?.busy);
+  $("hand-status").textContent = handError || [hand?.status, hand?.reason].filter(Boolean).join(" · ");
+  $("hand-feedback").textContent = hand?.measured_width_mm == null
+    ? "Measured opening unavailable (not the slider target)"
+    : `Measured opening: ${hand.measured_width_mm.toFixed(1)} mm total`;
+};
+
+const sendHand = async (mode) => {
+  if (handPosting) return;
+  const payload = { mode };
+  if (mode === "close") {
+    if (!$("hand-force").reportValidity() || !$("hand-width").reportValidity()) return;
+    payload.force_n = Number($("hand-force").value);
+    payload.width_m = Number($("hand-width").value) / 1000;
+  }
+  handPosting = true;
+  handError = "";
+  $("hand-grasp").disabled = true;
+  $("hand-open").disabled = true;
+  try {
+    await post("/hand", payload);
+  } catch (error) {
+    handError = error.message;
+    $("hand-status").textContent = handError;
+  } finally {
+    handPosting = false;
+  }
+};
+$("hand-grasp").onclick = () => sendHand("close");
+$("hand-open").onclick = () => sendHand("release");
 
 // -- gizmo: drag the target, one axis at a time ------------------------------
 gizmo.addEventListener("objectChange", () => {
@@ -136,6 +171,18 @@ const build = async (state) => {
     $("grip").textContent = "No Hand configured";
     $("grip-wrap").hidden = true;
   }
+  const hand = state.hand;
+  if (hand?.defaults) {
+    $("hand-force").min = hand.force_min_n;
+    $("hand-force").max = hand.force_max_n;
+    $("hand-force").value = hand.defaults.force_n;
+    $("hand-width").max = hand.width_max_mm;
+    $("hand-width").value = hand.defaults.width_m * 1000;
+    $("hand-settings").textContent =
+      `Commanded force · total jaw width · ${hand.defaults.speed_mps * 1000} mm/s. ` +
+      `Acceptance: −${hand.defaults.epsilon_inner_m * 1000} / +${hand.defaults.epsilon_outer_m * 1000} mm. ` +
+      `Open: ${hand.defaults.open_width_m * 1000} mm. DISARM blocks new actions; an executing Hand move/grasp may continue. It does not open a held object.`;
+  }
   if (state.jog) buildJogPad(state.jog);
 
   const strip = $("buttons");
@@ -195,6 +242,7 @@ const poll = async () => {
       syncSliders(jointSliders, state.sliders, 3);
       if (gripperSlider) syncSliders([gripperSlider], [state.gripper], 3);
     }
+    updateHand(state.hand);
     setPoses(measuredRobot, state.measured_geoms);
     setPoses(targetRobot, state.target_geoms);
     if (!isDraggingGizmo() && state.ee) {
@@ -221,6 +269,7 @@ const poll = async () => {
     updateGate(state);
   } catch (error) {
     setConnected(false);
+    updateHand(null);
     releaseJog();
     console.error(error);
   }
