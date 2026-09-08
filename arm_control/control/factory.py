@@ -137,7 +137,7 @@ def build_executor(
         max_torque=_gain("torque_limits", "max_tau"),
         # The plant compensates gravity (the FR3 control box on the bench, and
         # now the twin too), so ship RNEA MINUS gravity or the arm gets it
-        # twice. nodes/trajectory_executor.py already honoured this flag; this
+        # twice. The legacy standalone executor already honoured this flag; this
         # path silently ignored it.
         gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
         **tolerances,

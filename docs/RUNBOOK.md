@@ -85,6 +85,22 @@ The browser is not an emergency-stop device.
 Keep HTTP loopback-bound. Stop/hold and disarm have distinct semantics; follow
 the selected plant's safety policy rather than assuming process exit is safe.
 
+Ctrl-C requests orderly node shutdown. Logger buffers and Hand/console resources
+are closed; cancellation is not a successful motion result. Keep Rerun connected:
+its native disconnect can block without a receiver, requiring launcher fallback
+cleanup. The independent plant watchdog remains necessary.
+
+The controller can also receive an explicit deployment `execution_policy` block
+for deadline-driven execution with start/tracking/freshness/relatch limits. It
+does not turn those limits on implicitly in existing examples. The retired
+standalone executor node is no longer a supported process surface; its class
+remains available under `arm_control.control.trajectory_executor`.
+
+```bash
+PYTHONPATH=. python tools/bench/check_execution_policy.py
+PYTHONPATH=. python tools/bench/check_node_shutdown.py
+```
+
 Console policy checks (no hardware):
 
 ```bash

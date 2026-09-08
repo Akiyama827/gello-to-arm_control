@@ -100,10 +100,11 @@ verify those behaviors; the consuming project owns its integration rehearsal.
 
 ## Known unfinished boundaries
 
-- `nodes/trajectory_executor.py` remains for a consuming calibration workflow.
-  Current motion graphs use `arm_controller`. Migrating that old caller needs
-  a separate control-contract and safety review; do not delete the executor
-  class or treat the legacy process as the template for new graphs.
+- Motion and calibration use `arm_controller`; the duplicate standalone
+  executor process is retired, not the reusable executor class. Consumers can
+  explicitly select `control.execution_policy.ExecutionPolicy` for legacy
+  start/tracking limits, deadline scheduling, freshness and hold-relatch guards.
+  Entries without that policy retain existing event-driven behavior.
 - Project-shaped scene construction has moved to the consumer. The graph
   selects `SCENE_BACKEND_FACTORY` or `WORKCELL_BACKEND_FACTORY` through the
   existing entry-point resolver. `plants/mujoco/composer.py` otherwise consumes

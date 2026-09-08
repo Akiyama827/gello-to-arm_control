@@ -65,6 +65,7 @@ class ArmController:
         plant_reports_health: bool = True,
         jog_timeout_s: float = 0.2,
         clock=None,
+        execution_policy=None,
     ) -> None:
         self.node = node
         self.executor = executor
@@ -106,6 +107,15 @@ class ArmController:
                 f"got {state_period_s!r}"
             )
         self._clock = clock or time.monotonic
+        self.execution_policy = execution_policy
+        if execution_policy is not None:
+            if execution_policy.torque_limits.shape != (self.n_arm,):
+                raise ValueError("execution_policy torque limits must match the arm joint count")
+            if self._state_period is not None:
+                raise ValueError("deadline execution_policy requires wall time, not motor_state_period_s")
+        self._health_at: float | None = None
+        self._health_ok = not bool(plant_reports_health)
+        self._observation_paused = False
         self._plant_t = 0.0
         self._finger_m = 0.0
         # Operator-commanded finger target, or None to hold the configured open
@@ -181,6 +191,13 @@ class ArmController:
                 flush=True,
             )
             return
+        if self.execution_policy is not None:
+            reason = self._observation_error() or self.execution_policy.plan_error(
+                plan, self.last_state.position, self.n_arm)
+            if reason:
+                self.node.send_output("controller_event", pack_controller_event(
+                    kind="leg_result", plan_id=plan["plan_id"], ok=False, reason=reason))
+                return
         traj = JointTrajectory(
             times=plan["times"],
             positions=plan["positions"],
@@ -275,6 +292,13 @@ class ArmController:
 
     def on_motor_health(self, value) -> None:
         payload = unpack_json_message(value)
+        if self.execution_policy is not None:
+            self._health_at = self._clock()
+            self._health_ok = (payload.get("state_fresh") is True
+                               and not payload.get("any_fault", False)
+                               and not payload.get("latched_fault"))
+            if not self._health_ok:
+                self._pause_observation("plant health is faulted or stale")
         self.supports_pose_hold = bool(payload.get("supports_pose_hold", False))
         armed = bool(payload.get("armed", False))
         if armed and not self.bridge_armed:
@@ -283,6 +307,7 @@ class ArmController:
             self._fault("plant reported disarmed")
 
     def on_motor_state(self, value) -> None:
+        previous_state_at = self._last_state_at
         self._last_state_at = self._clock()
         if self.stopped:
             return
@@ -291,9 +316,54 @@ class ArmController:
         arm, finger_m = unpack_motor_state_to_joint(
             value, self.gripper["n_motors"], self.gripper["mimic"], n_arm=self.n_arm
         )
+        if self.execution_policy is not None:
+            if not (np.isfinite(arm.position).all() and np.isfinite(arm.velocity).all()):
+                self._last_state_at = None
+                self._pause_observation("non-finite motor state")
+                return
+            if (previous_state_at is not None
+                    and self._clock() - previous_state_at > self.execution_policy.state_timeout_sec):
+                self._pause_observation("motor state gap — re-plan")
         self.last_state = arm
         if finger_m is not None:
             self._finger_m = float(finger_m)
+        if self.execution_policy is None:
+            self._stream()
+
+    def _observation_error(self):
+        policy = self.execution_policy
+        now = self._clock()
+        if self._last_state_at is None or now - self._last_state_at > policy.state_timeout_sec:
+            return "motor state stale — re-plan"
+        if self._needs_health and (
+            not self._health_ok or self._health_at is None
+            or now - self._health_at > policy.health_timeout_sec
+        ):
+            return "motor health stale or faulted — re-plan"
+        return None
+
+    def _pause_observation(self, reason):
+        if (not self._observation_paused or self._plan is not None
+                or self._running or self._jog_q is not None or self._pose_hold is not None):
+            self._cancel(reason)
+        self._observation_paused = True
+        self.ready_sent = False
+        self.last_command = None
+        self._hold_anchor = None
+
+    def tick(self):
+        """One deadline-driven command; unused by event-driven deployments."""
+        if self.execution_policy is None or self.stopped:
+            return
+        reason = self._observation_error()
+        if reason:
+            self._pause_observation(reason)
+            return
+        self._observation_paused = False
+        self._stream()
+
+    def _stream(self) -> None:
+        arm = self.last_state
 
         if not self.armed:
             # Disarmed: track the pose, stream nothing. The bridge zero-holds.
@@ -309,11 +379,19 @@ class ArmController:
             )
             # Fall through: the planner needs a hold streaming from right now,
             # because it is about to spend seconds planning the first leg.
+        if (self.execution_policy is not None and self._running
+                and self.executor.has_trajectory and self.executor.done(self.exec_time, arm)):
+            # Legacy ordering: completed means measured idle hold NOW, not
+            # one more trajectory sample before dropping into hold.
+            self._finish_leg(ok=True, reason="")
+            self.last_command = self._hold_anchor = None
+            self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
         if self._running and self.executor.has_trajectory:
             command = self.executor.step(self.exec_time, arm)
             self._hold_anchor = None  # motion streams: next hold re-anchors
-            self._send(command, self._cartesian_for_time(self.exec_time))
-            if self._leg_done(arm):
+            if self._send(command, self._cartesian_for_time(self.exec_time)) is False:
+                return
+            if self.execution_policy is None and self._leg_done(arm):
                 self._finish_leg(ok=True, reason="")
             return
         jog = self._jog_command()
@@ -368,6 +446,13 @@ class ArmController:
             return
         if self._running:
             return
+        if self.execution_policy is not None:
+            reason = self._observation_error() or self.execution_policy.plan_error(
+                self._plan, self.last_state.position, self.n_arm)
+            if reason:
+                self._finish_leg(ok=False, reason=reason)
+                self._pending_traj = None
+                return
         self.executor.load_trajectory(self._pending_traj, t_start=self.exec_time)
         self._running = True
         print(
@@ -381,6 +466,8 @@ class ArmController:
 
     def _set_pose_hold(self, spec: dict) -> None:
         try:
+            if self.execution_policy is not None and self._observation_error():
+                raise ValueError("Soft needs fresh, healthy measured state")
             spec = unpack_pose_hold_values(pose_hold_values(spec))
             if (not self.supports_pose_hold or not self.armed or not self.ready_sent
                     or self.stopped or self.frozen):
@@ -451,6 +538,8 @@ class ArmController:
         ``_anchored_hold`` falls through to a static hold at the MEASURED
         pose -- which is where the arm actually is when the button is pressed.
         """
+        if self.execution_policy is not None:
+            self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
         if self._pose_hold is not None:
             self._pose_hold = None
             self.last_command = None
@@ -531,6 +620,13 @@ class ArmController:
         and anchoring there made the arm visibly dip at every gate. Falls back
         to the measured pose when the last command was not quiescent.
         """
+        if self.execution_policy is not None:
+            q = self.last_state.position
+            tolerance = self.execution_policy.relatch_tolerance(self.executor.kp)
+            if self._hold_anchor is None or np.any(np.abs(q - self._hold_anchor.q_des) > tolerance):
+                self._hold_anchor = self._static_hold()
+            # Keep only the target fixed: feedforward uses the measured pose.
+            return self.executor.hold_command(self.last_state, q_des=self._hold_anchor.q_des)
         if self._hold_anchor is None:
             last = self.last_command
             hold = getattr(self.executor, "hold_command", None)
@@ -564,7 +660,23 @@ class ArmController:
         idx = int(np.searchsorted(times, tau, side="right")) - 1
         return poses[max(0, min(idx, len(poses) - 1))]
 
-    def _send(self, command: JointServoCommand, cartesian_pose) -> None:
+    def _send(self, command: JointServoCommand, cartesian_pose) -> bool:
+        aborted = False
+        if self.execution_policy is not None:
+            if not self.execution_policy.command_valid(command, self.n_arm):
+                self._fault("non-finite or invalid servo command")
+                return False
+            if (self._pose_hold is None
+                    and self.execution_policy.tracking_error_exceeded(command, self.last_state.position)):
+                self._cancel("tracking error exceeded — holding measured pose")
+                self.last_command = None
+                self._hold_anchor = self._static_hold()
+                command = self._hold_anchor
+                if command is None or not self.execution_policy.command_valid(command, self.n_arm):
+                    self._fault("invalid measured hold command")
+                    return False
+                cartesian_pose = None
+                aborted = True
         self.last_command = command
         cartesian = None
         if self._cartesian_now is not None and cartesian_pose is not None:
@@ -592,6 +704,7 @@ class ArmController:
                 pose_hold=self._pose_hold,
             ),
         )
+        return not aborted
 
     def _set_arm(self, armed: bool) -> None:
         armed = bool(armed)
@@ -660,33 +773,40 @@ class ArmController:
             "control_replay": self.on_control,
         }
         seen_unknown: set[str] = set()
+        period = None if self.execution_policy is None else self.execution_policy.period
+        next_deadline = None if period is None else self._clock() + period
         while shutdown is None or not shutdown.stop_requested:
-            event = self.node.next(timeout=0.05)
+            timeout = .05 if period is None else max(0.0, min(.05, next_deadline - self._clock()))
+            event = self.node.next(timeout=timeout)
             if shutdown is not None and shutdown.stop_requested:
                 break
-            if event is None:
-                continue
-            if event["type"] == "STOP":
+            if event is not None and event["type"] == "STOP":
                 break
-            if event["type"] != "INPUT":
-                continue
-            handler = handlers.get(event["id"])
-            if handler is None:
+            if event is not None and event["type"] == "INPUT":
+                handler = handlers.get(event["id"])
                 # A graph can wire an input this controller has no handler for
                 # -- renaming `trajectory` to `plan` did exactly that -- and a
                 # silent drop makes it look like the producer is broken. Say it
                 # once per topic; every tick would be a log flood.
-                if event["id"] not in seen_unknown:
+                if handler is None and event["id"] not in seen_unknown:
                     seen_unknown.add(event["id"])
                     print(
                         f"[arm_controller] IGNORING input {event['id']!r}: no "
                         f"handler (known: {sorted(handlers)})",
                         flush=True,
                     )
-                continue
-            handler(event["value"])
+                if handler is not None:
+                    handler(event["value"])
             if self.stopped:
                 break
+            if period is not None:
+                now = self._clock()
+                if now >= next_deadline - .1 * period:
+                    # Legacy deadline/slack schedule: one command after a
+                    # stall, never a burst of catch-up commands.
+                    next_deadline = (next_deadline + period
+                                     if now - next_deadline < period else now + period)
+                    self.tick()
 
 
 # -- self-check ---------------------------------------------------------------

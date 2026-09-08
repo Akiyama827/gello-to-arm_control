@@ -12,13 +12,13 @@
 #
 # SAFETY — the graph comes up DISARMED. The console page carries the operator
 # gate (ARM/DISARM + armed badge on the same page as planning — one page,
-# and DISARM is one click during a live session; arm_console is the single
+# and DISARM is one click during a live session; arm_controller is the single
 # producer of the bridge `arm` topic). The RT server must be up with the
 # franka backend and its NORMAL deadman (default --fault-ms 1000, NOT the
 # handguide's 3600000 — this graph is a commander, and losing it must park
-# the arm). Executor refuses trajectories starting >0.1 rad from measured,
-# aborts on >0.35 rad tracking error; the server holds on staleness and
-# latches on faults.
+# the arm). The server holds on staleness and latches on faults. Legacy
+# start/tracking thresholds require an explicit deployment execution_policy;
+# this graph does not turn that policy on implicitly.
 #
 #   python tools/run.py real franka motion        # canonical launcher
 #   (raw dora run needs BOTH roots exported — dora rebases node cwd to this

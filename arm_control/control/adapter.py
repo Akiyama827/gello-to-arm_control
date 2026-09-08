@@ -25,6 +25,7 @@ from dora import Node
 
 from arm_control.config import arm_joints, load_robot_config
 from arm_control.control.arm_controller import ArmController
+from arm_control.control.execution_policy import ExecutionPolicy
 from arm_control.control.factory import build_executor, gripper_command_cfg
 from arm_control.node_utils import (
     ShutdownFlag,
@@ -50,11 +51,20 @@ def main() -> None:
         list(cfg.joint_names or cfg.motor_names),
         len(arm_joints(cfg)),
     )
+    policy_config = cfg.get("execution_policy")
+    policy = None
+    if policy_config is not None:
+        if gains is None:
+            raise ValueError("execution_policy requires resolved per-joint torque limits")
+        policy = ExecutionPolicy(
+            **policy_config, torque_limits=gains["torque_limits"][:len(arm_joints(cfg))]
+        )
     controller = ArmController(
         Node(),
         build_executor(cfg, arm_id=os.environ.get("ARM_ID", "arm"), gains=gains),
         arm_id=os.environ.get("ARM_ID", "arm"),
         gripper=gripper_command_cfg(cfg),
+        execution_policy=policy,
         # A bare sim plant (mujoco_interface with no sim_bridge) publishes no
         # motor_health, so the controller would wait forever for an armed edge
         # that cannot come. The GRAPH knows whether a bridge is in the path, so

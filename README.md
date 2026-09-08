@@ -43,7 +43,8 @@ PYTHONPATH=. python -B examples/run_console.py --check
 simulation pass or hardware-readiness check. Installation and optional
 dependencies are declared in `pyproject.toml`; see the runbook before launching.
 
-Two migration limits remain explicit: the legacy trajectory-executor process
-still has a consuming calibration caller, and the relocated MuJoCo backend
-retains coupled legacy fixture/contact policy. Project scene construction now
+The duplicate trajectory-executor process is retired; execution guards are an
+explicit consumer-selected controller policy, and the reusable executor class
+remains. The relocated MuJoCo backend still retains coupled legacy fixture/contact policy.
+Project scene construction now
 belongs to the consumer; this does not make the physics core fully generic.
