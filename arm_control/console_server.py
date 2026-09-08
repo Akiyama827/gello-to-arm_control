@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from arm_control.console_assets import CONSOLE_ASSETS, console_asset
 
@@ -170,8 +171,29 @@ class ConsoleServer:
             def _route(self) -> str:
                 return self.path.split("?", 1)[0].strip("/")
 
+            def _trusted_host(self) -> bool:
+                # Origin==Host alone trusts a rebinding website's own hostname.
+                # SSH tunnels use localhost or the literal bound loopback IP.
+                if not require_loopback:
+                    return True
+                try:
+                    host = urlsplit("http://" + self.headers.get("Host", ""))
+                    # A tunnel may expose a different browser-facing port.
+                    trusted = (host.hostname in {bind, "localhost"}
+                               and not (host.username or host.password or host.path
+                                        or host.query or host.fragment)
+                               and (host.port is None or 0 < host.port <= 65535))
+                except ValueError:
+                    trusted = False
+                if not trusted:
+                    self._json({"error": "untrusted Host refused"}, 403)
+                    return False
+                return True
+
             # -- methods ------------------------------------------------------
             def do_GET(self) -> None:
+                if not self._trusted_host():
+                    return
                 route = self._route() or server._index
                 if route in server._assets:
                     content_type, path, cache = server._assets[route]
@@ -190,6 +212,8 @@ class ConsoleServer:
                     self._json({"error": str(exc)}, 400)
 
             def do_POST(self) -> None:
+                if not self._trusted_host():
+                    return
                 # Two cheap gates on a server that can ARM a torque-controlled
                 # arm. A cross-origin browser POST always carries an Origin
                 # that will not match ours, which kills the CSRF class -- any
@@ -203,7 +227,14 @@ class ConsoleServer:
                 ):
                     self._json({"error": "cross-origin refused"}, 403)
                     return
-                length = int(self.headers.get("Content-Length", 0) or 0)
+                try:
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                except ValueError:
+                    self._json({"error": "invalid body length"}, 400)
+                    return
+                if length < 0:
+                    self._json({"error": "invalid body length"}, 400)
+                    return
                 if length > max_body:
                     self._json({"error": "body too large"}, 413)
                     return
@@ -268,6 +299,7 @@ def _self_check() -> None:
     server = ConsoleServer(name="t", bind="127.0.0.1", port=0, get=get, post=post,
                            index="console.html")
     base = f"http://127.0.0.1:{server.port}"
+    local = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         def fetch(path, *, headers=None, data=None, expect=200):
             request = urllib.request.Request(
@@ -275,7 +307,7 @@ def _self_check() -> None:
                 method="POST" if data is not None else "GET",
             )
             try:
-                with urllib.request.urlopen(request, timeout=5) as response:
+                with local.open(request, timeout=5) as response:
                     assert response.status == expect, (path, response.status)
                     # headers, not dict(headers): the client normalises
                     # header case, and Message lookups are insensitive.
@@ -307,6 +339,25 @@ def _self_check() -> None:
         assert len(posted) == 1, posted
         fetch("action", data=b"{}", headers={"Origin": "http://evil.test"}, expect=403)
         assert len(posted) == 1, f"a cross-origin POST reached the handler: {posted}"
+        fetch("action", data=b"{}", headers={
+            "Host": "evil.test", "Origin": "http://evil.test"}, expect=403)
+        assert len(posted) == 1, "an untrusted Host reached the action handler"
+        fetch("state", headers={"Host": "evil.test"}, expect=403)
+        assert fetch("state", headers={"Host": f"localhost:{server.port}"})
+        assert fetch("state", headers={"Host": "localhost:17500"})  # Remapped SSH tunnel.
+        for invalid in ("localhost:0", "localhost:65536", "evil@localhost:7500",
+                        "localhost:7500/path", "localhost.evil.test:7500"):
+            fetch("state", headers={"Host": invalid}, expect=403)
+        # Invalid lengths must fail before reading, even when the peer closes
+        # its write side (read(-1) used to consume the whole stream).
+        import socket
+        for length in ("-1", "invalid"):
+            with socket.create_connection(("127.0.0.1", server.port), timeout=2) as conn:
+                conn.sendall((f"POST /action HTTP/1.1\r\nHost: {host}\r\n"
+                              f"Content-Length: {length}\r\n\r\n{{}}").encode())
+                conn.shutdown(socket.SHUT_WR)
+                assert b" 400 " in conn.recv(4096).split(b"\r\n", 1)[0]
+        assert len(posted) == 1, "an invalid-length POST reached the handler"
 
         # 6. The body cap is declared-length, so it costs nothing to enforce.
         big = urllib.request.Request(
