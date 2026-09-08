@@ -175,6 +175,54 @@ class PinocchioIK:
         if q0.shape != (self.n_joints,):
             raise ValueError(f"q0 must have shape ({self.n_joints},)")
 
+        for seed in self._seeds(q0, self._restarts):
+            sol = self._solve_from(target_T, seed)
+            if sol is not None and (validate is None or validate(sol)):
+                return sol
+        return None
+
+    def solve_candidates(
+        self,
+        target_T: np.ndarray,
+        q0: np.ndarray,
+        validate=None,
+        *,
+        attempts: int = 64,
+    ) -> list[np.ndarray]:
+        """Return unique valid solutions from a bounded deterministic seed search.
+
+        Uses the same seed order as ``solve`` but keeps searching after success.
+        Solutions within 1e-6 per joint are duplicates; bounded joints never wrap.
+        """
+        if isinstance(attempts, bool) or not isinstance(attempts, (int, np.integer)) \
+                or not 1 <= attempts <= 128:
+            raise ValueError('attempts must be an integer in [1, 128]')
+        target_T = np.asarray(target_T, dtype=float)
+        q0 = np.asarray(q0, dtype=float)
+        if target_T.shape != (4, 4) or not np.isfinite(target_T).all():
+            raise ValueError('target_T must be finite and 4x4')
+        if q0.shape != (self.n_joints,) or not np.isfinite(q0).all():
+            raise ValueError(f'q0 must be finite with shape ({self.n_joints},)')
+        span = self._q_upper - self._q_lower
+        if not (np.isfinite(self._q_lower).all() and np.isfinite(self._q_upper).all()
+                and np.isfinite(span).all() and (span > 0).all()):
+            raise ValueError('candidate search requires finite positive joint spans')
+        candidates = []
+        for seed in self._seeds(q0, attempts):
+            sol = self._solve_from(target_T, seed)
+            if sol is None:
+                continue
+            sol = np.asarray(sol, dtype=float)
+            if sol.shape != q0.shape or not np.isfinite(sol).all() \
+                    or (sol < self._q_lower).any() or (sol > self._q_upper).any():
+                continue
+            if validate is not None and not validate(sol):
+                continue
+            if not any(np.allclose(sol, q, atol=1e-6, rtol=0) for q in candidates):
+                candidates.append(sol.copy())
+        return candidates
+
+    def _seeds(self, q0: np.ndarray, attempts: int) -> list[np.ndarray]:
         span = self._q_upper - self._q_lower
         inner_lo = self._q_lower + 0.1 * span
         inner_hi = self._q_upper - 0.1 * span
@@ -186,13 +234,9 @@ class PinocchioIK:
         # deterministic interior samples.
         seeds = [q0, home, 0.5 * (self._q_lower + self._q_upper)]
         seeds += [
-            rng.uniform(inner_lo, inner_hi) for _ in range(self._restarts - 3)
+            rng.uniform(inner_lo, inner_hi) for _ in range(attempts - 3)
         ]
-        for seed in seeds[: self._restarts]:
-            sol = self._solve_from(target_T, seed)
-            if sol is not None and (validate is None or validate(sol)):
-                return sol
-        return None
+        return seeds[:attempts]
 
     def _solve_from(self, target_T: np.ndarray, q0: np.ndarray) -> np.ndarray | None:
         # Build a full model-sized configuration; only update controlled joints.
@@ -224,3 +268,63 @@ class PinocchioIK:
                 q_full[self._q_indices_arr], self._q_lower, self._q_upper
             )
         return None
+
+
+def _self_check() -> None:
+    """Check restart semantics without relying on a robot's convergence basins."""
+    ik = object.__new__(PinocchioIK)
+    ik._joint_names = ['a', 'b']
+    ik._q_lower = np.full(2, -1.)
+    ik._q_upper = np.full(2, 1.)
+    ik._restarts = 16
+    calls = []
+
+    def solve_from(target, seed):
+        calls.append(seed.copy())
+        return seed.copy()
+
+    ik._solve_from = solve_from
+    target, start = np.eye(4), np.array([.2, .3])
+    assert np.array_equal(ik.solve(target, start), start) and len(calls) == 1
+    calls.clear()
+    assert ik.solve(target, start, validate=lambda q: False) is None
+    legacy_seeds = np.array(calls)
+    assert len(calls) == 16, 'legacy restart budget changed'
+    assert callable(getattr(ik, 'solve_candidates', None)), 'missing candidate enumeration'
+    calls.clear()
+    candidates = ik.solve_candidates(target, start)
+    assert len(calls) == 64, 'candidate attempts must bound seed solves'
+    assert np.array_equal(calls[:16], legacy_seeds), 'legacy seed order changed'
+    assert len(candidates) == 63, 'identical home and midpoint were not deduplicated'
+    assert np.array_equal(candidates, ik.solve_candidates(target, start))
+    for attempts in (1, 2, 3, 128):
+        calls.clear()
+        ik.solve_candidates(target, start, attempts=attempts)
+        assert len(calls) == attempts, 'candidate budget boundary changed'
+    filtered = ik.solve_candidates(target, start, validate=lambda q: q[0] > 0)
+    assert filtered and all(q[0] > 0 for q in filtered), 'invalid branch escaped'
+    assert ik.solve_candidates(target, start, validate=lambda q: False) == []
+    ik._solve_from = lambda target, seed: np.array([np.nan, 0.])
+    assert ik.solve_candidates(target, start, attempts=1) == []
+    ik._solve_from = lambda target, seed: np.array([2., 0.])
+    assert ik.solve_candidates(target, start, attempts=1) == []
+    for attempts in (True, 0, -1, 129, 1.5, '64'):
+        try:
+            ik.solve_candidates(target, start, attempts=attempts)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted invalid attempts: {attempts!r}')
+    for bad_target, bad_start in ((np.eye(3), start), (target, np.zeros(3)),
+                                   (target * np.nan, start), (target, start * np.nan)):
+        try:
+            ik.solve_candidates(bad_target, bad_start)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('accepted malformed or nonfinite candidate input')
+    print('ik self-check OK: legacy 16, bounded deterministic candidates, filtering')
+
+
+if __name__ == '__main__':
+    _self_check()

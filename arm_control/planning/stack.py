@@ -175,6 +175,8 @@ def build_planner(
         max_acc=gain_vector(cfg, "max_acc", n),
         world=world,
         trajectory_refiner=refiner,
+        ik_candidate_attempts=planner_cfg.get('ik_candidate_attempts', 0),
+        ik_limit_margin_fraction=planner_cfg.get('ik_limit_margin_fraction', 0.05),
     )
 
     return PlannerStack(

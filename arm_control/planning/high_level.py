@@ -91,6 +91,9 @@ class ArmPlanner:
         max_acc: np.ndarray,
         world=None,
         trajectory_refiner=None,
+        *,
+        ik_candidate_attempts: int = 0,
+        ik_limit_margin_fraction: float = 0.05,
     ) -> None:
         self.arm_id = str(arm_id)
         self._ik = ik
@@ -104,6 +107,23 @@ class ArmPlanner:
         self._max_acc = np.asarray(max_acc, dtype=float).ravel()
         if self._max_vel.shape != self._max_acc.shape:
             raise ValueError("max_vel and max_acc must have matching shape")
+        if isinstance(ik_candidate_attempts, bool) \
+                or not isinstance(ik_candidate_attempts, (int, np.integer)) \
+                or not 0 <= ik_candidate_attempts <= 128:
+            raise ValueError('ik_candidate_attempts must be an integer in [0, 128]')
+        margin = float(ik_limit_margin_fraction)
+        if not np.isfinite(margin) or not 0 <= margin <= 0.5:
+            raise ValueError('ik_limit_margin_fraction must be finite and in [0, 0.5]')
+        self._ik_candidate_attempts = ik_candidate_attempts
+        self._ik_limit_margin_fraction = margin
+        if ik_candidate_attempts:
+            lo, hi = ik.hard_limits
+            span = hi - lo
+            if lo.shape != self._max_vel.shape or hi.shape != lo.shape \
+                    or not lo.size or not np.isfinite(lo).all() \
+                    or not np.isfinite(hi).all() or not np.isfinite(span).all() \
+                    or not (span > 0).all():
+                raise ValueError('IK ranking requires finite positive joint spans')
 
     @property
     def ik(self) -> PinocchioIK:
@@ -128,8 +148,23 @@ class ArmPlanner:
                     f"plan world: q={np.round(q_start, 3).tolist()}",
                     flush=True,
                 )
-        q_goal = self._ik.solve(target_T, q_start, validate=validate)
-        if q_goal is None:
+        if self._ik_candidate_attempts:
+            candidates = self._ik.solve_candidates(
+                target_T, q_start, validate=validate, attempts=self._ik_candidate_attempts
+            )
+            lo, hi = self._ik.hard_limits
+            span = hi - lo
+
+            def score(q):
+                margin = float(np.min(np.minimum(q - lo, hi - q) / span))
+                travel = float(np.linalg.norm((q - q_start) / span))
+                return max(0., self._ik_limit_margin_fraction - margin), travel
+
+            candidates.sort(key=score)
+        else:
+            q_goal = self._ik.solve(target_T, q_start, validate=validate)
+            candidates = [] if q_goal is None else [q_goal]
+        if not candidates:
             print(
                 f"[planner:{self.arm_id}] IK found no"
                 f"{' collision-free' if validate else ''} goal branch for "
@@ -137,9 +172,23 @@ class ArmPlanner:
                 flush=True,
             )
             return None
-        return self.plan_joint(
-            q_goal, q_start, collision_check=collision_check, speed_scale=speed_scale
-        )
+        for rank, q_goal in enumerate(candidates, 1):
+            trajectory = self.plan_joint(
+                q_goal, q_start, collision_check=collision_check, speed_scale=speed_scale
+            )
+            if trajectory is not None:
+                if self._ik_candidate_attempts:
+                    margin = float(np.min(np.minimum(q_goal - lo, hi - q_goal) / span))
+                    shortfall, travel = score(q_goal)
+                    print(
+                        f'[planner:{self.arm_id}] IK candidate rank={rank}/{len(candidates)} '
+                        f'travel={travel:.6f} margin={margin:.6f} shortfall={shortfall:.6f} '
+                        f'q_start={np.round(q_start, 6).tolist()} '
+                        f'q_goal={np.round(q_goal, 6).tolist()}',
+                        flush=True,
+                    )
+                return trajectory
+        return None
 
     def plan_linear(
         self,
@@ -337,6 +386,98 @@ def _self_check() -> None:
         pass
     else:
         raise AssertionError('refinement failure silently fell back to seed')
+
+    assert 'ik_candidate_attempts' in inspect.signature(ArmPlanner).parameters, \
+        'missing opt-in candidate ranking'
+
+    class _CandidateIK(_FakeIK):
+        hard_limits = (np.full(3, -np.pi), np.full(3, np.pi))
+        candidates = [np.array([3.1, 0., 0.]), np.array([2.5, 0., 0.]), np.zeros(3)]
+        enumerations = 0
+        solves = 0
+
+        def solve_candidates(self, T, seed, validate=None, *, attempts=64):
+            self.enumerations += 1
+            assert attempts == 64
+            return [q for q in self.candidates if validate is None or validate(q)]
+
+        def solve(self, T, seed, validate=None):
+            self.solves += 1
+            return super().solve(T, seed, validate)
+
+    candidate_ik = _CandidateIK()
+    ranked = ArmPlanner('ranked', candidate_ik, None, np.ones(3), np.full(3, 2.),
+                        ik_candidate_attempts=64)
+    start = np.array([3., 0., 0.])
+    chosen = ranked.plan_cartesian(goal, start, collision_check=False)
+    assert np.allclose(chosen.positions[-1], [2.5, 0., 0.]), \
+        'ranking must clear the margin, then prefer shorter whole-arm travel'
+    candidate_ik.candidates = [np.array([-3.1, 0., 0.]), np.zeros(3)]
+    ranked._ik_limit_margin_fraction = 0.
+    chosen = ranked.plan_cartesian(goal, start, collision_check=False)
+    assert np.allclose(chosen.positions[-1], 0), 'bounded joints must not wrap'
+    candidate_ik.hard_limits = (np.array([-10., -1., -1.]), np.array([10., 1., 1.]))
+    candidate_ik.candidates = [np.array([1., 0., 0.]), np.array([0., .2, 0.])]
+    chosen = ranked.plan_cartesian(goal, np.zeros(3), collision_check=False)
+    assert np.allclose(chosen.positions[-1], [1., 0., 0.]), 'travel must use joint ranges'
+    candidate_ik.candidates = [np.array([1., .5, 0.]), np.array([1.5, 0., 0.])]
+    chosen = ranked.plan_cartesian(goal, np.zeros(3), collision_check=False)
+    assert np.allclose(chosen.positions[-1], [1.5, 0., 0.]), 'travel must use every joint'
+    candidate_ik.hard_limits = _CandidateIK.hard_limits
+
+    class _World:
+        def in_collision(self, q):
+            return q[0] > 1.
+
+    ranked._world = _World()
+    candidate_ik.candidates = [np.array([2.5, 0., 0.]), np.zeros(3)]
+    chosen = ranked.plan_cartesian(goal, start)
+    assert np.allclose(chosen.positions[-1], 0), 'colliding candidate was selected'
+    ranked._world = None
+    route_goals = []
+
+    class _RetryOMPL:
+        def plan(self, start, end):
+            route_goals.append(end.copy())
+            return None if len(route_goals) == 1 else np.vstack([start, end])
+
+    ranked._ompl = _RetryOMPL()
+    chosen = ranked.plan_cartesian(goal, start)
+    assert len(route_goals) == 2 and np.allclose(chosen.positions[-1], 0), \
+        'route search failure did not retry the next ranked goal'
+    ranked._trajectory_refiner = reject
+    route_goals.clear()
+    route_goals.append(start)  # route exists immediately; refinement must stop retries
+    try:
+        ranked.plan_cartesian(goal, start)
+    except ValueError as exc:
+        assert str(exc) == 'refinement rejected'
+    else:
+        raise AssertionError('candidate ranking swallowed refinement rejection')
+    assert len(route_goals) == 2, 'refinement failure retried another candidate'
+    enumerations = candidate_ik.enumerations
+    ranked.plan_linear(goal, np.zeros(3))
+    assert candidate_ik.enumerations == enumerations and candidate_ik.solves > 0
+    legacy = ArmPlanner('legacy', candidate_ik, None, np.ones(3), np.full(3, 2.))
+    legacy.plan_cartesian(goal, np.zeros(3), collision_check=False)
+    assert candidate_ik.enumerations == enumerations, 'default planner enumerates IK'
+    for kwargs in ([{'ik_candidate_attempts': v} for v in (True, -1, 129, 1.5, '64')]
+                   + [{'ik_limit_margin_fraction': v} for v in (-.1, .51, np.nan, np.inf)]):
+        try:
+            ArmPlanner('invalid', candidate_ik, None, np.ones(3), np.ones(3), **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted invalid ranking config: {kwargs}')
+    for upper in (np.zeros(3), np.full(3, np.inf), np.full(3, np.nan)):
+        candidate_ik.hard_limits = (np.zeros(3), upper)
+        try:
+            ArmPlanner('invalid', candidate_ik, None, np.ones(3), np.ones(3),
+                       ik_candidate_attempts=64)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('ranking accepted invalid joint bounds')
     print(f"high_level self-check OK: {len(traj.positions)} samples, bow {bow:.2e} m")
 
 
