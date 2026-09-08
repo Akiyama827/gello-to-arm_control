@@ -178,8 +178,20 @@ def unpack_control_update(payload: pa.Array) -> dict:
     return body
 
 
+def _mode_state_body(state) -> dict:
+    if not isinstance(state, dict) or state.get("law") not in ("joint", "soft"):
+        raise ValueError("mode_state requires law joint or soft")
+    kp = np.asarray(state.get("kp"), dtype=float)
+    kd = np.asarray(state.get("kd"), dtype=float)
+    if (kp.ndim != 1 or not kp.size or kd.shape != kp.shape
+            or not np.isfinite(kp).all() or not np.isfinite(kd).all()):
+        raise ValueError("mode_state requires matching finite gain arrays")
+    return {"law": state["law"], "kp": kp.tolist(), "kd": kd.tolist()}
+
+
 def pack_controller_event(
-    *, kind: str, plan_id: str = "", ok: bool = True, reason: str = "", q=None
+    *, kind: str, plan_id: str = "", ok: bool = True, reason: str = "", q=None,
+    mode_state=None,
 ) -> pa.Array:
     """Controller -> planner. ``kind`` is one of:
 
@@ -191,6 +203,9 @@ def pack_controller_event(
 
     Every result carries its ``plan_id`` so a late reply from a superseded plan
     is dropped rather than credited to the current one.
+
+    Optional ``mode_state`` reports the actual law and executor joint gains;
+    old senders and receivers may omit it. Mode heartbeats use the same event.
     """
     if kind not in {"ready", "leg_result", "fault", "mode"}:
         raise ValueError(f"pack_controller_event: unknown kind {kind!r}")
@@ -202,6 +217,7 @@ def pack_controller_event(
             "ok": bool(ok),
             "reason": str(reason),
             "q": None if q is None else np.asarray(q, dtype=float).ravel().tolist(),
+            **({} if mode_state is None else {"mode_state": _mode_state_body(mode_state)}),
         },
     )
 
@@ -211,6 +227,8 @@ def unpack_controller_event(payload: pa.Array) -> dict:
     body.pop("schema", None)
     if body.get("q") is not None:
         body["q"] = np.asarray(body["q"], dtype=float)
+    if "mode_state" in body:
+        body["mode_state"] = _mode_state_body(body["mode_state"])
     return body
 
 

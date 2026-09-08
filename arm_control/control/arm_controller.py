@@ -139,6 +139,7 @@ class ArmController:
 
         self.last_state = JointState(np.zeros(self.n_arm), np.zeros(self.n_arm))
         self._last_state_at: float | None = None
+        self._mode_report_at: float | None = None
         self.last_command: JointServoCommand | None = None
         self._hold_anchor: JointServoCommand | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
@@ -329,6 +330,25 @@ class ArmController:
             self._finger_m = float(finger_m)
         if self.execution_policy is None:
             self._stream()
+        if (np.isfinite(arm.position).all() and np.isfinite(arm.velocity).all()
+                and (self._mode_report_at is None
+                     or self._last_state_at - self._mode_report_at >= 0.25)):
+            self._report_mode(heartbeat=True)
+
+    def _report_mode(self, *, ok=True, reason=None, heartbeat=False) -> None:
+        law = "soft" if self._pose_hold is not None else "joint"
+        fields = dict(kind="mode", ok=ok, reason=law if reason is None else reason)
+        try:
+            event = pack_controller_event(**fields, mode_state=dict(
+                law=law, kp=self.executor.kp, kd=self.executor.kd))
+        except (TypeError, ValueError):
+            # Invalid executor gains cannot certify a mode. Preserve existing
+            # transition/refusal events, but let heartbeat freshness expire.
+            if heartbeat:
+                return
+            event = pack_controller_event(**fields)
+        self.node.send_output("controller_event", event)
+        self._mode_report_at = self._clock()
 
     def _observation_error(self):
         policy = self.execution_policy
@@ -479,8 +499,7 @@ class ArmController:
             if self._running or self._jog_q is not None or np.max(np.abs(self.last_state.velocity)) > 0.05:
                 raise ValueError("Stop and settle before selecting Soft")
         except (TypeError, ValueError) as exc:
-            self.node.send_output("controller_event", pack_controller_event(
-                kind="mode", ok=False, reason=str(exc)))
+            self._report_mode(ok=False, reason=str(exc))
             return
         self._cancel("entering Soft")
         self.executor.set_gains(kp=self._track_kp.copy(), kd=self._track_kd.copy())
@@ -488,7 +507,7 @@ class ArmController:
         self._cartesian_now = None
         self._last_cartesian_pose = None
         self._pose_hold = spec
-        self.node.send_output("controller_event", pack_controller_event(kind="mode", reason="soft"))
+        self._report_mode()
 
     def _set_gains(self, gains: dict) -> None:
         """Change the control law under an operator's hand.
@@ -515,7 +534,7 @@ class ArmController:
         # The anchor was built at the OLD stiffness; a softer law holding a
         # stiffer law's target is how an arm sags at a gate.
         self._hold_anchor = None
-        self.node.send_output("controller_event", pack_controller_event(kind="mode", reason="joint"))
+        self._report_mode()
         print(
             f"[arm_controller] gains set: kp={None if kp is None else np.round(kp, 2)} "
             f"kd={None if kd is None else np.round(kd, 2)}",
@@ -543,7 +562,7 @@ class ArmController:
         if self._pose_hold is not None:
             self._pose_hold = None
             self.last_command = None
-            self.node.send_output("controller_event", pack_controller_event(kind="mode", reason="joint"))
+            self._report_mode()
         if self._running:
             self._finish_leg(ok=False, reason=reason)
         self._plan = None
@@ -1012,13 +1031,14 @@ def _self_check() -> None:
     c.on_control(pack_control_update(payload={"mass_kg": 0.4051, "com_ee": [0.013, 0.0, 0.0]}))
     assert abs(c.executor.payload[0] - 0.4051) < 1e-9, c.executor.payload
 
-    # 7. Disarmed, it streams NOTHING (the bridge zero-holds); armed but before
-    #    the health ACK it streams nothing either, then announces ready once.
+    # 7. Disarmed, no commands stream (the bridge zero-holds); mode feedback
+    #    still reports gains. Commands wait for the health ACK after arming.
     node = _FakeNode()
     c = ArmController(node, _FakeExecutor(), gripper=dict(_GRIPPER),
                       state_period_s=0.01)
     c.on_motor_state(_state())
-    assert node.topics() == [], node.topics()
+    assert node.topics() == ["controller_event"], node.topics()
+    assert unpack_controller_event(node.sent[-1][1])["kind"] == "mode"
     c._set_arm(True)
     node.sent.clear()
     c.on_motor_state(_state())
