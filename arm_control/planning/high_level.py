@@ -90,6 +90,7 @@ class ArmPlanner:
         max_vel: np.ndarray,
         max_acc: np.ndarray,
         world=None,
+        trajectory_refiner=None,
     ) -> None:
         self.arm_id = str(arm_id)
         self._ik = ik
@@ -98,6 +99,7 @@ class ArmPlanner:
         # to collision-free branches — bare DLS happily converges into a
         # self-colliding posture and OMPL then rejects the goal outright.
         self._world = world
+        self._trajectory_refiner = trajectory_refiner
         self._max_vel = np.asarray(max_vel, dtype=float).ravel()
         self._max_acc = np.asarray(max_acc, dtype=float).ravel()
         if self._max_vel.shape != self._max_acc.shape:
@@ -224,6 +226,8 @@ class ArmPlanner:
         q_goal = np.asarray(q_goal, dtype=float).ravel()
         if q_start.shape != q_goal.shape:
             raise ValueError("q_start and q_goal must have the same shape")
+        if self._trajectory_refiner is not None and (self._ompl is None or not collision_check):
+            raise ValueError('trajectory refinement requires collision-checked OMPL planning')
         if np.allclose(q_start, q_goal):
             # Trivial hold: 2-point traj over 0.1 s with zero velocity.
             times = np.array([0.0, 0.1])
@@ -239,9 +243,16 @@ class ArmPlanner:
             waypoints = np.vstack([q_start, q_goal])
         # Blended retiming: continuous velocity along the whole path — the
         # per-segment trapezoids stopped at EVERY OMPL waypoint and crawled.
-        return time_parameterize_blended(
+        seed = time_parameterize_blended(
             waypoints, self._max_vel * speed_scale, self._max_acc * speed_scale
         )
+        if self._trajectory_refiner is not None:
+            # Keep the proven seed geometry/sampling; replace only its timing
+            # after refinement. Exceptions propagate to the planner's hold path.
+            return self._trajectory_refiner(
+                seed.positions, self._max_vel * speed_scale, self._max_acc * speed_scale
+            )
+        return seed
 
 
 def _self_check() -> None:
@@ -289,6 +300,43 @@ def _self_check() -> None:
     )
     assert bow < 1e-9, f"plan_linear bowed {bow * 1e3:.4f} mm off its own line"
     assert np.allclose(end, [0.3, 0.4, 0.0]), "plan_linear did not reach the goal"
+
+    # The optional refiner is planner-only and must not reshape linear legs.
+    import inspect
+    assert 'trajectory_refiner' in inspect.signature(ArmPlanner).parameters
+    calls = []
+
+    class _FakeOMPL:
+        def plan(self, start, end):
+            return np.vstack([start, end])
+
+    def refine(seed, vmax, amax):
+        calls.append((seed.copy(), vmax.copy(), amax.copy()))
+        return traj
+
+    hybrid = ArmPlanner('fake', _FakeIK(), _FakeOMPL(), np.ones(3),
+                        np.full(3, 2.), trajectory_refiner=refine)
+    assert hybrid.plan_joint(np.ones(3), np.zeros(3), speed_scale=.5) is traj
+    assert len(calls) == 1 and np.all(calls[0][1] == .5) and np.all(calls[0][2] == 1.)
+    hybrid.plan_linear(goal, np.zeros(3))
+    assert len(calls) == 1, 'Cartesian line entered free-space refinement'
+    try:
+        hybrid.plan_joint(np.ones(3), np.zeros(3), collision_check=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('hybrid accepted collision checking disabled')
+
+    def reject(*args):
+        raise ValueError('refinement rejected')
+
+    hybrid._trajectory_refiner = reject
+    try:
+        hybrid.plan_joint(np.ones(3), np.zeros(3))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('refinement failure silently fell back to seed')
     print(f"high_level self-check OK: {len(traj.positions)} samples, bow {bow:.2e} m")
 
 

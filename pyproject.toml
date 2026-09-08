@@ -32,6 +32,8 @@ viz = ["rerun-sdk"]
 # simulation/convex_decomp.py (coacd + trimesh, both lazy) and
 # tools/assets/setup_fr3.py (trimesh, lazy).
 mesh = ["trimesh", "coacd"]
+# Opt-in geometric refinement and native constrained spline timing.
+trajopt = ["tesseract-robotics-nanobind==0.35.0.7", "scipy", "mujoco"]
 
 # Backend/toolchain dependencies not managed by these extras:
 #   pinocchio / hpp-fcl — dynamics, FK/IK, geometry and preview.

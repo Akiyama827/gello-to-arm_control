@@ -103,9 +103,13 @@ class PlannerStack:
 
 
 def build_planner(
-    cfg, *, arm_id: str = "arm", collision_world=None
+    cfg, *, arm_id: str = "arm", collision_world=None, refinement_world=None
 ) -> PlannerStack:
-    """IK + collision world + OMPL + planner (+ preview) from config."""
+    """Build a planner; refinement_world returns the latest raw MuJoCo world.
+
+    Scene adapters that recompile must supply that callable, not capture an
+    initial model. It is called synchronously in the planner process only.
+    """
     urdf = arm_urdf(cfg)
     joints = arm_joints(cfg)
     grip_joints = gripper_joints(cfg)
@@ -140,6 +144,27 @@ def build_planner(
             + scene_obstacle_geoms(cfg),
         )
 
+    refinement = planner_cfg.get('refinement')
+    if refinement not in (None, 'trajopt'):
+        raise ValueError(f'unknown planner refinement: {refinement!r}')
+    refiner = None
+    if refinement == 'trajopt':
+        if world is None or ompl is None:
+            raise ValueError('TrajOpt refinement requires a collision world and OMPL seed')
+        from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
+        from arm_control.planning.trajopt import refine_trajectory
+
+        if refinement_world is None:
+            if not isinstance(world, MuJoCoCollisionWorld):
+                raise ValueError('scene adapters must supply the latest refinement_world callable')
+            def refinement_world():
+                return world
+        if not callable(refinement_world):
+            raise ValueError('refinement_world must be callable')
+
+        def refiner(seed, vmax, amax):
+            return refine_trajectory(refinement_world(), seed, vmax, amax)
+
     preview, ghost = build_preview(cfg, world, ik, urdf, joints, grip_joints)
 
     planner = ArmPlanner(
@@ -149,6 +174,7 @@ def build_planner(
         max_vel=gain_vector(cfg, "max_vel", n),
         max_acc=gain_vector(cfg, "max_acc", n),
         world=world,
+        trajectory_refiner=refiner,
     )
 
     return PlannerStack(
