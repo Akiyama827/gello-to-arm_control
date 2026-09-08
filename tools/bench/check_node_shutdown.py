@@ -68,6 +68,8 @@ def child(kind: str, stop: str, directory: Path) -> None:
     elif kind == "hand":
         import socket
 
+        # The Hand adapter imports Dora only at the process seam now.
+        sys.modules["dora"] = SimpleNamespace(Node=Node)
         from arm_control.end_effectors import franka_adapter as adapter
 
         closed = threading.Event()

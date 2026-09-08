@@ -45,6 +45,9 @@ if(WITH_FRANKA)
   # UDP, which cannot cross the PC-side NAT — the Hand must be owned from
   # the robot LAN, like the torque loop. See src/hand_bridge.cpp.
   add_executable(hand_bridge src/hand_bridge.cpp)
+  add_executable(hand_bridge_selfcheck src/hand_bridge_selfcheck.cpp)
+  target_link_libraries(hand_bridge_selfcheck PRIVATE Franka::Franka Threads::Threads)
+  target_compile_options(hand_bridge_selfcheck PRIVATE -UNDEBUG)
   target_link_libraries(hand_bridge PRIVATE Franka::Franka)
   set_target_properties(hand_bridge PROPERTIES
     BUILD_RPATH "\$ORIGIN/lib"
@@ -53,6 +56,8 @@ if(WITH_FRANKA)
 endif()
 
 add_executable(protocol_selfcheck src/selfcheck.cpp)
+add_executable(hand_admission_selfcheck src/hand_admission_selfcheck.cpp)
+target_compile_options(hand_admission_selfcheck PRIVATE -UNDEBUG)
 target_include_directories(protocol_selfcheck PRIVATE include)
 
 add_executable(pose_hold_selfcheck src/pose_hold_selfcheck.cpp)

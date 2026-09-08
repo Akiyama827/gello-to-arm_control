@@ -20,6 +20,8 @@ def pack_grasp_request(
     target_id: str,
     mode: str = "close",
     gripper_body: str = "gripper",
+    width_m: float | None = None,
+    force_n: float | None = None,
 ) -> pa.Array:
     return pack_json_message(
         "grasp_request",
@@ -28,6 +30,8 @@ def pack_grasp_request(
             "target_id": target_id,
             "mode": mode,
             "gripper_body": gripper_body,
+            **({"width_m": width_m} if width_m is not None else {}),
+            **({"force_n": force_n} if force_n is not None else {}),
         },
     )
 
