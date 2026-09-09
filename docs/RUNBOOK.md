@@ -195,10 +195,15 @@ PYTHONPATH=. python tools/bench/check_pose_hold_sim.py
 
 The single-model simulator advertises support only with an explicit EE body and
 the updated binding. Composed workcells do not advertise Soft. Remote Franka
-requires an updated server advertising `pose_hold=2`; older servers and DM
+requires an updated server advertising `pose_hold=4`; older servers and DM
 backends refuse this command before transmission. The DM example's existing
 joint-gain preset is not Cartesian impedance. No new dependency on project
 assembly or perception is introduced.
+
+Real FR3 operating gains and mode choices are deployment-owned. The consuming
+Control project supplies `configs/modes/franka_rt.yaml`; the old library
+`examples/profiles/motion_franka_rt.yaml` was retired. Mode paths resolve from
+`ARM_CONTROL_ROOT` first, then the library for reusable example profiles.
 
 The real controller uses libfranka's configured EE pose/Jacobian and Coriolis;
 Franka supplies gravity compensation. Verify the configured physical EE frame

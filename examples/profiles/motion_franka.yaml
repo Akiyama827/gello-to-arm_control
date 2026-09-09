@@ -73,7 +73,7 @@ jog:
 # --- Gain presets -----------------------------------------------------------
 # Buttons on the console, named at runtime. Applying one CANCELS a running leg
 # (a plan reviewed at one stiffness must not finish at another).
-# Sim-only: the real FR3 runs motion_franka_rt.yaml, where our servo law on the
+# Sim-only: the real FR3 uses a deployment-owned mode, where the servo law on the
 # RT box consumes these -- it deliberately has no presets.
 gain_presets:
   float:

@@ -5,6 +5,7 @@
 // fix protocol.hpp + rt_protocol.py in the same commit and bump VERSION.
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 #include "arm_rt/protocol.hpp"
 
@@ -55,6 +56,7 @@ int main() {
     st.tau[j] = 0.5 * j;
     st.tau_cmd[j] = 0.25 * j;
     st.q_cmd[j] = 0.1 * j;
+    st.qd_cmd[j] = 0.01 * j;
   }
   print_hex("STATE", &st, sizeof(st));
 
@@ -80,5 +82,12 @@ int main() {
   soft.pose_hold[13]=1; soft.pose_hold[14]=3;
   print_hex("POSE_HOLD", &soft, sizeof(soft));
   std::printf("POSE_HOLD_SIZE %zu\n",sizeof(soft));
+  PoseHoldCommandPacket decoded{};
+  for (uint16_t legacy : {uint16_t(1), uint16_t(2)}) {
+    cmd.version=legacy;
+    if (decode_command(&cmd,sizeof(cmd),true,decoded)) return 1;
+    soft.command.version=legacy;
+    if (decode_command(&soft,sizeof(soft),true,decoded)) return 1;
+  }
   return 0;
 }

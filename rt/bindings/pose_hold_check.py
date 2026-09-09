@@ -50,11 +50,12 @@ for key, value in [("id", 0), ("id", 1.5), ("id", 2**32),
 command = dict(n=7, seq=42, t_mono_ns=protocol._GOLDEN_T,
                q_des=[.1*j for j in range(7)], qd_des=[.01*j for j in range(7)],
                tau_ff=list(range(7)), kp=[100.+j for j in range(7)], kd=[.5*j for j in range(7)])
-v1 = protocol.pack_command(**command)
-v2 = protocol.pack_command(**command, pose_hold=spec)
-assert len(v1)==664 and len(v2)==784
-assert v2.hex()==protocol.golden_lines()[4].split()[1]
-assert struct.unpack_from("<H",v1,4)[0]==1 and struct.unpack_from("<H",v2,4)[0]==2
+joint = protocol.pack_command(**command)
+soft = protocol.pack_command(**command, pose_hold=spec)
+assert len(joint)==664 and len(soft)==784
+assert soft.hex()==protocol.golden_lines()[4].split()[1]
+assert struct.unpack_from("<H",joint,4)[0]==protocol.VERSION
+assert struct.unpack_from("<H",soft,4)[0]==protocol.POSE_HOLD_VERSION
 for key, value in [("q_des", [0.]*6), ("kd", [-1.]*7), ("tau_ff", [float("inf")]*7)]:
     rejected(lambda key=key,value=value: protocol.pack_command(**(command | {key:value})))
 client = RtBackend(RtConfig(host="127.0.0.1"), [str(i) for i in range(7)])
@@ -62,4 +63,4 @@ assert not client.supports_pose_hold and not client.motor_health()["supports_pos
 rejected(lambda: client.apply_command(dict(position=q, pose_hold=spec)))
 rejected(lambda: client.apply_command(dict(position=q, cartesian={})))
 assert client._cmd_seq==0  # rejection occurs before any send
-print("pose_hold_check: binding, v1/v2 encoder parity, validation, capability refusal passed")
+print("pose_hold_check: binding, joint/pose encoder parity, validation, capability refusal passed")

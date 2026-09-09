@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 MAGIC_CMD = 0x444D4341  # bytes "ACMD" on the wire
 MAGIC_STATE = 0x41545341  # "ASTA"
 MAGIC_CTL = 0x4C544341  # "ACTL"
-VERSION = 1
-POSE_HOLD_VERSION = 2
+VERSION = 3
+POSE_HOLD_VERSION = 4
 MAX_JOINTS = 16
 
 FLAG_ARMED = 1 << 0
@@ -42,14 +42,14 @@ FAULT_CTL_LOST = 2
 FAULT_PLANT = 3
 
 _CMD_FMT = "<IHHIIQ" + "80d"  # header 24 + 5*16 doubles = 664
-_STATE_FMT = "<IHHIIQII" + "88d"  # header 32 + (5*16 + 6 + 2) doubles = 736
+_STATE_FMT = "<IHHIIQII" + "104d"  # header 32 + (6*16 + 6 + 2) doubles = 864
 _CTL_FMT = "<IHHIIQ104s"  # header 24 + text 104 = 128
 
 CMD_SIZE = struct.calcsize(_CMD_FMT)
 POSE_HOLD_CMD_SIZE = CMD_SIZE + 15 * 8
 STATE_SIZE = struct.calcsize(_STATE_FMT)
 CTL_SIZE = struct.calcsize(_CTL_FMT)
-assert (CMD_SIZE, STATE_SIZE, CTL_SIZE) == (664, 736, 128)
+assert (CMD_SIZE, STATE_SIZE, CTL_SIZE) == (664, 864, 128)
 
 
 def with_online_mask(flags: int, mask: int) -> int:
@@ -109,6 +109,7 @@ class State:
     tau: list[float] = field(default_factory=list)
     tau_cmd: list[float] = field(default_factory=list)
     q_cmd: list[float] = field(default_factory=list)
+    qd_cmd: list[float] = field(default_factory=list)
     wrench: list[float] = field(default_factory=list)
 
     @property
@@ -145,6 +146,8 @@ def unpack_state(data: bytes) -> State:
     magic, version, n = vals[0], vals[1], vals[2]
     if magic != MAGIC_STATE or version != VERSION:
         raise ValueError(f"bad state packet (magic {magic:#x}, version {version})")
+    if not 1 <= n <= MAX_JOINTS:
+        raise ValueError(f"invalid state joint count: {n}")
     d = vals[8:]
     j = MAX_JOINTS
     return State(
@@ -159,7 +162,8 @@ def unpack_state(data: bytes) -> State:
         tau=list(d[2 * j : 2 * j + n]),
         tau_cmd=list(d[3 * j : 3 * j + n]),
         q_cmd=list(d[4 * j : 4 * j + n]),
-        wrench=list(d[5 * j : 5 * j + 6]),
+        qd_cmd=list(d[5 * j : 5 * j + n]),
+        wrench=list(d[6 * j : 6 * j + 6]),
     )
 
 
@@ -183,7 +187,7 @@ def unpack_control(data: bytes) -> Control:
         raise ValueError(f"control packet must be {CTL_SIZE} bytes, got {len(data)}")
     magic, version, ctl_type, seq, arg, t, text = struct.unpack(_CTL_FMT, data)
     if magic != MAGIC_CTL or version != VERSION:
-        raise ValueError(f"bad control packet (magic {magic:#x})")
+        raise ValueError(f"bad control packet (magic {magic:#x}, version {version})")
     return Control(ctl_type, seq, arg, t, text.split(b"\x00", 1)[0].decode(errors="replace"))
 
 
@@ -221,6 +225,7 @@ def golden_lines() -> list[str]:
         *_padded([0.5 * j for j in range(n)]),
         *_padded([0.25 * j for j in range(n)]),
         *_padded([0.1 * j for j in range(n)]),
+        *_padded([0.01 * j for j in range(n)]),
         *([0.0] * 8),  # wrench + reserved
     )
     ctl = pack_control(ctl_type=CTL_STATUS, seq=7, arg=1, t_mono_ns=_GOLDEN_T, text="ok")
@@ -244,15 +249,26 @@ def _demo() -> None:
     assert st.n == 7 and st.armed and not st.faulted and st.last_cmd_seq == 42
     assert st.online_mask == 0b101
     assert abs(st.q[3] - 0.31) < 1e-12 and abs(st.tau_cmd[4] - 1.0) < 1e-12
+    assert abs(st.qd_cmd[4] - .04) < 1e-12
     ctl = unpack_control(bytes.fromhex(golden_lines()[2].split()[1]))
     assert ctl.ctl_type == CTL_STATUS and ctl.arg == 1 and ctl.text == "ok"
     # Spot-check golden bytes against a constant CAPTURED from the C++ side
     # (protocol_selfcheck, 2026-07-27) — guards this file against silent
     # re-ordering even when the binary is not around to diff against.
     assert golden_lines()[2].split()[1] == (
-        "4143544c0100060007000000010000001581e97df4102211"
+        "4143544c0300060007000000010000001581e97df4102211"
         "6f6b" + "00" * 102
     ), "ControlPacket layout drifted from the captured C++ golden"
+    for version in (1, 2):
+        for index, unpack in ((1, unpack_state), (2, unpack_control)):
+            old = bytearray.fromhex(golden_lines()[index].split()[1])
+            struct.pack_into('<H', old, 4, version)
+            try:
+                unpack(old)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'legacy protocol version {version} accepted')
     print("rt_protocol: ok (sizes", CMD_SIZE, STATE_SIZE, CTL_SIZE, ")")
 
 

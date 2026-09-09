@@ -42,7 +42,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-def load_config_tree(path: str | Path, _seen: frozenset[Path] = frozenset()) -> dict:
+def load_config_tree(path: str | Path, _seen: frozenset[Path] = frozenset(), *,
+                     _layers: list | None = None, _trace: tuple | None = None) -> dict:
     """Read a config YAML, resolving an optional ``include:`` list.
 
     Split by LIFETIME, not by subsystem — that is the whole point of the
@@ -83,8 +84,53 @@ def load_config_tree(path: str | Path, _seen: frozenset[Path] = frozenset()) -> 
                 f"{config_path}: include {entry!r} not found (looked in "
                 f"{config_path.parent} and {CONTROL_ROOT})"
             )
-        merged = _deep_merge(merged, load_config_tree(child, _seen | {config_path}))
+        child_history = []
+        child_data = load_config_tree(
+            child, _seen | {config_path}, _layers=_layers,
+            _trace=(_trace[0], child_history) if _trace is not None else None)
+        if _trace is not None and _key_assignment(child_data, _trace[0]) is not None:
+            _trace[1].extend(child_history)
+        merged = _deep_merge(merged, child_data)
+    if _layers is not None:
+        _layers.append((config_path, data))
+    if _trace is not None:
+        assignment = _key_assignment(data, _trace[0])
+        if assignment is not None:
+            _trace[1].append(dict(source=str(config_path), **assignment))
     return _deep_merge(merged, data)
+
+
+def load_config_layers(path: str | Path) -> tuple[dict, list[tuple[Path, dict]]]:
+    """Resolved config and its own-key layers in the runtime's merge order."""
+    layers = []
+    resolved = load_config_tree(path, _layers=layers)
+    return resolved, layers
+
+
+def _key_assignment(data: dict, parts: tuple[str, ...]) -> dict | None:
+    """An explicit leaf assignment, or a scalar ancestor that removes it."""
+    node = data
+    for index, part in enumerate(parts):
+        if not isinstance(node, dict):
+            return dict(defined=False, value=None, key='.'.join(parts[:index]))
+        if part not in node:
+            return None
+        node = node[part]
+    return dict(defined=True, value=node, key='.'.join(parts))
+
+
+def config_key_provenance(path: str | Path, key: str) -> tuple[dict, list[dict]]:
+    """Runtime resolution and ordered contributing assignments for a dotted key.
+
+    Scalar ancestor replacements are explicit removals. Each include is resolved
+    before merging into its parent, so a removed/restored subtree in one include
+    cannot falsely erase the provenance inherited from an earlier sibling.
+    """
+    if not key or any(not part for part in key.split('.')):
+        raise ValueError('provenance requires a nonempty dotted key')
+    history = []
+    resolved = load_config_tree(path, _trace=(tuple(key.split('.')), history))
+    return resolved, history
 
 
 @dataclass(frozen=True)

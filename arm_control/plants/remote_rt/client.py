@@ -114,7 +114,14 @@ class RtBackend:
                 f"cannot reach arm_rt_server at {cfg.host}:{cfg.tcp_port}: {exc}"
             ) from exc
         self._tcp.settimeout(0.2)
-        hello = self._recv_control(deadline_s=cfg.ack_timeout_s)
+        try:
+            hello = self._recv_control(deadline_s=cfg.ack_timeout_s)
+        except ValueError as exc:
+            self._tcp.close()
+            self._tcp = None
+            raise RtLinkError(
+                f'RT protocol mismatch; client requires version {rtp.VERSION}: {exc}'
+            ) from exc
         if hello is None or hello.ctl_type != rtp.CTL_HELLO:
             raise RtLinkError("no HELLO from server (protocol/version mismatch?)")
         if hello.arg != self.n:
@@ -238,7 +245,7 @@ class RtBackend:
             raise RtLinkError("RT backend does not support the legacy cartesian command tail")
         pose_hold = command.get("pose_hold")
         if pose_hold is not None and not self.supports_pose_hold:
-            raise RtLinkError("RT backend does not advertise pose_hold=2")
+            raise RtLinkError(f"RT backend does not advertise pose_hold={rtp.POSE_HOLD_VERSION}")
         if self._udp is None:
             return
         self._send_command_raw(
@@ -297,16 +304,9 @@ class RtBackend:
             "position": np.asarray(state.q),
             "velocity": np.asarray(state.dq),
             "position_cmd": np.asarray(state.q_cmd),
-            # NOT zero -- UNKNOWN. StatePacket carries q_cmd and tau_cmd but no
-            # qd_cmd (adding one is a wire change: 736 -> 864 bytes, a VERSION
-            # bump, and a lockstep RT-box redeploy), so the servo's qd_des does
-            # not reach this host. Reporting 0.0 made a tracking plot and the
-            # CSV recorder show a flat commanded-velocity line that looked like
-            # a measurement. NaN reads as the gap it is -- rerun draws nothing
-            # and the CSV column is empty. `kp`/`kd` below are fake for the
-            # same reason; they are left at zero only because nothing plots
-            # them yet.
-            "velocity_cmd": np.full(self.n, np.nan),
+            # RT-selected reference, including zero-velocity holds. This is
+            # neither measured dq nor a local echo of the last sent packet.
+            "velocity_cmd": np.asarray(state.qd_cmd),
             # The servo's own post-clamp post-slew output — the tau_J_d
             # analogue, and the honest number for tracking plots.
             "torque_cmd": np.asarray(state.tau_cmd),
@@ -511,9 +511,11 @@ def _demo() -> None:
         backend.open()
         assert backend.backend_name == "fake"
         assert not backend.supports_pose_hold
+        assert not backend._control_roundtrip(rtp.CTL_STATUS).arg & rtp.FLAG_ARMED
         backend.set_active_mask(0b011)
         backend.enable_all()
         backend.set_active_mask(0b111)
+        assert backend._control_roundtrip(rtp.CTL_STATUS).arg & rtp.FLAG_ARMED
         try:
             backend.set_active_mask(0b011)
             raise AssertionError("active slots must not be removed while armed")
@@ -535,9 +537,17 @@ def _demo() -> None:
         err = float(np.max(np.abs(np.asarray(state.q) - target)))
         assert state.armed and not state.holding, backend.motor_health()
         assert err < 0.05, f"fake plant not tracking (err {err:.3f} rad)"
+        # Nonzero RT echo must survive the Python backend mapping. The hold
+        # below must then report zero despite retaining this incoming packet.
+        desired_velocity = np.array([.125, -.25, .375])
+        for _ in range(10):
+            backend.apply_command(dict(position=target, velocity=desired_velocity,
+                                       torque=np.zeros(3), kp=kp, kd=kd))
+            time.sleep(.01)
+        assert np.array_equal(backend.motor_state()['velocity_cmd'], desired_velocity)
 
         # Staleness -> HOLD (stop commanding past hold-ms, before fault-ms).
-        # Unsupported v2, oversized v1 and replayed sequences must neither
+        # Unsupported pose hold, oversized joint commands and replays must neither
         # change the accepted command nor refresh its deadman.
         replay = rtp.pack_command(n=3, seq=backend._cmd_seq,
             t_mono_ns=time.monotonic_ns(), q_des=target, qd_des=np.zeros(3),
@@ -552,6 +562,7 @@ def _demo() -> None:
             time.sleep(.01)
         state, _ = backend.latest_state()
         assert state.holding and not state.faulted, backend.motor_health()
+        assert np.array_equal(backend.motor_state()['velocity_cmd'], np.zeros(3))
         assert state.last_cmd_seq == backend._cmd_seq
         held = np.asarray(state.q)
 
@@ -569,6 +580,7 @@ def _demo() -> None:
         time.sleep(0.9 if remote is None else 1.4)
         state, _ = backend.latest_state()
         assert state.faulted and state.fault_code == rtp.FAULT_CMD_LOST
+        assert np.array_equal(backend.motor_state()['velocity_cmd'], np.zeros(3))
         try:
             backend.enable_all()
             raise AssertionError("ARM must be refused while latched")

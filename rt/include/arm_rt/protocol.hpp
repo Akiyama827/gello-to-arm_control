@@ -30,8 +30,10 @@ namespace arm_rt {
 constexpr uint32_t MAGIC_CMD = 0x444D4341;   // bytes "ACMD" on the wire
 constexpr uint32_t MAGIC_STATE = 0x41545341; // bytes "ASTA"
 constexpr uint32_t MAGIC_CTL = 0x4C544341;   // bytes "ACTL"
-constexpr uint16_t VERSION = 1;
-constexpr uint16_t POSE_HOLD_VERSION = 2;
+// v3 adds selected desired velocity to state; v4 is its pose-hold command.
+// Reject v1/v2 peers rather than mixing layouts or command authority epochs.
+constexpr uint16_t VERSION = 3;
+constexpr uint16_t POSE_HOLD_VERSION = 4;
 constexpr int MAX_JOINTS = 16;
 
 // StatePacket.flags bits
@@ -100,6 +102,7 @@ struct StatePacket {
   double tau[MAX_JOINTS];     // measured (fake: applied)
   double tau_cmd[MAX_JOINTS]; // servo's own output after clamp+slew (tau_J_d analogue)
   double q_cmd[MAX_JOINTS];   // servo's current position target (tracking plots)
+  double qd_cmd[MAX_JOINTS];  // selected servo velocity target; zero in holds/disarm
   double wrench[6];           // reserved for an FT sensor; FLAG_WRENCH_VALID gates
   double reserved[2];
 };
@@ -120,7 +123,7 @@ struct ControlPacket {
 static_assert(sizeof(CommandPacket) == 24 + 5 * 8 * MAX_JOINTS, "cmd layout");
 static_assert(sizeof(CommandPacket) == 664, "cmd size");
 static_assert(sizeof(PoseHoldCommandPacket) == 784, "pose hold cmd size");
-static_assert(sizeof(StatePacket) == 736, "state size");
+static_assert(sizeof(StatePacket) == 864, "state size");
 static_assert(sizeof(ControlPacket) == 128, "ctl size");
 
 inline bool valid_pose_hold_spec(const double* s) {

@@ -30,7 +30,7 @@ nodes:
   - id: arm_console
     path: ../nodes/arm_console.py
     env:
-      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka_rt.yaml
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
     inputs:
       motor_state: plant_interface/motor_state_viz
       # Armed badge + Execute gating + gate visibility on the panel.
@@ -61,7 +61,7 @@ nodes:
   - id: trajectory_replay
     path: ../nodes/trajectory_replay.py
     env:
-      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka_rt.yaml
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
     inputs:
       motor_state: plant_interface/motor_state
       # Replay is a second motion-authority path (file trigger, no page in
@@ -74,7 +74,7 @@ nodes:
   - id: arm_controller
     path: ../nodes/arm_controller.py
     env:
-      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka_rt.yaml
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
     inputs:
       motor_state: plant_interface/motor_state
       motor_health: plant_interface/motor_health
@@ -93,7 +93,7 @@ nodes:
   - id: plant_interface
     path: ../nodes/rt_interface.py
     env:
-      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka_rt.yaml
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
     inputs:
       motor_command: arm_controller/motor_command
       arm:           arm_controller/arm

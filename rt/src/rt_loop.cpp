@@ -335,6 +335,9 @@ void rt_loop(ServerCtx& ctx) {
     std::memcpy(out.tau, ps.tau, sizeof(out.tau));
     std::memcpy(out.tau_cmd, tau_out, sizeof(out.tau_cmd));
     std::memcpy(out.q_cmd, q_des, sizeof(double) * size_t(n));
+    // Echo the reference selected AFTER hold/fault/pose-hold handling, never
+    // the latest UDP packet (which may no longer have command authority).
+    std::memcpy(out.qd_cmd, qd_des, sizeof(double) * size_t(n));
     // The wrench field has been reserved in StatePacket since v1 and
     // FLAG_WRENCH_VALID has always gated it — filling it is NOT a wire
     // change, so no VERSION bump. Copied unconditionally: a backend with no

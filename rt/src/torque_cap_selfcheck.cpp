@@ -31,6 +31,15 @@ class ScriptedBackend final : public Backend {
 
   bool read(PlantState& state) override {
     ++tick;
+    if (tick > 1) {
+      StatePacket previous{};
+      assert(ctx->state_out.read(previous));
+      assert(previous.version == VERSION);
+      for (int j=0; j<2; ++j) {
+        const double expected = (tick == 4 || tick == 5) ? .125 * (j+1) : 0.;
+        assert(previous.qd_cmd[j] == expected);
+      }
+    }
     state = {};
     state.n = 2;
     state.dq[0] = -100;
@@ -54,6 +63,7 @@ class ScriptedBackend final : public Backend {
         const double sign = (j == 0 ? 1 : -1) * (tick == 3 ? 1 : -1);
         command.tau_ff[j] = sign * 100;
         command.kd[j] = 20;
+        command.qd_des[j] = .125 * (j+1);
         state.dq[j] = 0;
         // Echo outside the cap: post-slew clamping must still win.
         if (tick == 4) state.tau_ref[j] = sign * 10000;

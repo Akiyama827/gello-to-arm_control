@@ -72,10 +72,13 @@ void serve_client(ServerCtx& ctx, int fd) {
   // configured for hand-guiding (--fault-ms 3600000) — a commander graph
   // against that server has no staleness reflex at all (audit 2026-07-29).
   char hello[96];
+  char capability[24] = {};
+  if (ctx.supports_pose_hold.load())
+    std::snprintf(capability, sizeof(capability), " pose_hold=%u", POSE_HOLD_VERSION);
   std::snprintf(hello, sizeof(hello),
                 "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s",
                 ctx.backend_name, ctx.cfg.hold_ms, ctx.cfg.fault_ms,
-                ctx.active_mask.load(), ctx.supports_pose_hold.load() ? " pose_hold=2" : "");
+                ctx.active_mask.load(), capability);
   send_frame(fd, make(CTL_HELLO, uint32_t(ctx.backend_n.load()), hello));
 
   // Session deadman: the client answers CTL_PING with CTL_PONG, so a healthy
@@ -117,6 +120,10 @@ void serve_client(ServerCtx& ctx, int fd) {
     last_alive_ns = mono_ns();  // any valid frame (PONGs included) is life
 
     switch (rx.type) {
+      case CTL_STATUS:
+        // Read-only inspection; never changes authority or clears a fault.
+        send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "status"));
+        break;
       case CTL_ARM:
         if (ctx.fault.load()) {
           // Refused: flags still show ARMED when the server is fault-holding

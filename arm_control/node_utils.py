@@ -81,6 +81,11 @@ def _load_mode_config() -> dict:
     raw = os.environ.get("ARM_CONTROL_MODE_CONFIG")
     if not raw:
         return {}
+    return yaml.safe_load(resolve_mode_config_path(raw).read_text()) or {}
+
+
+def resolve_mode_config_path(raw: str | Path) -> Path:
+    """Resolve a deployment-owned mode, falling back to a library example."""
     path = Path(raw)
     if not path.is_absolute():
         # Deployment root first (a project may override a mode wholesale),
@@ -91,7 +96,7 @@ def _load_mode_config() -> dict:
                 break
         else:
             path = CONTROL_ROOT / path
-    return yaml.safe_load(path.read_text()) or {}
+    return path
 
 
 def expand_named_values(

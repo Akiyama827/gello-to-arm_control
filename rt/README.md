@@ -139,7 +139,8 @@ parsers can silently ignore the range suffix and retain their type defaults.
 UDP fast path, both directions latest-wins with sequence numbers:
 `CommandPacket` (q_des, qd_des, tau_ff, kp, kd — the full bridge contract
 word, typically 100 Hz from the executor) and `StatePacket` (q, dq, tau, the servo's
-post-limiter `tau_cmd` (DM: sampled prediction), its current target `q_cmd`, flags, plus reserved
+post-limiter `tau_cmd` (DM: sampled prediction), selected targets `q_cmd` and
+`qd_cmd`, flags, plus reserved
 FT-sensor fields), streamed at `--state-hz` to the source address of the last
 command. TCP control channel, fixed 128-byte frames: HELLO (n + backend
 name), ARM, DISARM, PING/PONG, STATUS, FAULT. Clocks are NOT assumed synced —
@@ -151,13 +152,21 @@ for: `./build/protocol_selfcheck` and `python -m arm_control.plants.remote_rt.pr
 arm_control.plants.remote_rt.client` diffs them automatically before its loopback
 test. Any layout change edits both files in one commit and bumps `VERSION`.
 
-Cartesian Soft adds a separate 784-byte command version 2: the unchanged
+State/control and ordinary joint commands use version 3; StatePacket is 864
+bytes. `qd_cmd` echoes the RT-selected desired velocity, including zero in
+initial/stale/fault holds, Cartesian pose hold and disarm. It is not measured
+joint velocity or proof that a plant accepted/tracked the target. CTL_STATUS
+requests report current flags without changing authority or clearing a fault.
+
+Cartesian Soft uses a separate 784-byte command version 4: the unchanged
 664-byte joint-command prefix, followed by 15 doubles
-`[id, kc[6], dc[6], nullspace_kp, nullspace_kd]`. State/control and ordinary
-joint commands remain version 1. Only Franka advertises `pose_hold=2` in HELLO;
+`[id, kc[6], dc[6], nullspace_kp, nullspace_kd]`. Only Franka advertises
+`pose_hold=4` in HELLO;
 the client rejects Soft without that capability and rejects legacy Cartesian
 tails. Unsupported versions, invalid gains and replayed sequences do not renew
 the command deadman.
+Legacy v1/v2 peers are rejected. Deploy PC clients and every arm/base RT
+instance together; the base uses the same wire contract as Franka.
 
 `PoseHold` captures measured EE pose and nullspace joint posture on each new
 nonzero id. The shared compiled law uses local pose/Jacobian/Coriolis, ramps
