@@ -39,6 +39,7 @@ engineering checks; they are not certification of a particular deployment.
 cmake -B build -G Ninja rt && cmake --build build          # fake + selfcheck
 cmake -B build -G Ninja -DWITH_FRANKA=ON rt && cmake --build build   # + FR3
 pip install -e rt/bindings                                  # optional: sim same-law
+PYTHONPATH=. python tools/bench/rt/torque_cap.py build/arm_rt_server  # offline caps + parity
 ```
 
 ## Protocol in one paragraph
@@ -76,6 +77,20 @@ Offline checks: `pose_hold_selfcheck` includes Eigen's no-allocation guard;
 `rt/bindings/pose_hold_check.py` checks the compiled Python API and encoder.
 
 ## Safety semantics (the part to re-read before bench day)
+
+`--tau-max NM` optionally lowers every joint's command ceiling to the smaller
+of this positive finite value and its backend limit. Omit it to preserve the
+backend defaults. The resolved per-joint limits are printed at startup and
+apply to joint/Cartesian commands and initial, stale, and latched-fault holds
+through the same clamp/slew law. The final clamp wins even when the robot's
+torque echo lies outside the cap. The option cannot be changed by a command
+packet; deployment values belong in the consuming project's service unit.
+
+DM keeps its firmware-compatible MIT encoding scale. With an explicit cap,
+the torque field uses only codes whose decoded values lie inside that cap;
+unrepresentably small caps are rejected before opening the bus. This limits
+requested torque, not measured torque, thermal duty, or contact force. It
+does not provide a brake or make disarming a gravity-loaded joint safe.
 
 Authority ladder while ARMED, most-alive first:
 

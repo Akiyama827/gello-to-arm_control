@@ -26,6 +26,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 
 #include "arm_rt/servo_law.hpp"
 #include "arm_rt/pose_hold.hpp"
@@ -37,7 +38,7 @@ std::unique_ptr<Backend> make_fake_backend(int n);
 std::unique_ptr<Backend> make_franka_backend(const std::string& ip, double ee_mass,
                                              const double ee_com[3]);
 std::unique_ptr<Backend> make_dm_backend(const std::string& can_if,
-                                         uint32_t active_mask);
+                                         uint32_t active_mask, double tau_max);
 
 namespace {
 
@@ -73,7 +74,8 @@ void rt_loop(ServerCtx& ctx) {
       std::fprintf(stderr, "[rt] franka backend failed to start "
                            "(reason above; RT perms? FCI on? robot reachable?)\n");
   } else if (ctx.cfg.backend == "dm") {
-    backend = make_dm_backend(ctx.cfg.can_if, ctx.cfg.initial_active_mask);
+    backend = make_dm_backend(ctx.cfg.can_if, ctx.cfg.initial_active_mask,
+                              ctx.cfg.tau_max);
     if (!backend)
       std::fprintf(stderr, "[rt] dm backend failed to start (reason above; "
                            "--dm-spec? link up? fd on?)\n");
@@ -86,6 +88,15 @@ void rt_loop(ServerCtx& ctx) {
     return;
   }
   const int n = backend->n();
+  double tau_limits[MAX_JOINTS] = {};
+  std::printf("[rt] effective torque limits (N.m):");
+  for (int j = 0; j < n; ++j) {
+    tau_limits[j] = ctx.cfg.tau_max > 0
+        ? std::min(ctx.cfg.tau_max, backend->tau_limit()[j])
+        : backend->tau_limit()[j];
+    std::printf(" %.9g", tau_limits[j]);
+  }
+  std::printf("\n");
   ctx.backend_n.store(n);
   ctx.online_mask.store(backend->online_mask());
   ctx.active_mask.store(backend->active_mask());
@@ -274,7 +285,7 @@ void rt_loop(ServerCtx& ctx) {
         }
       }
       servo_torque(n, ps.q, ps.dq, q_des, qd_des, tau_ff, kp, kd, ps.tau_ref,
-                   backend->tau_limit(), ctx.cfg.slew, tau_out);
+                   tau_limits, ctx.cfg.slew, tau_out);
       if (!backend->write(tau_out, n)) {
         ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
         plant_ok = false;

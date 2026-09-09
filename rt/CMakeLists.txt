@@ -65,3 +65,8 @@ target_include_directories(pose_hold_selfcheck PRIVATE include)
 target_link_libraries(pose_hold_selfcheck PRIVATE Eigen3::Eigen)
 # Assertions and Eigen's allocation guard must survive release builds.
 target_compile_options(pose_hold_selfcheck PRIVATE -UNDEBUG)
+
+add_executable(torque_cap_selfcheck src/torque_cap_selfcheck.cpp src/rt_loop.cpp)
+target_include_directories(torque_cap_selfcheck PRIVATE include)
+target_link_libraries(torque_cap_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
+target_compile_options(torque_cap_selfcheck PRIVATE -UNDEBUG)

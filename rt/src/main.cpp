@@ -10,6 +10,8 @@
 #include <arpa/inet.h>
 
 #include <csignal>
+#include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,13 +36,15 @@ void usage(const char* argv0) {
       "usage: %s [--backend fake|franka|dm] [--n N] [--udp-port P] [--tcp-port P]\n"
       "          [--state-hz HZ] [--hold-ms MS] [--fault-ms MS] [--slew NM]\n"
       "          [--hold-kp V] [--hold-kd V] [--franka-ip IP] [--can-if IF]\n"
-      "          [--ee-mass KG] [--ee-com X,Y,Z]\n"
+      "          [--ee-mass KG] [--ee-com X,Y,Z] [--tau-max NM]\n"
       "          [--dm-spec IF;ID:TYPE[:MST],...] [--rt-priority N]\n"
       "          [--active-mask MASK] [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
       "\n"
       "  --ee-mass  payload past the flange (wrist camera + mount, carried\n"
       "             module) in kg, ADDED to Desk's end-effector config.\n"
-      "  --ee-com   that payload's centre of mass in the FLANGE frame, metres.\n",
+      "  --ee-com   that payload's centre of mass in the FLANGE frame, metres.\n"
+      "  --tau-max  positive operating torque cap per joint (N.m), never above\n"
+      "             backend limits; omitted keeps the backend defaults.\n",
       argv0);
 }
 
@@ -87,6 +91,17 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--hold-ms")) cfg.hold_ms = std::atof(next("--hold-ms"));
     else if (!std::strcmp(argv[i], "--fault-ms")) cfg.fault_ms = std::atof(next("--fault-ms"));
     else if (!std::strcmp(argv[i], "--slew")) cfg.slew = std::atof(next("--slew"));
+    else if (!std::strcmp(argv[i], "--tau-max")) {
+      const char* value = next("--tau-max");
+      char* end = nullptr;
+      errno = 0;
+      const double cap = std::strtod(value, &end);
+      if (errno || end == value || *end || !std::isfinite(cap) || cap <= 0) {
+        std::fprintf(stderr, "--tau-max must be finite and > 0 N.m (got '%s')\n", value);
+        return 2;
+      }
+      cfg.tau_max = cap;
+    }
     else if (!std::strcmp(argv[i], "--hold-kp")) cfg.hold_kp = std::atof(next("--hold-kp"));
     else if (!std::strcmp(argv[i], "--hold-kd")) cfg.hold_kd = std::atof(next("--hold-kd"));
     else if (!std::strcmp(argv[i], "--franka-ip")) cfg.franka_ip = next("--franka-ip");

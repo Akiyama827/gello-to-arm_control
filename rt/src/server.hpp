@@ -52,6 +52,7 @@ struct ServerConfig {
   double hold_ms = 100.0;   // stale commands -> hold current pose
   double fault_ms = 1000.0; // prolonged staleness -> latch (DISARM+ARM clears)
   double slew = 1.0;        // N.m per tick, the servo slew budget
+  double tau_max = 0.0;     // optional operating cap; 0 = backend limits
   double hold_kp = 50.0;    // hold gains when no command was ever received
   double hold_kd = 5.0;
   uint32_t initial_active_mask = 0xFFFFu;

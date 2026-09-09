@@ -42,11 +42,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -96,7 +99,7 @@ double u2f(uint32_t raw, double lo, double hi, int bits) {
 // MIT control frame: pos16 | vel12 | kp12 | kd12 | tau12 (dm_backend.py
 // pack_mit_control_frame). No gain validation here: the RT path never
 // throws, and this backend hardwires kp=kd=0 — the clip in f2u is the
-// backstop, rt_loop's clamp against tau_limit() the real ceiling.
+// backstop. Explicit caps additionally constrain the final torque code below.
 void pack_mit(double pos, double vel, double kp, double kd, double tau,
               const DmLimits& L, uint8_t out[8]) {
   const uint32_t p = f2u(pos, L.p_lo, L.p_hi, 16);
@@ -140,10 +143,52 @@ struct Motor {
   int mst = 0;  // reply CAN id (Master ID)
   std::string type;
   DmLimits lim{};
+  double tau_cap = 0;  // zero keeps the legacy wire encoding
+  uint32_t tau_code_min = 0, tau_code_max = 4095;
   double q = 0, dq = 0, tau = 0;
   uint64_t last_rx_ns = 0;
   bool seen = false;
 };
+
+// Run before constructing the backend: an impossible cap must never open CAN.
+bool set_torque_cap(Motor& m, double tau_max, std::string& err) {
+  if (tau_max == 0) return true;
+  if (!std::isfinite(tau_max) || tau_max <= 0) {
+    err = "torque cap must be finite and positive";
+    return false;
+  }
+  m.tau_cap = std::min(tau_max, m.lim.t_hi);
+  const DmLimits& L = m.lim;
+  m.tau_code_min = f2u(-m.tau_cap, L.t_lo, L.t_hi, 12);
+  m.tau_code_max = f2u(m.tau_cap, L.t_lo, L.t_hi, 12);
+  // Use the actual decoder at boundaries: floating-point inverse rounding
+  // and the MIT encoder's truncation can otherwise exceed a negative cap.
+  while (m.tau_code_min > 0 &&
+         u2f(m.tau_code_min - 1, L.t_lo, L.t_hi, 12) >= -m.tau_cap)
+    --m.tau_code_min;
+  while (m.tau_code_min < 4095 &&
+         u2f(m.tau_code_min, L.t_lo, L.t_hi, 12) < -m.tau_cap)
+    ++m.tau_code_min;
+  while (m.tau_code_max < 4095 &&
+         u2f(m.tau_code_max + 1, L.t_lo, L.t_hi, 12) <= m.tau_cap)
+    ++m.tau_code_max;
+  while (m.tau_code_max > 0 &&
+         u2f(m.tau_code_max, L.t_lo, L.t_hi, 12) > m.tau_cap)
+    --m.tau_code_max;
+  if (m.tau_code_min > m.tau_code_max) {
+    err = "torque cap has no representable MIT code for motor " + m.type;
+    return false;
+  }
+  return true;
+}
+
+void clamp_torque_field(uint8_t out[8], const Motor& m) {
+  if (m.tau_cap == 0) return;
+  const uint32_t raw = (uint32_t(out[6] & 0x0F) << 8) | out[7];
+  const uint32_t t = std::clamp(raw, m.tau_code_min, m.tau_code_max);
+  out[6] = uint8_t((out[6] & 0xF0) | (t >> 8));
+  out[7] = uint8_t(t & 0xFF);
+}
 
 uint64_t ts_ns(const timespec& t) {
   return uint64_t(t.tv_sec) * 1'000'000'000ull + uint64_t(t.tv_nsec);
@@ -215,7 +260,8 @@ public:
       : iface_(iface), motors_(std::move(motors)) {
     fault_.reserve(256);  // latch path must not allocate on the RT thread
     for (size_t j = 0; j < motors_.size(); ++j)
-      tau_limit_[j] = motors_[j].lim.t_hi;
+      tau_limit_[j] = motors_[j].tau_cap == 0 ? motors_[j].lim.t_hi
+                                            : motors_[j].tau_cap;
     const uint32_t configured = motors_.size() >= 16
                                     ? 0xFFFFu
                                     : ((1u << motors_.size()) - 1u);
@@ -397,6 +443,7 @@ public:
       if (t < L.t_lo) t = L.t_lo;
       if (t > L.t_hi) t = L.t_hi;
       pack_mit(0, 0, 0, 0, t, L, buf);  // pure torque: motor PD bypassed
+      clamp_torque_field(buf, motors_[j]);
       if (!send8(motors_[j].id, buf)) return false;
       last_tau_[j] = t;
     }
@@ -514,13 +561,19 @@ private:
 } // namespace
 
 std::unique_ptr<Backend> make_dm_backend(const std::string& spec,
-                                         uint32_t active_mask) {
+                                         uint32_t active_mask, double tau_max) {
   std::string iface, err;
   std::vector<Motor> motors;
   if (!parse_spec(spec, iface, motors, err)) {
     std::fprintf(stderr, "[rt] dm backend: %s (spec '%s')\n", err.c_str(),
                  spec.c_str());
     return nullptr;
+  }
+  for (Motor& m : motors) {
+    if (!set_torque_cap(m, tau_max, err)) {
+      std::fprintf(stderr, "[rt] dm backend: %s\n", err.c_str());
+      return nullptr;
+    }
   }
   auto backend =
       std::make_unique<DmBackend>(iface, std::move(motors), active_mask);
@@ -536,17 +589,80 @@ std::unique_ptr<Backend> make_dm_backend(const std::string& spec,
 // mirror (pack_mit_control_frame / decode_mit_reply through the SAME inputs)
 // must print byte-identical lines — the dm equivalent of protocol_selfcheck.
 int dm_mit_selfcheck() {
+  // Explicit failures keep these checks active in release/NDEBUG builds.
+  for (const char* type : {"4340", "4340p", "4310", "4310p"}) {
+    DmLimits L;
+    limits_for(type, L);
+    const double nearest = std::min(-u2f(2047, L.t_lo, L.t_hi, 12),
+                                    u2f(2048, L.t_lo, L.t_hi, 12));
+    for (double cap : {0.0, 27.0, 0.01, nearest, 1000.0}) {
+      Motor m;
+      m.type = type;
+      m.lim = L;
+      std::string err;
+      if (!set_torque_cap(m, cap, err)) {
+        std::fprintf(stderr, "MIT cap check: %s cap %.17g rejected: %s\n",
+                     type, cap, err.c_str());
+        return 1;
+      }
+      const double effective = cap == 0 ? L.t_hi : std::min(cap, L.t_hi);
+      if ((cap == 0 && m.tau_cap != 0) ||
+          (cap != 0 && m.tau_cap != effective)) {
+        std::fprintf(stderr, "MIT cap check: %s incorrect effective cap\n", type);
+        return 1;
+      }
+      for (double tau : {-2 * L.t_hi, -effective, 0.0, effective, 2 * L.t_hi}) {
+        uint8_t legacy[8], out[8];
+        pack_mit(1.234, -2.5, 123.4, 2.71, tau, L, legacy);
+        std::memcpy(out, legacy, sizeof out);
+        clamp_torque_field(out, m);
+        const uint32_t raw = (uint32_t(out[6] & 0x0F) << 8) | out[7];
+        const double decoded = u2f(raw, L.t_lo, L.t_hi, 12);
+        if (decoded < -effective || decoded > effective) {
+          std::fprintf(stderr, "MIT cap check: %s cap %.17g torque %.17g "
+                               "encoded as %.17g\n", type, cap, tau, decoded);
+          return 1;
+        }
+        if (std::memcmp(out, legacy, 6) || (out[6] & 0xF0) != (legacy[6] & 0xF0) ||
+            ((cap == 0 || cap >= L.t_hi) && std::memcmp(out, legacy, 8))) {
+          std::fprintf(stderr, "MIT cap check: %s changed legacy fields\n", type);
+          return 1;
+        }
+      }
+    }
+    for (double cap : {1e-12, std::nextafter(nearest, 0.0), -1.0,
+                       std::numeric_limits<double>::infinity(),
+                       std::numeric_limits<double>::quiet_NaN()}) {
+      Motor m;
+      m.type = type;
+      m.lim = L;
+      std::string err;
+      if (set_torque_cap(m, cap, err) ||
+          (cap > 0 && cap < nearest && err.find("representable") == std::string::npos)) {
+        std::fprintf(stderr, "MIT cap check: %s invalid cap %.17g accepted "
+                             "or wrong error\n", type, cap);
+        return 1;
+      }
+    }
+  }
   struct PackCase {
     const char* type;
     double p, v, kp, kd, t;
+    uint8_t expected[8];
   };
   const PackCase packs[] = {
-      {"4340", 1.234, -2.5, 0, 0, 13.579},
-      {"4340", 0, 0, 0, 0, 0},
-      {"4340", -12.5, -10, 0, 0, -28},
-      {"4340", 12.5, 10, 500, 5, 28},
-      {"4310", -3.3, 7.77, 123.4, 2.71, -9.87},
-      {"4310p", 5, 41, 250, 1, 3.3},
+      {"4340", 1.234, -2.5, 0, 0, 13.579,
+       {0x8c, 0xa2, 0x5f, 0xf0, 0x00, 0x00, 0x0b, 0xe0}},
+      {"4340", 0, 0, 0, 0, 0,
+       {0x7f, 0xff, 0x7f, 0xf0, 0x00, 0x00, 0x07, 0xff}},
+      {"4340", -12.5, -10, 0, 0, -28,
+       {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+      {"4340", 12.5, 10, 500, 5, 28,
+       {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
+      {"4310", -3.3, 7.77, 123.4, 2.71, -9.87,
+       {0x5e, 0x34, 0xa1, 0x13, 0xf2, 0x8a, 0xb0, 0x1a}},
+      {"4310p", 5, 41, 250, 1, 3.3,
+       {0xb3, 0x32, 0xe8, 0xe7, 0xff, 0x33, 0x3a, 0xa3}},
   };
   struct DecCase {
     const char* type;
@@ -563,6 +679,10 @@ int dm_mit_selfcheck() {
     limits_for(c.type, L);
     uint8_t out[8];
     pack_mit(c.p, c.v, c.kp, c.kd, c.t, L, out);
+    if (std::memcmp(out, c.expected, sizeof out)) {
+      std::fprintf(stderr, "MIT cap check: %s legacy golden changed\n", c.type);
+      return 1;
+    }
     std::printf("PACK %s %.9g %.9g %.9g %.9g %.9g ", c.type, c.p, c.v, c.kp,
                 c.kd, c.t);
     for (int i = 0; i < 8; ++i) std::printf("%02x", out[i]);
