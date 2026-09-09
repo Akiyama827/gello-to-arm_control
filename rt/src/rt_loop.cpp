@@ -286,9 +286,20 @@ void rt_loop(ServerCtx& ctx) {
       }
       servo_torque(n, ps.q, ps.dq, q_des, qd_des, tau_ff, kp, kd, ps.tau_ref,
                    tau_limits, ctx.cfg.slew, tau_out);
-      if (!backend->write(tau_out, n)) {
+      // Preserve the authority-selected fields for native MIT. In particular,
+      // tau_out contains PD already; it must NOT become an extra MIT tau_ff.
+      CommandPacket selected{};
+      selected.n = uint16_t(n);
+      std::copy_n(q_des, n, selected.q_des);
+      std::copy_n(qd_des, n, selected.qd_des);
+      std::copy_n(tau_ff, n, selected.tau_ff);
+      std::copy_n(kp, n, selected.kp);
+      std::copy_n(kd, n, selected.kd);
+      if (!backend->write_command(selected, ctx.cfg.slew, tau_out)) {
         ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
         plant_ok = false;
+        holding = false;
+        std::fill_n(tau_out, n, 0.0);  // rejected output is not commanded torque
       }
     } else {
       pose_hold.reset();

@@ -70,3 +70,15 @@ add_executable(torque_cap_selfcheck src/torque_cap_selfcheck.cpp src/rt_loop.cpp
 target_include_directories(torque_cap_selfcheck PRIVATE include)
 target_link_libraries(torque_cap_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
 target_compile_options(torque_cap_selfcheck PRIVATE -UNDEBUG)
+
+add_executable(dm_command_selfcheck src/dm_command_selfcheck.cpp src/rt_loop.cpp)
+target_include_directories(dm_command_selfcheck PRIVATE include)
+target_link_libraries(dm_command_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
+target_compile_options(dm_command_selfcheck PRIVATE -UNDEBUG)
+
+add_executable(dm_backend_selfcheck src/dm_backend_selfcheck.cpp src/backend_dm.cpp)
+target_include_directories(dm_backend_selfcheck PRIVATE include)
+target_compile_options(dm_backend_selfcheck PRIVATE -UNDEBUG)
+foreach(call socket setsockopt ioctl bind close write recv ppoll)
+  target_link_options(dm_backend_selfcheck PRIVATE "-Wl,--wrap=${call}")
+endforeach()

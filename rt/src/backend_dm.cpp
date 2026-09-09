@@ -31,12 +31,12 @@
 // (rt_handguide.py:130: safe_stop "verified: ack + state stream"); if some
 // firmware doesn't, the disarmed silence fault will say so loudly.
 //
-// Enable: DM enable frame per motor on the FIRST read(), and lazily on the
-// first write() after a stop() (franka's lazy-session pattern). stop()
+// Enable: only on the first authorized write_command() after a stop(). Reads
+// never enable. stop()
 // sends zero-torque + disable per motor — the Python
 // _zero_torque_and_disable sequence — idempotent, never throws. tau_ref
-// self-echoes the last written (clamped) torque: fake-backend semantics,
-// DM has no accepted-torque echo.
+// self-echoes the last encoded command's predicted total torque at the last
+// measured q/dq; DM has no accepted-torque echo. Python owns model feedforward.
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
@@ -101,9 +101,8 @@ double u2f(uint32_t raw, double lo, double hi, int bits) {
 }
 
 // MIT control frame: pos16 | vel12 | kp12 | kd12 | tau12 (dm_backend.py
-// pack_mit_control_frame). No gain validation here: the RT path never
-// throws, and this backend hardwires kp=kd=0 — the clip in f2u is the
-// backstop. Explicit caps additionally constrain the final torque code below.
+// pack_mit_control_frame). Authorized commands are validated by pack_native_mit
+// BEFORE reaching this raw codec. Zero-gain lifecycle frames use it directly.
 void pack_mit(double pos, double vel, double kp, double kd, double tau,
               const DmLimits& L, uint8_t out[8]) {
   const uint32_t p = f2u(pos, L.p_lo, L.p_hi, 16);
@@ -153,6 +152,62 @@ struct Motor {
   uint64_t last_rx_ns = 0;
   bool seen = false;
 };
+
+bool reserved_mit_control(const uint8_t frame[8]) {
+  // Reserve the lifecycle-word family (enable/disable/zero/error reset),
+  // including all-FF, rather than interpreting it as a normal motion command.
+  return std::all_of(frame, frame + 7, [](uint8_t byte) { return byte == 0xff; }) &&
+         frame[7] >= 0xfb;
+}
+
+const char* pack_native_mit(const Motor& motor, const CommandPacket& command,
+                            int joint, double previous, double slew,
+                            uint8_t out[8], double& predicted) {
+  const auto& L = motor.lim;
+  const double values[] = {command.q_des[joint], command.qd_des[joint],
+                           command.kp[joint], command.kd[joint], command.tau_ff[joint]};
+  const double lower[] = {L.p_lo, L.v_lo, L.kp_lo, L.kd_lo, L.t_lo};
+  const double upper[] = {L.p_hi, L.v_hi, L.kp_hi, L.kd_hi, L.t_hi};
+  for (int i = 0; i < 5; ++i)
+    if (!std::isfinite(values[i]) || values[i] < lower[i] || values[i] > upper[i])
+      return "native MIT field nonfinite/out of wire range (q, qd, kp, kd, ff)";
+  if (!std::isfinite(motor.q) || !std::isfinite(motor.dq) ||
+      !std::isfinite(previous) || !std::isfinite(slew) || slew <= 0)
+    return "native MIT requires finite feedback, reference and positive slew";
+
+  pack_mit(values[0], values[1], values[2], values[3], values[4], L, out);
+  // Predict what the MOTOR will compute from the actual quantized fields.
+  // This is only the safety check, never an extra PD feedforward term.
+  const double p = u2f((uint32_t(out[0]) << 8) | out[1], L.p_lo, L.p_hi, 16);
+  const double v = u2f((uint32_t(out[2]) << 4) | (out[3] >> 4), L.v_lo, L.v_hi, 12);
+  const double kp = u2f((uint32_t(out[3] & 15) << 8) | out[4], L.kp_lo, L.kp_hi, 12);
+  const double kd = u2f((uint32_t(out[5]) << 4) | (out[6] >> 4), L.kd_lo, L.kd_hi, 12);
+  const double pd = kp * (p - motor.q) + kd * (v - motor.dq);
+  const uint32_t ff_code = (uint32_t(out[6] & 15) << 8) | out[7];
+  predicted = pd + u2f(ff_code, L.t_lo, L.t_hi, 12);
+  if (!std::isfinite(pd) || !std::isfinite(predicted)) return "native MIT torque overflow";
+  const double cap = motor.tau_cap == 0 ? L.t_hi : motor.tau_cap;
+  const double lo = std::clamp(previous - slew, -cap, cap);
+  const double hi = std::clamp(previous + slew, -cap, cap);
+  if (predicted >= lo && predicted <= hi)
+    return reserved_mit_control(out) ? "native MIT overlaps reserved control word" : nullptr;
+
+  // Saturation/slew is the ONLY exception to preserving Python's feedforward.
+  // Keep q/qd/kp/kd bits; choose an ff code whose TOTAL satisfies the budget.
+  // Clamping ff alone would let onboard PD exceed the configured torque cap.
+  const double target = std::clamp(predicted, lo, hi) - pd;
+  const int code = int(f2u(target, L.t_lo, L.t_hi, 12));
+  for (int candidate : {code, code + 1, code - 1}) {
+    if (candidate < 0 || candidate > 4095) continue;
+    const double total = pd + u2f(uint32_t(candidate), L.t_lo, L.t_hi, 12);
+    if (total < lo || total > hi) continue;
+    out[6] = uint8_t((out[6] & 0xf0) | (candidate >> 8));
+    out[7] = uint8_t(candidate & 0xff);
+    predicted = total;
+    return reserved_mit_control(out) ? "native MIT overlaps reserved control word" : nullptr;
+  }
+  return "no native MIT feedforward code satisfies total torque/slew limit";
+}
 
 // Run before constructing the backend: an impossible cap must never open CAN.
 bool set_torque_cap(Motor& m, double tau_max, std::string& err) {
@@ -375,7 +430,6 @@ public:
                                     ? 0xFFFFu
                                     : ((1u << motors_.size()) - 1u);
     if (mask & ~configured || mask & ~online_mask()) return false;
-    const uint32_t added = mask & ~active_mask_;
     const uint32_t removed = active_mask_ & ~mask;
     uint8_t zero[8];
     for (size_t j = 0; j < motors_.size(); ++j) {
@@ -385,8 +439,7 @@ public:
             !send8(motors_[j].id, DM_DISABLE_FRAME))
           return false;
         last_tau_[j] = 0.0;
-      } else if (enabled_ && (added & (1u << j))) {
-        if (!send8(motors_[j].id, DM_ENABLE_FRAME)) return false;
+        enabled_mask_ &= ~(1u << j);
       }
     }
     active_mask_ = mask;
@@ -394,6 +447,14 @@ public:
   }
 
   bool read(PlantState& out) override {
+    if (read_tick(out)) return true;
+    // Unlike a streamed torque backend, onboard PD retains authority until
+    // explicitly disabled. A failed read must not leave that command active.
+    if (enabled_mask_) stop_preserving_fault();
+    return false;
+  }
+
+  bool read_tick(PlantState& out) {
     timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     ts_add(next_, TICK_NS);
@@ -463,7 +524,7 @@ public:
       out.q[j] = motors_[j].q;
       out.dq[j] = motors_[j].dq;
       out.tau[j] = motors_[j].tau;
-      out.tau_ref[j] = last_tau_[j];  // self-echo (fake semantics)
+      out.tau_ref[j] = last_tau_[j];  // encoded prediction, NOT a motor echo
     }
     // No EE geometry here (the base's kinematics live PC-side): explicit
     // zeros + false flags, same decision the fake backend documents.
@@ -473,20 +534,43 @@ public:
     return true;
   }
 
-  bool write(const double* tau, int n) override {
-    if (!enabled_ && !enable_all()) return false;  // lazy re-arm after stop()
-    uint8_t buf[8];
-    for (int j = 0; j < n && j < int(motors_.size()); ++j) {
-      if (!(active_mask_ & (1u << j))) continue;
-      const DmLimits& L = motors_[j].lim;
-      double t = tau[j];
-      if (t < L.t_lo) t = L.t_lo;
-      if (t > L.t_hi) t = L.t_hi;
-      pack_mit(0, 0, 0, 0, t, L, buf);  // pure torque: motor PD bypassed
-      clamp_torque_field(buf, motors_[j]);
-      if (!send8(motors_[j].id, buf)) return false;
-      last_tau_[j] = t;
+  bool write(const double*, int) override {
+    if (enabled_mask_) stop();
+    fail("DM requires native MIT write_command, not torque-only write");
+    return false;
+  }
+
+  bool write_command(const CommandPacket& command, double slew, double* tau_out) override {
+    uint8_t frames[MAX_JOINTS][8]{};
+    double predicted[MAX_JOINTS]{};
+    if (command.n != motors_.size()) {
+      if (enabled_mask_) stop();
+      fail("native MIT command joint count does not match configured motors");
+      return false;
     }
+    // Prepare the ENTIRE batch before enabling or sending a single command.
+    for (int j = 0; j < command.n; ++j) {
+      if (!(active_mask_ & (1u << j))) continue;
+      if (const char* error = pack_native_mit(motors_[j], command, j, last_tau_[j],
+                                             slew, frames[j], predicted[j])) {
+        if (enabled_mask_) stop();
+        fail("motor %d: %s", motors_[j].id, error);
+        return false;
+      }
+    }
+    if (!enable_all()) {
+      stop_preserving_fault();  // enable may have succeeded for only some motors
+      return false;
+    }
+    for (int j = 0; j < command.n; ++j) {
+      if (!(active_mask_ & (1u << j))) continue;
+      if (!send8(motors_[j].id, frames[j])) {
+        stop_preserving_fault();
+        return false;
+      }
+    }
+    std::copy_n(predicted, command.n, last_tau_);
+    std::copy_n(predicted, command.n, tau_out);
     wrote_ = true;
     return true;
   }
@@ -503,12 +587,19 @@ public:
       send8(m.id, DM_DISABLE_FRAME);
     }
     for (size_t j = 0; j < motors_.size(); ++j) last_tau_[j] = 0.0;
-    enabled_ = false;
+    enabled_mask_ = 0;
   }
 
   const std::string& fault_text() const override { return fault_; }
 
 private:
+  void stop_preserving_fault() {
+    char original[256];
+    std::snprintf(original, sizeof original, "%s", fault_.c_str());
+    stop();
+    fault_.assign(original);  // pre-reserved; no allocation in the RT loop
+  }
+
   bool send8(int can_id, const uint8_t* payload) {
     canfd_frame f{};
     f.can_id = canid_t(can_id);
@@ -525,11 +616,15 @@ private:
   }
 
   bool enable_all() {
-    for (size_t j = 0; j < motors_.size(); ++j)
-      if ((active_mask_ & (1u << j)) &&
-          !send8(motors_[j].id, DM_ENABLE_FRAME))
-        return false;
-    enabled_ = true;
+    // Newly activated slots are enabled here, AFTER the complete batch passed
+    // preflight, never in set_active_mask(). Track partial enable failures too.
+    for (size_t j = 0; j < motors_.size(); ++j) {
+      const uint32_t bit = 1u << j;
+      if ((active_mask_ & bit) && !(enabled_mask_ & bit)) {
+        if (!send8(motors_[j].id, DM_ENABLE_FRAME)) return false;
+        enabled_mask_ |= bit;
+      }
+    }
     return true;
   }
 
@@ -589,8 +684,8 @@ private:
   double last_tau_[MAX_JOINTS] = {};
   int fd_ = -1;
   bool ok_ = false;
-  bool started_ = false;   // first read() done (enable + first elicit)
-  bool enabled_ = false;   // motors enabled since the last stop()
+  bool started_ = false;   // first read() done (disarmed feedback solicitation)
+  uint32_t enabled_mask_ = 0;  // motors enabled since the last stop()
   bool wrote_ = false;     // a write() happened since the last read()
   bool all_seen_ = false;  // every motor has replied at least once
   uint32_t active_mask_ = 0;
@@ -631,6 +726,86 @@ std::unique_ptr<Backend> make_dm_backend(const std::string& spec,
 int dm_mit_selfcheck() {
   // Explicit failures keep these checks active in release/NDEBUG builds.
   std::string iface, err;
+  {
+    Motor motor;
+    motor.type = "4340";
+    motor.lim = LIM_4340;
+    motor.lim.v_lo = -20; motor.lim.v_hi = 20;
+    motor.q = .1; motor.dq = .05;
+    if (!set_torque_cap(motor, 27, err)) return 1;
+    CommandPacket cmd{};
+    cmd.n = 1;
+    cmd.q_des[0] = .12; cmd.qd_des[0] = .2;
+    cmd.kp[0] = 50; cmd.kd[0] = 2; cmd.tau_ff[0] = 1.5;
+    uint8_t expected[8], out[8];
+    double predicted = 0;
+    pack_mit(.12, .2, 50, 2, 1.5, motor.lim, expected);
+    if (pack_native_mit(motor, cmd, 0, 0, 100, out, predicted) ||
+        std::memcmp(out, expected, 8) || predicted < 2.5 || predicted > 3) {
+      std::fputs("Native MIT check: five fields changed or external PD added to ff\n", stderr);
+      return 1;
+    }
+    // Preserve all four non-torque fields when the sampled limiter intervenes.
+    motor.q = motor.dq = 0;
+    cmd.q_des[0] = .5; cmd.qd_des[0] = 0;
+    cmd.kp[0] = 50; cmd.kd[0] = 0; cmd.tau_ff[0] = 10;
+    pack_mit(.5, 0, 50, 0, 10, motor.lim, expected);
+    for (double slew : {1., 100.}) {
+      for (int sign : {-1, 1}) {
+        cmd.q_des[0] = sign * .5; cmd.tau_ff[0] = sign * 10;
+        pack_mit(cmd.q_des[0], 0, 50, 0, cmd.tau_ff[0], motor.lim, expected);
+        if (pack_native_mit(motor, cmd, 0, 0, slew, out, predicted) ||
+            std::abs(predicted) > std::min(27., slew) ||
+            std::abs(predicted) < std::min(27., slew) - .02 ||
+            std::memcmp(out, expected, 6) || (out[6] & 0xf0) != (expected[6] & 0xf0)) {
+          std::fputs("Native MIT check: encoded cap/slew or preserved fields failed\n", stderr);
+          return 1;
+        }
+      }
+    }
+    cmd.q_des[0] = 0; cmd.tau_ff[0] = 0;
+    // Every field must be rejected before any encoder clipping or integer cast.
+    for (double* field : {cmd.q_des, cmd.qd_des, cmd.kp, cmd.kd, cmd.tau_ff}) {
+      const double saved = field[0];
+      for (double invalid : {std::numeric_limits<double>::quiet_NaN(),
+                              std::numeric_limits<double>::infinity(),
+                              -std::numeric_limits<double>::infinity(), 501., -501.}) {
+        field[0] = invalid;
+        if (!pack_native_mit(motor, cmd, 0, 0, 100, out, predicted)) {
+          std::fputs("Native MIT check: invalid command silently encoded\n", stderr);
+          return 1;
+        }
+      }
+      field[0] = saved;
+    }
+    cmd.kd[0] = 5.001;
+    if (!pack_native_mit(motor, cmd, 0, 0, 100, out, predicted)) return 1;
+    cmd.kd[0] = 0;
+    cmd.kp[0] = -.001;
+    if (!pack_native_mit(motor, cmd, 0, 0, 100, out, predicted)) return 1;
+    // A requested PD effort that ff cannot safely offset must fail closed.
+    cmd.kp[0] = 500; cmd.q_des[0] = 1;
+    if (!pack_native_mit(motor, cmd, 0, 0, 1, out, predicted)) {
+      std::fputs("Native MIT check: unrepresentable limiting correction accepted\n", stderr);
+      return 1;
+    }
+    // Extreme but finite fields can collide with MIT enable/disable/zero
+    // control words. They must never escape as an ordinary servo command.
+    motor.tau_cap = 0;
+    cmd.q_des[0] = motor.q = motor.lim.p_hi;
+    cmd.qd_des[0] = motor.dq = motor.lim.v_hi;
+    cmd.kp[0] = 500; cmd.kd[0] = 5;
+    for (int code = 4091; code <= 4095; ++code) {
+      cmd.tau_ff[0] = code == 4095 ? motor.lim.t_hi :
+          motor.lim.t_lo + (code + .25) * (motor.lim.t_hi - motor.lim.t_lo) / 4095;
+      if (!pack_native_mit(motor, cmd, 0, 0, 100, out, predicted)) {
+        std::fputs("Native MIT check: reserved control word accepted\n", stderr);
+        return 1;
+      }
+    }
+    motor.tau_cap = 27.98;  // also reject a reserved word after FF limiting
+    if (!pack_native_mit(motor, cmd, 0, 0, 100, out, predicted)) return 1;
+  }
   std::vector<Motor> mapped;
   if (!parse_spec("can0;1:4340:0x11:12.5:20:28", iface, mapped, err) ||
       mapped.size() != 1 || iface != "can0" || mapped[0].mst != 0x11) {

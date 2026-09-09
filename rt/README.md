@@ -1,6 +1,6 @@
 # rt/ — the RT machine's servo server
 
-One static C++ binary (`arm_rt_server`) that owns the arm's 1 kHz torque loop
+One C++ binary (`arm_rt_server`) that owns the arm's RT servo loop
 on a realtime Linux box, speaking a small UDP/TCP protocol to the PC's Dora
 graph. The PC-side counterpart is `arm_control/plants/remote_rt/client.py` behind
 `nodes/rt_interface.py` — the same plant-node contract every other bridge
@@ -40,6 +40,8 @@ cmake -B build -G Ninja rt && cmake --build build          # fake + selfcheck
 cmake -B build -G Ninja -DWITH_FRANKA=ON rt && cmake --build build   # + FR3
 pip install -e rt/bindings                                  # optional: sim same-law
 PYTHONPATH=. python tools/bench/rt/torque_cap.py build/arm_rt_server  # offline caps + parity
+build/dm_command_selfcheck                                # native command dispatch, no devices
+build/dm_backend_selfcheck                                # DM lifecycle via intercepted CAN syscalls
 ```
 
 ## DM wire mappings
@@ -68,6 +70,37 @@ The doubled range and its encoder product (65535 position levels, 4095
 velocity/torque levels) must also be finite. `arm_rt_server --mit-check`
 checks mappings, malformed specs, and caps offline, including Release builds.
 
+### Native MIT actuation (500 Hz)
+
+Python retains trajectory sampling, q/qd/qdd and model feedforward computation.
+RT forwards `q_des`, `qd_des`, `kp`, `kd`, `tau_ff` to the motor's native MIT
+controller. The motor applies its own PD; RT does not encode externally
+computed PD as an additional feedforward torque. No model loading or reference
+interpolation occurs in RT, and qdd is not added to the network protocol.
+Slower PC updates leave the latest reference in place between packets, while
+RT continues reading feedback and applying authority/freshness checks at 500 Hz.
+
+All active motors' five fields are checked for finiteness and wire limits
+before any motor is enabled or receives a command. Invalid gains are rejected,
+never silently clipped. Normal frames match the existing Python MIT codec.
+Native payloads that overlap reserved MIT lifecycle control words are rejected.
+
+The safety limiter is the one exception to forwarding feedforward unchanged:
+RT predicts total `PD + ff` from the **encoded** fields and latest feedback.
+If necessary it changes only the ff code to keep that prediction inside both
+the torque cap and the per-tick slew interval; q/qd/kp/kd codes stay unchanged.
+If no representable ff can satisfy those bounds, it faults and disables rather
+than sending an unsafe command. Invalid batches, failed writes and failed
+feedback reads also trigger a best-effort zero-gain/disable sequence. A broken
+bus cannot guarantee delivery of that sequence.
+
+DM `tau_cmd` and its slew reference are the last encoded command's **predicted
+total torque at sampled q/dq**, not a motor-accepted or measured torque. Actual
+torque remains the feedback `tau` field. Onboard PD reacts between samples, so
+neither the sampled cap nor slew check guarantees actual motor torque/current
+or its rate. A physical motor-side limit needs independent verification.
+Franka and fake retain their existing external torque law unchanged.
+
 Deploy the updated binary and generated specification together: older RT
 parsers can silently ignore the range suffix and retain their type defaults.
 
@@ -75,8 +108,8 @@ parsers can silently ignore the range suffix and retain their type defaults.
 
 UDP fast path, both directions latest-wins with sequence numbers:
 `CommandPacket` (q_des, qd_des, tau_ff, kp, kd — the full bridge contract
-word, 100 Hz from the executor) and `StatePacket` (q, dq, tau, the servo's
-own post-clamp `tau_cmd`, its current target `q_cmd`, flags, plus reserved
+word, typically 100 Hz from the executor) and `StatePacket` (q, dq, tau, the servo's
+post-limiter `tau_cmd` (DM: sampled prediction), its current target `q_cmd`, flags, plus reserved
 FT-sensor fields), streamed at `--state-hz` to the source address of the last
 command. TCP control channel, fixed 128-byte frames: HELLO (n + backend
 name), ARM, DISARM, PING/PONG, STATUS, FAULT. Clocks are NOT assumed synced —
@@ -110,15 +143,17 @@ Offline checks: `pose_hold_selfcheck` includes Eigen's no-allocation guard;
 `--tau-max NM` optionally lowers every joint's command ceiling to the smaller
 of this positive finite value and its backend limit. Omit it to preserve the
 backend defaults. The resolved per-joint limits are printed at startup and
-apply to joint/Cartesian commands and initial, stale, and latched-fault holds
-through the same clamp/slew law. The final clamp wins even when the robot's
-torque echo lies outside the cap. The option cannot be changed by a command
+apply to joint/Cartesian commands and initial, stale, and latched-fault holds.
+Torque backends use the shared clamp/slew law; DM uses the native sampled
+limiter described above. The final cap wins even when the previous torque
+reference lies outside the cap. The option cannot be changed by a command
 packet; deployment values belong in the consuming project's service unit.
 
-DM keeps its firmware-compatible MIT encoding scale. With an explicit cap,
-the torque field uses only codes whose decoded values lie inside that cap;
-unrepresentably small caps are rejected before opening the bus. This limits
-requested torque, not measured torque, thermal duty, or contact force. It
+DM keeps its firmware-compatible MIT encoding scale. The cap applies to the
+predicted total including onboard PD, not just the ff field. Unrepresentably
+small caps are rejected before opening the bus; an unrepresentable runtime
+limiter correction fails closed. This does not limit measured torque, thermal
+duty, or contact force. It
 does not provide a brake or make disarming a gravity-loaded joint safe.
 
 Authority ladder while ARMED, most-alive first:
@@ -128,12 +163,14 @@ Authority ladder while ARMED, most-alive first:
    command's gains (or `--hold-kp/--hold-kd` if none ever arrived — the
    state right after arming, which *is* "hold where you are"). tau_ff is
    slewed out, never stepped.
-3. **Stale past `--fault-ms`**, control session lost, or plant error: still
+3. **Stale past `--fault-ms`** or control session lost, with a healthy plant: still
    holding, but LATCHED — commands are ignored and ARM is refused until an
    explicit DISARM→ARM cycle. Nothing auto-re-arms. Losing the PC never
-   drops the arm: it parks it.
+   requests zero authority: it requests a local hold.
+4. **Plant error**: torque writes are suppressed. DM also attempts zero-gain
+   commands and disable frames; holding is no longer guaranteed.
 
-DISARM is the only authority drop (backend `stop()`: for the FR3 that is the
+DISARM explicitly drops authority (backend `stop()`: for the FR3 that is the
 last accepted torque + `motion_finished` — a controlled stop, never zero
 torque, which would drop a loaded arm). The staleness clock starts AT ARM,
 matching the bench bridges — and so does the **command epoch**: whatever the

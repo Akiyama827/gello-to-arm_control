@@ -1,6 +1,6 @@
 // Plant backends the RT loop drives. One interface, three implementations:
 // fake (loopback integrator — the permanent test double), franka (libfranka
-// torque mode), dm (FDCAN, skeleton). The backend owns loop PACING: read()
+// torque mode), dm (native MIT over FDCAN). The backend owns loop PACING: read()
 // blocks until this tick's state is due (libfranka's readOnce, the bus, or a
 // deadline sleep), which is what keeps the servo phase-locked to the plant.
 #pragma once
@@ -20,6 +20,7 @@ struct PlantState {
   double tau[MAX_JOINTS] = {};     // measured joint torque
   double tau_ref[MAX_JOINTS] = {}; // robot's echo of last ACCEPTED torque
                                    // (franka: tau_J_d) — the slew reference
+                                   // DM: last encoded total prediction, not echo
   // Cartesian sensing. INTERNAL struct — never on the wire (the StatePacket
   // ships only the 6 wrench numbers, into a field that already exists), so
   // the 96-double Jacobian costs nothing but stack.
@@ -63,6 +64,14 @@ public:
 
   // Apply this tick's torque (already clamped + slewed by the caller).
   virtual bool write(const double* tau, int n) = 0;
+
+  // The authorized joint command, including locally synthesized holds.
+  // Torque plants keep the existing law/output. Native MIT plants preserve
+  // the five fields and update tau_out with their encoded torque prediction.
+  virtual bool write_command(const CommandPacket& command, double /*slew*/,
+                             double* tau_out) {
+    return write(tau_out, command.n);
+  }
 
   // Drop to zero authority safely (disarm path). Idempotent.
   virtual void stop() = 0;
