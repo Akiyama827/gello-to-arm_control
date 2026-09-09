@@ -326,11 +326,10 @@ class ArmPlanner:
                 blend_tolerance_rad=BLEND_TOLERANCE_RAD * ds / self.RETIMER_STEPS_RAD[0],
             )
             if self._trajectory_refiner is not None:
-                # Keep the proven seed geometry/sampling; replace only its
-                # timing after refinement. Exceptions propagate to the
-                # planner's hold path. Re-run per attempt because refinement
-                # rewrites the VELOCITIES, and the flown cubic is a function
-                # of those as much as of the positions.
+                # Refine the seed's positions, then replace its timing with
+                # the refiner's native spline timing. Both positions and
+                # velocities may change, so check the returned curve on
+                # every attempt. Exceptions propagate to the planner's hold.
                 seed = self._trajectory_refiner(
                     seed.positions, self._max_vel * speed_scale,
                     self._max_acc * speed_scale,
