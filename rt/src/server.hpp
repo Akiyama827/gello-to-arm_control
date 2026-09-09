@@ -42,7 +42,7 @@ struct ServerConfig {
   // joint-4 limit (2026-08-06, cost a joint_velocity_violation reflex).
   double ee_mass = 0.0;          // kg
   double ee_com[3] = {0, 0, 0};  // load CoM in the FLANGE frame (m)
-  // dm backend spec: "IF;ID:TYPE[:MST],..." (--dm-spec / --can-if). A bare
+  // dm backend spec: "IF;ID:TYPE[:MST[:PMAX:VMAX:TMAX]],...". A bare
   // interface name has no motors and is refused by make_dm_backend.
   std::string can_if = "can0";
   int n = 7;                // joints (fake); franka fixes 7 itself

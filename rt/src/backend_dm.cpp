@@ -8,7 +8,7 @@
 // CommandPacket, never the CAN frame.
 //
 // Ctor spec (one string, via --dm-spec / --can-if):
-//   "can0;1:4340,2:4340"        iface ; comma list of id:type[:mst]
+//   "can0;1:4340,2:4340"    iface ; list of id:type[:mst[:pmax:vmax:tmax]]
 // id   = motor CAN id, 1..15 (replies carry it in the payload LOW nibble),
 // type = 4310 | 4310p | 4340 | 4340p (per-type encode limits below, ported
 //        verbatim from arm_control/plants/dm/backend.py),
@@ -17,6 +17,9 @@
 //        Replies are routed by the payload nibble exactly like the Python
 //        backend, so a shared mst collides nowhere; a motor flashed with a
 //        different Master ID is a spec edit, not a code change.
+// pmax/vmax/tmax = optional symmetric MIT half-ranges (rad, rad/s, N.m).
+//        Supply all three and mst together; omission keeps the type defaults.
+//        Host mappings must match firmware; this does not program registers.
 //
 // Pacing: tick 2 ms (500 Hz). read() drains feedback while sleeping toward
 // an ABSOLUTE deadline (fake-backend discipline, ppoll instead of a blind
@@ -47,6 +50,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <limits>
@@ -67,8 +71,8 @@ constexpr uint8_t DM_ENABLE_FRAME[8] = {0xFF, 0xFF, 0xFF, 0xFF,
 constexpr uint8_t DM_DISABLE_FRAME[8] = {0xFF, 0xFF, 0xFF, 0xFF,
                                          0xFF, 0xFF, 0xFF, 0xFD};
 
-// Per-motor-TYPE MIT encode limits — protocol constants, ported EXACTLY from
-// dm_backend.py DEFAULT_LIMITS_BY_TYPE (same precedent as FR3_TAU_LIMIT).
+// Default per-type MIT limits, matching dm_backend.py DEFAULT_LIMITS_BY_TYPE.
+// A per-motor spec override changes the host's encoding and feedback decoding.
 struct DmLimits {
   double p_lo, p_hi, v_lo, v_hi, kp_lo, kp_hi, kd_lo, kd_hi, t_lo, t_hi;
 };
@@ -201,7 +205,7 @@ void ts_add(timespec& t, int64_t ns) {
   }
 }
 
-// "iface;id:type[:mst],..." -> iface + motors. Errors to `err`.
+// "iface;id:type[:mst[:pmax:vmax:tmax]],..." -> iface + motors. Errors to `err`.
 bool parse_spec(const std::string& spec, std::string& iface,
                 std::vector<Motor>& motors, std::string& err) {
   const size_t semi = spec.find(';');
@@ -211,33 +215,69 @@ bool parse_spec(const std::string& spec, std::string& iface,
     return false;
   }
   if (semi == std::string::npos || semi + 1 >= spec.size()) {
-    err = "no motors in spec — want \"can0;1:4340,2:4340\" (id:type[:mst])";
+    err = "no motors in spec — want iface;id:type[:mst[:pmax:vmax:tmax]],...";
     return false;
   }
   std::string rest = spec.substr(semi + 1);
-  for (size_t pos = 0; pos < rest.size();) {
+  auto parse_id = [](const std::string& text, int lo, int hi, int& out) {
+    char* end = nullptr;
+    errno = 0;
+    const long value = std::strtol(text.c_str(), &end, 0);
+    if (errno || end == text.c_str() || end != text.c_str() + text.size() ||
+        value < lo || value > hi)
+      return false;
+    out = int(value);
+    return true;
+  };
+  for (size_t pos = 0; pos <= rest.size();) {
     size_t comma = rest.find(',', pos);
     if (comma == std::string::npos) comma = rest.size();
     const std::string item = rest.substr(pos, comma - pos);
     pos = comma + 1;
+    std::vector<std::string> fields;
+    for (size_t start = 0; start <= item.size();) {
+      size_t colon = item.find(':', start);
+      if (colon == std::string::npos) colon = item.size();
+      fields.push_back(item.substr(start, colon - start));
+      start = colon + 1;
+    }
     Motor m;
-    char type_buf[16] = {};
-    int mst = 0;
-    const int fields = std::sscanf(item.c_str(), "%i:%15[^:]:%i", &m.id,
-                                   type_buf, &mst);
-    if (fields < 2) {
-      err = "bad motor entry '" + item + "' — want id:type[:mst]";
+    if (fields.size() != 2 && fields.size() != 3 && fields.size() != 6) {
+      err = "bad motor entry '" + item + "' — want id:type[:mst[:pmax:vmax:tmax]]";
       return false;
     }
-    m.type = type_buf;
-    m.mst = fields >= 3 ? mst : 0x00;  // DM factory default Master ID
-    if (m.id < 1 || m.id > 15) {
+    m.type = fields[1];
+    if (!parse_id(fields[0], 1, 15, m.id)) {
       err = "motor id must be 1..15 (payload-nibble routed): '" + item + "'";
+      return false;
+    }
+    if (fields.size() >= 3 && !parse_id(fields[2], 0, 0x7ff, m.mst)) {
+      err = "master id must be 0..0x7ff: '" + item + "'";
       return false;
     }
     if (!limits_for(m.type, m.lim)) {
       err = "unknown motor type '" + m.type + "' (4310|4310p|4340|4340p)";
       return false;
+    }
+    if (fields.size() == 6) {
+      double ranges[3];
+      for (int i = 0; i < 3; ++i) {
+        const std::string& text = fields[i + 3];
+        char* end = nullptr;
+        errno = 0;
+        ranges[i] = std::strtod(text.c_str(), &end);
+        const double span = 2 * ranges[i];
+        const double levels = i == 0 ? 65535 : 4095;
+        if (errno || end == text.c_str() || end != text.c_str() + text.size() ||
+            !std::isfinite(ranges[i]) || ranges[i] < std::numeric_limits<double>::min() ||
+            !std::isfinite(span) || !std::isfinite(span * levels)) {
+          err = "MIT half-ranges must be finite, positive, and representable: '" + item + "'";
+          return false;
+        }
+      }
+      m.lim.p_lo = -ranges[0]; m.lim.p_hi = ranges[0];
+      m.lim.v_lo = -ranges[1]; m.lim.v_hi = ranges[1];
+      m.lim.t_lo = -ranges[2]; m.lim.t_hi = ranges[2];
     }
     for (const Motor& o : motors)
       if (o.id == m.id) {
@@ -590,6 +630,140 @@ std::unique_ptr<Backend> make_dm_backend(const std::string& spec,
 // must print byte-identical lines — the dm equivalent of protocol_selfcheck.
 int dm_mit_selfcheck() {
   // Explicit failures keep these checks active in release/NDEBUG builds.
+  std::string iface, err;
+  std::vector<Motor> mapped;
+  if (!parse_spec("can0;1:4340:0x11:12.5:20:28", iface, mapped, err) ||
+      mapped.size() != 1 || iface != "can0" || mapped[0].mst != 0x11) {
+    std::fprintf(stderr, "MIT map check: explicit map rejected: %s\n", err.c_str());
+    return 1;
+  }
+  if (mapped[0].lim.v_lo != -20 || mapped[0].lim.v_hi != 20) {
+    std::fprintf(stderr, "MIT map check: explicit VMAX 20 parsed as %.17g\n",
+                 mapped[0].lim.v_hi);
+    return 1;
+  }
+  std::vector<Motor> mixed;
+  if (!parse_spec("can0;1:4340,2:4340:0x12,0xf:4310p:0x7ff,03:4340p:00,"
+                  "4:4310,5:4340:0:8:15:16,6:4310:0:6:7:8",
+                  iface, mixed, err) || mixed.size() != 7 ||
+      mixed[0].mst != 0 || mixed[0].lim.v_hi != 10 ||
+      mixed[1].mst != 0x12 || mixed[1].lim.v_hi != 10 ||
+      mixed[2].id != 15 || mixed[2].mst != 0x7ff || mixed[2].lim.v_hi != 50 ||
+      mixed[3].id != 3 || mixed[3].mst != 0 || mixed[3].lim.v_hi != 10 ||
+      mixed[4].lim.v_hi != 30 ||
+      mixed[5].lim.p_hi != 8 || mixed[5].lim.v_hi != 15 || mixed[5].lim.t_hi != 16 ||
+      mixed[6].lim.p_hi != 6 || mixed[6].lim.v_hi != 7 || mixed[6].lim.t_hi != 8) {
+    std::fprintf(stderr, "MIT map check: legacy or independent maps changed: %s\n",
+                 err.c_str());
+    return 1;
+  }
+  for (const char* spec : {
+      "", ";1:4340", "can0", "can0;", "can0;,1:4340", "can0;1:4340,",
+      "can0;1:4340,,2:4340", "can0;1:4340,1:4310", "can0;1:4340,01:4310",
+      "can0;1", "can0;:4340", "can0;1:", "can0;1:9999", "can0;1:4340:",
+      "can0;1:4340:0:12.5", "can0;1:4340:0:12.5:20",
+      "can0;1:4340::12.5:20:28", "can0;1:4340:0::20:28",
+      "can0;1:4340:0:12.5::28", "can0;1:4340:0:12.5:20:",
+      "can0;1:4340:0:12.5:20:28:", "can0;1:4340:0:12.5:20:28:1",
+      "can0;0:4340", "can0;16:4340", "can0;-1:4340", "can0;1x:4340",
+      "can0;1.0:4340", "can0;08:4340", "can0;0x1g:4340",
+      "can0;999999999999999999999999:4340", "can0;1:4340:-1",
+      "can0;1:4340:0x800", "can0;1:4340:0x11x", "can0;1:4340:1.5",
+      "can0;1:4340:999999999999999999999999"}) {
+    std::vector<Motor> invalid;
+    err.clear();
+    if (parse_spec(spec, iface, invalid, err) || err.empty()) {
+      std::fprintf(stderr, "MIT map check: malformed spec accepted: '%s'\n", spec);
+      return 1;
+    }
+  }
+  for (const char* value : {"nan", "inf", "-inf", "0", "-1", "1e-999",
+                            "1e-310", "0x1p-1074", "1e309", "1e308", "8e307",
+                            "20junk", "20 "}) {
+    for (int field = 0; field < 3; ++field) {
+      std::string spec = "can0;1:4340:0";
+      for (int j = 0; j < 3; ++j) spec += ":" + std::string(j == field ? value : "20");
+      std::vector<Motor> invalid;
+      err.clear();
+      if (parse_spec(spec, iface, invalid, err) || err.empty()) {
+        std::fprintf(stderr, "MIT map check: invalid half-range accepted: '%s'\n",
+                     spec.c_str());
+        return 1;
+      }
+    }
+  }
+  const uint8_t reply[8] = {0xA1, 0x80, 0x00, 0x99, 0x98, 0x00, 25, 34};
+  MitReply corrected, legacy;
+  if (!decode_mit(reply, 8, mapped[0].lim, corrected) ||
+      !decode_mit(reply, 8, mixed[0].lim, legacy) ||
+      corrected.dq != 4 || legacy.dq != 2 || corrected.q != legacy.q ||
+      corrected.tau != legacy.tau || corrected.id != 1 || corrected.err != 10 ||
+      corrected.t_mos != 25 || corrected.t_rotor != 34) {
+    std::fprintf(stderr, "MIT map check: reply velocity code 2457 must decode as 4/2\n");
+    return 1;
+  }
+  const double velocities[] = {-20, -4, 0, 4, 20};
+  const uint8_t expected[5][8] = {
+      {0x8c, 0xa2, 0x00, 0x03, 0xf2, 0x8a, 0xbb, 0xe0},
+      {0x8c, 0xa2, 0x66, 0x63, 0xf2, 0x8a, 0xbb, 0xe0},
+      {0x8c, 0xa2, 0x7f, 0xf3, 0xf2, 0x8a, 0xbb, 0xe0},
+      {0x8c, 0xa2, 0x99, 0x93, 0xf2, 0x8a, 0xbb, 0xe0},
+      {0x8c, 0xa2, 0xff, 0xf3, 0xf2, 0x8a, 0xbb, 0xe0},
+  };
+  for (int i = 0; i < 5; ++i) {
+    uint8_t out[8];
+    pack_mit(1.234, velocities[i], 123.4, 2.71, 13.579, mapped[0].lim, out);
+    if (std::memcmp(out, expected[i], sizeof out)) {
+      std::fprintf(stderr, "MIT map check: VMAX 20 golden changed at velocity %.17g\n",
+                   velocities[i]);
+      return 1;
+    }
+  }
+  for (Motor m : {mapped[0], mixed[5], mixed[6]}) {
+    const DmLimits& L = m.lim;
+    if (L.p_lo != -L.p_hi || L.v_lo != -L.v_hi || L.t_lo != -L.t_hi ||
+        L.kp_lo != 0 || L.kp_hi != 500 || L.kd_lo != 0 || L.kd_hi != 5) {
+      std::fprintf(stderr, "MIT map check: range symmetry or gains changed\n");
+      return 1;
+    }
+    for (int sign : {-1, 1}) {
+      uint8_t out[8];
+      pack_mit(sign * L.p_hi, sign * L.v_hi, sign > 0 ? 500 : 0,
+               sign > 0 ? 5 : 0, sign * L.t_hi, L, out);
+      for (uint8_t byte : out) {
+        if (byte != (sign > 0 ? 0xff : 0)) {
+          std::fprintf(stderr, "MIT map check: signed endpoint encoding changed\n");
+          return 1;
+        }
+      }
+      const uint8_t edge = sign > 0 ? 0xff : 0;
+      const uint8_t feedback[8] = {1, edge, edge, edge, edge, edge, 25, 34};
+      MitReply decoded;
+      if (!decode_mit(feedback, 8, L, decoded) || decoded.q != sign * L.p_hi ||
+          decoded.dq != sign * L.v_hi || decoded.tau != sign * L.t_hi) {
+        std::fprintf(stderr, "MIT map check: signed endpoint decoding changed\n");
+        return 1;
+      }
+    }
+    if (!set_torque_cap(m, 27, err) || m.tau_cap != std::min(27.0, L.t_hi)) {
+      std::fprintf(stderr, "MIT map check: operating cap not based on mapped TMAX\n");
+      return 1;
+    }
+    for (double tau : {-1000.0, -27.0, 0.0, 27.0, 1000.0}) {
+      uint8_t original[8], out[8];
+      pack_mit(1.234, 4, 123.4, 2.71, tau, L, original);
+      std::memcpy(out, original, sizeof out);
+      clamp_torque_field(out, m);
+      const double decoded = u2f((uint32_t(out[6] & 0x0f) << 8) | out[7],
+                                 L.t_lo, L.t_hi, 12);
+      if (decoded < -m.tau_cap || decoded > m.tau_cap ||
+          std::memcmp(out, original, 6) || (out[6] & 0xf0) != (original[6] & 0xf0) ||
+          (L.v_hi == 20 && ((uint32_t(out[2]) << 4) | (out[3] >> 4)) != 2457)) {
+        std::fprintf(stderr, "MIT map check: encoding or operating cap changed fields\n");
+        return 1;
+      }
+    }
+  }
   for (const char* type : {"4340", "4340p", "4310", "4310p"}) {
     DmLimits L;
     limits_for(type, L);

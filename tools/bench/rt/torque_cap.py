@@ -34,6 +34,18 @@ def main(binary: Path) -> None:
     )
     assert missing.returncode == 2 and "needs a value" in missing.stderr, missing
 
+    # Invalid wire maps must fail before the DM factory opens any CAN socket.
+    for entry in ("1:4340:0x11:12.5:20", "1:4340:0x11:12.5:nan:28",
+                  "1:4340:0x11:12.5:0:28", "1:4340:0x11:12.5:20:28junk",
+                  "1:4340:0x800:12.5:20:28", "1:4340:0x11:8e307:20:28"):
+        result = subprocess.run(
+            [str(binary), "--backend", "dm", "--dm-spec", f"wire_check_no;{entry}",
+             *local, "--tau-max", "27"],
+            capture_output=True, text=True, timeout=3,
+        )
+        assert result.returncode != 0 and "dm backend:" in result.stderr, result
+        assert "no CAN interface" not in result.stderr and "socket(PF_CAN)" not in result.stderr
+
     # This value is valid as a float, but cannot encode even a near-zero DM
     # torque. Factory admission must reject it BEFORE opening a CAN socket.
     tiny = subprocess.run(

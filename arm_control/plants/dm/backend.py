@@ -1,6 +1,8 @@
 """DM motor backend using the DM USB2FDCAN device SDK."""
 from __future__ import annotations
 
+import math
+import sys
 import threading
 import time
 from collections import deque
@@ -774,7 +776,8 @@ def _optional_str(value: Any) -> str | None:
 def dm_spec_from_config(cfg: Any, iface: str | None = None) -> str:
     """Build ``arm_rt_server --backend dm``'s ``--dm-spec`` from a hardware config.
 
-    The RT server takes its motor list as a CLI string (``iface;id:type[:mst]``)
+    The RT server takes its motor list as a CLI string
+    (``iface;id:type[:mst[:pmax:vmax:tmax]],...``)
     while the same facts live in ``hardware.yaml``'s ``motors:`` block. Deriving
     the string here keeps the two from drifting: a motor reflashed to a new
     Master ID is a config edit, not a systemd-unit edit.
@@ -784,15 +787,34 @@ def dm_spec_from_config(cfg: Any, iface: str | None = None) -> str:
     every reply before the backend sees it and surfaces as "motor N never
     replied". ``None`` means the DM factory default 0x00 and is emitted as a
     bare ``id:type`` pair, matching the server's own default.
+
+    Carry non-default motor ``limits`` as symmetric wire half-ranges. These
+    are codec parameters, not task speed limits or the RT operating torque
+    cap. An explicit mapping needs all three values and a Master ID (zero
+    if absent); partial/asymmetric ranges cannot be represented by this CLI.
     """
     motors = _parse_motor_configs(cfg)
     if iface is None:
         iface = str((getattr(cfg, "raw", {}) or {}).get("bus", {}).get("interface", "can0"))
     parts = []
     for m in motors:
+        defaults = DEFAULT_LIMITS_BY_TYPE[m.motor_type]
+        ranges = []
+        overridden = False
+        for axis in ("position", "velocity", "torque"):
+            lo, hi = getattr(m.limits, f"{axis}_min"), getattr(m.limits, f"{axis}_max")
+            levels = 65535 if axis == "position" else 4095
+            if not (math.isfinite(lo) and math.isfinite(hi) and hi >= sys.float_info.min
+                    and lo == -hi and math.isfinite((2 * hi) * levels)):
+                raise ValueError(f"motor {m.name}: {axis} wire range must be finite, "
+                                 "positive, symmetric and encodable")
+            ranges.append(hi)
+            overridden |= hi != getattr(defaults, f"{axis}_max")
         item = f"0x{m.can_id:02X}:{m.motor_type}"
-        if m.master_id is not None:
-            item += f":0x{m.master_id:02X}"
+        if m.master_id is not None or overridden:
+            item += f":0x{m.master_id if m.master_id is not None else 0:02X}"
+        if overridden:
+            item += ":" + ":".join(format(value, ".17g") for value in ranges)
         parts.append(item)
     return f"{iface};" + ",".join(parts)
 
@@ -814,6 +836,46 @@ __all__ = [
 def _self_check() -> None:
     """In-memory only: attach touches no transport and needs no bus."""
     from collections import deque
+    from types import SimpleNamespace
+
+    # Configured wire ranges must survive the Python -> RT launch boundary.
+    item = {"can_id": 1, "motor_type": "4340", "master_id": 0x11,
+            "limits": {"velocity_min": -20.0, "velocity_max": 20.0}}
+    cfg = SimpleNamespace(raw={"motors": [item]})
+    assert dm_spec_from_config(cfg) == "can0;0x01:4340:0x11:12.5:20:28"
+    item.pop("master_id")
+    assert dm_spec_from_config(cfg) == "can0;0x01:4340:0x00:12.5:20:28"
+    item["limits"] = {}
+    assert dm_spec_from_config(cfg) == "can0;0x01:4340"
+    item["master_id"] = 0x11
+    assert dm_spec_from_config(cfg, "can1") == "can1;0x01:4340:0x11"
+    other = {"can_id": 2, "motor_type": "4310p", "master_id": 0x12,
+             "limits": {"position_min": -6.0, "position_max": 6.0,
+                        "velocity_min": -5.0, "velocity_max": 5.0,
+                        "torque_min": -3.0, "torque_max": 3.0}}
+    cfg.raw["motors"].append(other)
+    assert dm_spec_from_config(cfg) == (
+        "can0;0x01:4340:0x11,0x02:4310p:0x12:6:5:3")
+    cfg.raw["motors"].pop()
+    for axis in ("position", "velocity", "torque"):
+        for lo, hi in ((-10.0, 20.0), (0.0, 0.0), (20.0, -20.0),
+                       (-float("inf"), float("inf")),
+                       (float("nan"), 20.0), (-20.0, float("nan")),
+                       (-1e308, 1e308), (-8e307, 8e307), (-1e-310, 1e-310)):
+            item["limits"] = {f"{axis}_min": lo, f"{axis}_max": hi}
+            try:
+                dm_spec_from_config(cfg)
+            except ValueError as exc:
+                assert axis in str(exc), exc
+            else:
+                raise AssertionError(f"invalid {axis} wire mapping accepted: {lo}, {hi}")
+    item["limits"] = {"velocity_min": -20.0, "velocity_max": 20.0}
+    limits = _parse_motor_configs(cfg)[0].limits
+    # Velocity code 2457 = +4 rad/s at VMAX=20, not +2 at the legacy default.
+    state = decode_mit_reply(bytes.fromhex("0180009998001922"), limits)
+    assert state is not None and abs(state.velocity - 4.0) < 1e-12
+    assert DEFAULT_LIMITS_BY_TYPE["4340"].velocity_max == 10.0
+    assert DEFAULT_LIMITS_BY_TYPE["4340p"].velocity_max == 10.0
 
     def motor(name: str, can_id: int, **kw) -> DmMotorConfig:
         return DmMotorConfig(name=name, joint=name, can_id=can_id,

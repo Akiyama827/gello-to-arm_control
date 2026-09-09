@@ -37,12 +37,14 @@ void usage(const char* argv0) {
       "          [--state-hz HZ] [--hold-ms MS] [--fault-ms MS] [--slew NM]\n"
       "          [--hold-kp V] [--hold-kd V] [--franka-ip IP] [--can-if IF]\n"
       "          [--ee-mass KG] [--ee-com X,Y,Z] [--tau-max NM]\n"
-      "          [--dm-spec IF;ID:TYPE[:MST],...] [--rt-priority N]\n"
+      "          [--dm-spec IF;ID:TYPE[:MST[:PMAX:VMAX:TMAX]],...] [--rt-priority N]\n"
       "          [--active-mask MASK] [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
       "\n"
       "  --ee-mass  payload past the flange (wrist camera + mount, carried\n"
       "             module) in kg, ADDED to Desk's end-effector config.\n"
       "  --ee-com   that payload's centre of mass in the FLANGE frame, metres.\n"
+      "  --dm-spec DM host MIT maps; optional symmetric PMAX/VMAX/TMAX must\n"
+      "             match firmware (rad, rad/s, N.m). Omit for type defaults.\n"
       "  --tau-max  positive operating torque cap per joint (N.m), never above\n"
       "             backend limits; omitted keeps the backend defaults.\n",
       argv0);

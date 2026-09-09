@@ -42,6 +42,35 @@ pip install -e rt/bindings                                  # optional: sim same
 PYTHONPATH=. python tools/bench/rt/torque_cap.py build/arm_rt_server  # offline caps + parity
 ```
 
+## DM wire mappings
+
+`--dm-spec 'IF;ID:TYPE[:MST[:PMAX:VMAX:TMAX]],...'` configures each motor's
+host MIT encoding and feedback decoding. `ID` is 1..15; the optional reply
+Master ID `MST` is 0..0x7ff and defaults to 0. Decimal and `0x` hexadecimal
+IDs are supported. `TYPE` is `4310`, `4310p`, `4340`, or `4340p`.
+
+Omitting the three ranges preserves the generic type defaults, including
+4340/4340p velocity ±10 rad/s. An override supplies `MST` and all three
+positive symmetric half-ranges: position in rad, velocity in rad/s, torque
+in N.m. For motors configured in firmware with PMAX 12.5, VMAX 20, TMAX 28:
+
+```text
+--dm-spec 'can0;1:4340:0x11:12.5:20:28,2:4340p:0x12:12.5:20:28'
+```
+
+These are host wire maps and must match the motor firmware registers; the
+server does not probe or change registers. An identical velocity code 2457
+decodes to 4 rad/s with VMAX 20 and 2 rad/s with VMAX 10. The operating
+`--tau-max 27` remains a separate ±27 N.m command cap within the TMAX 28 map.
+Malformed entries, incomplete triples, duplicate IDs, and nonpositive,
+nonfinite, underflowed, or overflowing ranges fail before opening CAN.
+The doubled range and its encoder product (65535 position levels, 4095
+velocity/torque levels) must also be finite. `arm_rt_server --mit-check`
+checks mappings, malformed specs, and caps offline, including Release builds.
+
+Deploy the updated binary and generated specification together: older RT
+parsers can silently ignore the range suffix and retain their type defaults.
+
 ## Protocol in one paragraph
 
 UDP fast path, both directions latest-wins with sequence numbers:
