@@ -141,6 +141,7 @@ def main():
     c.on_motor_state(state())
     assert c._running and commands(c), "profile-off scheduling/recovery changed"
     check_deadlines()
+    check_interpolated_limits()
     check_modes_and_validation()
     check_cartesian_lifecycle()
     check_completion_order()
@@ -187,6 +188,45 @@ def check_deadlines():
         pass
     else:
         raise AssertionError("mixed wall/plant clocks accepted")
+
+
+def check_interpolated_limits():
+    """A plan legal at every WAYPOINT and CHORD, illegal in flight.
+
+    The executor flies a cubic Hermite between waypoints, so the samples a
+    policy inspects are a proxy for the curve, not the curve. Here both
+    endpoint velocities are exactly zero and the chord is 0.05 rad/s, while
+    the cubic actually peaks at 0.075 rad/s halfway along -- 50% over the
+    chord. Under a 0.06 cap every sampled check passes and the arm would fly
+    past the limit. This is what ExecutionPolicy.plan_error's bounds() pass
+    exists for; without it the case below is admitted.
+    """
+    from arm_control.control.execution_policy import ExecutionPolicy
+    from arm_control.contracts.motion import unpack_plan
+
+    policy = ExecutionPolicy(
+        command_rate_hz=100, state_timeout_sec=.25, health_timeout_sec=1,
+        start_pos_tol_rad=.1, abort_pos_err_rad=.35, hold_relatch_rad=.3,
+        torque_limits=np.array([87.0]), velocity_limits=np.array([0.06]),
+        acceleration_limits=np.array([1.0]),
+    )
+    over = unpack_plan(plan(width=1, times=[0, 1],
+                            positions=np.array([[0.0], [0.05]]),
+                            velocities=np.zeros((2, 1)), kp=[600], kd=[20]))
+    # The proxies really are clean, or this proves nothing.
+    assert np.abs(over["velocities"]).max() <= 0.06
+    assert abs(np.diff(over["positions"], axis=0).max()) / 1.0 <= 0.06
+    reason = policy.plan_error(over, np.zeros(1), 1)
+    assert reason and "between waypoints" in reason, reason
+
+    # A curve genuinely inside the cap is still admitted -- the check must not
+    # simply refuse anything with curvature.
+    ok = unpack_plan(plan(width=1, times=[0, 1],
+                          positions=np.array([[0.0], [0.02]]),
+                          velocities=np.zeros((2, 1)), kp=[600], kd=[20]))
+    assert policy.plan_error(ok, np.zeros(1), 1) is None, \
+        policy.plan_error(ok, np.zeros(1), 1)
+    print("interpolated limits: curve certified, not just its samples OK")
 
 
 def check_modes_and_validation():

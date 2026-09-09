@@ -10,6 +10,8 @@ import math
 
 import numpy as np
 
+from arm_control.motion import JointTrajectory
+
 
 @dataclass(frozen=True)
 class ExecutionPolicy:
@@ -86,6 +88,39 @@ class ExecutionPolicy:
         if self.acceleration_limits is not None:
             if np.any(np.abs(np.diff(v, axis=0) / dt) > self.acceleration_limits + 1e-8):
                 return "trajectory exceeds configured joint acceleration limits"
+
+        # Certify the CURVE, not its samples. The executor flies a cubic
+        # Hermite between waypoints (JointTrajectory.sample_at), and a cubic
+        # can hold an interior velocity extremum with both endpoint
+        # velocities legal -- so chords and waypoints are a proxy that can
+        # pass a trajectory whose flown speed exceeds the limit. bounds() is
+        # closed-form over every segment, so this is a statement about all t,
+        # not about the points that happened to be sampled.
+        #
+        # Runs AFTER the sampled checks, not before: those are cheaper and
+        # name which proxy failed, so a plan that violates both should be
+        # reported in the more specific terms. This block therefore speaks
+        # only when the samples were CLEAN -- which is exactly the hole it
+        # exists to close. It is additive rather than a replacement, since
+        # the sampled checks also catch a malformed plan (a v that disagrees
+        # with its own chord) that a well-formed curve would hide. Measured before wiring: on real retimed legs this
+        # changes no verdict -- a straight leg lands exactly on both caps and
+        # a cornered one was already refused -- so it closes the hole without
+        # newly refusing anything the retimer produces today.
+        curve = JointTrajectory(times=t, positions=q, velocities=v).bounds()
+        if self.position_lower is not None:
+            if (np.any(curve["q_min"] < self.position_lower - 1e-8)
+                    or np.any(curve["q_max"] > self.position_upper + 1e-8)):
+                return ("interpolated trajectory leaves the position envelope "
+                        "between waypoints")
+        if self.velocity_limits is not None:
+            if np.any(curve["qd_abs_max"] > self.velocity_limits + 1e-8):
+                return ("interpolated trajectory exceeds joint velocity limits "
+                        "between waypoints")
+        if self.acceleration_limits is not None:
+            if np.any(curve["qdd_abs_max"] > self.acceleration_limits + 1e-8):
+                return ("interpolated trajectory exceeds joint acceleration "
+                        "limits between waypoints")
         for key in ("kp", "kd"):
             if plan[key].shape != (n_arm,) or np.any(plan[key] < 0):
                 return f"trajectory {key} must be a nonnegative joint vector"
