@@ -47,6 +47,33 @@ class PinocchioDynamics:
     def n_joints(self) -> int:
         return len(self._joint_names)
 
+    @property
+    def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        """(lower, upper) FACTORY position limits, straight off the URDF.
+
+        The robot description is the one place these digits live -- the FR3's
+        are the vendor's to a ten-thousandth of a radian -- so a deployment
+        must READ them rather than restate them. Read off the model this class
+        already built for RNEA: parsing the same URDF a second time would be a
+        second copy with its own way of going stale.
+
+        Pinocchio reports +/-inf for a continuous joint; callers get that
+        unchanged, since a fabricated bound would be worse than an honest
+        infinity.
+        """
+        return (self._model.lowerPositionLimit[self._q_indices].copy(),
+                self._model.upperPositionLimit[self._q_indices].copy())
+
+    @property
+    def velocity_limits(self) -> np.ndarray:
+        """FACTORY joint velocity limits (URDF ``limit velocity``), per joint."""
+        return self._model.velocityLimit[self._v_indices].copy()
+
+    @property
+    def effort_limits(self) -> np.ndarray:
+        """FACTORY joint torque limits (URDF ``limit effort``), per joint."""
+        return self._model.effortLimit[self._v_indices].copy()
+
     def _embed(self, q_sub: np.ndarray, qd_sub: np.ndarray, qdd_sub: np.ndarray):
         q = pin.neutral(self._model)
         qd = np.zeros(self._model.nv)

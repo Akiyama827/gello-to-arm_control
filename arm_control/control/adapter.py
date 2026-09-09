@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import os
 
+
 from dora import Node
 
 
 from arm_control.config import arm_joints, load_robot_config
 from arm_control.control.arm_controller import ArmController
-from arm_control.control.execution_policy import ExecutionPolicy
+from arm_control.control.execution_policy import build_execution_policy
 from arm_control.control.factory import build_executor, gripper_command_cfg
 from arm_control.node_utils import (
     ShutdownFlag,
@@ -51,17 +52,20 @@ def main() -> None:
         list(cfg.joint_names or cfg.motor_names),
         len(arm_joints(cfg)),
     )
+    executor = build_executor(cfg, arm_id=os.environ.get("ARM_ID", "arm"), gains=gains)
     policy_config = cfg.get("execution_policy")
-    policy = None
-    if policy_config is not None:
-        if gains is None:
-            raise ValueError("execution_policy requires resolved per-joint torque limits")
-        policy = ExecutionPolicy(
-            **policy_config, torque_limits=gains["torque_limits"][:len(arm_joints(cfg))]
-        )
+    if policy_config is not None and gains is None:
+        raise ValueError("execution_policy requires resolved per-joint torque limits")
+    # The position envelope comes from the robot description, not from YAML --
+    # see build_execution_policy.
+    policy = build_execution_policy(
+        policy_config,
+        torque_limits=None if gains is None else gains["torque_limits"][:len(arm_joints(cfg))],
+        joint_limits=executor.joint_limits,
+    )
     controller = ArmController(
         Node(),
-        build_executor(cfg, arm_id=os.environ.get("ARM_ID", "arm"), gains=gains),
+        executor,
         arm_id=os.environ.get("ARM_ID", "arm"),
         gripper=gripper_command_cfg(cfg),
         execution_policy=policy,

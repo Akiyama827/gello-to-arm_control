@@ -142,6 +142,7 @@ def main():
     assert c._running and commands(c), "profile-off scheduling/recovery changed"
     check_deadlines()
     check_interpolated_limits()
+    check_factory_envelope()
     check_modes_and_validation()
     check_cartesian_lifecycle()
     check_completion_order()
@@ -227,6 +228,44 @@ def check_interpolated_limits():
     assert policy.plan_error(ok, np.zeros(1), 1) is None, \
         policy.plan_error(ok, np.zeros(1), 1)
     print("interpolated limits: curve certified, not just its samples OK")
+
+
+def check_factory_envelope():
+    """The position envelope comes from the DESCRIPTION, never from YAML.
+
+    A deployment that restates the machine's own limits gets a second copy
+    with its own way of going stale -- real-add carried a hand-derived inner
+    envelope ([-2.3093, ...]) narrower than the FR3's factory bounds and
+    justified only by a comment. build_execution_policy fills it from the
+    URDF, and an explicit declaration still wins so a deployment can NARROW
+    the machine deliberately.
+    """
+    from arm_control.control.execution_policy import build_execution_policy
+
+    base = dict(command_rate_hz=100, state_timeout_sec=.25, health_timeout_sec=1,
+                start_pos_tol_rad=.1, abort_pos_err_rad=.35, hold_relatch_rad=.3)
+    tau = np.array([87.0, 12.0])
+    described = (np.array([-2.9007, -3.0508]), np.array([2.9007, 3.0508]))
+
+    filled = build_execution_policy(base, torque_limits=tau, joint_limits=described)
+    assert np.allclose(filled.position_lower, described[0]), filled.position_lower
+    assert np.allclose(filled.position_upper, described[1]), filled.position_upper
+
+    # An explicit narrowing wins; it is an operating choice, not an invention.
+    narrowed = build_execution_policy(
+        dict(base, position_lower=[-1.0, -1.0], position_upper=[1.0, 1.0]),
+        torque_limits=tau, joint_limits=described)
+    assert np.allclose(narrowed.position_lower, [-1.0, -1.0])
+
+    # A continuous joint reports infinite bounds; leave them unset rather
+    # than fabricate a number the machine never stated.
+    infinite = build_execution_policy(
+        base, torque_limits=tau,
+        joint_limits=(np.array([-np.inf, -1.0]), np.array([np.inf, 1.0])))
+    assert infinite.position_lower is None
+
+    assert build_execution_policy(None, torque_limits=tau) is None
+    print("factory envelope: read from the description, narrowing honoured OK")
 
 
 def check_modes_and_validation():

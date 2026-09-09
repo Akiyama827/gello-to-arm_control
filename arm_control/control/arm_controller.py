@@ -873,6 +873,10 @@ class _FakeExecutor:
         self.kd = np.full(n, 30.0)
         self.payload = (0.0, None)
         self.steps = 0
+        # The real executor reads these off the URDF it loaded; a double with
+        # no model states an honest, permissive envelope rather than omitting
+        # the property, so control/adapter.py can keep requiring it.
+        self.joint_limits = (np.full(n, -np.pi), np.full(n, np.pi))
 
     def set_gains(self, kp=None, kd=None) -> None:
         if kp is not None:

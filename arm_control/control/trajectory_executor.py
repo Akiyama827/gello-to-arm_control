@@ -98,6 +98,11 @@ class JointTrajectoryExecutor:
         return len(self._joints)
 
     @property
+    def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        """(lower, upper) FACTORY limits off the URDF this executor loaded."""
+        return self._dyn.joint_limits
+
+    @property
     def has_trajectory(self) -> bool:
         return self._traj is not None
 

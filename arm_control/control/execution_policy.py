@@ -159,3 +159,26 @@ class ExecutionPolicy:
             return False
         return bool(np.all(command.kp >= 0) and np.all(command.kd >= 0)
                     and np.all(np.abs(command.tau_ff) <= self.torque_limits))
+
+
+def build_execution_policy(policy_config, *, torque_limits, joint_limits=None):
+    """Assemble the policy, taking factory facts from the robot description.
+
+    One constructor for every caller, because the interesting part is not the
+    dataclass but WHICH numbers are allowed to come from YAML. The position
+    envelope is a factory limit: the URDF owns it and a deployment reads it.
+    A deployment may still declare both bounds to NARROW the machine
+    deliberately -- an operating choice -- and that declaration wins here.
+
+    ``joint_limits`` is the description's ``(lower, upper)``; non-finite
+    bounds (a continuous joint) are left unset rather than fabricated.
+    Returns None when the deployment configures no policy at all.
+    """
+    if policy_config is None:
+        return None
+    config = dict(policy_config)
+    if config.get("position_lower") is None and joint_limits is not None:
+        lower, upper = (np.asarray(v, dtype=float) for v in joint_limits)
+        if np.isfinite(lower).all() and np.isfinite(upper).all():
+            config["position_lower"], config["position_upper"] = lower, upper
+    return ExecutionPolicy(**config, torque_limits=torque_limits)
