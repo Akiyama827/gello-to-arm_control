@@ -55,9 +55,9 @@ class JointTrajectory:
         derivative of q -- measured on a real retimed leg (0.4 rad/s cap):
         max |dq/dt - qd_provided| = 0.127 rad/s, 32% of the velocity cap. The
         position loop, the velocity loop and the RNEA feedforward were each
-        tracking a different trajectory. With the Hermite the same check reads
-        2e-4 rad/s, and the interpolant does not overshoot the retimer's
-        velocity cap (measured peak 0.400 against a 0.400 limit).
+        tracking a different trajectory. The Hermite makes these derivatives
+        consistent; the retimer and execution policy separately bound its
+        extrema. Legal waypoint velocities alone do not bound a cubic.
 
         This is the ONLY reference evaluator in the stack -- sim and hardware
         both come through here, and the RT server holds the last command

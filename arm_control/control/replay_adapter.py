@@ -4,8 +4,8 @@ Turns a hand-guided recording (the CSV ``rt_handguide`` writes while the arm
 floats) into an executable trajectory and feeds it to the trajectory
 executor: resample -> smooth -> trim motionless head/tail -> uniform
 time-scale under a velocity cap (times ``slow_factor``) -> prepend a min-jerk
-JOIN from the arm's measured pose to the recording start (so the executor's
-start-pose gate always passes and there is never a first-sample jump).
+JOIN from the arm's measured pose to the recording start. The complete cubic
+is then time-scaled to the velocity and acceleration caps, including the join.
 
 Triggers (file-based, like the operator gate — dora nodes have no stdin):
 
@@ -66,7 +66,7 @@ def load_recording(path: Path, n_arm: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def build_replay(
-    t: np.ndarray, q: np.ndarray, q_now: np.ndarray, rp: dict
+    t: np.ndarray, q: np.ndarray, q_now: np.ndarray, rp: dict, *, max_acc
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     """(times, positions, velocities, summary) — join + retimed recording."""
     hz = float(rp.get("resample_hz", 50))
@@ -109,12 +109,22 @@ def build_replay(
     out_t = np.concatenate([tj, times + t_join])
     out_q = np.concatenate([qj, qs])
     out_v = np.concatenate([vj, vel])
+    from arm_control.motion import JointTrajectory
+    from arm_control.planning.retiming import bound_trajectory
+
+    amax = np.broadcast_to(np.asarray(max_acc, dtype=float), (q.shape[1],))
+    if not np.isfinite(amax).all() or np.any(amax <= 0):
+        raise ValueError("replay requires finite positive acceleration caps")
+    curve = bound_trajectory(JointTrajectory(out_t, out_q, out_v),
+                             np.full(q.shape[1], cap), amax)
+    stretch = curve.duration_sec / out_t[-1]
     summary = (
-        f"join {dist:.3f} rad over {t_join:.1f}s + replay {times[-1]:.1f}s "
+        f"join {dist:.3f} rad over {t_join * stretch:.1f}s + replay {times[-1] * stretch:.1f}s "
         f"({len(qs)} samples, time-scale x{scale:.2f}, "
-        f"max vel {np.max(np.abs(out_v)):.2f} rad/s)"
+        f"curve stretch x{stretch:.2f}, "
+        f"max vel {np.max(curve.bounds()['qd_abs_max']):.2f} rad/s)"
     )
-    return out_t, out_q, out_v, summary
+    return curve.times, curve.positions, curve.velocities, summary
 
 
 def main() -> None:
@@ -123,6 +133,8 @@ def main() -> None:
     cfg = load_robot_config()
     mode_cfg = _load_mode_config()
     rp = dict(mode_cfg.get("replay") or {})
+    max_acc = (cfg.get('execution_policy') or {}).get(
+        'acceleration_limits', mode_cfg['planner']['acc_limits'])
     n_arm = len(arm_joints(cfg))
     # Gains travel WITH the plan (pack_plan carries kp/kd), resolved by the same
     # helper the controller's own node uses -- one number for one arm.
@@ -198,7 +210,7 @@ def main() -> None:
             continue
         try:
             t, q = load_recording(csv_path, n_arm)
-            times, qs, vs, summary = build_replay(t, q, q_now, rp)
+            times, qs, vs, summary = build_replay(t, q, q_now, rp, max_acc=max_acc)
         except (ValueError, IndexError) as exc:
             print(f"[trajectory_replay] REFUSED: {exc}", flush=True)
             continue

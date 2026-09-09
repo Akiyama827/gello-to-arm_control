@@ -14,11 +14,7 @@ plant:
   listen_mode: false
 
 controller:
-  command_rate_hz: 100
-  state_timeout_sec: 0.25
-  start_pos_tol_rad: 0.1   # refuse a trajectory starting farther than this from measured
-  abort_pos_err_rad: 0.35  # runaway guard: abort tracking when q_des leaves the arm behind
-  hold_relatch_rad: 0.3    # idle hold re-anchors if the arm is moved externally past this
+  # Runtime guards belong in the deployment config's execution_policy block.
   # Raise the DM wire-format ceilings: these are stiffnesses, not MIT kp.
   kp_max: 3000.0           # Franka's own default tops out at 3000 N·m/rad
   kd_max: 200.0            # sim needs real damping (no real-arm loop on this host)
@@ -52,8 +48,6 @@ controller:
 planner:
   vel_limits: 0.5          # rad/s — keep <= franka.max_joint_velocities
   acc_limits: 1.0          # rad/s^2
-  soft_speed_frac: 0.5
-  soft_acc_floor: 0.15
   self_collision_padding_m: -0.002
   solve_time_sec: 2.0
   simplify_time_sec: 0.5

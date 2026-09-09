@@ -25,6 +25,8 @@ dependencies = [
 # simulation/ + planning/mujoco_collision.py import mujoco at MODULE top level,
 # so `pip install arm_control[sim]` is required before importing those.
 sim = ["mujoco"]
+# Shared joint-path retiming; imported only by planning processes.
+planning = ["toppra==0.6.10", "scipy"]
 # nodes/visualizer.py, planning/preview_rerun.py, simulation/rerun_scene.py.
 # visualizer is in every dataflow, so in practice this is not optional at
 # RUNTIME — it is an extra only because the library imports it lazily.
@@ -33,7 +35,7 @@ viz = ["rerun-sdk"]
 # tools/assets/setup_fr3.py (trimesh, lazy).
 mesh = ["trimesh", "coacd"]
 # Opt-in geometric refinement and native constrained spline timing.
-trajopt = ["tesseract-robotics-nanobind==0.35.0.7", "scipy", "mujoco"]
+trajopt = ["toppra==0.6.10", "tesseract-robotics-nanobind==0.35.0.7", "scipy", "mujoco"]
 
 # Backend/toolchain dependencies not managed by these extras:
 #   pinocchio / hpp-fcl — dynamics, FK/IK, geometry and preview.

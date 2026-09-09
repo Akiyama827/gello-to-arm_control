@@ -12,11 +12,7 @@ plant:
 # inertia) carries the modeled dynamics. kp/kd start at the bench-ramp anchor
 # (kp=20/kd=0.5) — climb on the bench.
 controller:
-  command_rate_hz: 100
-  state_timeout_sec: 0.25
-  start_pos_tol_rad: 0.1   # refuse a trajectory starting farther than this from measured
-  abort_pos_err_rad: 0.35  # runaway guard: abort tracking when q_des leaves the arm behind
-  hold_relatch_rad: 0.3    # idle hold re-anchors if the arm is moved externally past this
+  # Runtime guards belong in the deployment config's execution_policy block.
   kp:
     Joint1: 20.0
     Joint2: 20.0
@@ -49,12 +45,6 @@ planner:
   # Joint1..Joint6, which made the file unusable for any other arm.)
   vel_limits: 0.5          # rad/s, scalar or per-joint dict — bench-conservative
   acc_limits: 1.0          # rad/s^2
-  # Soft launch/landing: allowed acc tapers with speed below
-  # soft_speed_frac * local vel cap, floored at soft_acc_floor * acc_limits.
-  # Kills the end-of-motion jerk impulse (ringing at kp=40/kd=2.5).
-  # Floor 1.0 = old hard trapezoid; lower floor = softer + slower ends.
-  soft_speed_frac: 0.5
-  soft_acc_floor: 0.15
   # Absorbs shallow convex-hull overlap at the rest pose (MuJoCo hulls the
   # concave STLs for collision); hulls stay conservative elsewhere.
   self_collision_padding_m: -0.002

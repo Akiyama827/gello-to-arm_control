@@ -4,12 +4,10 @@ Install ``arm_control[trajopt]`` to use this opt-in path. Native dependencies
 are lazy. Unsupported projection, optimization, timing or validation raises;
 there is no unchecked seed fallback.
 
-Both native cubic geometry and the executor's linearly interpolated q are
-collision-sampled at <=0.001 rad maximum joint motion. Exact cubic q/qd/qdd
-extrema and linear commanded q/qd segment slopes satisfy supplied limits after
-uniform time dilation. The executor still interpolates q and qd independently:
-qd is not the derivative of commanded q; continuous commanded qdd and jerk
-are NOT certified. Sampled collision checks are not continuous certification.
+The native cubic is the executor's Hermite curve. It is collision-sampled at
+<=0.001 rad maximum joint motion, along with the knot chords. Exact cubic
+q/qd/qdd extrema satisfy supplied limits after uniform time dilation.
+Jerk is not limited. Sampled collision checks are not continuous certification.
 """
 
 from time import perf_counter

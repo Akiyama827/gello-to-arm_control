@@ -30,6 +30,13 @@ records; they are not current operating instructions.
 
 ## Quick offline checks
 
+Planning requires `pip install -e '.[planning]'`, which pins TOPPRA 0.6.10.
+The shared retimer blends corners locally, solves per-joint velocity and
+acceleration constraints, and bounds the returned Hermite curve. Planning
+callers validate the blended geometry for collisions. Jerk limits are not
+provided. `PYTHONPATH=. python tools/bench/check_retiming.py` exercises the
+corner regression, short moves, reversals, collision retries and replay caps.
+
 From this repository, in an environment containing the required dependencies:
 
 ```bash

@@ -9,7 +9,10 @@ import numpy as np
 from arm_control.frames import T_to_pose_xyzquat, pose_xyzquat_to_T
 from arm_control.planning.ik import PinocchioIK
 from arm_control.motion import JointTrajectory
-from arm_control.planning.retiming import time_parameterize_blended
+from arm_control.planning.retiming import (
+    BLEND_TOLERANCE_RAD, COLLISION_STEP_RAD, RETIMING_STEPS_RAD,
+    bound_trajectory, collision_checked_retiming, time_parameterize_blended,
+)
 
 if TYPE_CHECKING:
     from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
@@ -255,10 +258,13 @@ class ArmPlanner:
                 return None
             waypoints.append(q)
             seed = q
+        if collision_check and self._world is not None:
+            return collision_checked_retiming(
+                np.vstack(waypoints), self._max_vel * speed_scale,
+                self._max_acc * speed_scale, self._world.in_collision)
         return time_parameterize_blended(
             np.vstack(waypoints), self._max_vel * speed_scale,
-            self._max_acc * speed_scale,
-        )
+            self._max_acc * speed_scale)
 
     def plan_joint(
         self,
@@ -317,6 +323,7 @@ class ArmPlanner:
             seed = time_parameterize_blended(
                 waypoints, self._max_vel * speed_scale,
                 self._max_acc * speed_scale, ds=ds,
+                blend_tolerance_rad=BLEND_TOLERANCE_RAD * ds / self.RETIMER_STEPS_RAD[0],
             )
             if self._trajectory_refiner is not None:
                 # Keep the proven seed geometry/sampling; replace only its
@@ -328,19 +335,18 @@ class ArmPlanner:
                     seed.positions, self._max_vel * speed_scale,
                     self._max_acc * speed_scale,
                 )
+            seed = bound_trajectory(seed, self._max_vel * speed_scale,
+                                    self._max_acc * speed_scale)
             if not certify:
                 break
             try:
                 self._certify_curve(seed)
             except ValueError as exc:
-                # The cubic left the cleared corridor. That is a property of
-                # how coarsely the path was SAMPLED, not of the path itself:
-                # the curve's departure from the chord falls roughly linearly
-                # with ds (measured 4.3 -> 2.2 -> 1.1 mrad at 0.02/0.01/0.005),
-                # so tighten and re-certify rather than abandon a route OMPL
-                # already proved clear. Only a path still in contact at the
-                # finest step is genuinely unflyable. Found by sim-add's
-                # move_to_pre_dock, the tightest leg in the sequence.
+                # Retry the same route with finer samples: a corner's cubic
+                # can depart from the cleared polyline. Refinement may also
+                # change the curve, so every attempt needs its own check.
+                # Exhausting this ladder rejects this candidate; it does not
+                # prove that no collision-free trajectory exists.
                 failure = exc
                 continue
             failure = None
@@ -353,29 +359,18 @@ class ArmPlanner:
         print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
         return seed
 
-    #: Retimer densification steps, tried in order until the flown curve
-    #: certifies. The first is time_parameterize_blended's own default, so a
-    #: trajectory that certifies immediately is retimed exactly as before and
-    #: pays nothing; the finer steps run only for a leg whose cubic clips the
-    #: corridor, which is a near-obstacle condition.
-    RETIMER_STEPS_RAD = (0.02, 0.01, 0.005, 0.0025)
-
-    #: Collision resolution along the flown curve, radians of joint travel.
-    #: Half the retimer's own densification step (ds=0.02), so the certificate
-    #: is finer than the geometry OMPL already cleared rather than merely
-    #: matching it. Measured cost on a 2.8 s FR3 leg: ~110 extra checks.
-    CURVE_COLLISION_STEP_RAD = 0.01
+    # Tighten both geometric blending and timing resolution on contact.
+    RETIMER_STEPS_RAD = RETIMING_STEPS_RAD
+    CURVE_COLLISION_STEP_RAD = COLLISION_STEP_RAD
 
     def _certify_curve(self, trajectory) -> None:
         """Collision-check what will actually be FLOWN, not its waypoints.
 
-        OMPL clears the path and the retimer samples it, but the executor
-        interpolates a cubic between those samples and the two are not the
-        same geometry: measured on retimed FR3 legs, the curve departs from
-        the chord by up to 4.5 mrad, ~2 mm at the flange. Against a
-        connector's lead-in that is not a rounding error, and it is the one
-        place where "the plan was validated" and "the arm did that" could
-        legitimately disagree.
+        OMPL clears a polyline; the retimer blends its corners and exports
+        samples for the executor's cubic. Those changes need a final check.
+        Equal-time curve/chord differences are not geometric deviations:
+        a straight leg can change timing while staying on the same segment.
+        This is a sampled collision check, not continuous collision proof.
 
         Raises rather than returning a flag: a trajectory that cannot be
         certified is not a slower trajectory, it is not a trajectory, and
@@ -455,7 +450,10 @@ def _self_check() -> None:
 
     output = StringIO()
     with redirect_stdout(output):
-        assert hybrid.plan_cartesian(goal, np.zeros(3), speed_scale=.5) is traj
+        refined = hybrid.plan_cartesian(goal, np.zeros(3), speed_scale=.5)
+    assert np.array_equal(refined.positions, traj.positions)
+    assert np.all(refined.bounds()['qd_abs_max'] <= .5 + 1e-8)
+    assert np.all(refined.bounds()['qdd_abs_max'] <= 1. + 1e-8)
     for stage in ('IK', 'OMPL', 'seed_retiming', 'joint_total', 'cartesian_total'):
         assert f'[planner:fake] stage={stage} elapsed_s=' in output.getvalue(), stage
     assert len(calls) == 1 and np.all(calls[0][1] == .5) and np.all(calls[0][2] == 1.)

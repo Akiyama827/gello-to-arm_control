@@ -1,4 +1,10 @@
-"""Joint-path retiming into sampled trajectories."""
+"""Local parabolic corner blends and TOPPRA constrained path timing.
+
+TOPPRA: Pham & Pham, IEEE T-RO 2018, doi:10.1109/TRO.2018.2819195.
+The geometric path is C1 (linear segments joined by quadratic Bezier blends).
+Both terms of qdd = q_s * sdd + q_ss * sd**2 enter its acceleration constraints.
+The returned Hermite curve is independently bounded, as it is what we execute.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -6,131 +12,183 @@ import numpy as np
 from arm_control.motion import JointTrajectory
 
 
-def time_parameterize_blended(
-    waypoints: np.ndarray,
-    max_vel: np.ndarray,
-    max_acc: np.ndarray,
-    *,
-    ds: float = 0.02,
-    corner_slowdown_floor: float = 0.2,
-    soft_speed_frac: float = 0.5,
-    soft_acc_floor: float = 0.15,
-) -> JointTrajectory:
-    """Continuous-velocity retiming over the WHOLE waypoint path.
+# Euclidean joint-space deviation, not a Cartesian clearance allowance.
+BLEND_TOLERANCE_RAD = 0.002
+INTERPOLATION_TOLERANCE_RAD = 1e-6
+COLLISION_STEP_RAD = 0.001
+RETIMING_STEPS_RAD = (0.02, 0.01, 0.005, 0.0025)
 
-    The old per-segment trapezoidal retimer (deleted 2026-07-22) brought
-    every joint to a FULL STOP at every waypoint — an OMPL path with a
-    handful of waypoints then crawled at a fraction of ``max_vel``
-    (measured: ~0.06 rad/s effective against a 1.0 rad/s limit). This
-    parameterizer densifies the path in joint space and runs the classic
-    numerical forward/backward velocity passes, so speed is continuous along
-    the path and the arm stops only at the two ends.
 
-    Corner handling: the per-sample velocity cap is scaled by the cosine of
-    the local direction change (floored at ``corner_slowdown_floor``) — a
-    cheap stand-in for full time-optimal blending. Direction (and therefore
-    commanded joint velocity) still flips discretely at sharp corners; the
-    1 kHz plant PD low-passes the resulting feed-forward step. Upgrade path
-    if bench tracking demands it: real parabolic blends / TOTG.
+class _BlendedPath:
+    """TOPPRA geometric-path interface; exact line/quadratic derivatives."""
 
-    Soft launch/landing: below ``soft_speed_frac`` of the local velocity cap,
-    the allowed acceleration tapers linearly with speed (floored at
-    ``soft_acc_floor``) — the trapezoid's full-decel-to-standstill jerk
-    impulse at the ends becomes an exponential-style landing, so the arm
-    settles during the taper instead of arriving hot (bench 2026-07-23:
-    end-of-motion ringing at kp=40/kd=2.5). ``soft_acc_floor=1`` disables.
+    def __init__(self, waypoints, tolerance):
+        delta = np.diff(waypoints, axis=0)
+        lengths = np.linalg.norm(delta, axis=1)
+        directions = delta / lengths[:, None]
+        segments, spans = [], []
+        previous = waypoints[0]
+
+        def line(end):
+            distance = np.linalg.norm(end - previous)
+            if distance > 1e-12:
+                segments.append((previous, end - previous, np.zeros_like(end)))
+                spans.append(distance)
+
+        for i in range(1, len(waypoints) - 1):
+            incoming, outgoing = directions[i - 1:i + 1]
+            # Bezier controls all lie within tolerance of the corner, so the
+            # entire blend does too. Quarter-leg trimming prevents overlap.
+            trim = min(tolerance, .25 * lengths[i - 1], .25 * lengths[i])
+            start = waypoints[i] - trim * incoming
+            end = waypoints[i] + trim * outgoing
+            line(start)
+            segments.append((start, 2 * trim * incoming, trim * (outgoing - incoming)))
+            spans.append(2 * trim)
+            previous = end
+        line(waypoints[-1])
+        self.coefficients = np.asarray(segments)
+        self.knots = np.r_[0., np.cumsum(spans)]
+        self.dof = waypoints.shape[1]
+        self.path_interval = self.knots[[0, -1]]
+
+    def __call__(self, s, order=0):
+        s = np.asarray(s, dtype=float)
+        index = np.clip(np.searchsorted(self.knots, s, side="right") - 1,
+                        0, len(self.knots) - 2)
+        h = (self.knots[index + 1] - self.knots[index])[..., None]
+        u = ((s - self.knots[index])[..., None]) / h
+        c = self.coefficients[index]
+        if order == 0:
+            return c[..., 0, :] + u * (c[..., 1, :] + u * c[..., 2, :])
+        if order == 1:
+            return (c[..., 1, :] + 2 * u * c[..., 2, :]) / h
+        if order == 2:
+            return 2 * c[..., 2, :] / h**2
+        raise ValueError("path derivative order must be 0, 1 or 2")
+
+
+def bound_trajectory(trajectory, max_vel, max_acc):
+    """Bound the executed cubic by uniform time scaling, preserving geometry."""
+    bounds = trajectory.bounds()
+    if not all(np.isfinite(v).all() for v in bounds.values()):
+        raise ValueError("nonfinite trajectory extrema")
+    scale = max(1., float(np.max(bounds["qd_abs_max"] / max_vel)),
+                float(np.sqrt(np.max(bounds["qdd_abs_max"] / max_acc))))
+    if scale > 1.:
+        scale *= 1. + 1e-10
+        trajectory = JointTrajectory(
+            trajectory.times * scale, trajectory.positions, trajectory.velocities / scale)
+    final = trajectory.bounds()
+    if (np.any(final["qd_abs_max"] > max_vel + 1e-8)
+            or np.any(final["qdd_abs_max"] > max_acc + 1e-8)):
+        raise ValueError("executed cubic exceeds operating limits after timing")
+    return trajectory
+
+
+def _time_path(waypoints, vmax, amax, ds, tolerance):
+    # Planning-only dependency: controller and RT processes do not import it.
+    try:
+        import toppra as ta
+        from toppra.algorithm import TOPPRA
+        from toppra.constraint import JointAccelerationConstraint, JointVelocityConstraint
+    except ImportError as exc:
+        raise ValueError("TOPPRA retiming requires arm_control[planning]") from exc
+
+    path = _BlendedPath(waypoints, tolerance)
+    # Include every geometric boundary and several interior points per blend.
+    grid = np.unique(np.concatenate([
+        np.linspace(a, b, max(4, int(np.ceil((b - a) / ds))) + 1)
+        for a, b in zip(path.knots[:-1], path.knots[1:])]))
+    algorithm = TOPPRA(
+        [JointVelocityConstraint(vmax), JointAccelerationConstraint(amax)],
+        path, gridpoints=grid, solver_wrapper="seidel",
+        parametrizer="ParametrizeConstAccel")
+    _, speed, _ = algorithm.compute_parameterization(0., 0.)
+    if speed is None or not np.isfinite(speed).all() or np.any(speed < 0):
+        raise ValueError("TOPPRA could not find a finite rest-to-rest timing")
+    pairs = speed[:-1] + speed[1:]
+    if np.any(pairs <= 0):
+        raise ValueError("TOPPRA returned an interval with no forward progress")
+    times = np.r_[0., np.cumsum(2 * np.diff(grid) / pairs)]
+    reference = ta.ParametrizeConstAccel(path, grid, speed)
+    q, v = reference(times), reference(times, 1)
+    h = np.diff(times)
+    midpoint = .5 * (times[:-1] + times[1:])
+    hermite_midpoint = .5 * (q[:-1] + q[1:]) + h[:, None] / 8 * (v[:-1] - v[1:])
+    error = np.linalg.norm(reference(midpoint) - hermite_midpoint, axis=1)
+    # Each interval is quadratic geometry composed with quadratic s(t): a
+    # quartic. Its Hermite error is c4*(t-a)^2*(t-b)^2, whose norm peaks at
+    # the midpoint and shrinks by 16 on bisection. This is an error bound,
+    # not a heuristic sample of an arbitrary function.
+    divisions = np.maximum(1, np.ceil((error / INTERPOLATION_TOLERANCE_RAD)**.25).astype(int))
+    samples = np.concatenate([
+        np.linspace(a, b, int(n) + 1)[:-1]
+        for a, b, n in zip(times[:-1], times[1:], divisions)] + [times[-1:]])
+    positions, velocities = reference(samples), reference(samples, 1)
+    positions[[0, -1]] = waypoints[[0, -1]]
+    velocities[[0, -1]] = 0.
+    return bound_trajectory(JointTrajectory(samples, positions, velocities), vmax, amax)
+
+
+def time_parameterize_blended(waypoints, max_vel, max_acc, *, ds=0.02,
+                              blend_tolerance_rad=BLEND_TOLERANCE_RAD):
+    """Retiming with local blends, per-joint v/a caps and zero endpoint speed.
+
+    No heuristic acceleration taper or implicit jerk limit. Smaller blend
+    tolerance preserves tighter geometry at the cost of slower corner motion.
+    Exact reversals require a stop; other corners are traversed continuously.
     """
     wps = np.asarray(waypoints, dtype=float)
-    if wps.ndim != 2 or wps.shape[0] < 2:
-        raise ValueError("waypoints must be (N>=2, n_dof)")
-    vmax = np.asarray(max_vel, dtype=float).ravel()
-    amax = np.asarray(max_acc, dtype=float).ravel()
-    if vmax.shape != (wps.shape[1],) or amax.shape != (wps.shape[1],):
-        raise ValueError("max_vel/max_acc shape must match n_dof")
-    if np.any(vmax <= 0) or np.any(amax <= 0):
-        raise ValueError("max_vel/max_acc must be > 0")
-
-    # Drop zero-motion waypoints, densify to <= ds joint-space arc length.
-    deltas = np.diff(wps, axis=0)
-    keep = np.linalg.norm(deltas, axis=1) > 1e-12
-    if not np.any(keep):
+    vmax, amax = (np.asarray(x, dtype=float).ravel() for x in (max_vel, max_acc))
+    if wps.ndim != 2 or len(wps) < 2 or wps.shape[1] == 0 or not np.isfinite(wps).all():
+        raise ValueError("waypoints must be finite (N>=2, n_dof)")
+    for value in (vmax, amax):
+        if value.shape != (wps.shape[1],) or not np.isfinite(value).all() or np.any(value <= 0):
+            raise ValueError("max_vel/max_acc must be finite positive joint vectors")
+    if not np.isfinite(ds) or ds <= 0 or not np.isfinite(blend_tolerance_rad) or blend_tolerance_rad <= 0:
+        raise ValueError("ds and blend_tolerance_rad must be finite and positive")
+    wps = wps[np.r_[True, np.linalg.norm(np.diff(wps, axis=0), axis=1) > 1e-12]]
+    if len(wps) < 2:
         raise ValueError("waypoints describe zero motion")
-    pts: list[np.ndarray] = [wps[0]]
-    for i in np.flatnonzero(keep):
-        seg = wps[i + 1] - wps[i]
-        # >= 2, never 1: a single interval has no INTERIOR sample, and both
-        # endpoint caps are pinned to zero below — the forward/backward passes
-        # then leave v == 0 everywhere and the time integration falls back on
-        # its 1e-9 divide-by-zero floor, so a 1.7 mrad move retimed to 40 DAYS
-        # (measured; the executor's done() waits on plan time and hung there
-        # forever). Any move shorter than `ds` hit this.
-        n_sub = max(2, int(np.ceil(np.linalg.norm(seg) / float(ds))))
-        for k in range(1, n_sub + 1):
-            pts.append(wps[i] + seg * (k / n_sub))
-    path = np.vstack(pts)
-    n = path.shape[0]
-
-    step = np.diff(path, axis=0)
-    step_len = np.linalg.norm(step, axis=1)
-    tangent = step / step_len[:, None]  # per-interval unit direction
-
-    # Per-interval caps from the binding joint, corner-scaled.
-    with np.errstate(divide="ignore"):
-        v_int = np.min(np.where(np.abs(tangent) > 0, vmax / np.abs(tangent), np.inf), axis=1)
-        a_int = np.min(np.where(np.abs(tangent) > 0, amax / np.abs(tangent), np.inf), axis=1)
-    cos_turn = np.ones(n)  # per-SAMPLE corner factor
-    if n > 2:
-        dots = np.einsum("ij,ij->i", tangent[:-1], tangent[1:])
-        cos_turn[1:-1] = np.clip(dots, corner_slowdown_floor, 1.0)
-    v_cap = np.empty(n)
-    v_cap[0] = v_cap[-1] = 0.0
-    v_cap[1:-1] = np.minimum(v_int[:-1], v_int[1:]) * cos_turn[1:-1]
-
-    # ponytail: linear low-speed acc taper, not true jerk limits — Ruckig/TOTG
-    # if the bench outgrows it.
-    def _a_soft(a: float, v_now: float, v_ref: float) -> float:
-        scale = max(soft_acc_floor, min(1.0, v_now / max(v_ref, 1e-9)))
-        return a * scale
-
-    v = v_cap.copy()
-    for i in range(n - 1):  # forward: acceleration limit, soft launch
-        a = _a_soft(a_int[i], v[i], soft_speed_frac * v_int[i])
-        v[i + 1] = min(v[i + 1], np.sqrt(v[i] ** 2 + 2.0 * a * step_len[i]))
-    for i in range(n - 2, -1, -1):  # backward: deceleration limit, soft landing
-        a = _a_soft(a_int[i], v[i + 1], soft_speed_frac * v_int[i])
-        v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2.0 * a * step_len[i]))
-
-    times = np.empty(n)
-    times[0] = 0.0
-    for i in range(n - 1):
-        pair = max(v[i] + v[i + 1], 1e-9)
-        times[i + 1] = times[i] + 2.0 * step_len[i] / pair
-    velocities = np.zeros_like(path)
-    velocities[:-1] = tangent * v[:-1, None]
-    velocities[-1] = 0.0
-    return JointTrajectory(times=times, positions=path, velocities=velocities)
+    # A true cusp cannot have nonzero speed. Solve each side rest-to-rest.
+    direction = np.diff(wps, axis=0)
+    direction /= np.linalg.norm(direction, axis=1)[:, None]
+    cusps = np.flatnonzero(np.linalg.norm(direction[:-1] + direction[1:], axis=1) < 1e-8) + 1
+    boundaries = np.r_[0, cusps, len(wps) - 1]
+    parts = [_time_path(wps[a:b + 1], vmax, amax, ds, blend_tolerance_rad)
+             for a, b in zip(boundaries[:-1], boundaries[1:])]
+    times, positions, velocities, offset = [], [], [], 0.
+    for i, part in enumerate(parts):
+        start = int(i > 0)
+        times.append(part.times[start:] + offset)
+        positions.append(part.positions[start:])
+        velocities.append(part.velocities[start:])
+        offset += part.duration_sec
+    return bound_trajectory(JointTrajectory(np.concatenate(times), np.vstack(positions),
+                                            np.vstack(velocities)), vmax, amax)
 
 
+def collision_checked_retiming(waypoints, max_vel, max_acc, in_collision):
+    """Retry smaller blends and finer timing; fail closed on sampled contact."""
+    for ds in RETIMING_STEPS_RAD:
+        trajectory = time_parameterize_blended(
+            waypoints, max_vel, max_acc, ds=ds,
+            blend_tolerance_rad=BLEND_TOLERANCE_RAD * ds / RETIMING_STEPS_RAD[0])
+        if not any(in_collision(q) for q in trajectory.densify(COLLISION_STEP_RAD)):
+            return trajectory
+    raise ValueError("blended trajectory collides; no checked blend in the retry ladder")
 
 
-def _self_check() -> None:
-    """A move must be retimed to a sane duration at EVERY scale."""
-    vmax = np.full(7, 1.0)
-    amax = np.full(7, 2.0)
-    for delta in (1e-4, 1.7e-3, 0.02, 0.5, 2.0):
-        wps = np.zeros((2, 7))
-        wps[1, 0] = delta
-        traj = time_parameterize_blended(wps, vmax, amax)
-        # Bracket: never faster than the velocity limit allows, never slower
-        # than a full-stop-at-both-ends triangular profile at the acc floor.
-        floor = delta / vmax[0]
-        ceiling = 4.0 * np.sqrt(delta / (0.15 * amax[0])) + 1.0
-        assert floor <= traj.duration_sec <= ceiling, (
-            f"{delta} rad retimed to {traj.duration_sec}s "
-            f"(expected {floor:.3f}..{ceiling:.3f})"
-        )
-        print(f"  {delta:8.4f} rad -> {traj.duration_sec:7.3f} s")
-    print("trajectory self-check OK")
+def _self_check():
+    for angle in (0, 15, 90, 180):
+        w = np.zeros((3, 2))
+        w[1:, 0] = .5
+        w[2] += .5 * np.array([np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle))])
+        tr = time_parameterize_blended(w, np.full(2, .4), np.full(2, .8))
+        assert np.max(tr.bounds()["qd_abs_max"]) <= .4 + 1e-8
+        assert np.max(tr.bounds()["qdd_abs_max"]) <= .8 + 1e-8
+    print("TOPPRA retiming self-check OK")
 
 
 if __name__ == "__main__":

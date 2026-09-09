@@ -62,7 +62,7 @@ from arm_control.planning.jog import JogLimits, check_step
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.planning.ompl_planner import OMPLPlanner
 from arm_control.motion import JointTrajectory
-from arm_control.planning.retiming import time_parameterize_blended
+from arm_control.planning.retiming import collision_checked_retiming
 from arm_control.node_utils import (
     ShutdownFlag,
     _load_mode_config,
@@ -768,8 +768,6 @@ def plan_trajectory(
     q_goal: np.ndarray,
     vmax: np.ndarray,
     amax: np.ndarray,
-    soft_speed_frac: float = 0.5,
-    soft_acc_floor: float = 0.15,
 ) -> JointTrajectory:
     """Plan start -> goal or raise ValueError with an operator-readable reason."""
     q_start = np.clip(q_start, world.lower, world.upper)  # measured can sit eps outside
@@ -785,13 +783,7 @@ def plan_trajectory(
     waypoints = ompl.plan(q_start, q_goal)
     if waypoints is None:
         raise ValueError("no collision-free path found (try a different target)")
-    return time_parameterize_blended(
-        waypoints,
-        vmax,
-        amax,
-        soft_speed_frac=soft_speed_frac,
-        soft_acc_floor=soft_acc_floor,
-    )
+    return collision_checked_retiming(waypoints, vmax, amax, world.in_collision)
 
 
 def main(*, cfg=None, collision_world=None, static_geoms=None) -> None:
@@ -880,8 +872,6 @@ def _run(
         )
     vmax = expand_named_values(planner_cfg.get("vel_limits", 0.5), names=planned, default=0.5)
     amax = expand_named_values(planner_cfg.get("acc_limits", 1.0), names=planned, default=1.0)
-    soft_speed_frac = float(planner_cfg.get("soft_speed_frac", 0.5))
-    soft_acc_floor = float(planner_cfg.get("soft_acc_floor", 0.15))
 
     world, ompl = build_collision_stack(
         cfg.urdf_path,
@@ -1231,7 +1221,6 @@ def _run(
                     try:
                         traj = plan_trajectory(
                             world, ompl, m, t, vmax, amax,
-                            soft_speed_frac, soft_acc_floor,
                         )
                         plan_box.append(("ok", traj, t, t0, rev))
                     except ValueError as exc:
