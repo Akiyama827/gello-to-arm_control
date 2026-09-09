@@ -297,7 +297,16 @@ class RtBackend:
             "position": np.asarray(state.q),
             "velocity": np.asarray(state.dq),
             "position_cmd": np.asarray(state.q_cmd),
-            "velocity_cmd": zeros,
+            # NOT zero -- UNKNOWN. StatePacket carries q_cmd and tau_cmd but no
+            # qd_cmd (adding one is a wire change: 736 -> 864 bytes, a VERSION
+            # bump, and a lockstep RT-box redeploy), so the servo's qd_des does
+            # not reach this host. Reporting 0.0 made a tracking plot and the
+            # CSV recorder show a flat commanded-velocity line that looked like
+            # a measurement. NaN reads as the gap it is -- rerun draws nothing
+            # and the CSV column is empty. `kp`/`kd` below are fake for the
+            # same reason; they are left at zero only because nothing plots
+            # them yet.
+            "velocity_cmd": np.full(self.n, np.nan),
             # The servo's own post-clamp post-slew output — the tau_J_d
             # analogue, and the honest number for tracking plots.
             "torque_cmd": np.asarray(state.tau_cmd),
