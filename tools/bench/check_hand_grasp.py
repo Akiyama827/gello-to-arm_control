@@ -61,6 +61,110 @@ def wait_for(predicate, timeout=3.0):
     assert predicate(), "fake peer deadline"
 
 
+def check_active_stop():
+    from arm_control.end_effectors.franka_adapter import BridgeClient
+    client = BridgeClient("127.0.0.1", 1)
+    client._connected = True
+    client._receive(b"STATE 0.075 0")
+    client._receive(b"META 2 8 1 0 1 10")
+    request = dict(request_id="empty-move", _position_move=True)
+    assert not client.send_line("MOVE 0.045 0.05", request), \
+        "position-only pipeline accepted a bridge without active STOP"
+    client._receive(b"CAPS active_stop")
+    assert client.snapshot()["active_stop"]
+    assert client.send_line("MOVE 0.045 0.05", request)
+    client.cancel_move()
+    assert client.pop_move_results() == [dict(
+        request_id="empty-move", ok=False, reason="hand operation canceled")]
+    assert client._command is None and client.snapshot()["busy"]
+    client._cancel = False  # Socket worker has sent GSTOP.
+    client._receive(b"DONE 8 1")  # Late success cannot resurrect cancellation.
+    assert client.pop_move_results() == []
+    client._receive(b"META 2 8 1 0 1 11")  # Buffered before GSTOP arrived.
+    assert client.snapshot()["busy"]
+    assert not client.send_line("MOVE 0.075 0.05")
+    client._receive(b"STOPPING 10")
+    client._receive(b"META 2 10 1 1 0 11")
+    assert client.snapshot()["busy"]
+    client._receive(b"META 2 10 0 0 0 11")  # Failed stop remains unavailable.
+    assert not client.snapshot()["available"]
+    client._receive(b"STATE 0.060 0")
+    client._receive(b"META 2 11 1 0 1 12")  # Recovered + fresh post-stop read.
+    assert not client.snapshot()["busy"] and client.snapshot()["measured"]
+    assert client.send_line("MOVE 0.075 0.05", dict(request, request_id="new"))
+    print("PASS active STOP capability, cancellation barrier and late DONE rejection")
+
+
+def check_gated_grasp():
+    from arm_control.end_effectors.franka_adapter import (
+        BridgeClient, submit_grasp_request, cancel_grasp_on_authority_loss,
+    )
+
+    def setup():
+        client = BridgeClient('127.0.0.1', 1)  # Never started: no socket.
+        client._connected = True
+        client._receive(b'CAPS active_stop')
+        client._receive(b'STATE 0.075 0')
+        client._receive(b'META 2 8 1 0 1 1')
+        return client, franka_hand.HandGraspFsm({}, measured_completion=True)
+
+    req = dict(request_id='close', target_id='module', mode='close')
+    client, fsm = setup()
+    for authorized, pending, capability in ((False, False, True), (True, True, True), (True, False, False)):
+        client._active_stop = capability
+        result = submit_grasp_request(client, fsm, req, 1., require_authority=True,
+                                      authorized=authorized, position_pending=pending)
+        assert not result['ok'] and client._command is None and not fsm.awaiting_result
+    client._active_stop = True
+    assert submit_grasp_request(client, fsm, req, 1., require_authority=True, authorized=True) is None
+    assert client._command[1].startswith('GRASP ')
+    assert client._command[2]['_requires_active_stop']
+    assert not submit_grasp_request(client, fsm, dict(req, request_id='duplicate'), 1.,
+                                   require_authority=True, authorized=True)['ok']
+    def poll(now=1.1):
+        state = client.snapshot()
+        return fsm.poll(state if state['measured'] else None, client.gdone_count,
+                        client.gdone_ok, now, done_sample_seq=client.gdone_sample_seq)
+    client._receive(b'DONE 7 1')
+    assert client.gdone_count == 0 and poll() is None
+    client._receive(b'DONE 8 1')
+    assert poll() is None, 'completion without fresh measurement passed'
+    client._receive(b'STATE 0.045 1')
+    client._receive(b'META 2 9 1 0 1 2')
+    assert poll()['ok']
+    client._receive(b'DONE 8 1')
+    assert poll() is None
+    # Release is measured completion, never an immediate successful grasp_result.
+    release = dict(request_id='release', target_id='module', mode='release')
+    assert submit_grasp_request(client, fsm, release, 2., require_authority=True, authorized=True) is None
+    assert client._command[1].startswith('MOVE ')
+    client._receive(b'DONE 9 1')
+    assert poll(2.1) is None
+    client._receive(b'STATE 0.075 0')
+    client._receive(b'META 2 10 1 0 1 3')
+    result = poll(2.2)
+    assert result['ok'] and result['request_id'] == 'release'
+    for held in (False, True):
+        client, fsm = setup()
+        submit_grasp_request(client, fsm, req, 1., require_authority=True, authorized=True)
+        if held:
+            client._receive(b'DONE 8 1')
+            client._receive(b'STATE 0.045 1')
+            client._receive(b'META 2 9 1 0 1 2')
+            assert poll()['ok']
+        result = cancel_grasp_on_authority_loss(client, fsm, False)
+        assert not result['ok'] and client._cancel_waiting and client._command is None
+        client._receive(b'DONE 8 1')
+        assert poll() is None, 'late completion resurrected canceled grasp'
+    client, fsm = setup()
+    submit_grasp_request(client, fsm, req, 1., require_authority=True, authorized=True)
+    # Unlike the legacy FSM, a held observation without matching DONE cannot pass.
+    client._receive(b'STATE 0.045 1')
+    client._receive(b'META 2 9 1 0 1 2')
+    assert not poll(1. + franka_hand.GRASP_TIMEOUT_S + 1.)['ok']
+    print('PASS gated grasp/release admission, measured completion, authority cancellation and late DONE')
+
+
 def check_socket():
     from arm_control.end_effectors.franka_adapter import BridgeClient, submit_grasp_request
     class FastClient:
@@ -112,6 +216,8 @@ def check_socket():
         conn.sendall(b"STATE 0.075 0\nMETA 2 8 1 0 1 10\n")
         wait_for(lambda: client.snapshot()["measured"])
         first = client.snapshot()["sample_seq"]
+        conn.sendall(b'CAPS active_stop\n')
+        wait_for(lambda: client.snapshot()['active_stop'])
         conn.sendall(b"STATE 0.075 0\nMETA 2 8 1 0 1 10\n")
         time.sleep(.2)
         assert client.snapshot()["sample_seq"] == first
@@ -149,13 +255,52 @@ def check_socket():
             assert not conn.recv(256), "stale command replayed after reconnect"
         except socket.timeout:
             pass
+        assert not client.snapshot()['active_stop'], 'capability leaked across reconnect'
+        conn.sendall(b'CAPS active_stop\n')
+        wait_for(lambda: client.snapshot()['active_stop'])
+        conn.settimeout(1)
+        assert client.send_line('MOVE 0.045 0.05', dict(
+            request_id='cancel-wire', _position_move=True))
+        assert conn.recv(256) == b'CMD 20 MOVE 0.045 0.05\n'
+        client.cancel_move()
+        assert conn.recv(256) == b'GSTOP\n'
+        client.cancel_move()  # Coalesced while waiting, never queues another action.
+        conn.sendall(b'DONE 20 1\nSTATE 0.045 0\nMETA 2 21 1 0 1 2\n')
+        wait_for(lambda: client._epoch == 21)
+        assert client.snapshot()['busy'], 'pre-STOP buffered state cleared cancellation'
+        results = client.pop_move_results()
+        assert len(results) == 1 and not results[0]['ok']
+        conn.sendall(b'STOPPING 22\nMETA 2 22 1 1 0 2\n')
+        wait_for(lambda: client._stop_epoch == 22)
+        assert client.snapshot()['busy']
+        conn.sendall(b'STATE 0.060 0\nMETA 2 22 1 0 1 3\n')
+        wait_for(lambda: not client.snapshot()['busy'])
+        assert client.snapshot()['measured'] and not client.pop_move_results()
+        conn.settimeout(.3)
+        try:
+            assert not conn.recv(256), 'duplicate STOP or canceled command replayed'
+        except socket.timeout:
+            pass
+        # Cancel an admitted command before run() can move it to the wire.
+        with client._lock:
+            assert client.send_line('MOVE 0.075 0.05', dict(
+                request_id='cancel-unsent', _position_move=True))
+            client.cancel_move()
+        conn.settimeout(1)
+        assert conn.recv(256) == b'GSTOP\n', 'unsent MOVE escaped cancellation'
+        conn.sendall(b'STOPPING 23\nSTATE 0.060 0\nMETA 2 23 1 0 1 4\n')
+        wait_for(lambda: not client.snapshot()['busy'])
+        assert client.pop_move_results() == [dict(
+            request_id='cancel-unsent', ok=False, reason='hand operation canceled')]
     finally:
         conn.close()
         client.close()
         server.close()
-    print("PASS actual TCP force framing, busy rejection, measured freshness, reconnect cancellation")
+    print("PASS actual TCP force framing, freshness, reconnect, GSTOP and post-stop barrier")
 
 
 if __name__ == "__main__":
     check_parameters()
+    check_active_stop()
+    check_gated_grasp()
     check_socket()

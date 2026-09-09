@@ -12,7 +12,7 @@
 //
 //   PC -> "CMD <epoch> MOVE <width_m> <speed_mps>\n" | "CMD <epoch> HOME\n"
 //      | "CMD <epoch> GRASP <width_m> <speed_mps> <force_n> <eps_in_m> <eps_out_m>\n"
-//      | "GSTOP\n" (cancel pending; cannot interrupt a blocking SDK action)
+//      | "GSTOP\n" (cancel pending and actively stop a running move/grasp)
 //   <-  "STATE <width_m> <0|1>\n"   (~10 Hz, streams DURING moves too)
 //   <-  "GDONE <0|1>\n"             (once per completed GRASP: the
 //                                    franka::Gripper::grasp verdict — object
@@ -20,12 +20,15 @@
 //                                    killed by GSTOP sends nothing; the PC
 //                                    client owns the timeout.)
 //   <-  "META 2 <epoch> <available> <busy> <measured> <sample_seq>\n"
+//   <-  "CAPS active_stop\n" (the older mailbox-only bridge omits this)
+//   <-  "STOPPING <epoch>\n" (request admitted, NOT physical stop completion)
 //   <-  "ACCEPT|REJECT <command_epoch> <reason>\n" | "DONE <command_epoch> <ok>\n"
 // Epoch changes on every admission/cancellation/client or robot disconnect.
 // Legacy STATE/GDONE framing is retained; unversioned actuator commands fail.
 //
-// ONE franka::Gripper session, owned entirely by the actor thread (reads AND
-// actions). A dual-session design was tried and is IMPOSSIBLE: the Hand
+// ONE franka::Gripper session: the actor owns reads and actions; a separate
+// worker calls its thread-safe stop() concurrently. A dual-session design
+// was tried and is IMPOSSIBLE: the Hand
 // server is single-client with NEWEST-WINS EVICTION — a second connect is
 // "accepted" by starving the first session's UDP and then RST-ing its TCP
 // (bench 2026-07-29: reader and actor evicted each other in a ping-pong,
@@ -73,6 +76,7 @@ double mono_s() {
 std::mutex mx;
 std::condition_variable cv;
 HandAdmission admission;
+std::shared_ptr<franka::Gripper> hand_session; // protected by mx
 uint64_t grasp_seq = 0;  // bumped per completed GRASP; serve() sends GDONE on change
 uint64_t done_seq = 0, done_token = 0, sample_seq = 0;
 bool done_ok = false;
@@ -91,6 +95,7 @@ constexpr double width_measurement_tolerance_m = 1e-5;
 
 // Called under mx. Only a new device timestamp can refresh measured freshness.
 void observe_state(const franka::GripperState& st) {
+  if (admission.stopping) return; // Never attest freshness during stop dispatch.
   const auto stamp = st.time.toMSec();
   if (seen_robot_sample && stamp <= robot_sample_time) return;
   if (!std::isfinite(st.width) || st.width < -width_measurement_tolerance_m ||
@@ -114,23 +119,63 @@ void observe_state(const franka::GripperState& st) {
 // GSTOP is STICKY: clearing the mailbox alone loses the race where the
 // actor already drained the goal but has not executed it yet (it can be
 // inside a reconnect backoff). The sequence number kills any action taken
-// before the stop, wherever it is in the actor's pipeline. A single session
-// cannot abort its OWN blocking move/grasp. Cancellation prevents replay;
-// it does not promise an immediate physical stop of the blocking SDK call.
-void gstop_pending() {
+// before the stop, wherever it is in the actor's pipeline. The stop worker
+// interrupts blocking move/grasp on this SAME session (libfranka is thread-safe).
+uint64_t gstop_pending() {
   std::lock_guard<std::mutex> lk(mx);
-  admission.cancel();
+  admission.request_stop();
+  have_real = false;
+  cv.notify_all();
+  return admission.epoch;
+}
+
+// Called with mx locked; drop it across the SDK call so neither TCP handling
+// nor action completion waits on stop(). The caller pins the session lifetime.
+template<class Stop>
+void perform_hand_stop(std::unique_lock<std::mutex>& lk, Stop stop) {
+  const auto serial = admission.stop_serial;
+  const bool was_acting = admission.acting;
+  lk.unlock();
+  bool ok = false;
+  try {
+    ok = stop();
+  } catch (const std::exception& e) {
+    std::printf("[hand] stop failed: %s\n", e.what());
+  }
+  lk.lock();
+  admission.finish_stop(serial, was_acting, ok);
+  have_real = false;
+  if (!admission.stopping) {
+    std::printf("[hand] stop %s; fresh measured state required\n",
+                ok ? "acknowledged" : "FAILED — commands inhibited");
+  }
+}
+
+void stopper() {
+  std::unique_lock<std::mutex> lk(mx);
+  for (;;) {
+    cv.wait(lk, [] { return admission.stopping; });
+    const auto hand = hand_session; // Cannot be destroyed during stop().
+    perform_hand_stop(lk, [&] { return hand && hand->stop(); });
+    if (admission.stopping) {
+      // Retry until canceled action exit, including the pre-SDK-entry race.
+      // This is a retry interval, NOT a guaranteed physical stopping latency.
+      cv.wait_for(lk, std::chrono::milliseconds(20));
+    }
+  }
 }
 
 void actor(const char* robot_ip) {
-  std::unique_ptr<franka::Gripper> hand;
+  std::shared_ptr<franka::Gripper> hand;
   double next_connect = 0.0;
   bool warned = false;
   for (;;) {
     {
       std::unique_lock<std::mutex> lk(mx);
       cv.wait_for(lk, std::chrono::milliseconds(100),
-                  [] { return admission.pending.kind != 0; });
+                  [] { return admission.pending.kind != 0 && !admission.stopping; });
+      // Never replace a session until concurrent stop calls have drained.
+      if (!hand && admission.stopping) continue;
     }
     if (!hand) {
       if (mono_s() < next_connect) {
@@ -138,9 +183,10 @@ void actor(const char* robot_ip) {
         continue;
       }
       try {
-        hand = std::make_unique<franka::Gripper>(robot_ip);
+        hand = std::make_shared<franka::Gripper>(robot_ip);
         std::printf("[hand] connected to %s\n", robot_ip);
         std::lock_guard<std::mutex> lk(mx);
+        hand_session = hand;
         admission.connected = true;
         seen_robot_sample = false;
         warned = false;
@@ -164,9 +210,10 @@ void actor(const char* robot_ip) {
         // Re-check under the lock immediately before executing: a GSTOP
         // that landed while we were connecting outranks the carried action.
         std::lock_guard<std::mutex> lk(mx);
-        if (!admission.current(a)) {
+        if (!admission.begin_action(a)) {
           std::printf("[hand] action dropped (GSTOP outranks it)\n");
           admission.acting = false;
+          admission.dispatch_committed = false;
           continue;
         }
         act_from = have_real ? real_w : a.w;
@@ -204,8 +251,10 @@ void actor(const char* robot_ip) {
       }
       std::lock_guard<std::mutex> lk(mx);
       admission.acting = false;
+      admission.dispatch_committed = false;
       have_real = false; // Require a new measured sample before another action.
       if (!hand) {
+        hand_session.reset();
         admission.connected = false;
         admission.cancel();
       }
@@ -222,12 +271,20 @@ void actor(const char* robot_ip) {
       }
       continue;  // loop straight into a real readOnce to truth the width
     }
-    // Idle: refresh the real sample (same thread, same session — the ONLY
-    // Hand access; the serve loop never touches the session).
+    // Idle: the actor remains the only readOnce caller. The stop worker may
+    // concurrently call stop(), but never opens a second Hand session.
+    uint64_t read_stop_serial;
+    bool read_during_stop;
+    {
+      std::lock_guard<std::mutex> lk(mx);
+      read_stop_serial = admission.stop_serial;
+      read_during_stop = admission.stopping;
+    }
     try {
       const franka::GripperState st = hand->readOnce();
       std::lock_guard<std::mutex> lk(mx);
-      observe_state(st);
+      if (!read_during_stop && read_stop_serial == admission.stop_serial)
+        observe_state(st);
     } catch (const franka::Exception& e) {
       std::printf("[hand] read failed (%s) — reconnecting\n", e.what());
       {
@@ -235,6 +292,7 @@ void actor(const char* robot_ip) {
         have_real = false;
         admission.connected = false;
         admission.cancel();
+        hand_session.reset();
       }
       hand.reset();
       next_connect = mono_s() + 2.0;
@@ -243,12 +301,20 @@ void actor(const char* robot_ip) {
 }
 
 void serve(int fd) {
-  // Every return cancels pending/carried work; a blocking action may finish.
+  // Disconnect interrupts outstanding work, not an already completed grasp.
   struct Disconnect {
     ~Disconnect() {
       std::lock_guard<std::mutex> lk(mx);
       admission.client = false;
-      admission.cancel();
+      if (admission.dispatch_committed || admission.stopping) {
+        admission.request_stop();
+        have_real = false;
+        cv.notify_all();
+      } else {
+        // An open may be queued or carried but not committed to SDK dispatch.
+        // Invalidate it without stopping the existing grasp's holding force.
+        admission.cancel();
+      }
     }
   } disconnect;
   double last_state = 0.0;
@@ -279,14 +345,18 @@ void serve(int fd) {
         *nl = '\0';
         HandAction action;
         if (!std::strcmp(line, "GSTOP")) {
-          gstop_pending();
+          const auto epoch = gstop_pending();
+          char out[64];
+          const int n = std::snprintf(out, sizeof(out), "STOPPING %llu\n",
+                                     (unsigned long long)epoch);
+          if (send(fd, out, size_t(n), MSG_NOSIGNAL) != n) return;
         } else {
           const char* error = "invalid_command";
           if (parse_hand_command(line, action)) {
             std::lock_guard<std::mutex> lk(mx);
             error = admission.admit(action, have_real && mono_s() - real_t < .6);
           }
-          if (!error) cv.notify_one();
+          if (!error) cv.notify_all();
           char out[128];
           const int n = std::snprintf(out, sizeof(out), "%s %llu %s\n",
               error ? "REJECT" : "ACCEPT", (unsigned long long)action.token,
@@ -344,8 +414,8 @@ void serve(int fd) {
       {
         std::lock_guard<std::mutex> lk(mx);
         valid = have_real;
-        available = admission.connected;
-        busy = admission.acting || admission.pending.kind;
+        available = admission.connected && !admission.stop_fault;
+        busy = admission.acting || admission.pending.kind || admission.stopping;
         measured = available && have_real && mono_s() - real_t < .6 && !busy;
         epoch = admission.epoch;
         seq = sample_seq;
@@ -369,7 +439,7 @@ void serve(int fd) {
         if (send(fd, out, size_t(n), MSG_NOSIGNAL) != n) return;
       }
       char meta[160];
-      const int n = std::snprintf(meta, sizeof(meta), "META 2 %llu %d %d %d %llu\n",
+      const int n = std::snprintf(meta, sizeof(meta), "CAPS active_stop\nMETA 2 %llu %d %d %d %llu\n",
           (unsigned long long)epoch, available ? 1 : 0, busy ? 1 : 0,
           measured ? 1 : 0, (unsigned long long)seq);
       if (send(fd, meta, size_t(n), MSG_NOSIGNAL) != n) return;
@@ -397,8 +467,6 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  std::thread(actor, robot_ip).detach();
-
   const int lfd = socket(AF_INET, SOCK_STREAM, 0);
   const int one = 1;
   setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -412,6 +480,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::printf("[hand] hand_bridge up: robot %s, port %u\n", robot_ip, port);
+  std::thread(stopper).detach();
+  std::thread(actor, robot_ip).detach();
   for (;;) {
     const int client = accept(lfd, nullptr, nullptr);
     if (client < 0) continue;

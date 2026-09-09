@@ -39,6 +39,7 @@ def main() -> None:
     period = 1.0 / rate_hz
     viz_period = 1.0 / float(cfg.get("viz_publish_rate_hz", 60.0))
     joints = arm_joints(cfg)
+    end_frame = ee_frame(cfg)  # Validate model metadata before opening any transport.
 
     backend = RtBackend.from_config(cfg)
     node = Node()
@@ -204,7 +205,7 @@ def main() -> None:
                             "revision": 0,
                             "backend": f"rt:{backend.backend_name}",
                             "joint_names": joints,
-                            "ee_frame": ee_frame(cfg),
+                            "ee_frame": end_frame,
                             "num_motors": backend.num_motors,
                         },
                     ),

@@ -37,5 +37,28 @@ int main() {
   action.token = gate.epoch;
   assert(gate.admit(action, true) == nullptr);
   assert(gate.take(action) && gate.current(action));
+  gate.request_stop();
+  const auto first_stop = gate.stop_serial;
+  assert(!gate.current(action));
+  action.token = gate.epoch;
+  assert(gate.admit(action, true) != nullptr);
+  gate.finish_stop(first_stop, true, true); // Stop may precede SDK entry.
+  assert(gate.stopping);
+  gate.acting = false;
+  gate.finish_stop(first_stop, true, true); // Still needs the final stop.
+  assert(gate.stopping);
+  gate.request_stop(); // An older completion cannot consume a newer STOP.
+  gate.finish_stop(first_stop, false, true);
+  assert(gate.stopping);
+  gate.finish_stop(gate.stop_serial, false, false);
+  assert(!gate.stopping && gate.stop_fault);
+  action.token = gate.epoch;
+  assert(gate.admit(action, true) != nullptr);
+  gate.request_stop(); // Explicit retry; no automatic motion on recovery.
+  gate.finish_stop(gate.stop_serial, false, true);
+  assert(!gate.stopping && !gate.stop_fault);
+  action.token = gate.epoch;
+  assert(gate.admit(action, false) != nullptr);
+  assert(gate.admit(action, true) == nullptr);
   std::cout << "PASS hand TCP parsing, admission, cancellation and stale generation\n";
 }

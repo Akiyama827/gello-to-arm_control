@@ -11,6 +11,7 @@ const el = (id) => document.getElementById(id);
 const POLL_MS = 400;
 
 let lastLog = 0;
+let confirmationToken = null;
 
 function setStatus(node, text, kind) {
   node.textContent = text;
@@ -66,6 +67,7 @@ function renderStep(state) {
 }
 
 function renderGate(state) {
+  confirmationToken = state.confirmation_token ?? null;
   const badge = el("gatebadge");
   if (state.stopped) setStatus(badge, "STOPPED", "bad");
   else if (state.holding) setStatus(badge, "HELD — awaiting review", "hold");
@@ -74,10 +76,17 @@ function renderGate(state) {
 
   // RE-PLAN only means something for a phase held at a gate; GO doubles as the
   // initial arm, so it stays live before the sequence starts.
-  el("plan").disabled = !state.holding || state.stopped;
+  el("plan").disabled = !state.holding || state.stopped || state.action_only;
   el("play").disabled = !state.holding || state.stopped
     || !Number.isFinite(state.step?.duration_s);
-  el("go").disabled = state.stopped;
+  el("go").disabled = state.stopped || confirmationToken === "" || state.action_only;
+  el("custom-actions").replaceChildren(...Object.entries(state.actions || {}).map(([action, label]) => {
+    const button = document.createElement("button");
+    button.textContent = label;
+    button.disabled = state.stopped || !confirmationToken;
+    button.addEventListener("click", () => send(action));
+    return button;
+  }));
   el("stop").disabled = state.stopped;
 
   const failure = el("failure");
@@ -118,7 +127,7 @@ async function send(action) {
     const response = await fetch("/action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, confirmation_token: confirmationToken }),
     });
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));

@@ -71,10 +71,17 @@ class OperatorWorkspace:
     failure: str = ""
     started: bool = False
     stopped: bool = False
+    # None keeps the legacy uncorrelated signal API. An empty token disables GO.
+    confirmation_token: str | None = None
+
+    actions: dict[str, str] = field(default_factory=dict)
+    action_only: bool = False
 
     def json(self) -> dict:
         step = self.step
         return {
+            "actions": dict(self.actions),
+            "action_only": self.action_only,
             "phases": list(self.phases),
             "current": self.current,
             "accepted": list(self.accepted),
@@ -82,6 +89,7 @@ class OperatorWorkspace:
             "failure": self.failure,
             "started": bool(self.started),
             "stopped": bool(self.stopped),
+            "confirmation_token": self.confirmation_token,
             "step": None if step is None else {
                 "phase": step.phase,
                 "summary": step.summary,
@@ -97,7 +105,7 @@ class OperatorPanel:
     def __init__(
         self,
         read: Callable[[], OperatorWorkspace],
-        signal: Callable[[str], None],
+        signal: Callable[..., None],
         *,
         bind: str = "127.0.0.1",
         port: int = 7503,
@@ -135,12 +143,23 @@ class OperatorPanel:
         if not isinstance(payload, dict):
             raise TypeError("action payload must be an object")
         action = str(payload.get("action", "")).strip().lower()
-        if action not in ACTIONS:
+        workspace = self._read()
+        if action not in (*ACTIONS, *workspace.actions):
             raise ValueError(
                 f"unknown operator action {action!r} (expected one of "
                 f"{', '.join(ACTIONS)})"
             )
-        self._signal(action)
+        if workspace.stopped and action != 'stop':
+            raise ValueError('operator workspace is stopped')
+        if workspace.action_only and action in ('go', 'plan', 'play'):
+            raise ValueError('this gate requires an explicit outcome decision')
+        token = workspace.confirmation_token
+        if (action == 'go' and token is not None) or action in workspace.actions:
+            if not token or payload.get('confirmation_token') != token:
+                raise ValueError('the displayed gate is no longer current; review it again')
+            self._signal(action, token)
+        else:
+            self._signal(action)
         self.note(f"operator: {action.upper()}")
         return {"ok": True, "action": action}
 
@@ -205,6 +224,29 @@ def _self_check() -> None:
             body = post({"action": bogus}, 400)
             assert "unknown operator action" in body["error"], body
         assert fired == list(ACTIONS), f"a refused action still signalled: {fired}"
+
+        from dataclasses import replace
+        workspace = replace(workspace, confirmation_token='gate-1')
+        scoped = []
+        panel._signal = lambda *args: scoped.append(args)
+        for token in (None, '', 'previous'):
+            post({'action': 'go', 'confirmation_token': token}, 400)
+        assert scoped == []
+        post({'action': 'go', 'confirmation_token': 'gate-1'}, 200)
+        assert scoped == [('go', 'gate-1')]
+        workspace = replace(workspace, actions={'acknowledge': 'Record observation', 'omit': 'Skip event'}, action_only=True)
+        for action in ('acknowledge', 'omit'):
+            post({'action': action, 'confirmation_token': 'stale'}, 400)
+            post({'action': action, 'confirmation_token': 'gate-1'}, 200)
+            assert scoped[-1] == (action, 'gate-1')
+        post({'action': 'go', 'confirmation_token': 'gate-1'}, 400)
+        post({'action': 'plan'}, 400)
+        workspace = replace(workspace, actions={}, action_only=False)
+        post({'action': 'acknowledge', 'confirmation_token': 'gate-1'}, 400)
+        workspace = replace(workspace, confirmation_token='')
+        post({'action': 'go', 'confirmation_token': 'gate-1'}, 400)
+        post({'action': 'stop'}, 200)
+        assert scoped[-1] == ('stop',)
 
         # 3. There is no route that could command motion, and no method that
         #    could reach one. Only /state and the static page answer at all.

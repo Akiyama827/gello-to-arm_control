@@ -20,10 +20,14 @@ class ExecutionPolicy:
     abort_pos_err_rad: float
     hold_relatch_rad: float
     torque_limits: np.ndarray
+    position_lower: np.ndarray | None = None
+    position_upper: np.ndarray | None = None
+    velocity_limits: np.ndarray | None = None
+    acceleration_limits: np.ndarray | None = None
 
     def __post_init__(self):
         for field in fields(self):
-            if field.name == "torque_limits":
+            if field.name in ("torque_limits", "velocity_limits", "acceleration_limits", "position_lower", "position_upper"):
                 continue
             value = float(getattr(self, field.name))
             if not math.isfinite(value) or value <= 0:
@@ -34,6 +38,27 @@ class ExecutionPolicy:
             raise ValueError("execution_policy torque limits must be a finite positive joint vector")
         limits.setflags(write=False)
         object.__setattr__(self, "torque_limits", limits)
+        for name in ("velocity_limits", "acceleration_limits"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            value = np.asarray(value, dtype=float).copy()
+            if value.shape != limits.shape or not np.isfinite(value).all() or np.any(value <= 0):
+                raise ValueError(f"execution_policy.{name} must match the positive joint limits")
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+        if (self.position_lower is None) != (self.position_upper is None):
+            raise ValueError("execution_policy requires both position bounds")
+        if self.position_lower is not None:
+            for name in ("position_lower", "position_upper"):
+                value = np.asarray(getattr(self, name), dtype=float).copy()
+                if value.shape != limits.shape or not np.isfinite(value).all():
+                    raise ValueError(f"execution_policy.{name} must match joint limits")
+                value.setflags(write=False)
+                object.__setattr__(self, name, value)
+            if np.any(self.position_lower >= self.position_upper):
+                raise ValueError("execution_policy position bounds must be ordered")
 
     @property
     def period(self):
@@ -50,6 +75,17 @@ class ExecutionPolicy:
                 return "trajectory contains non-finite values"
         if np.any(np.diff(t) <= 0):
             return "trajectory times must be strictly increasing"
+        if self.position_lower is not None:
+            if np.any(q < self.position_lower) or np.any(q > self.position_upper):
+                return "trajectory outside configured position/velocity safety envelope"
+        dt = np.diff(t)[:, None]
+        if self.velocity_limits is not None:
+            if (np.any(np.abs(v) > self.velocity_limits + 1e-8)
+                    or np.any(np.abs(np.diff(q, axis=0) / dt) > self.velocity_limits + 1e-8)):
+                return "trajectory exceeds configured joint velocity limits"
+        if self.acceleration_limits is not None:
+            if np.any(np.abs(np.diff(v, axis=0) / dt) > self.acceleration_limits + 1e-8):
+                return "trajectory exceeds configured joint acceleration limits"
         for key in ("kp", "kd"):
             if plan[key].shape != (n_arm,) or np.any(plan[key] < 0):
                 return f"trajectory {key} must be a nonnegative joint vector"
@@ -81,5 +117,10 @@ class ExecutionPolicy:
             value = np.asarray(getattr(command, key))
             if value.shape != (n_arm,) or not np.isfinite(value).all():
                 return False
+        if self.position_lower is not None:
+            if np.any(command.q_des < self.position_lower) or np.any(command.q_des > self.position_upper):
+                return False
+        if self.velocity_limits is not None and np.any(np.abs(command.qd_des) > self.velocity_limits + 1e-8):
+            return False
         return bool(np.all(command.kp >= 0) and np.all(command.kd >= 0)
                     and np.all(np.abs(command.tau_ff) <= self.torque_limits))

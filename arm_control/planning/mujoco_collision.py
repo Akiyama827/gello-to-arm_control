@@ -15,6 +15,7 @@ import re
 import hashlib
 import tempfile
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import mujoco
 import numpy as np
@@ -33,6 +34,23 @@ def _rpy_to_quat(roll: float, pitch: float, yaw: float) -> np.ndarray:
             sy * cp * cr - cy * sp * sr,
         ]
     )
+
+def _explicit_geom_names(text: str) -> str:
+    """Keep unnamed URDF geoms unnamed in MuJoCo's generated input copy.
+
+    MuJoCo 3.12 can inherit the preceding visual's name for an unnamed
+    collision, then warn and discard the duplicate name. An explicit empty
+    name avoids that parser path and produces the same compiled geom names.
+    Geometry and named geoms remain unchanged; the source URDF is not edited.
+    """
+    root = ET.fromstring(text)
+    changed = False
+    for geom in (*root.iter('visual'), *root.iter('collision')):
+        if 'name' not in geom.attrib:
+            geom.set('name', '')
+            changed = True
+    return ET.tostring(root, encoding='unicode') if changed else text
+
 
 def build_planning_model(
     urdf_path: str | Path, cache_dir: str | Path, *, keep_visual: bool = False
@@ -58,7 +76,7 @@ def build_planning_model(
     cache_dir = Path(cache_dir).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     suffix = "sim" if keep_visual else "planning"
-    text = urdf_path.read_text()
+    text = _explicit_geom_names(urdf_path.read_text())
     identity = hashlib.sha256((str(urdf_path) + '\0' + text).encode()).hexdigest()[:20]
     out = cache_dir / f"{urdf_path.stem}_{identity}_mj_{suffix}.urdf"
     if out.exists():
@@ -529,6 +547,24 @@ class MuJoCoCollisionWorld:
 def _self_check() -> None:
     """Accept scalar joints without weakening held-joint validation."""
     import tempfile
+
+    unnamed = ('<robot name="names"><link name="base"><visual name="first">'
+               '<geometry><box size="1 1 1"/></geometry></visual>'
+               '<collision><geometry><box size="1 1 1"/></geometry></collision>'
+               '</link></robot>')
+    normalized = _explicit_geom_names(unnamed)
+    assert _explicit_geom_names(normalized) == normalized
+    parsed = ET.fromstring(normalized)
+    assert parsed.find('.//visual').get('name') == 'first'
+    assert parsed.find('.//collision').get('name') == ''
+    warnings = []
+    previous_warning = mujoco.get_mju_user_warning()
+    mujoco.set_mju_user_warning(warnings.append)
+    try:
+        mujoco.MjModel.from_xml_string(normalized)
+    finally:
+        mujoco.set_mju_user_warning(previous_warning)
+    assert not warnings, warnings
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

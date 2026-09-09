@@ -48,7 +48,7 @@ if(WITH_FRANKA)
   add_executable(hand_bridge_selfcheck src/hand_bridge_selfcheck.cpp)
   target_link_libraries(hand_bridge_selfcheck PRIVATE Franka::Franka Threads::Threads)
   target_compile_options(hand_bridge_selfcheck PRIVATE -UNDEBUG)
-  target_link_libraries(hand_bridge PRIVATE Franka::Franka)
+  target_link_libraries(hand_bridge PRIVATE Franka::Franka Threads::Threads)
   set_target_properties(hand_bridge PROPERTIES
     BUILD_RPATH "\$ORIGIN/lib"
     INSTALL_RPATH "\$ORIGIN/lib")

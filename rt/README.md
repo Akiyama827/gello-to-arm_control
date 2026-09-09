@@ -33,6 +33,36 @@ project's deployment tree, not this reusable core. Moving those files does
 not alter an installed RT host. The bring-up notes below record existing
 engineering checks; they are not certification of a particular deployment.
 
+## Hand active STOP
+
+`hand_bridge` keeps one libfranka Gripper session. Its action thread owns reads,
+move, grasp and homing; a separate worker invokes the same session's thread-safe
+`stop()` for `GSTOP`. This uses the vendor's
+[move/grasp interruption API](https://frankarobotics.github.io/libfranka/latest/classfranka_1_1Gripper.html).
+It neither joins nor blocks the arm RT servo loop.
+
+- `CAPS active_stop` advertises the updated bridge; legacy META 2 framing stays.
+- `STOPPING <epoch>` acknowledges receipt, not physical completion. Admission
+  stays busy while stopping. Canceled actions cannot report successful DONE.
+- Stop is retried while the canceled action is active, then once after its exit
+  to cover cancellation just before SDK entry. New commands require a successful
+  final stop and a subsequent fresh measured sample. A false/exceptional final
+  stop inhibits commands until an explicit successful GSTOP retry or bridge
+  restart; reconnect alone does not clear the stop-failure latch.
+- Client disconnect interrupts an active action and discards queued commands.
+  It does not stop an already completed grasp, including when an unsent open was
+  queued. Explicit GSTOP does request stop even when idle; do not use it as a
+  promise to retain grasp force or a suspended object.
+- The gated position-move client requires this capability. Updating Python alone
+  does not update the daemon installed on the RT host. Standalone slider/grasp
+  interfaces keep their existing admission policy.
+
+This is a software stop, not a safety-rated E-stop. The 20 ms retry interval is
+not a physical latency guarantee. Homing interruption, loss of the robot link,
+bridge process death and physical stopping latency are not certified by the
+offline checks. Deployment and an authorized empty-Hand stopping test remain
+separate acceptance steps.
+
 ## Build
 
 ```bash

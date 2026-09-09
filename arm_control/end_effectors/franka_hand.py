@@ -82,8 +82,9 @@ def _result(rid: str, tid: str, ok: bool, reason: str) -> dict:
 class HandGraspFsm:
     """grasp_request -> hand action + verdict -> grasp_result."""
 
-    def __init__(self, gripper_cfg: dict) -> None:
+    def __init__(self, gripper_cfg: dict, *, measured_completion=False) -> None:
         g = gripper_cfg
+        self.measured_completion = measured_completion
         self._config = dict(g)
         self.parameters = resolve_grasp_parameters(g, {})
         self.grasp_width_m = float(g.get("grasp_width_m", 0.045))
@@ -109,7 +110,7 @@ class HandGraspFsm:
         except ValueError as exc:
             return None, _result(rid, tid, False, str(exc))
         self.parameters = parameters
-        if str(payload.get("mode", "close")) == "release":
+        if str(payload.get("mode", "close")) == "release" and not self.measured_completion:
             # Unsensed, like the DM release: ack now, jaws travel after.
             self._pending = None
             self._held = None
@@ -119,9 +120,11 @@ class HandGraspFsm:
             "target_id": tid,
             "deadline": now + GRASP_TIMEOUT_S,
             "gdone_base": gdone_count,
+            "mode": payload.get("mode", "close"),
+            "width_m": parameters["width_m"],
         }
         self._held = None
-        return "grasp", None
+        return ("open" if payload.get("mode") == "release" else "grasp"), None
 
     def fail(self, reason: str, request_id: str | None = None) -> dict | None:
         """Resolve an in-flight request on transport loss; cached state is no verdict."""
@@ -134,10 +137,29 @@ class HandGraspFsm:
         return None
 
     def poll(self, state: dict | None, gdone_count: int, gdone_ok: bool,
-             now: float) -> dict | None:
+             now: float, *, done_sample_seq: int = -1) -> dict | None:
         """Tick -> a grasp_result to publish, or None."""
         p = self._pending
         if p is not None:
+            if self.measured_completion:
+                if gdone_count > p['gdone_base']:
+                    if not gdone_ok:
+                        return self.fail('hand action failed')
+                    if (state and state.get('measured') and not state.get('busy')
+                            and state.get('sample_seq', -1) > done_sample_seq):
+                        release = p['mode'] == 'release'
+                        ok = (not state.get('is_grasped') and abs(state['width'] - p['width_m']) <= .001
+                              if release else state.get('is_grasped') is True)
+                        if not ok:
+                            return self.fail('measured Hand state does not confirm action')
+                        self._pending = None
+                        if not release:
+                            self._held, self._held_seen_grasped = p, True
+                        return _result(p['request_id'], p['target_id'], True,
+                                       'released' if release else 'grasped')
+                if now >= p['deadline']:
+                    return self.fail('hand action completion/measurement timeout')
+                return None
             if gdone_count > p["gdone_base"]:
                 self._pending = None
                 if gdone_ok:
@@ -160,6 +182,8 @@ class HandGraspFsm:
                 )
             return None
         h = self._held
+        if h is not None and self.measured_completion and state is None:
+            return self.fail('held Hand feedback stale')
         if h is not None and state is not None:
             if state.get("is_grasped"):
                 self._held_seen_grasped = True

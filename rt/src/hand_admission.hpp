@@ -41,9 +41,27 @@ struct HandAdmission {
   HandAction pending;
   uint64_t epoch = 1;
   bool connected = false, client = false, acting = false;
+  bool dispatch_committed = false;
+  bool stopping = false, stop_fault = false;
+  uint64_t stop_serial = 0;
   void cancel() { pending = {}; ++epoch; }
+  void request_stop() {
+    cancel();
+    stopping = true;
+    ++stop_serial;
+  }
+  void finish_stop(uint64_t serial, bool was_acting, bool ok) {
+    // A stop sent before the SDK action starts can return before that action
+    // enters the device. Keep stopping while acting, then send one final stop
+    // after action exit. New actions are barred throughout this interval.
+    if (serial != stop_serial || was_acting || acting) return;
+    stopping = false;
+    stop_fault = !ok;
+  }
   const char* admit(HandAction action, bool fresh) {
     if (!connected || !client) return "offline";
+    if (stopping) return "stopping";
+    if (stop_fault) return "stop_failed";
     if (action.token != epoch) return "stale_epoch";
     if (acting || pending.kind) return "busy";
     if (!fresh) return "stale_state";
@@ -52,11 +70,17 @@ struct HandAdmission {
     return nullptr;
   }
   bool take(HandAction& action) {
-    if (!connected || !client || !pending.kind || acting) return false;
+    if (!connected || !client || !pending.kind || acting || stopping || stop_fault) return false;
     action = pending;
     pending = {};
     if (!current(action)) return false;
     acting = true;
+    dispatch_committed = false;
+    return true;
+  }
+  bool begin_action(const HandAction& action) {
+    if (!acting || !current(action)) return false;
+    dispatch_committed = true;
     return true;
   }
   bool current(const HandAction& action) const {

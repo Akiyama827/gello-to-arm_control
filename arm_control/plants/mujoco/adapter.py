@@ -94,6 +94,7 @@ def main() -> None:
     rate_hz = float(cfg.get("sim_update_rate_hz", cfg.update_rate_hz))
     period = 1.0 / rate_hz
     idle_timeout = float(cfg.get("idle_timeout_sec", 0.1))
+    debug_forces = os.environ.get('MUJOCO_DEBUG_FORCES', '0') == '1'
 
     # Injected by the GRAPH, resolved for BOTH scene paths. This used to sit
     # inside the `if scene_path:` branch below, so the composed-scene path
@@ -112,6 +113,7 @@ def main() -> None:
         backend, arm_slices, joint_names, n = build_workcell_backend(
             scene_path,
             control_period=period,
+            timestep=float(cfg.get("sim_timestep", 0.001)),
             launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
             enable_self_collision=bool(cfg.get("sim_self_collision", False)),
             loader=loader,
@@ -441,7 +443,11 @@ def main() -> None:
                     # downstream like a servo that cannot track: the arm sags
                     # off its target and whoever measures next reads the sag
                     # as tracking error. Once per gap, not per tick.
-                    if not idle_warned[arm]:
+                    info = arm_slices[arm]
+                    span = slice(info['start'], info['start'] + info['n'])
+                    active_effort = any(np.any(command[key][span]) for key in ('kp', 'kd', 'torque'))
+                    active_effort = active_effort or command.get('pose_hold') is not None or command.get('cartesian') is not None
+                    if not idle_warned[arm] and active_effort:
                         idle_warned[arm] = True
                         print(
                             f"[mujoco_interface] {arm}: no command for "
@@ -464,7 +470,7 @@ def main() -> None:
             # servo's inputs: no bridge, no decimation, no orchestrator. If
             # this reads ~0 while the orchestrator reports a residual, the
             # miss is in the state path, not the servo.
-            if arm_slices and now - _plant_err_at[0] > 2.0:
+            if debug_forces and arm_slices and now - _plant_err_at[0] > 2.0:
                 _plant_err_at[0] = now
                 for _arm, _info in arm_slices.items():
                     _s, _m = _info["start"], _info["n"]
