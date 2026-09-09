@@ -312,8 +312,49 @@ class ArmPlanner:
             seed = self._trajectory_refiner(
                 seed.positions, self._max_vel * speed_scale, self._max_acc * speed_scale
             )
+        # Certify only where a path was actually CLEARED. Without OMPL the
+        # waypoints are a bare start->goal line nothing collision-checked, so
+        # a complaint here would report the absence of planning rather than a
+        # curve that left its corridor. NOTE this is deliberately narrower
+        # than the `self._world is not None` guards above, which gate
+        # collision-aware IK CANDIDATE selection and must stay on with or
+        # without OMPL -- widening this condition to those cost a self-check
+        # ("colliding candidate was selected") while writing this.
+        if collision_check and self._world is not None and self._ompl is not None:
+            stage_started = perf_counter()
+            self._certify_curve(seed)
+            print(f'[planner:{self.arm_id}] stage=curve_collision '
+                  f'elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
         print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
         return seed
+
+    #: Collision resolution along the flown curve, radians of joint travel.
+    #: Half the retimer's own densification step (ds=0.02), so the certificate
+    #: is finer than the geometry OMPL already cleared rather than merely
+    #: matching it. Measured cost on a 2.8 s FR3 leg: ~110 extra checks.
+    CURVE_COLLISION_STEP_RAD = 0.01
+
+    def _certify_curve(self, trajectory) -> None:
+        """Collision-check what will actually be FLOWN, not its waypoints.
+
+        OMPL clears the path and the retimer samples it, but the executor
+        interpolates a cubic between those samples and the two are not the
+        same geometry: measured on retimed FR3 legs, the curve departs from
+        the chord by up to 4.5 mrad, ~2 mm at the flange. Against a
+        connector's lead-in that is not a rounding error, and it is the one
+        place where "the plan was validated" and "the arm did that" could
+        legitimately disagree.
+
+        Raises rather than returning a flag: a trajectory that cannot be
+        certified is not a slower trajectory, it is not a trajectory, and
+        plan_joint's callers already treat an exception as the hold path.
+        """
+        for q in trajectory.densify(self.CURVE_COLLISION_STEP_RAD):
+            if self._world.in_collision(q):
+                raise ValueError(
+                    f'[planner:{self.arm_id}] interpolated trajectory collides '
+                    'between waypoints — the flown cubic leaves the cleared '
+                    'path; re-plan or tighten the retimer step')
 
 
 def _self_check() -> None:
@@ -500,5 +541,63 @@ def _self_check() -> None:
     print(f"high_level self-check OK: {len(traj.positions)} samples, bow {bow:.2e} m")
 
 
+
+def _check_curve_certificate() -> None:
+    """The certificate must catch a collision the WAYPOINTS do not contain.
+
+    A cubic between two collision-free knots can bulge into an obstacle. The
+    planted world here is collision-free at every knot and blocked only in the
+    band the curve bulges through, so a waypoint-only check passes it and the
+    flown-curve check must not.
+    """
+    from arm_control.motion import JointTrajectory
+
+    # Both ends at rest at 0.0, velocities pushing out and back: the knots sit
+    # at 0.0 and the curve peaks near 0.087 (see types.py's own self-check).
+    traj = JointTrajectory(np.array([0.0, 1.0]), np.array([[0.0], [0.0]]),
+                           np.array([[0.6], [-0.6]]))
+
+    class _BandWorld:
+        """Blocked strictly between the knots' value and the curve's peak."""
+
+        lower, upper = np.array([-10.0]), np.array([10.0])
+
+        def __init__(self):
+            self.calls = 0
+
+        def in_collision(self, q):
+            self.calls += 1
+            return bool(0.05 < float(q[0]) < 0.09)
+
+    world = _BandWorld()
+    assert not world.in_collision(traj.positions[0]), "knots must be clear"
+    assert not world.in_collision(traj.positions[1]), "knots must be clear"
+
+    planner = ArmPlanner.__new__(ArmPlanner)
+    planner.arm_id = "curve-check"
+    planner._world = world
+    try:
+        planner._certify_curve(traj)
+    except ValueError as exc:
+        assert "between waypoints" in str(exc), exc
+    else:
+        raise AssertionError(
+            "certificate passed a curve that leaves the cleared path")
+    assert world.calls > 2, "certificate checked only the endpoints"
+
+    # A clear world must still pass, and must actually sample the interior.
+    class _Clear(_BandWorld):
+        def in_collision(self, q):
+            self.calls += 1
+            return False
+
+    clear = _Clear()
+    planner._world = clear
+    planner._certify_curve(traj)
+    assert clear.calls >= 60, f"too coarse to certify anything ({clear.calls})"
+    print("curve collision certificate: catches between-waypoint contact OK")
+
+
 if __name__ == "__main__":
+    _check_curve_certificate()
     _self_check()
