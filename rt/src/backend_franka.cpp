@@ -104,6 +104,11 @@ public:
   int n() const override { return FR3_N; }
   double tick_s() const override { return 0.001; }
   const double* tau_limit() const override { return FR3_TAU_LIMIT; }
+  // FR3 joint torque rate: 1000 N.m/s (frankarobotics.github.io/docs
+  // robot_specifications; libfranka's own rate limiter uses the same number),
+  // i.e. 1.0 N.m per 1 ms tick. Expressed as rate x tick so it stays right if
+  // the tick ever changes rather than being a second place to edit.
+  double tau_slew_max() const override { return 1000.0 * tick_s(); }
   bool supports_pose_hold() const override { return true; }
 
   bool read(PlantState& out) override {

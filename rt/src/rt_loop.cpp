@@ -97,6 +97,14 @@ void rt_loop(ServerCtx& ctx) {
     std::printf(" %.9g", tau_limits[j]);
   }
   std::printf("\n");
+  // A launch flag may only be MORE conservative than the plant's torque-rate
+  // limit -- main.cpp checks --slew > 0 and nothing else, so the ceiling has
+  // to land here, where the backend is known. Same shape as the tau_max
+  // clamp above: min(), announced, never a silent acceptance.
+  const double slew = std::min(ctx.cfg.slew, backend->tau_slew_max());
+  if (slew < ctx.cfg.slew)
+    std::printf("[rt] --slew %.4g N.m/tick exceeds the %s torque-rate limit; "
+                "clamped to %.4g\n", ctx.cfg.slew, backend->name(), slew);
   ctx.backend_n.store(n);
   ctx.online_mask.store(backend->online_mask());
   ctx.active_mask.store(backend->active_mask());
@@ -106,7 +114,7 @@ void rt_loop(ServerCtx& ctx) {
   ctx.backend_ready.store(true);
   elevate(ctx.cfg);
   std::printf("[rt] %s backend up: %d joints, tick %.1f ms, slew %.2f N.m/tick\n",
-              backend->name(), n, backend->tick_s() * 1e3, ctx.cfg.slew);
+              backend->name(), n, backend->tick_s() * 1e3, slew);
 
   const double hold_ns = ctx.cfg.hold_ms * 1e6;
   const double fault_ns = ctx.cfg.fault_ms * 1e6;
@@ -285,7 +293,7 @@ void rt_loop(ServerCtx& ctx) {
         }
       }
       servo_torque(n, ps.q, ps.dq, q_des, qd_des, tau_ff, kp, kd, ps.tau_ref,
-                   tau_limits, ctx.cfg.slew, tau_out);
+                   tau_limits, slew, tau_out);
       // Preserve the authority-selected fields for native MIT. In particular,
       // tau_out contains PD already; it must NOT become an extra MIT tau_ff.
       CommandPacket selected{};
@@ -295,7 +303,7 @@ void rt_loop(ServerCtx& ctx) {
       std::copy_n(tau_ff, n, selected.tau_ff);
       std::copy_n(kp, n, selected.kp);
       std::copy_n(kd, n, selected.kd);
-      if (!backend->write_command(selected, ctx.cfg.slew, tau_out)) {
+      if (!backend->write_command(selected, slew, tau_out)) {
         ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
         plant_ok = false;
         holding = false;

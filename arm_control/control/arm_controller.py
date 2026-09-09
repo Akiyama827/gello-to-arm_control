@@ -35,6 +35,7 @@ import time
 import numpy as np
 from arm_control.contracts.impedance import pose_hold_values, unpack_pose_hold_values
 
+from arm_control.control.trajectory_executor import gain_error
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
 from arm_control.joint_motor_map import (
     pack_arm_gripper_command,
@@ -199,6 +200,17 @@ class ArmController:
                 self.node.send_output("controller_event", pack_controller_event(
                     kind="leg_result", plan_id=plan["plan_id"], ok=False, reason=reason))
                 return
+        # Checked here as well as in set_gains: this path must REPORT a bad
+        # law back to the planner, not raise inside a Dora handler. Outside
+        # the execution_policy block on purpose — the graphs that configure no
+        # policy are exactly the ones with no other admission check.
+        reason = gain_error(plan["kp"], plan["kd"])
+        if reason:
+            print(f"[arm_controller] REFUSED plan {plan['plan_id']}: {reason}",
+                  flush=True)
+            self.node.send_output("controller_event", pack_controller_event(
+                kind="leg_result", plan_id=plan["plan_id"], ok=False, reason=reason))
+            return
         traj = JointTrajectory(
             times=plan["times"],
             positions=plan["positions"],
@@ -521,6 +533,14 @@ class ArmController:
         kp = gains.get("kp")
         kd = gains.get("kd")
         if kp is None and kd is None:
+            return
+        # BEFORE the cancel: a preset that will be refused must not also cost
+        # the operator the running leg.
+        reason = gain_error(self.executor.kp if kp is None else kp,
+                            self.executor.kd if kd is None else kd)
+        if reason:
+            print(f"[arm_controller] REFUSED gains: {reason}", flush=True)
+            self._report_mode()
             return
         if self._pose_hold is not None:
             self._cancel("leaving Soft")

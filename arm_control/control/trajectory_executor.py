@@ -9,12 +9,41 @@ from arm_control.dynamics import PinocchioDynamics
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
 
 
+def gain_error(kp, kd) -> str | None:
+    """Reject positive stiffness with zero damping; None when the law is sane.
+
+    An undamped spring on a 1 kHz plant is an oscillator with nothing to take
+    energy out of it. Real-add shipped kp=[600...] with kd=[0...] for one run
+    (the YAML has since been corrected) and the arm rang until the plant's
+    own velocity reflex fired -- a CONFIGURATION reaching the servo through an
+    admission path that checked only `>= 0`.
+
+    kp == 0 stays legal at any kd: that is Float and the pose-hold law, where
+    the joint spring is meant to be absent. The rule is only that a joint
+    which is being SPRUNG must also be damped.
+    """
+    kp = np.asarray(kp, dtype=float).ravel()
+    kd = np.asarray(kd, dtype=float).ravel()
+    if kp.shape != kd.shape:
+        return f"kp shape {kp.shape} != kd shape {kd.shape}"
+    if not (np.isfinite(kp).all() and np.isfinite(kd).all()):
+        return "gains must be finite"
+    if np.any(kp < 0) or np.any(kd < 0):
+        return "gains must be nonnegative"
+    undamped = np.flatnonzero((kp > 0) & (kd <= 0))
+    if undamped.size:
+        return (f"joint(s) {undamped.tolist()} have stiffness with zero damping "
+                f"(kp={kp[undamped].tolist()}, kd=0) — an undamped spring "
+                f"rings; set kd > 0 or kp = 0")
+    return None
+
+
 class JointTrajectoryExecutor:
     """Samples a JointTrajectory and produces joint servo commands.
 
-    The feedforward torque is RNEA(q_meas, qd_des, qdd_des) where qdd_des is
-    a finite-difference of qd_des. This adds gravity, Coriolis, and inertia
-    feedforward in one call. The downstream PD law (which lives in the
+    The feedforward torque is RNEA(q_meas, qd_des, qdd_des), all three taken
+    off the SAME trajectory polynomial. This adds gravity, Coriolis, and
+    inertia feedforward in one call. The downstream PD law (which lives in the
     simulator / motor firmware) applies kp*(q_des - q) + kd*(qd_des - qd).
     """
 
@@ -135,6 +164,17 @@ class JointTrajectoryExecutor:
         )
 
     def set_gains(self, kp: np.ndarray | None = None, kd: np.ndarray | None = None) -> None:
+        """Install a control law. Refuses stiffness without damping.
+
+        THE chokepoint: plans (ArmController.on_plan), operator presets
+        (_set_gains) and config all arrive here, so the guard lives here once
+        rather than in each caller. See gain_error for why the rule is what
+        it is.
+        """
+        reason = gain_error(self._kp if kp is None else kp,
+                            self._kd if kd is None else kd)
+        if reason:
+            raise ValueError(reason)
         if kp is not None:
             kp = np.asarray(kp, dtype=float)
             if kp.shape != self._kp.shape:
@@ -162,14 +202,11 @@ class JointTrajectoryExecutor:
             raise RuntimeError("step() called before load_trajectory()")
         tau_local = float(t_now) - self._t_start
         pt = self._traj.sample_at(tau_local)
-        # Finite-difference qdd. Avoid sampling beyond duration (where vel = 0
-        # by construction) - clamp to within [0, duration_sec].
-        dt = 1e-3
-        t1 = min(tau_local + dt, self._traj.duration_sec)
-        pt_next = self._traj.sample_at(t1)
-        actual_dt = max(t1 - tau_local, 1e-9)
-        qdd = (pt_next.velocity - pt.velocity) / actual_dt
-        tau_ff = self._dyn.rnea(state.position, pt.velocity, qdd)
+        # qdd comes off the SAME polynomial as q and qd (JointTrajectory is a
+        # cubic Hermite). It used to be a 1 ms forward difference of qd, which
+        # both lagged half a step and straddled knots -- and differenced a qd
+        # that was not the derivative of the q being commanded anyway.
+        tau_ff = self._dyn.rnea(state.position, pt.velocity, pt.acceleration)
         tau_ff = tau_ff + self._payload_tau(np.asarray(state.position, dtype=float))
         if self._gravity_comp:
             tau_ff = tau_ff - self._dyn.gravity(state.position)

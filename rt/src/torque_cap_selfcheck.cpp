@@ -13,6 +13,11 @@ namespace {
 ServerCtx* ctx;
 int tick, writes, stops;
 constexpr double native_limits[] = {28, 10};
+// Backend-declared torque-RATE ceiling, and whether this run is the case that
+// exercises it. Infinity in every pre-existing scenario, so those keep
+// saturating at the magnitude cap exactly as before.
+double slew_max = std::numeric_limits<double>::infinity();
+bool slew_case = false;
 
 class ScriptedBackend final : public Backend {
  public:
@@ -20,6 +25,7 @@ class ScriptedBackend final : public Backend {
   int n() const override { return 2; }
   double tick_s() const override { return .001; }
   const double* tau_limit() const override { return native_limits; }
+  double tau_slew_max() const override { return slew_max; }
   const std::string& fault_text() const override { return error_; }
   void stop() override { ++stops; }
 
@@ -84,6 +90,16 @@ class ScriptedBackend final : public Backend {
           ? std::min(ctx->cfg.tau_max, native_limits[j]) : native_limits[j];
       const double sign = (j == 0 ? 1 : -1) * (tick == 2 || tick == 4 ? -1 : 1);
       assert(std::isfinite(tau[j]) && std::abs(tau[j]) <= cap);
+      // Tick 4 deliberately scripts tau_ref far OUTSIDE the cap, so the
+      // ramp there starts from +-10000 and the final magnitude clamp is what
+      // bounds it -- that tick still checks saturation below. Every other
+      // tick has tau_ref == 0, so the rate ceiling is the only thing that can
+      // bound the output, and it must, however reckless --slew was.
+      if (slew_case && tick != 4) {
+        assert(std::abs(tau[j]) <= slew_max + 1e-9);
+        assert(std::abs(tau[j]) < cap);  // rate-bound, NOT magnitude-bound
+        continue;
+      }
       assert(tau[j] == sign * cap);  // each phase actually reaches saturation
     }
     return true;
@@ -120,5 +136,23 @@ int main() {
     rt_loop(context);
     assert(!context.failed && writes == 7 && stops == 2 && tick == 10);
   }
-  std::puts("PASS RT torque caps: tracking, initial/stale/fault holds, echo, disarm");
+  // A --slew larger than the backend allows must be CLAMPED, not honoured:
+  // main.cpp checks only `> 0`, so this is the guard that a launch flag
+  // cannot defeat a vendor torque-rate limit.
+  {
+    ServerCtx context;
+    ctx = &context;
+    tick = writes = stops = 0;
+    slew_max = 0.5;
+    slew_case = true;
+    context.cfg.tau_max = 0;      // magnitude cap out of the way
+    context.cfg.slew = 1000;      // reckless flag
+    context.cfg.rt_priority = 0;
+    rt_loop(context);
+    assert(!context.failed && writes == 7 && stops == 2 && tick == 10);
+    slew_max = std::numeric_limits<double>::infinity();
+    slew_case = false;
+  }
+  std::puts("PASS RT torque caps: tracking, initial/stale/fault holds, echo, "
+            "disarm, backend slew ceiling");
 }

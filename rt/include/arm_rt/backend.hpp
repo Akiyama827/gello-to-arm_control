@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -46,6 +47,18 @@ public:
   virtual int n() const = 0;
   virtual double tick_s() const = 0;                 // nominal servo period
   virtual const double* tau_limit() const = 0;       // per-joint, length n
+
+  // Vendor ceiling on per-tick torque CHANGE, N.m per tick. main.cpp only
+  // checks --slew > 0, so a launch flag could otherwise ask for a torque step
+  // the robot refuses (or worse, accepts). The RT loop clamps the configured
+  // slew against this exactly as it clamps --tau-max against tau_limit():
+  // a flag may only ever be MORE conservative than the plant's own limit.
+  // Unconstrained by default; a backend with a published torque-rate limit
+  // overrides.
+  virtual double tau_slew_max() const {
+    return std::numeric_limits<double>::infinity();
+  }
+
   virtual bool supports_pose_hold() const { return false; }
 
   // Fixed slots are configured once. A backend may report a subset online

@@ -21,6 +21,18 @@ def _load_cfg() -> dict:
     return load_robot_config_dict()
 
 
+#: Per-motor columns, in order. ``qdes`` is what the PC SENT (off
+#: motor_command); ``pos_cmd``/``vel_cmd``/``tor_cmd`` are what the plant
+#: actually SERVOED on the tick it reported. Keeping both is the point: the
+#: difference between qdes and pos_cmd is the transport (a 100 Hz command
+#: zero-order-held for ten 1 kHz ticks), and tor_cmd against torque is where
+#: the clamp and the slew limiter show up. A post-mortem that has only
+#: measured position cannot separate "the reference was wrong" from "the
+#: tracking was wrong" -- which is exactly where the 2026-09-09 review ran out
+#: of evidence.
+_COLUMNS = ("pos", "vel", "torque", "qdes", "pos_cmd", "vel_cmd", "tor_cmd")
+
+
 def _row(
     elapsed_s: float, motor_names: list[str], state: dict, q_des: np.ndarray
 ) -> dict[str, float]:
@@ -30,6 +42,9 @@ def _row(
         row[f"{name}_vel"] = float(state["velocity"][i])
         row[f"{name}_torque"] = float(state["torque"][i])
         row[f"{name}_qdes"] = float(q_des[i])  # nan until the first command
+        row[f"{name}_pos_cmd"] = float(state["position_cmd"][i])
+        row[f"{name}_vel_cmd"] = float(state["velocity_cmd"][i])
+        row[f"{name}_tor_cmd"] = float(state["torque_cmd"][i])
     return row
 
 
@@ -48,9 +63,7 @@ def main() -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = ["elapsed_s"] + [
-        f"{name}_{suffix}"
-        for name in motor_names
-        for suffix in ("pos", "vel", "torque", "qdes")
+        f"{name}_{suffix}" for name in motor_names for suffix in _COLUMNS
     ]
 
     node = Node()
