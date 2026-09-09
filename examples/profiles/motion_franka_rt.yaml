@@ -43,14 +43,12 @@ controller:
     fr3_joint5: 20.0
     fr3_joint6: 20.0
     fr3_joint7: 10.0
-  torque_limits:
-    fr3_joint1: 87.0
-    fr3_joint2: 87.0
-    fr3_joint3: 87.0
-    fr3_joint4: 87.0
-    fr3_joint5: 12.0
-    fr3_joint6: 12.0
-    fr3_joint7: 12.0
+  # torque_limits deliberately ABSENT: these were the URDF's `effort`
+  # restated (87/12), and the FR3's torque limit is a FACTORY fact, not
+  # a mode choice. resolve_gains falls back to `arm.max_tau`, which the
+  # robot config states once; add_contracts asserts that value against
+  # the description. A profile states torque limits only to run an arm
+  # BELOW its rating -- an operating cap, which this was not.
 
 # OMPL RRT-Connect over joint space + MuJoCo self-collision oracle. Slower
 # caps than sim: first real tracking sessions.

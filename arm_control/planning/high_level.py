@@ -301,32 +301,64 @@ class ArmPlanner:
             waypoints = np.vstack([q_start, q_goal])
         # Blended retiming: continuous velocity along the whole path — the
         # per-segment trapezoids stopped at EVERY OMPL waypoint and crawled.
-        stage_started = perf_counter()
-        seed = time_parameterize_blended(
-            waypoints, self._max_vel * speed_scale, self._max_acc * speed_scale
-        )
-        print(f'[planner:{self.arm_id}] stage=seed_retiming elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
-        if self._trajectory_refiner is not None:
-            # Keep the proven seed geometry/sampling; replace only its timing
-            # after refinement. Exceptions propagate to the planner's hold path.
-            seed = self._trajectory_refiner(
-                seed.positions, self._max_vel * speed_scale, self._max_acc * speed_scale
-            )
+        #
         # Certify only where a path was actually CLEARED. Without OMPL the
         # waypoints are a bare start->goal line nothing collision-checked, so
-        # a complaint here would report the absence of planning rather than a
-        # curve that left its corridor. NOTE this is deliberately narrower
-        # than the `self._world is not None` guards above, which gate
-        # collision-aware IK CANDIDATE selection and must stay on with or
-        # without OMPL -- widening this condition to those cost a self-check
-        # ("colliding candidate was selected") while writing this.
-        if collision_check and self._world is not None and self._ompl is not None:
-            stage_started = perf_counter()
-            self._certify_curve(seed)
-            print(f'[planner:{self.arm_id}] stage=curve_collision '
-                  f'elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
+        # a complaint would report the absence of planning rather than a curve
+        # that left its corridor. NOTE this is deliberately narrower than the
+        # `self._world is not None` guards above, which gate collision-aware
+        # IK CANDIDATE selection and must stay on with or without OMPL --
+        # widening this condition to those cost a self-check ("colliding
+        # candidate was selected") while writing it.
+        certify = collision_check and self._world is not None and self._ompl is not None
+        stage_started = perf_counter()
+        failure = None
+        for ds in self.RETIMER_STEPS_RAD:
+            seed = time_parameterize_blended(
+                waypoints, self._max_vel * speed_scale,
+                self._max_acc * speed_scale, ds=ds,
+            )
+            if self._trajectory_refiner is not None:
+                # Keep the proven seed geometry/sampling; replace only its
+                # timing after refinement. Exceptions propagate to the
+                # planner's hold path. Re-run per attempt because refinement
+                # rewrites the VELOCITIES, and the flown cubic is a function
+                # of those as much as of the positions.
+                seed = self._trajectory_refiner(
+                    seed.positions, self._max_vel * speed_scale,
+                    self._max_acc * speed_scale,
+                )
+            if not certify:
+                break
+            try:
+                self._certify_curve(seed)
+            except ValueError as exc:
+                # The cubic left the cleared corridor. That is a property of
+                # how coarsely the path was SAMPLED, not of the path itself:
+                # the curve's departure from the chord falls roughly linearly
+                # with ds (measured 4.3 -> 2.2 -> 1.1 mrad at 0.02/0.01/0.005),
+                # so tighten and re-certify rather than abandon a route OMPL
+                # already proved clear. Only a path still in contact at the
+                # finest step is genuinely unflyable. Found by sim-add's
+                # move_to_pre_dock, the tightest leg in the sequence.
+                failure = exc
+                continue
+            failure = None
+            break
+        if failure is not None:
+            raise failure
+        print(f'[planner:{self.arm_id}] stage=seed_retiming '
+              f'elapsed_s={perf_counter() - stage_started:.6f} '
+              f'samples={len(seed.times)}', flush=True)
         print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
         return seed
+
+    #: Retimer densification steps, tried in order until the flown curve
+    #: certifies. The first is time_parameterize_blended's own default, so a
+    #: trajectory that certifies immediately is retimed exactly as before and
+    #: pays nothing; the finer steps run only for a leg whose cubic clips the
+    #: corridor, which is a near-obstacle condition.
+    RETIMER_STEPS_RAD = (0.02, 0.01, 0.005, 0.0025)
 
     #: Collision resolution along the flown curve, radians of joint travel.
     #: Half the retimer's own densification step (ds=0.02), so the certificate
