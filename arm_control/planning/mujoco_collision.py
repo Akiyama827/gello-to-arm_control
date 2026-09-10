@@ -348,6 +348,7 @@ class MuJoCoCollisionWorld:
         self_collision_padding_m: float = -0.002,
         held_positions: dict[str, float] | None = None,
         ground_z: float | None = 0.0,
+        body_sites: dict[str, str] | None = None,
     ) -> "MuJoCoCollisionWorld":
         """Build collision truth from the same generic composed workcell."""
         if self_collision_padding_m > 0.0:
@@ -363,6 +364,7 @@ class MuJoCoCollisionWorld:
             scene,
             state,
             ground_z=ground_z,
+            body_sites=body_sites,
         ).compile()
         self.data = mujoco.MjData(self.model)
         for item in scene.actors:
@@ -405,6 +407,11 @@ class MuJoCoCollisionWorld:
             ],
             dtype=bool,
         )
+        # Attached payload bodies keep their object names. Membership follows
+        # the kinematic tree, so their contacts also constrain the planned arm.
+        for body in range(1, self.model.nbody):
+            self._planned_body[body] |= self._planned_body[self.model.body_parentid[body]]
+        self._allowed_body_pairs = set()
         self._scene_gids = np.asarray(
             [
                 i
@@ -454,6 +461,8 @@ class MuJoCoCollisionWorld:
             contact = self.data.contact[i]
             body1 = self.model.geom_bodyid[contact.geom1]
             body2 = self.model.geom_bodyid[contact.geom2]
+            if tuple(sorted((int(body1), int(body2)))) in getattr(self, '_allowed_body_pairs', ()):
+                continue
             if hasattr(self, "_planned_body") and not (
                 self._planned_body[body1] or self._planned_body[body2]
             ):
@@ -463,6 +472,13 @@ class MuJoCoCollisionWorld:
             if contact.dist <= self._pad:
                 return True  # self: deeper than the tolerated hull overlap
         return False
+
+    def set_allowed_contacts(self, pairs) -> None:
+        """Replace exact body-pair contact permissions; geometry stays enabled."""
+        self._allowed_body_pairs = {
+            tuple(sorted((self.model.body(a).id, self.model.body(b).id)))
+            for a, b in pairs
+        }
 
     def set_cloud_obstacles(self, points_base: np.ndarray) -> None:
         """Voxelize ``points_base`` (Nx3, arm-base frame — e.g. a perception

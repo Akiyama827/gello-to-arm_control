@@ -81,6 +81,7 @@ class RerunSceneMirror:
         self._data = data
         self._prefix = str(prefix).rstrip("/")
         self._geoms: list[tuple[int, str]] = []
+        self._sites: list[tuple[int, str]] = []
         # Geom IDs/names can change on recompile. Clear only our subtree, and
         # log assets temporally: timeless assets would survive this clear and
         # leave the old model floating beside its replacement.
@@ -98,6 +99,18 @@ class RerunSceneMirror:
             entity = f"{self._prefix}/{body}/{name}"
             if self._log_asset(i, entity):
                 self._geoms.append((i, entity))
+        for i in range(model.nsite):
+            name = model.site(i).name or ''
+            if not name.endswith(('active_connector', 'passive_connector')):
+                continue
+            entity = f'{self._prefix}/connectors/{name}'
+            rr.log(entity, rr.Points3D([[0, 0, 0]], radii=.004,
+                                      colors=[[255, 220, 80]], labels=[name], show_labels=True))
+            rr.log(entity + '/axes', rr.Arrows3D(
+                origins=np.zeros((3, 3)), vectors=np.eye(3) * .025,
+                colors=[[255, 80, 80], [80, 255, 80], [80, 120, 255]],
+            ))
+            self._sites.append((i, entity))
 
     def _log_asset(self, i: int, entity: str) -> bool:
         model = self._model
@@ -143,6 +156,11 @@ class RerunSceneMirror:
                     mat3x3=self._data.geom_xmat[i].reshape(3, 3),
                 ),
             )
+        for i, entity in self._sites:
+            rr.log(entity, rr.Transform3D(
+                translation=self._data.site_xpos[i],
+                mat3x3=self._data.site_xmat[i].reshape(3, 3),
+            ))
 
 
 def start_mirror_thread(

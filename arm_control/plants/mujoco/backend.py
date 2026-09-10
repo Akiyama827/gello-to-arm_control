@@ -334,6 +334,7 @@ def compose_workcell_scene(
     *,
     timestep: float = 0.001,
     ground_z: float | None = 0.0,
+    body_sites: dict[str, str] | None = None,
 ) -> mujoco.MjSpec:
     """Compose arbitrary actors, separable objects, and static obstacles.
 
@@ -394,6 +395,8 @@ def compose_workcell_scene(
             child, prefix=f"{actor.name}__",
             frame=spec.worldbody.add_frame(pos=list(actor.pos), quat=list(_rpy_to_quat(*actor.rpy))),
         )
+    for body, site in (body_sites or {}).items():
+        spec.body(body).add_site(name=site)
     for obj in scene.objects:
         child = _load_model_spec(obj.path)
         attachment = state.attachments.get(obj.name)

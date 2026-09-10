@@ -153,7 +153,8 @@ def project_world(world):
             parent = wa != 0 and wb != 0 and (model.body_weldid[model.body_parentid[wa]] == wb or model.body_weldid[model.body_parentid[wb]] == wa)
             masks = (model.geom_contype[a] & model.geom_conaffinity[b]) or (model.geom_contype[b] & model.geom_conaffinity[a])
             signature = (min(ba, bb) << 16) + max(ba, bb)
-            if wa == wb or parent or not masks or signature in excluded or not (planned_body[ba] or planned_body[bb]):
+            allowed_contact = tuple(sorted((ba, bb))) in getattr(world, '_allowed_body_pairs', ())
+            if wa == wb or parent or not masks or signature in excluded or allowed_contact or not (planned_body[ba] or planned_body[bb]):
                 graph.addAllowedCollision(f'geom_{a}', f'geom_{b}', 'canonical MuJoCo filter')
     srdf = SRDFModel()
     srdf.initString(graph, '<robot name="planning_snapshot"><contact_managers_plugin_config filename="package://tesseract/support/urdf/contact_manager_plugins.yaml"/></robot>', GeneralResourceLocator())
