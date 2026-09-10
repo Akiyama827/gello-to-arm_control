@@ -191,6 +191,9 @@ const sendHand = async (mode) => {
     if (!$("hand-force").reportValidity() || !$("hand-width").reportValidity()) return;
     payload.force_n = Number($("hand-force").value);
     payload.width_m = Number($("hand-width").value) / 1000;
+    // What the hand is about to hold. Nothing else in a manual graph knows,
+    // so an unset selector means "declare nothing" -- never a stale carry-over.
+    payload.payload_id = $("hand-payload").value;
   }
   handPosting = true;
   handError = "";
@@ -324,6 +327,19 @@ const build = async (state) => {
     $("hand-force").value = hand.defaults.force_n;
     $("hand-width").max = hand.width_max_mm;
     $("hand-width").value = hand.defaults.width_m * 1000;
+    const sel = $("hand-payload");
+    const want = (hand.payloads || []).map((p) => `${p.id} (${p.mass_kg.toFixed(3)} kg)`).join("|");
+    if (sel.dataset.built !== want) {
+      sel.dataset.built = want;
+      sel.innerHTML = '<option value="">none</option>';
+      for (const p of hand.payloads || []) {
+        const o = document.createElement("option");
+        o.value = p.id;
+        o.textContent = `${p.id} (${p.mass_kg.toFixed(3)} kg)`;
+        sel.appendChild(o);
+      }
+    }
+    sel.hidden = !(hand.payloads || []).length;
     $("hand-settings").textContent =
       `Commanded force · total jaw width · ${hand.defaults.speed_mps * 1000} mm/s. ` +
       `Acceptance: −${hand.defaults.epsilon_inner_m * 1000} / +${hand.defaults.epsilon_outer_m * 1000} mm. ` +

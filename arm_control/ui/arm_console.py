@@ -151,6 +151,7 @@ class ControlPanel:
         jog_joint_speed_rad_s: float = 0.15,
         gripper_cfg: dict | None = None,
         gain_presets: dict | None = None,
+        payload_table: dict | None = None,
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
         # arm config (gripper_range_m) or its joint_mimics entry — never a
@@ -188,6 +189,16 @@ class ControlPanel:
         self._grip_dirty = False
         self._hand_cfg = dict(gripper_cfg or {})
         self._hand_defaults = resolve_grasp_parameters(self._hand_cfg, {}) if self._hand_cfg else None
+        # Manual teleop has no planner to declare what the hand is carrying, and
+        # the FR3's own model cannot know either: Desk's end effector and the RT
+        # box's --ee-mass are both FIXED startup values. So the operator names
+        # the module, and its mass rides the controller's tau_ff exactly as the
+        # planner's does. Keys are module ids from the config's `module_grasps`.
+        self._payload_table = {
+            str(k): v for k, v in (payload_table or {}).items() if isinstance(v, dict)
+        }
+        self._payload_id = ""
+        self._payload_pending: dict | None = None
         self._hand_state: dict = {}
         self._hand_seq = None
         self._hand_sample_at = float("-inf")
@@ -638,14 +649,23 @@ class ControlPanel:
             "force_min_n": MIN_FORCE_N, "force_max_n": MAX_FORCE_N,
             "width_max_mm": self._grip_hi * 2000,
             "measured_width_mm": float(width) * 1000 if fresh and self._hand_state.get("measured") and width is not None else None,
+            "payloads": [
+                {"id": k, "mass_kg": float(v.get("mass_kg", 0.0))}
+                for k, v in sorted(self._payload_table.items())
+            ],
+            "payload_id": self._payload_id,
         }
 
     def request_hand(self, payload: dict) -> None:
         with self._lock:
-            if not isinstance(payload, dict) or set(payload) - {"mode", "width_m", "force_n"}:
-                raise ValueError("Hand action accepts mode, width_m and force_n only")
+            if not isinstance(payload, dict) or set(payload) - {"mode", "width_m", "force_n", "payload_id"}:
+                raise ValueError("Hand action accepts mode, width_m, force_n and payload_id only")
             if payload.get("mode") == "release" and set(payload) != {"mode"}:
                 raise ValueError("Open uses the configured open width and speed")
+            payload_id = str(payload.get("payload_id", "") or "")
+            if payload_id and payload_id not in self._payload_table:
+                raise ValueError(f"unknown payload {payload_id!r}")
+            payload = {k: v for k, v in payload.items() if k != "payload_id"}
             reason = self._hand_refusal()
             if reason:
                 raise ValueError(reason)
@@ -660,7 +680,14 @@ class ControlPanel:
             self._hand_waiting = True
             self._hand_sent_at = time.monotonic()
             self._hand_status = "Grasp pending" if payload.get("mode", "close") == "close" else "Open pending"
+            self._payload_id = "" if payload.get("mode", "close") == "release" else payload_id
             self._grip_dirty = False
+
+    def pop_payload(self) -> dict | None:
+        """The payload declaration owed to the controller, at most once each."""
+        with self._lock:
+            pending, self._payload_pending = self._payload_pending, None
+            return pending
 
     def pop_hand(self) -> dict | None:
         with self._lock:
@@ -688,6 +715,22 @@ class ControlPanel:
             else:
                 self._hand_status = "Lost" if reason == "object lost" else "Missed" if reason == "no object" else f"Unavailable: {reason}"
             self._log.append(f"Hand: {self._hand_status}")
+            # A held module's weight is feedforward the controller cannot guess.
+            # Declare on a confirmed hold; retract on anything else -- an open,
+            # a miss, a drop -- because feeding forward a mass that is NOT in
+            # the hand pushes the arm up just as hard as an undeclared one sags.
+            held = bool(result.get("ok")) and reason != "released"
+            entry = self._payload_table.get(self._payload_id) if held else None
+            if not held:
+                self._payload_id = ""
+            self._payload_pending = {
+                "mass_kg": float(entry.get("mass_kg", 0.0)) if entry else 0.0,
+                "com_ee": list(entry.get("com_offset_ee") or ()) or None if entry else None,
+            }
+            if entry:
+                self._log.append(
+                    f"Payload: {self._payload_id} {self._payload_pending['mass_kg']:.4f} kg"
+                )
 
     def set_measured(self, q) -> None:
         with self._lock:
@@ -960,6 +1003,7 @@ def _run(
         jog_joint_speed_rad_s=jog_joint_speed,
         gripper_cfg=dict((cfg.get("franka") or {}).get("gripper") or {}),
         gain_presets={name: gains for name, gains in gain_presets.items() if name not in pose_hold_presets},
+        payload_table=dict(cfg.get("module_grasps") or {}),
     )
     cleanup.callback(panel.close)
     # The legend, stated once, the same on the page and in Rerun. It used to
@@ -1199,6 +1243,9 @@ def _run(
         hand_request = panel.pop_hand()
         if hand_request is not None:
             node.send_output("grasp_request", pack_grasp_request(**hand_request))
+        declaration = panel.pop_payload()
+        if declaration is not None:
+            node.send_output("control", pack_control_update(payload=declaration))
 
         # The collision world is shared with the planning worker. Update its
         # held joints only while that worker is absent; jogging below follows
@@ -1505,6 +1552,62 @@ def _check_routes() -> None:
     print(f"arm_console: {len(called)} page routes all handled by ControlPanel")
 
 
+def _check_payload_declaration() -> None:
+    """A held module's mass reaches the controller; a miss/open retracts it.
+
+    Manual teleop runs no planner, so this panel is the ONLY thing that can
+    tell the controller what the hand is carrying -- the FR3's own model
+    cannot: Desk's end effector and the RT box's --ee-mass are both fixed
+    startup values. Feeding forward a mass that is not in the hand pushes the
+    arm up as hard as an undeclared one sags, so every non-hold retracts.
+    """
+    import re
+
+    panel = object.__new__(ControlPanel)
+    panel._lock = threading.Lock()
+    panel._payload_table = {"row_module": {"mass_kg": 0.5, "com_offset_ee": [0., 0., .06]}}
+    panel._payload_id = ""
+    panel._payload_pending = None
+    panel._log = []
+
+    def result(ok, reason="", rid="r1"):
+        panel._hand_request_id = rid
+        panel._hand_status = ""
+        panel.set_hand_result({"request_id": rid, "ok": ok, "reason": reason})
+        return panel.pop_payload()
+
+    panel._payload_id = "row_module"
+    held = result(True)
+    assert held == {"mass_kg": 0.5, "com_ee": [0., 0., .06]}, held
+    assert panel.pop_payload() is None, "a declaration must be sent once, not resent"
+
+    for ok, reason in ((True, "released"), (False, "no object"), (False, "object lost")):
+        panel._payload_id = "row_module"
+        assert result(ok, reason) == {"mass_kg": 0.0, "com_ee": None}, (ok, reason)
+        assert not panel._payload_id
+
+    # An unnamed payload declares zero rather than carrying the last one over.
+    panel._payload_id = ""
+    assert result(True) == {"mass_kg": 0.0, "com_ee": None}
+
+    for bad in ({"mode": "close", "payload_id": "nope"},
+                {"mode": "release", "payload_id": "row_module"}):
+        try:
+            panel.request_hand(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+
+    # The page must actually offer the selector the panel reads back.
+    from arm_control.console_assets import CONSOLE_DIR
+    html = (CONSOLE_DIR / "console.html").read_text()
+    js = (CONSOLE_DIR / "console.js").read_text()
+    assert 'id="hand-payload"' in html, "no payload selector on the page"
+    assert re.search(r'payload\.payload_id\s*=\s*\$\("hand-payload"\)', js), \
+        "the grasp POST does not carry the selected payload"
+    print("arm_console: payload declaration reaches the controller on hold only")
+
+
 def _check_graphs() -> None:
     """Every arm_controller in every graph must be able to stream.
 
@@ -1563,6 +1666,7 @@ def cli() -> None:
     # dora runs a node as `python <node>.py`, so __main__ MUST be the node.
     if "--self-check" in sys.argv:
         _check_routes()
+        _check_payload_declaration()
         _check_graphs()
     else:
         main()
