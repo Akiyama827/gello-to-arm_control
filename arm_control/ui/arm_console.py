@@ -1083,7 +1083,12 @@ def _run(
                     elif result['ok']:
                         control_mode = str(result['reason'])
                         panel.set_control_mode(control_mode)
-                if result['kind'] != 'mode' or not result['ok']:
+                if result['kind'] == 'leg_progress':
+                    progress = result.get('completion') or {}
+                    panel.log(f"Settling: {progress.get('remaining_s', 0):.1f}s left; "
+                              f"joint error {progress.get('error_rad')} rad, "
+                              f"speed {progress.get('speed_rad_s')} rad/s")
+                elif result['kind'] != 'mode' or not result['ok']:
                     panel.log(f"Controller {result['kind']}: {result.get('reason') or ''}")
             elif event["type"] == "INPUT" and event["id"] == "motor_health":
                 health = unpack_json_message(event["value"])

@@ -67,9 +67,19 @@ class ArmController:
         jog_timeout_s: float = 0.2,
         clock=None,
         execution_policy=None,
+        settle_timeout_s: float = 5.0,
+        settle_dwell_s: float = 0.2,
     ) -> None:
         self.node = node
         self.executor = executor
+        self._settle_timeout = float(settle_timeout_s)
+        self._settle_dwell = float(settle_dwell_s)
+        if not (math.isfinite(self._settle_timeout) and math.isfinite(self._settle_dwell)
+                and 0 <= self._settle_dwell < self._settle_timeout):
+            raise ValueError('settling requires 0 <= dwell < finite positive timeout')
+        self._settled_since = self._settle_report_at = None
+        self._completion_sample_at = None
+        self._leg_end = 0.
         # Soft's stale-stream fallback must remain a real joint hold, even
         # when the preceding operator mode was Float (zero joint stiffness).
         self._track_kp = executor.kp.copy()
@@ -412,19 +422,20 @@ class ArmController:
             # Fall through: the planner needs a hold streaming from right now,
             # because it is about to spend seconds planning the first leg.
         if (self.execution_policy is not None and self._running
-                and self.executor.has_trajectory and self.executor.done(self.exec_time, arm)):
+                and self.executor.has_trajectory and self._check_completion(arm)):
             # Legacy ordering: completed means measured idle hold NOW, not
             # one more trajectory sample before dropping into hold.
-            self._finish_leg(ok=True, reason="")
-            self.last_command = self._hold_anchor = None
+            # _check_completion reports the result and anchors a timeout hold.
+            if not self.frozen:
+                self.last_command = self._hold_anchor = None
             self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
         if self._running and self.executor.has_trajectory:
             command = self.executor.step(self.exec_time, arm)
             self._hold_anchor = None  # motion streams: next hold re-anchors
             if self._send(command, self._cartesian_for_time(self.exec_time)) is False:
                 return
-            if self.execution_policy is None and self._leg_done(arm):
-                self._finish_leg(ok=True, reason="")
+            if self.execution_policy is None:
+                self._check_completion(arm)
             return
         jog = self._jog_command()
         if jog is not None:
@@ -485,7 +496,10 @@ class ArmController:
                 self._finish_leg(ok=False, reason=reason)
                 self._pending_traj = None
                 return
-        self.executor.load_trajectory(self._pending_traj, t_start=self.exec_time)
+        start = self.exec_time
+        self.executor.load_trajectory(self._pending_traj, t_start=start)
+        self._leg_end = start + self._pending_traj.duration_sec
+        self._settled_since = self._settle_report_at = self._completion_sample_at = None
         self._running = True
         print(
             f"[arm_controller] executing {self._plan['phase']} "
@@ -620,7 +634,65 @@ class ArmController:
         residual = float(np.max(np.abs(np.asarray(state.position) - goal)))
         return residual <= spec["residual_max"]
 
-    def _finish_leg(self, *, ok: bool, reason: str) -> None:
+    def _check_completion(self, state: JointState) -> bool:
+        """Bounded settling after reference end; never accept a stopped miss."""
+        now = self.exec_time
+        if now < self._leg_end:
+            return False
+        fresh = self._completion_sample_at != self._last_state_at
+        if fresh:
+            self._completion_sample_at = self._last_state_at
+            if self._leg_done(state):
+                if self._settled_since is None:
+                    self._settled_since = now
+            else:
+                self._settled_since = None
+        elapsed = max(0., now - self._leg_end)
+        if (fresh and self._settled_since is not None
+                and now - self._settled_since >= self._settle_dwell
+                and elapsed <= self._settle_timeout):
+            self._finish_leg(ok=True, reason='')
+            return True
+        spec = self._plan.get('completion')
+        pos_tol, vel_tol = self.executor.completion_tolerances
+        goal = self._plan['positions'][-1]
+        if spec is not None:
+            vel_tol = spec['vel_tol']
+            goal, pos_tol = spec.get('goal_q'), spec.get('residual_max')
+        error = None if goal is None else np.abs(state.position - goal)
+        joint = None if error is None else int(np.argmax(error)) + 1
+        residual = None if error is None else float(np.max(error))
+        speed = float(np.max(np.abs(state.velocity)))
+        progress = dict(state='settling', elapsed_s=elapsed,
+                        remaining_s=max(0., self._settle_timeout - elapsed),
+                        joint=joint, error_rad=residual, position_tolerance_rad=pos_tol,
+                        speed_rad_s=speed, velocity_tolerance_rad_s=vel_tol)
+        if elapsed >= self._settle_timeout:
+            progress['state'] = 'timed_out'
+            detail = ('' if residual is None else
+                      f'joint {joint} error {residual:.5f} rad (limit {pos_tol:.5f}); ')
+            reason = (f'Completion timeout after {self._settle_timeout:g}s settling: '
+                      f'{detail}speed {speed:.5f} rad/s (limit {vel_tol:.5f}). '
+                      'Holding measured pose; completion criteria not met.')
+            # A failed settle must not turn into another motion or release an
+            # attached object. Freeze at the measured pose with zero velocity.
+            self.last_command = self._hold_anchor = self._static_hold()
+            self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
+            self._pending_traj = None
+            self.frozen = True
+            self._finish_leg(ok=False, reason=reason, completion=progress)
+            print(f'[arm_controller] {reason}', flush=True)
+            return True
+        if self._settle_report_at is None or now - self._settle_report_at >= .25:
+            if self._settle_report_at is None:
+                print(f'[arm_controller] settling {self._plan["phase"]}: '
+                      f'up to {self._settle_timeout:g}s, dwell {self._settle_dwell:g}s', flush=True)
+            self._settle_report_at = now
+            self.node.send_output('controller_event', pack_controller_event(
+                kind='leg_progress', plan_id=self._plan['plan_id'], completion=progress))
+        return False
+
+    def _finish_leg(self, *, ok: bool, reason: str, completion=None) -> None:
         plan_id = "" if self._plan is None else self._plan["plan_id"]
         self.executor.clear_trajectory()
         self._running = False
@@ -628,7 +700,8 @@ class ArmController:
         self.node.send_output(
             "controller_event",
             pack_controller_event(
-                kind="leg_result", plan_id=plan_id, ok=ok, reason=reason
+                kind="leg_result", plan_id=plan_id, ok=ok, reason=reason,
+                completion=completion,
             ),
         )
 
@@ -865,6 +938,8 @@ class _FakeNode:
 class _FakeExecutor:
     """Just enough executor to exercise the controller's own decisions."""
 
+    completion_tolerances = (0.01, 0.05)
+
     def __init__(self, n: int = 7) -> None:
         self.n_joints = n
         self._traj = None
@@ -925,6 +1000,7 @@ def _controller(**kw) -> "ArmController":
     # which only means anything under that policy. The WALL policy -- what a
     # config without motor_state_period_s gets -- has its own check below.
     kw.setdefault("state_period_s", 0.01)
+    kw.setdefault('settle_dwell_s', 0.)  # Legacy lifecycle checks; dwell has its own replay.
     c = ArmController(node, _FakeExecutor(), gripper=dict(_GRIPPER), **kw)
     c._set_arm(True)
     c.bridge_armed = True

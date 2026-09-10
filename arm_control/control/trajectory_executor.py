@@ -242,3 +242,8 @@ class JointTrajectoryExecutor:
         pos_ok = bool(np.max(np.abs(state.position - last.position)) <= pos_tol)
         vel_ok = bool(np.max(np.abs(state.velocity)) <= vel_tol)
         return pos_ok and vel_ok
+
+    @property
+    def completion_tolerances(self) -> tuple[float, float]:
+        """Joint position and velocity limits used by default completion."""
+        return self._done_pos_tol, self._done_vel_tol

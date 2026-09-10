@@ -70,6 +70,8 @@ function renderGate(state) {
   confirmationToken = state.confirmation_token ?? null;
   const badge = el("gatebadge");
   if (state.stopped) setStatus(badge, "STOPPED", "bad");
+  else if (state.motion_state === "timed_out") setStatus(badge, "COMPLETION FAILED — HOLDING", "bad");
+  else if (state.motion_state === "settling") setStatus(badge, "SETTLING", "hold");
   else if (state.holding) setStatus(badge, "HELD — awaiting review", "hold");
   else if (state.started) setStatus(badge, "RUNNING", "ok");
   else setStatus(badge, "DISARMED", "neutral");
@@ -79,7 +81,8 @@ function renderGate(state) {
   el("plan").disabled = !state.holding || state.stopped || state.action_only;
   el("play").disabled = !state.holding || state.stopped
     || !Number.isFinite(state.step?.duration_s);
-  el("go").disabled = state.stopped || confirmationToken === "" || state.action_only;
+  el("go").disabled = state.stopped || state.motion_state === "timed_out"
+    || confirmationToken === "" || state.action_only;
   el("custom-actions").replaceChildren(...Object.entries(state.actions || {}).map(([action, label]) => {
     const button = document.createElement("button");
     button.textContent = label;

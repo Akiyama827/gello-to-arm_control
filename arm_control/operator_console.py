@@ -76,12 +76,14 @@ class OperatorWorkspace:
 
     actions: dict[str, str] = field(default_factory=dict)
     action_only: bool = False
+    motion_state: str = ''
 
     def json(self) -> dict:
         step = self.step
         return {
             "actions": dict(self.actions),
             "action_only": self.action_only,
+            "motion_state": self.motion_state,
             "phases": list(self.phases),
             "current": self.current,
             "accepted": list(self.accepted),
@@ -149,7 +151,7 @@ class OperatorPanel:
                 f"unknown operator action {action!r} (expected one of "
                 f"{', '.join(ACTIONS)})"
             )
-        if workspace.stopped and action != 'stop':
+        if (workspace.stopped or workspace.motion_state == 'timed_out') and action != 'stop':
             raise ValueError('operator workspace is stopped')
         if workspace.action_only and action in ('go', 'plan', 'play'):
             raise ValueError('this gate requires an explicit outcome decision')
@@ -247,6 +249,12 @@ def _self_check() -> None:
         post({'action': 'go', 'confirmation_token': 'gate-1'}, 400)
         post({'action': 'stop'}, 200)
         assert scoped[-1] == ('stop',)
+        workspace = replace(workspace, motion_state='timed_out')
+        for action in ('go', 'plan', 'play'):
+            post({'action': action}, 400)
+        post({'action': 'stop'}, 200)
+        assert scoped[-1] == ('stop',)
+        workspace = replace(workspace, motion_state='')
 
         # 3. There is no route that could command motion, and no method that
         #    could reach one. Only /state and the static page answer at all.

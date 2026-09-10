@@ -196,9 +196,30 @@ def _controller_velocity(q, qd) -> np.ndarray:
     return qd
 
 
+def _completion_progress(value):
+    if value is None:
+        return None
+    body = dict(value)
+    if body.get('state') not in ('settling', 'timed_out'):
+        raise ValueError('invalid completion progress state')
+    for key in ('elapsed_s', 'remaining_s', 'speed_rad_s', 'velocity_tolerance_rad_s'):
+        body[key] = float(body[key])
+        if not np.isfinite(body[key]) or body[key] < 0:
+            raise ValueError(f'invalid completion progress {key}')
+    for key in ('error_rad', 'position_tolerance_rad'):
+        if body.get(key) is not None:
+            body[key] = float(body[key])
+            if not np.isfinite(body[key]) or body[key] < 0:
+                raise ValueError(f'invalid completion progress {key}')
+    joint = body.get('joint')
+    if joint is not None and (type(joint) is not int or joint < 1):
+        raise ValueError('completion joint must be a positive one-based index')
+    return body
+
+
 def pack_controller_event(
     *, kind: str, plan_id: str = "", ok: bool = True, reason: str = "", q=None,
-    qd=None, mode_state=None,
+    qd=None, mode_state=None, completion=None,
 ) -> pa.Array:
     """Controller -> planner. ``kind`` is one of:
 
@@ -207,6 +228,7 @@ def pack_controller_event(
                    Optional ``qd`` is measured joint velocity from that same
                    sample; omission means unknown, not zero or settled.
     ``leg_result`` ``plan_id`` finished (``ok``) or gave up (``reason``).
+    ``leg_progress`` correlated settling measurements, never a successful result.
     ``fault``      the controller stopped driving; nothing else will move.
     ``mode``       accepted ``soft``/``joint`` in reason, or ok=False refusal.
 
@@ -216,7 +238,7 @@ def pack_controller_event(
     Optional ``mode_state`` reports the actual law and executor joint gains;
     old senders and receivers may omit it. Mode heartbeats use the same event.
     """
-    if kind not in {"ready", "leg_result", "fault", "mode"}:
+    if kind not in {"ready", "leg_result", "leg_progress", "fault", "mode"}:
         raise ValueError(f"pack_controller_event: unknown kind {kind!r}")
     return pack_json_message(
         "controller_event",
@@ -228,6 +250,7 @@ def pack_controller_event(
             "q": None if q is None else np.asarray(q, dtype=float).ravel().tolist(),
             **({} if qd is None else {"qd": _controller_velocity(q, qd).tolist()}),
             **({} if mode_state is None else {"mode_state": _mode_state_body(mode_state)}),
+            **({} if completion is None else {"completion": _completion_progress(completion)}),
         },
     )
 
@@ -235,12 +258,16 @@ def pack_controller_event(
 def unpack_controller_event(payload: pa.Array) -> dict:
     body = unpack_json_message(payload, expected_schema="controller_event")
     body.pop("schema", None)
+    if body.get('kind') not in {'ready', 'leg_result', 'leg_progress', 'fault', 'mode'}:
+        raise ValueError('unknown controller event kind')
     if body.get("q") is not None:
         body["q"] = np.asarray(body["q"], dtype=float)
     if body.get("qd") is not None:
         body["qd"] = _controller_velocity(body.get("q"), body["qd"])
     if "mode_state" in body:
         body["mode_state"] = _mode_state_body(body["mode_state"])
+    if 'completion' in body:
+        body['completion'] = _completion_progress(body['completion'])
     return body
 
 

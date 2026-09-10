@@ -69,6 +69,8 @@ def main() -> None:
         arm_id=os.environ.get("ARM_ID", "arm"),
         gripper=gripper_command_cfg(cfg),
         execution_policy=policy,
+        settle_timeout_s=float((cfg.get('arm') or {}).get('settle_timeout_s', 5.0)),
+        settle_dwell_s=float((cfg.get('arm') or {}).get('settle_dwell_s', 0.2)),
         # A bare sim plant (mujoco_interface with no sim_bridge) publishes no
         # motor_health, so the controller would wait forever for an armed edge
         # that cannot come. The GRAPH knows whether a bridge is in the path, so
