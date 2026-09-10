@@ -349,6 +349,7 @@ class MuJoCoCollisionWorld:
         held_positions: dict[str, float] | None = None,
         ground_z: float | None = 0.0,
         body_sites: dict[str, str] | None = None,
+        workspace_xy=None,
     ) -> "MuJoCoCollisionWorld":
         """Build collision truth from the same generic composed workcell."""
         if self_collision_padding_m > 0.0:
@@ -360,12 +361,47 @@ class MuJoCoCollisionWorld:
         from arm_control.plants.mujoco.backend import compose_workcell_scene
 
         self = cls.__new__(cls)
-        self.model = compose_workcell_scene(
+        spec = compose_workcell_scene(
             scene,
             state,
             ground_z=ground_z,
             body_sites=body_sites,
-        ).compile()
+        )
+        if workspace_xy is not None:
+            from types import SimpleNamespace
+            from arm_control.planning.projection import _workspace_bound
+
+            bounds = np.asarray(workspace_xy, dtype=float)
+            if bounds.shape != (2, 2) or not np.isfinite(bounds).all() or not np.all(bounds[0] < bounds[1]):
+                raise ValueError('workspace_xy requires finite ordered lower/upper XY bounds')
+            reference = spec.compile()
+            reference_data = mujoco.MjData(reference)
+            mujoco.mj_kinematics(reference, reference_data)
+            # Four forbidden half-spaces, truncated OUTSIDE the complete
+            # kinematic reach bound. No reachable posture can fly over/around
+            # them or start on their far side. Recomputed with carried payloads.
+            radius = max(_workspace_bound(SimpleNamespace(model=reference, data=reference_data)),
+                         float(np.max(np.abs(bounds)))) + 1.0
+            for joint in range(reference.njnt):
+                if reference.jnt_type[joint] == mujoco.mjtJoint.mjJNT_SLIDE:
+                    if not reference.jnt_limited[joint]:
+                        raise ValueError('workspace boundary requires bounded sliding joints')
+                    initial = reference.qpos0[reference.jnt_qposadr[joint]]
+                    radius += float(np.max(np.abs(reference.jnt_range[joint] - initial)))
+                elif reference.jnt_type[joint] == mujoco.mjtJoint.mjJNT_HINGE:
+                    radius += 2 * float(np.linalg.norm(reference.jnt_pos[joint]))
+            for axis in (0, 1):
+                for side in (0, 1):
+                    edge = bounds[side, axis]
+                    outer = -radius if side == 0 else radius
+                    pos, size = np.zeros(3), np.full(3, radius)
+                    pos[axis], size[axis] = (edge + outer) / 2, abs(outer - edge) / 2
+                    spec.worldbody.add_geom(
+                        name=f'obstacle__workspace_{axis}_{side}',
+                        type=mujoco.mjtGeom.mjGEOM_BOX, pos=pos, size=size,
+                        rgba=[1., .6, .1, .08],
+                    )
+        self.model = spec.compile()
         self.data = mujoco.MjData(self.model)
         for item in scene.actors:
             for joint, value in zip(item.joints, state.actor_q[item.name]):

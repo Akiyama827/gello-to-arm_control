@@ -35,6 +35,8 @@ def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_d
     out = []
     for i in range(model.ngeom):
         name = model.geom(i).name or f"geom{i}"
+        if name.startswith('obstacle__workspace_'):
+            continue  # rendered as a perimeter, not giant forbidden-volume boxes
         body = model.body(model.geom_bodyid[i]).name
         if any(body.startswith(p) or name.startswith(p) for p in exclude_prefixes):
             continue
@@ -74,6 +76,7 @@ class RerunSceneMirror:
         data,
         prefix: str = "sim",
         exclude_prefixes: tuple[str, ...] = (),
+        boundary_only: bool = False,
     ) -> None:
         # exclude_prefixes: the ARM bodies (scene.arm_prefixes) — the measured
         # ghost renders the arm; mirroring it twice reads as two robots.
@@ -88,6 +91,8 @@ class RerunSceneMirror:
         rr.log(self._prefix, rr.Clear(recursive=True))
         for i in range(model.ngeom):
             name = model.geom(i).name or f"geom{i}"
+            if boundary_only or name.startswith('obstacle__workspace_'):
+                continue
             body = model.body(model.geom_bodyid[i]).name
             if any(body.startswith(p) or name.startswith(p) for p in exclude_prefixes):
                 continue
@@ -100,6 +105,8 @@ class RerunSceneMirror:
             if self._log_asset(i, entity):
                 self._geoms.append((i, entity))
         for i in range(model.nsite):
+            if boundary_only:
+                break
             name = model.site(i).name or ''
             if not name.endswith(('active_connector', 'passive_connector')):
                 continue
@@ -111,6 +118,23 @@ class RerunSceneMirror:
                 colors=[[255, 80, 80], [80, 255, 80], [80, 120, 255]],
             ))
             self._sites.append((i, entity))
+        boundary = {}
+        for axis in (0, 1):
+            for side in (0, 1):
+                name = f'obstacle__workspace_{axis}_{side}'
+                gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+                if gid >= 0:
+                    boundary[axis, side] = float(model.geom_pos[gid, axis]
+                                                + (1 if side == 0 else -1) * model.geom_size[gid, axis])
+        if len(boundary) == 4:
+            corners = np.array([[boundary[0, x], boundary[1, y], .005]
+                                for x, y in ((0, 0), (1, 0), (1, 1), (0, 1))])
+            rr.log(f'{self._prefix}/boundary', rr.LineStrips3D(
+                [np.vstack([corners, corners[0]])], colors=[[255, 170, 40]], radii=.003))
+            # Upright arrows indicate vertical planes, not a height-limited box.
+            rr.log(f'{self._prefix}/boundary/up', rr.Arrows3D(
+                origins=corners, vectors=np.tile([0., 0., .35], (4, 1)),
+                colors=[[255, 170, 40]], labels=['Planning boundary'] * 4))
 
     def _log_asset(self, i: int, entity: str) -> bool:
         model = self._model
@@ -164,7 +188,8 @@ class RerunSceneMirror:
 
 
 def start_mirror_thread(
-    source, data=None, hz: float = 15.0, exclude_prefixes: tuple[str, ...] = ()
+    source, data=None, hz: float = 15.0, exclude_prefixes: tuple[str, ...] = (),
+    boundary_only: bool = False, prefix: str = 'sim',
 ) -> None:
     """Run the whole mirror (init, asset upload, updates) on a daemon thread.
 
@@ -217,7 +242,8 @@ def start_mirror_thread(
             if bound != (id(model), id(data_now)):
                 bound = (id(model), id(data_now))
                 mirror = RerunSceneMirror(
-                    model, data_now, exclude_prefixes=exclude_prefixes
+                    model, data_now, exclude_prefixes=exclude_prefixes,
+                    boundary_only=boundary_only, prefix=prefix,
                 )
             mirror.update()
             time.sleep(period)
