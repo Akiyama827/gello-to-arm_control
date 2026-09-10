@@ -64,6 +64,13 @@ class JointTrajectoryExecutor:
         for arr, name in ((kp_default, "kp_default"), (kd_default, "kd_default")):
             if np.asarray(arr).shape != (n,):
                 raise ValueError(f"{name} must have shape ({n},)")
+        # The SAME contract set_gains() enforces. Without this the constructor
+        # is a way in to exactly the undamped kp>0/kd=0 pair that method exists
+        # to reject, and this is a reusable public class -- the invariant
+        # belongs at the class boundary, not in whichever factory calls it.
+        reason = gain_error(kp_default, kd_default)
+        if reason:
+            raise ValueError(reason)
         max_torque = validate_torque_limits(max_torque, n, where="max_torque")
         self.arm_id = str(arm_id)
         self._joints = list(joint_names)

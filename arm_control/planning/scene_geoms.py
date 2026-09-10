@@ -1,5 +1,11 @@
 """Scene geometry the PLANNER and the viewers both read, with no viewer dep.
 
+ONE DERIVATION, TWO FAILURE POLICIES. A viewer that cannot find the dock mesh
+should still draw the robot; a PLANNER that cannot find it must not plan, because
+the alternative is planning through a dock that silently left the collision
+world. Same geometry, opposite response to a missing file -- so both callers go
+through the same resolver and choose with ``strict``.
+
 These two functions turn the ``scene:`` block into geometry: the same bodies a
 viewer draws are the ones the planner must not hit, so they are derived once
 here rather than duplicated. They lived in ``preview_rerun`` until 2026-09-10,
@@ -16,8 +22,15 @@ import numpy as np
 
 
 
-def static_scene_geoms(cfg) -> list:
+class SceneGeometryError(RuntimeError):
+    """A configured scene body could not be resolved. Fatal for planning."""
+
+
+def static_scene_geoms(cfg, *, strict: bool = False) -> list:
     """[(body, mesh_name, mesh_path, arm_T_geom)] for every non-arm scene body.
+
+    ``strict`` raises SceneGeometryError instead of skipping what it cannot
+    resolve. Planning passes it; viewers do not. See the module docstring.
 
     Reads the SAME `scene:` block the sim composes its MuJoCo model from, so the
     Rerun recordings, the teleop page and the sim can never disagree about where
@@ -57,6 +70,8 @@ def static_scene_geoms(cfg) -> list:
 
         arm_T_world = frames.invert(frames.world_T_arm(cfg))
     except Exception as exc:  # mujoco is optional on a viewer-only host
+        if strict:
+            raise SceneGeometryError(f"scene geometry unavailable: {exc}") from exc
         print(f"[scene] static scene skipped: {exc}", flush=True)
         return []
 
@@ -119,6 +134,8 @@ def static_scene_geoms(cfg) -> list:
                     continue
                 mesh_path = xml_path.parent / meshdir / mesh_file
                 if not mesh_path.is_file():
+                    if strict:
+                        raise SceneGeometryError(f"mesh missing: {mesh_path}")
                     print(f"[scene] mesh missing: {mesh_path}", flush=True)
                     continue
                 T_body_geom = np.eye(4)
@@ -141,12 +158,16 @@ def static_scene_geoms(cfg) -> list:
                     (name, f"{mesh_name}_{gid}", mesh_path,
                      arm_T_world @ world_T_body @ T_body_geom @ frames.invert(T_mesh))
                 )
+        except SceneGeometryError:
+            raise
         except Exception as exc:
+            if strict:
+                raise SceneGeometryError(f"scene body {name!r} failed: {exc}") from exc
             print(f"[scene] body {name!r} failed: {exc}", flush=True)
     return out
 
 
-def scene_obstacle_geoms(cfg) -> list[dict]:
+def scene_obstacle_geoms(cfg, *, strict: bool = True) -> list[dict]:
     """`environment`-style MESH obstacles for the static scene bodies.
 
     The planner only ever knew about `environment:` boxes, so a dock drawn in
@@ -164,10 +185,17 @@ def scene_obstacle_geoms(cfg) -> list[dict]:
     insertion leg, where the dock stops being an obstacle and becomes the
     target. Poses place the RAW FILE; MuJoCo's own asset recentering is the
     collision world's problem to undo (see MuJoCoCollisionWorld._build).
+
+    STRICT BY DEFAULT, unlike the viewer path: this list IS the collision
+    world's knowledge of the scene, so a configured body that cannot be
+    resolved must refuse to plan rather than quietly not exist. Dropping one
+    here does not degrade a picture -- it invites the arm through a dock.
     """
     try:
         import pinocchio as pin
     except Exception as exc:
+        if strict:
+            raise SceneGeometryError(f"obstacles unavailable: {exc}") from exc
         print(f"[scene] obstacles skipped: {exc}", flush=True)
         return []
     out = [
@@ -178,7 +206,7 @@ def scene_obstacle_geoms(cfg) -> list[dict]:
             + [float(v) for v in pin.rpy.matrixToRpy(T[:3, :3])],
             "toggleable": True,
         }
-        for body, mesh_name, mesh_path, T in static_scene_geoms(cfg)
+        for body, mesh_name, mesh_path, T in static_scene_geoms(cfg, strict=strict)
     ]
     # The plant's static fixtures (module nests, table) are obstacles for the
     # PLANNER too. They live in scene.static_boxes, which only the plant read,
@@ -205,7 +233,11 @@ def scene_obstacle_geoms(cfg) -> list[dict]:
                     "toggleable": True,
                 }
             )
+    except SceneGeometryError:
+        raise
     except Exception as exc:  # never let a fixture stop the robot rendering
+        if strict:
+            raise SceneGeometryError(f"static fixtures failed: {exc}") from exc
         print(f"[scene] static fixtures skipped: {exc}", flush=True)
     if out:
         print(f"[scene] {len(out)} obstacles from scene", flush=True)
@@ -244,6 +276,22 @@ def _self_check() -> None:
     assert done.returncode == 0, (
         "planning.stack must import without rerun:\n" + done.stdout + done.stderr
     )
+
+    # ONE derivation, TWO failure policies. A configured body that cannot be
+    # resolved must degrade a PICTURE and refuse a PLAN -- because a dropped
+    # obstacle does not look wrong, it just quietly stops existing, and the arm
+    # is then invited through the dock that was supposed to be in its way.
+    broken = {"scene": {"dock": {"model_path": "/nonexistent/dock.xml",
+                                 "pos": [0, 0, 0], "rpy": [0, 0, 0]}}}
+    assert static_scene_geoms(broken) == [], "viewers must degrade, not raise"
+    assert scene_obstacle_geoms(broken, strict=False) == []
+    for call in (lambda: static_scene_geoms(broken, strict=True),
+                 lambda: scene_obstacle_geoms(broken)):
+        try:
+            call()
+        except SceneGeometryError:
+            continue
+        raise AssertionError("planning geometry failed open on a missing body")
 
     from arm_control.planning import preview_rerun, scene_geoms
     assert preview_rerun.scene_obstacle_geoms is scene_geoms.scene_obstacle_geoms

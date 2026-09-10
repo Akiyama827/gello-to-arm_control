@@ -208,6 +208,11 @@ class HandPanel:
     def set_result(self, result: dict) -> None:
         if not self._request_id or result.get("request_id") != self._request_id:
             return
+        # Consume the id: one request, one accepted result. A duplicated or
+        # replayed result would otherwise regenerate the payload declaration,
+        # and a re-declared payload after an intervening open is a mass fed
+        # forward for a module that is no longer in the hand.
+        self._request_id = ""
         self._waiting = False
         reason = str(result.get("reason", ""))
         if result.get("ok"):
@@ -265,6 +270,11 @@ def _self_check() -> None:
     p._payload_id = "row_module"
     assert result(p, True) == {"mass_kg": .5, "com_ee": [0., 0., .06]}
     assert p.pop_payload() is None, "a declaration must be sent once, not resent"
+
+    # The same result arriving twice must not re-declare: correlation is
+    # one request id -> one accepted result.
+    p.set_result({"request_id": "r1", "ok": True, "reason": ""})
+    assert p.pop_payload() is None, "a replayed result was accepted again"
 
     for ok, reason in ((True, "released"), (False, "no object"), (False, "object lost")):
         p = panel()

@@ -12,6 +12,8 @@ latch so that re-anchoring happens exactly once per expiry, not every tick.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 
@@ -20,8 +22,10 @@ class JogHold:
 
     def __init__(self, *, timeout_s: float, n_joints: int) -> None:
         self.timeout_s = float(timeout_s)
-        if not self.timeout_s > 0.0:
-            raise ValueError("jog_timeout_s must be positive")
+        # FINITE, not merely positive: inf is a syntactically valid timeout that
+        # silently disables the deadman this class exists to be.
+        if not (math.isfinite(self.timeout_s) and self.timeout_s > 0.0):
+            raise ValueError("jog_timeout_s must be finite and positive")
         self.n_joints = int(n_joints)
         self._q: np.ndarray | None = None
         self._at = 0.0
@@ -106,7 +110,7 @@ def _self_check() -> None:
             continue
         raise AssertionError(f"accepted q of shape {np.shape(bad)}")
 
-    for bad in (0.0, -1.0):
+    for bad in (0.0, -1.0, float("inf"), float("nan")):
         try:
             JogHold(timeout_s=bad, n_joints=7)
         except ValueError:
