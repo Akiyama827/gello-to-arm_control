@@ -100,7 +100,7 @@ def child(kind: str, stop: str, directory: Path) -> None:
         Node.next = next_connected
     else:
         from arm_control.control import adapter
-        from arm_control.control.arm_controller import _FakeExecutor, _GRIPPER
+        from arm_control.control.doubles import _FakeExecutor, _GRIPPER
 
         names = [f"joint_{i}" for i in range(7)]
         adapter.load_robot_config = lambda: SimpleNamespace(

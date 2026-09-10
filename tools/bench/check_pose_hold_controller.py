@@ -1,7 +1,7 @@
 """Controller-only pose hold assertions: no FK, IK, planner or plant."""
 import numpy as np
 
-from arm_control.control.arm_controller import _controller, _state, _plan_msg
+from arm_control.control.doubles import _controller, _plan_msg, _state
 from arm_control.messages import pack_control_update, unpack_motor_command, pack_jog
 
 
@@ -21,7 +21,7 @@ def main():
     wire = [v for t, v in c.node.sent if t == "motor_command"][-1]
     assert unpack_motor_command(wire, 7)["pose_hold"] == spec
     c.on_jog(pack_jog(q=np.ones(7)*0.02, reason="test"))
-    assert c._jog_q is None
+    assert not c._jog.active
     c.on_plan(_plan_msg("must-not-execute", gated=False))
     assert not c._running and c._pose_hold is not None
     c.on_control(pack_control_update(gains={"kp": [10]*7, "kd": [1]*7}))

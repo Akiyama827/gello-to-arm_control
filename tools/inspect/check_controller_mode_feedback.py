@@ -1,7 +1,8 @@
 """Controller mode snapshots and bounded heartbeat; no hardware or services."""
 import numpy as np
 
-from arm_control.control.arm_controller import ArmController, _FakeExecutor, _FakeNode, _GRIPPER, _state
+from arm_control.control.arm_controller import ArmController
+from arm_control.control.doubles import _FakeExecutor, _FakeNode, _GRIPPER, _state
 from arm_control.contracts.motion import pack_controller_event, unpack_controller_event
 from arm_control.messages import pack_control_update, pack_json_message, pack_plan
 

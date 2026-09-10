@@ -4,7 +4,8 @@ from __future__ import annotations
 import numpy as np
 from dataclasses import replace
 
-from arm_control.control.arm_controller import ArmController, _FakeExecutor, _FakeNode, _GRIPPER
+from arm_control.control.arm_controller import ArmController
+from arm_control.control.doubles import _FakeExecutor, _FakeNode, _GRIPPER
 from arm_control.messages import (
     pack_control_update, pack_json_message, pack_motor_state, pack_plan,
     pack_jog, unpack_json_message, unpack_motor_command,
@@ -326,7 +327,7 @@ def check_modes_and_validation():
     clock[0] += .21
     c.on_motor_state(state(.01))
     c.tick()
-    assert c._jog_q is None and np.allclose(commands(c)[-1]["position"], .01)
+    assert not c._jog.active and np.allclose(commands(c)[-1]["position"], .01)
     c.on_jog(pack_jog(q=[float("nan")]*7))
     count = len(commands(c))
     c.tick()
@@ -437,7 +438,7 @@ def check_settle_dwell():
     waypoint, not a cubic extrapolated off the end of the plan.
     """
     c, clock = setup(health=False)          # production settle_dwell_s
-    assert c._settle_dwell > 0, "this check is meaningless at dwell 0"
+    assert c._settling.dwell_s > 0, "this check is meaningless at dwell 0"
     c.on_plan(plan(start=.0, ident="dwell"))
     c.on_control(pack_control_update(execute="dwell"))
     advance(c, clock, .9, q=.0005)
@@ -452,7 +453,7 @@ def check_settle_dwell():
     # off the end of the plan. That is what this asserts.
     assert np.allclose(commands(c)[-1]["position"], 0.), commands(c)[-1]["position"]
 
-    advance(c, clock, c._settle_dwell + .1, q=.0005)
+    advance(c, clock, c._settling.dwell_s + .1, q=.0005)
     assert not c._running, "dwell elapsed: the leg must complete"
     after = c.executor.steps
     clock[0] += .1
