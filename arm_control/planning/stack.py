@@ -24,11 +24,10 @@ from arm_control.control.factory import (
     gripper_command_cfg,
 )
 from arm_control.planning.high_level import ArmPlanner, build_collision_stack
-# Scene-derived obstacles. NOTE: preview_rerun imports `rerun` AT MODULE
-# LEVEL, so importing this module requires the optional [viz] extra. That
-# is why the executor factory lives in arm_control.control.factory and
-# not here -- a controller host must not need a visualiser to servo.
-from arm_control.planning.preview_rerun import scene_obstacle_geoms
+# Scene-derived obstacles, from the rerun-free module: a controller host must
+# not need a visualiser to servo, and this import used to drag `rerun` in at
+# module level for a function that logs nothing.
+from arm_control.planning.scene_geoms import scene_obstacle_geoms
 from arm_control.planning.ik import PinocchioIK
 
 __all__ = [

@@ -32,7 +32,7 @@ from typing import Any
 import mujoco
 import numpy as np
 
-from arm_control.planning.mujoco_collision import _rpy_to_quat
+from arm_control import frames
 from arm_control.scene import SceneSpec, SceneState
 from arm_control.contracts.impedance import pose_hold_values
 from arm_control.simulation.convex_decomp import replace_with_decomposition
@@ -265,10 +265,10 @@ def _load_model_spec(
         # extension (meshdir, balanceinertia, undecodable-visual fallback) —
         # the FR3's raw URDF fails on all three. keep_visual: this model feeds
         # the viewer/Rerun mirror too.
-        from arm_control.planning.mujoco_collision import build_planning_model
+        from arm_control.simulation.mujoco_model import build_mujoco_model
         from arm_control import CONTROL_ROOT
 
-        path = build_planning_model(
+        path = build_mujoco_model(
             path,
             CONTROL_ROOT / ".cache" / "mujoco_models" if cache_dir is None else cache_dir,
             keep_visual=True,
@@ -363,7 +363,7 @@ def compose_workcell_scene(
         kwargs = {
             "name": f"obstacle__{obstacle.name}",
             "pos": list(obstacle.pos),
-            "quat": list(_rpy_to_quat(*obstacle.rpy)),
+            "quat": list(frames.rpy_to_quat(*obstacle.rpy)),
         }
         if obstacle.shape == "box":
             kwargs.update(
@@ -382,7 +382,7 @@ def compose_workcell_scene(
         body = spec.worldbody.add_body(
             name=fixture.name,
             pos=list(fixture.pos),
-            quat=list(_rpy_to_quat(*fixture.rpy)),
+            quat=list(frames.rpy_to_quat(*fixture.rpy)),
         )
         spec.attach(
             child,
@@ -393,7 +393,7 @@ def compose_workcell_scene(
         child = _load_model_spec(actor.path)
         spec.attach(
             child, prefix=f"{actor.name}__",
-            frame=spec.worldbody.add_frame(pos=list(actor.pos), quat=list(_rpy_to_quat(*actor.rpy))),
+            frame=spec.worldbody.add_frame(pos=list(actor.pos), quat=list(frames.rpy_to_quat(*actor.rpy))),
         )
     for body, site in (body_sites or {}).items():
         spec.body(body).add_site(name=site)
@@ -401,7 +401,7 @@ def compose_workcell_scene(
         child = _load_model_spec(obj.path)
         attachment = state.attachments.get(obj.name)
         storage = spec.worldbody.add_frame(
-            pos=list(obj.pos), quat=list(_rpy_to_quat(*obj.rpy))
+            pos=list(obj.pos), quat=list(frames.rpy_to_quat(*obj.rpy))
         )
         if attachment is None:
             spec.attach(child, prefix=f"{obj.name}__", frame=storage)
@@ -534,7 +534,7 @@ def compose_scene(
     for model in (spec_cfg.arm, spec_cfg.base):
         child = _load_model_spec(model.model_path)
         frame = spec.worldbody.add_frame(
-            pos=list(model.world_pos), quat=list(_rpy_to_quat(*model.world_rpy))
+            pos=list(model.world_pos), quat=list(frames.rpy_to_quat(*model.world_rpy))
         )
         spec.attach(child, prefix=f"{model.prefix}", frame=frame)
     for slot in spec_cfg.objects:
@@ -543,7 +543,7 @@ def compose_scene(
         child = _load_model_spec(slot.spec.model_path)
         frame = spec.worldbody.add_frame(
             pos=list(slot.spec.world_pos),
-            quat=list(_rpy_to_quat(*slot.spec.world_rpy)),
+            quat=list(frames.rpy_to_quat(*slot.spec.world_rpy)),
         )
         spec.attach(child, prefix=slot.prefix, frame=frame)
     # Docked modules go on IN CHAIN ORDER: each mates onto a port that only
@@ -843,9 +843,9 @@ class MuJoCoBackend:
         if path.suffix.lower() == ".urdf":
             # URDF needs the <mujoco> compiler extension (meshdir/strippath);
             # keep visuals — this model feeds the viewer too.
-            from arm_control.planning.mujoco_collision import build_planning_model
+            from arm_control.simulation.mujoco_model import build_mujoco_model
 
-            path = build_planning_model(
+            path = build_mujoco_model(
                 path, path.parent / ".mj_cache", keep_visual=True
             )
             spec = mujoco.MjSpec.from_string(path.read_text())

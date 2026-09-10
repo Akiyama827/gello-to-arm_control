@@ -44,6 +44,28 @@ def _rpy_to_matrix(rpy: Sequence[float]) -> np.ndarray:
     return np.asarray(pin.rpy.rpyToMatrix(*values))
 
 
+def rpy_to_quat(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """URDF-convention rpy (extrinsic xyz, R = Rz.Ry.Rx) -> wxyz quaternion.
+
+    The rotation twin of :func:`_rpy_to_matrix`, public because MuJoCo model
+    building wants a quaternion rather than a matrix. It lived as a private
+    helper in ``planning.mujoco_collision`` until 2026-09-10, which meant the
+    MuJoCo PLANT reached across into the PLANNING package for a private name
+    to place its own bodies.
+    """
+    cr, sr = np.cos(roll / 2), np.sin(roll / 2)
+    cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
+    cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
+    return np.array(
+        [
+            cy * cp * cr + sy * sp * sr,
+            cy * cp * sr - sy * sp * cr,
+            cy * sp * cr + sy * cp * sr,
+            sy * cp * cr - cy * sp * sr,
+        ]
+    )
+
+
 def _quat_to_matrix(quat: Sequence[float]) -> np.ndarray:
     import pinocchio as pin
 
