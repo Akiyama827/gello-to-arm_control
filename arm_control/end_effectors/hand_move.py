@@ -63,7 +63,8 @@ class HandMove:
                 or not math.isfinite(width) or abs(width - p['width_m']) > .001):
             return self.fail('hand stopped outside position tolerance')
         self.pending = None
-        return dict(request_id=p['request_id'], ok=True, reason='position reached')
+        return dict(request_id=p['request_id'], ok=True, reason='position reached',
+                    width_m=float(width))
 
 
 def _self_check():
@@ -80,6 +81,7 @@ def _self_check():
     assert move.poll(dict(state, width=.045, sample_seq=3), .3) is None
     result = move.poll(dict(state, width=.045, sample_seq=4), .4)
     assert result['ok'] and result['request_id'] == 'a'
+    assert result['width_m'] == .045
     assert not hasattr(move, '_held'), 'position completion must not own a grasp'
     move.start(dict(request, request_id='b'), state, 1.)
     result = move.poll(dict(state, available=False), 1.1)
