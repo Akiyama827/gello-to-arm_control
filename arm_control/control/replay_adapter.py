@@ -127,14 +127,40 @@ def build_replay(
     return curve.times, curve.positions, curve.velocities, summary
 
 
+def _replay_acceleration_limits(cfg, mode_cfg):
+    """Where replay's acceleration cap comes from, resolved in explicit order.
+
+    This was one nested `.get()` with `mode_cfg['planner']['acc_limits']` as the
+    default. Python evaluates that default BEFORE calling `.get()`, so a
+    deployment carrying `execution_policy.acceleration_limits` and no mode
+    profile raised KeyError on a fallback it never needed -- and
+    `_load_mode_config()` legitimately returns {} when none is configured. A
+    reusable package must not demand a mode-profile file to read a limit its
+    caller already supplied.
+
+    KEY PRESENCE, not truthiness: the same rule as the torque limits. A missing
+    key may fall back; a key that is PRESENT and malformed is an operator error
+    and must not silently resolve to some other number.
+    """
+    execution = cfg.get("execution_policy") or {}
+    if "acceleration_limits" in execution:
+        return execution["acceleration_limits"]
+    planner = mode_cfg.get("planner") or {}
+    if "acc_limits" in planner:
+        return planner["acc_limits"]
+    raise ValueError(
+        "replay requires execution_policy.acceleration_limits (robot config) "
+        "or planner.acc_limits (mode profile); neither is configured"
+    )
+
+
 def main() -> None:
     shutdown = ShutdownFlag()
     install_signal_handlers(shutdown)
     cfg = load_robot_config()
     mode_cfg = _load_mode_config()
     rp = dict(mode_cfg.get("replay") or {})
-    max_acc = (cfg.get('execution_policy') or {}).get(
-        'acceleration_limits', mode_cfg['planner']['acc_limits'])
+    max_acc = _replay_acceleration_limits(cfg, mode_cfg)
     n_arm = len(arm_joints(cfg))
     # Gains travel WITH the plan (pack_plan carries kp/kd), resolved by the same
     # helper the controller's own node uses -- one number for one arm.

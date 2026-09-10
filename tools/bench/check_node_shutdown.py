@@ -58,8 +58,24 @@ def child(kind: str, stop: str, directory: Path) -> None:
         from arm_control.control import replay_adapter as adapter
 
         names = [f"joint_{i}" for i in range(7)]
-        adapter.load_robot_config = lambda: SimpleNamespace(
-            joint_names=names, motor_names=names, num_motors=7)
+        # A REAL RobotConfig, not a hand-written imitation of one. The
+        # SimpleNamespace that used to stand here reproduced attribute access
+        # and not `.get()`, so replay's own config reads blew up inside the
+        # fixture rather than in the code under test -- and the fixture was
+        # the only thing claiming this node boots.
+        #
+        # With `_load_mode_config` returning {} (no mode profile configured,
+        # which is legal), this is also the regression test for replay booting
+        # from ROBOT configuration alone: a reusable package must not demand a
+        # mode-profile file for a limit its caller already supplies.
+        from arm_control.config import RobotConfig
+
+        cfg = RobotConfig.from_mapping({
+            "arm": {"name": "shutdown-check", "joint_names": names,
+                    "motor_names": names},
+            "execution_policy": {"acceleration_limits": [1.0] * 7},
+        })
+        adapter.load_robot_config = lambda: cfg
         adapter.arm_joints = lambda cfg: names
         adapter._load_mode_config = lambda: {}
         adapter.resolve_gains = lambda *args: {"kp": np.ones(7), "kd": np.ones(7)}
