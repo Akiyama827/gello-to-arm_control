@@ -197,6 +197,16 @@ class JointTrajectoryExecutor:
         self._traj = traj
         self._t_start = float(t_start)
 
+    def elapsed(self, t_now: float) -> float:
+        """Seconds into the loaded trajectory -- the executor's OWN clock.
+
+        The controller needs this to index a Cartesian pose alongside the joint
+        reference, and used to read ``executor._t_start`` directly. Both sides
+        must agree on the anchor, so the anchor stays private and the elapsed
+        time is what crosses the seam.
+        """
+        return float(t_now) - self._t_start
+
     def clear_trajectory(self) -> None:
         self._traj = None
 

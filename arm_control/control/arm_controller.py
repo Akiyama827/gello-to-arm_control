@@ -768,7 +768,7 @@ class ArmController:
         if poses is None or self._plan is None:
             return None
         times = self._plan["times"]
-        tau = np.clip(t_now - self.executor._t_start, times[0], times[-1])
+        tau = np.clip(self.executor.elapsed(t_now), times[0], times[-1])
         idx = int(np.searchsorted(times, tau, side="right")) - 1
         return poses[max(0, min(idx, len(poses) - 1))]
 
@@ -968,6 +968,9 @@ class _FakeExecutor:
 
     def load_trajectory(self, traj, t_start: float) -> None:
         self._traj, self._t_start = traj, float(t_start)
+
+    def elapsed(self, t_now: float) -> float:
+        return float(t_now) - self._t_start
 
     def clear_trajectory(self) -> None:
         self._traj = None
