@@ -23,7 +23,7 @@ def plan(ident="p", start=0.0, width=7, **changes):
     return pack_plan(**(fields | changes))
 
 
-def setup(*, strict=True, health=True):
+def setup(*, strict=True, health=True, **kw):
     from arm_control.control.execution_policy import ExecutionPolicy
 
     clock = [10.0]
@@ -34,7 +34,7 @@ def setup(*, strict=True, health=True):
     ) if strict else None
     c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
                       clock=lambda: clock[0], plant_reports_health=health,
-                      execution_policy=policy)
+                      execution_policy=policy, **kw)
     c._set_arm(True)
     if health:
         c.on_motor_health(pack_json_message("motor_health", dict(
@@ -44,6 +44,22 @@ def setup(*, strict=True, health=True):
     assert c.ready_sent
     c.node.sent.clear()
     return c, clock
+
+
+def advance(c, clock, seconds, q=0.0, dt=.1):
+    """Run the controller forward, feeding state at a policy-legal rate.
+
+    Jumping the clock in one step trips ``state_timeout_sec`` and CANCELS the
+    leg -- which from outside is indistinguishable from completion (not
+    running, no further steps, holding the measured pose). Anything asserting
+    on completion has to get there without a state gap.
+    """
+    end = clock[0] + seconds
+    while clock[0] < end:
+        clock[0] = min(clock[0] + dt, end)
+        c.on_motor_state(state(q))
+        c.tick()
+        assert not c._observation_paused, "state gap: the leg was cancelled, not completed"
 
 
 def commands(c):
@@ -378,13 +394,23 @@ def check_cartesian_lifecycle():
 
 
 def check_completion_order():
-    c, clock = setup(health=False)
+    # dwell 0 isolates the ORDERING invariant this stanza is about, the way
+    # arm_controller._controller() does for the same reason. The production
+    # dwell is exercised below.
+    c, clock = setup(health=False, settle_dwell_s=0.)
     c.on_plan(cartesian_plan())
     c.on_control(pack_control_update(execute="p"))
+    # Completion is gated on the trajectory clock since bounded settling landed
+    # (fffec10): before _leg_end there is nothing to complete and the executor
+    # is SUPPOSED to keep stepping. Play the reference out first.
+    advance(c, clock, .9, q=.0005)
+    assert c._running and c.executor.steps, "the reference must play out first"
     c.executor.done = lambda *args, **kwargs: True
+    stepped = c.executor.steps
+    clock[0] += .1                           # t == _leg_end; dwell 0 completes now
     c.on_motor_state(state(.0005))
     c.tick()
-    assert c.executor.steps == 0, "completed trajectory was stepped again"
+    assert c.executor.steps == stepped, "completed trajectory was stepped again"
     assert not c._running
     assert np.allclose(commands(c)[-1]["position"], .0005)
     assert commands(c)[-1]["cartesian"] is None
@@ -399,6 +425,40 @@ def check_completion_order():
     results = [unpack_json_message(v) for t, v in c.node.sent if t == "controller_event"]
     assert results[-1]["kind"] == "leg_result" and not results[-1]["ok"]
     assert np.allclose(commands(c)[-1]["position"], .4)
+    check_settle_dwell()
+
+
+def check_settle_dwell():
+    """Settling is not completion: the dwell streams the GOAL, then finishes.
+
+    ``done()`` true only ends the reference; the leg completes once the arm has
+    held that verdict for ``settle_dwell_s``. Stepping during the dwell is
+    correct BECAUSE sample_at clamps past times[-1] -- the command is the final
+    waypoint, not a cubic extrapolated off the end of the plan.
+    """
+    c, clock = setup(health=False)          # production settle_dwell_s
+    assert c._settle_dwell > 0, "this check is meaningless at dwell 0"
+    c.on_plan(plan(start=.0, ident="dwell"))
+    c.on_control(pack_control_update(execute="dwell"))
+    advance(c, clock, .9, q=.0005)
+    c.executor.done = lambda *args, **kwargs: True
+    clock[0] += .1                           # t == _leg_end: settling starts
+    c.on_motor_state(state(.0005))
+    c.tick()
+    assert c._running, "dwell not elapsed: the leg must not be complete yet"
+    assert c.executor.steps, "the dwell must keep streaming, not go silent"
+    # Stepping during the dwell is safe only because sample_at CLAMPS past
+    # times[-1]: the command is the final waypoint, not a cubic extrapolated
+    # off the end of the plan. That is what this asserts.
+    assert np.allclose(commands(c)[-1]["position"], 0.), commands(c)[-1]["position"]
+
+    advance(c, clock, c._settle_dwell + .1, q=.0005)
+    assert not c._running, "dwell elapsed: the leg must complete"
+    after = c.executor.steps
+    clock[0] += .1
+    c.on_motor_state(state(.0005))
+    c.tick()
+    assert c.executor.steps == after, "completed trajectory was stepped again"
 
 
 if __name__ == "__main__":
