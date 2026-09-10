@@ -4,7 +4,8 @@ Run from the repo: PYTHONPATH=. python tools/bench/check_console_authority.py
 """
 import time
 
-from arm_control.ui.arm_console import ControlPanel, JOG_STALE_S
+from arm_control.ui.arm_console import ControlPanel
+from arm_control.ui.jog_panel import JOG_STALE_S
 
 
 class _Visual:
@@ -41,7 +42,7 @@ def main():
             panel.set_jog("x", 1, False)
             assert panel.jog_held() is None
             panel.set_jog("x", -1, True)
-            panel._jog_at = time.monotonic() - JOG_STALE_S - 0.01
+            panel.jog._at = time.monotonic() - JOG_STALE_S - 0.01
             assert panel.jog_held() is None
             assert not panel.clicked("DISARM"), "jog release must not disarm"
             panel.set_control_mode("soft")

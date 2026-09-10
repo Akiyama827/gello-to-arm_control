@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import threading
 import uuid
+import inspect
 import time
 from collections import deque
 from contextlib import ExitStack
@@ -43,9 +44,8 @@ from arm_control import CONTROL_ROOT, REPO_ROOT
 from arm_control.config import arm_joints, ee_frame, gripper_joints, load_robot_config
 from arm_control.contracts.impedance import pose_hold_values
 from arm_control.contracts.gripper import pack_grasp_request, unpack_grasp_result
-from arm_control.end_effectors.franka_hand import (
-    GRASP_TIMEOUT_S, MIN_FORCE_N, MAX_FORCE_N, resolve_grasp_parameters,
-)
+from arm_control.ui.hand_panel import HandPanel
+from arm_control.ui.jog_panel import JogPanel
 from arm_control.grasp_visual import VisualFK
 from arm_control.joint_motor_map import gripper_motor_to_finger
 from arm_control.messages import (
@@ -87,12 +87,6 @@ _GATE_BUTTONS = ("ARM", "DISARM")
 _CART_NAMES = ("x", "y", "z", "roll", "pitch", "yaw")
 #: Jog axes the page offers. World frame for translation -- an operator asking
 #: for "down" means down in the room, not down along a tool that may be tilted.
-_JOG_AXES = ("x", "y", "z")
-#: How long a held-jog assertion stays good at the console. The page re-asserts
-#: every 100 ms, so this tolerates a few missed polls and no more -- it is the
-#: browser->console half of the jog's two independent deadmen.
-JOG_STALE_S = 0.4
-HAND_STALE_S = 0.6
 FEEDBACK_STALE_S = 1.0
 
 
@@ -173,42 +167,25 @@ class ControlPanel:
         # A held jog direction: ("x".."z" | "rx".."rz" | "j0".."jN", +1/-1), or
         # None while nothing is held. The page re-asserts it; releasing clears
         # it. Held state, not a queue -- a jog is "keep going", not "go once".
-        self._jog: tuple[str, int] | None = None
-        self._jog_at = 0.0
-        self._jog_note = ""
-        self._jog_speed_m_s = float(jog_speed_m_s)
-        self._jog_joint_speed_rad_s = float(jog_joint_speed_rad_s)
-        self._jog_max = (self._jog_speed_m_s, self._jog_joint_speed_rad_s)
-        if not np.isfinite(self._jog_max).all() or min(self._jog_max) <= 0:
-            raise ValueError('configured jog speeds must be finite and positive')
-        self._jog_latched = self._jog_max
-        self._jog_epoch = 0
+        # Declared before the sub-panels: both log through it.
+        self._log: deque[str] = deque(maxlen=200)  # page shows [-8:]; a stuck
+        # gizmo drag logged at loop rate once grew this without bound
+        self.jog = JogPanel(
+            speed_m_s=jog_speed_m_s,
+            joint_speed_rad_s=jog_joint_speed_rad_s,
+            n_joints=len(self._names),
+            log=self._log.append,
+        )
         self._plan: dict = {"version": 0, "times": [], "frames": []}
         self._grip_lo, self._grip_hi = float(grip_range[0]), float(grip_range[1])
         self._grip = self._grip_hi               # start open
         self._grip_dirty = False
-        self._hand_cfg = dict(gripper_cfg or {})
-        self._hand_defaults = resolve_grasp_parameters(self._hand_cfg, {}) if self._hand_cfg else None
-        # Manual teleop has no planner to declare what the hand is carrying, and
-        # the FR3's own model cannot know either: Desk's end effector and the RT
-        # box's --ee-mass are both FIXED startup values. So the operator names
-        # the module, and its mass rides the controller's tau_ff exactly as the
-        # planner's does. Keys are module ids from the config's `module_grasps`.
-        self._payload_table = {
-            str(k): v for k, v in (payload_table or {}).items() if isinstance(v, dict)
-        }
-        self._payload_id = ""
-        self._payload_pending: dict | None = None
-        self._hand_state: dict = {}
-        self._hand_seq = None
-        self._hand_sample_at = float("-inf")
-        self._hand_pending: dict | None = None
-        self._hand_request_id = ""
-        self._hand_waiting = False
-        self._hand_sent_at = 0.0
-        self._hand_submit_seq = None
-        self._hand_status = "Idle"
-        self._hand_disarm_requested = False
+        self.hand = HandPanel(
+            gripper_cfg=gripper_cfg,
+            payload_table=payload_table,
+            width_max_m=self._grip_hi,
+            log=self._log.append,
+        )
         # Gain presets (and anything else runtime-named) join the same strip:
         # the page renders `state.buttons`, so this costs no page code.
         self._buttons = tuple(_BUTTONS) + tuple(extra_buttons)
@@ -225,8 +202,6 @@ class ControlPanel:
         self._mode_at = float('-inf')
         self._mode_reason = ''
         self._measured_grip: float | None = None  # live finger m (Franka Hand)
-        self._log: deque[str] = deque(maxlen=200)  # page shows [-8:]; a stuck
-        # gizmo drag logged at loop rate once grew this without bound
         self._ident = ident
 
         # Loopback by REFUSAL, not merely by default. This inherited
@@ -319,7 +294,7 @@ class ControlPanel:
                     "step": 0.001,
                     "value": grip,
                 },
-                "hand": self._hand_snapshot(),
+                "hand": self.hand.snapshot(armed=self._armed, fault=self._fault),
                 "buttons": list(self._buttons),
                 "armed": self._armed,
                 "fault": self._fault,
@@ -334,16 +309,7 @@ class ControlPanel:
                 "log": list(self._log)[-8:],  # deque: copy THEN slice
                 "plan_version": self._plan["version"],
                 "ident": self._ident,
-                "jog": {
-                    "axes": list(_JOG_AXES),
-                    "joints": len(self._names),
-                    "held": None if self._jog is None else list(self._jog),
-                    "note": self._jog_note,
-                    "speed_m_s": self._jog_speed_m_s,
-                    "joint_speed_rad_s": self._jog_joint_speed_rad_s,
-                    "max_speed_m_s": self._jog_max[0],
-                    "max_joint_speed_rad_s": self._jog_max[1],
-                },
+                "jog": self.jog.snapshot(),
             }
         target_fk = self._vfk.poses(values, grip)   # vfk has its own lock
         payload["target_geoms"] = target_fk["geoms"]
@@ -364,13 +330,10 @@ class ControlPanel:
                 self._log.append("REFUSED: Execute requires confirmed ARM and no fault")
                 return
             if button in ("Stop (hold)", "DISARM"):
-                self._jog = None
+                self.jog.release()
             if button == "DISARM":
-                self._hand_disarm_requested = True
+                self.hand.disarm_requested()
                 self._grip_dirty = False
-                if self._hand_pending is not None:
-                    self._hand_pending = None
-                    self._hand_waiting = False
             if button in self._clicks:
                 if button in ('Stop (hold)', 'DISARM', 'Sync target to robot') or button.startswith(_GAIN_PREFIX):
                     self._invalidate_target_locked()
@@ -382,64 +345,24 @@ class ControlPanel:
                 self._clicks[button] += 1
 
     def set_jog_speed(self, payload):
-        if not isinstance(payload, dict) or set(payload) != {'speed_m_s', 'joint_speed_rad_s'}:
-            raise ValueError('provide Cartesian and joint jog speeds only')
-        values = _finite_values([payload['speed_m_s'], payload['joint_speed_rad_s']], 2)
-        if any(v <= 0 or v > hi for v, hi in zip(values, self._jog_max)):
-            raise ValueError('jog speeds must be positive and no higher than configured limits')
         with self._lock:
-            self._jog_speed_m_s, self._jog_joint_speed_rad_s = map(float, values)
+            self.jog.set_speeds(payload)
 
     def set_jog(self, axis, direction, held) -> None:
-        """Hold or release one jog direction. Unknown axes are refused loudly."""
         with self._lock:
-            if not held:
-                self._jog = None
-                return
-            if self._control_mode == "soft":
-                self._jog_note = "jog refused — select Track before jogging"
-                return
-            axis = str(axis or "")
-            if axis not in _JOG_AXES and not (
-                axis.startswith("j") and axis[1:].isdigit()
-                and int(axis[1:]) < len(self._names)
-            ):
-                raise ValueError(f"unknown jog axis {axis!r}")
-            selected = (axis, 1 if float(direction or 0) >= 0 else -1)
-            if self._jog != selected or time.monotonic() - self._jog_at > JOG_STALE_S:
-                self._jog_latched = (self._jog_speed_m_s, self._jog_joint_speed_rad_s)
-                self._jog_epoch += 1
-            self._jog = selected
-            self._jog_at = time.monotonic()
+            self.jog.set(axis, direction, held, control_mode=self._control_mode)
 
     def jog_held(self) -> tuple[str, int] | None:
-        """The held direction, while the page keeps saying it is still held.
-
-        The held jog button IS the deadman: the page re-asserts every 100 ms
-        and this goes stale in
-        JOG_STALE_S. Releasing stops the motion and leaves the arm armed and
-        holding. The controller's own expiry is the second, independent stop --
-        this one cannot save an arm from a console that has itself wedged.
-        """
-        command = self.jog_command()
-        return None if command is None else command[:2]
+        with self._lock:
+            return self.jog.held()
 
     def jog_command(self):
-        """One atomic direction/speed/stroke snapshot for the console loop."""
         with self._lock:
-            if self._jog is None:
-                return None
-            if time.monotonic() - self._jog_at > JOG_STALE_S:
-                self._jog = None
-                return None
-            return (*self._jog, *self._jog_latched, self._jog_epoch)
+            return self.jog.command()
 
     def set_jog_note(self, note: str) -> None:
         with self._lock:
-            if note != self._jog_note:
-                self._jog_note = note
-                if note:
-                    self._log.append(note)
+            self.jog.set_note(note)
 
     def set_sliders(self, values, *, revision=None) -> bool:
         with self._lock:
@@ -553,12 +476,10 @@ class ControlPanel:
             self._fault = fault
             if armed is False:
                 self._control_mode = "joint"
-                self._hand_disarm_requested = False
+                self.hand.rearmed()
             if armed is not True or fault:
                 self._grip_dirty = False
-                if self._hand_pending is not None:
-                    self._hand_pending = None
-                    self._hand_waiting = False
+                self.hand.cancel_pending()
 
     def set_control_mode(self, mode: str) -> None:
         with self._lock:
@@ -597,140 +518,24 @@ class ControlPanel:
 
     def set_hand_state(self, state: dict) -> None:
         with self._lock:
-            if not state.get("available"):
-                self._hand_pending = None
-                self._hand_request_id = ""
-                self._hand_waiting = False
-                self._hand_status = "Unavailable: Hand disconnected"
-            self._hand_state = dict(state)
-            seq = state.get("sample_seq")
-            if seq is not None and seq != self._hand_seq and state.get("measured"):
-                self._hand_seq = seq
-                self._hand_sample_at = time.monotonic()
-
-    def _hand_refusal(self, *, consuming: bool = False) -> str:
-        """Called under the panel lock, both at HTTP admission and dispatch."""
-        if self._hand_defaults is None or not self._hand_state.get("force_grasp"):
-            return "Force grasp unavailable: plant or Hand bridge does not support it"
-        if not self._hand_state.get("available") or not self._hand_state.get("measured") or time.monotonic() - self._hand_sample_at > HAND_STALE_S:
-            return "Hand feedback unavailable or stale"
-        if self._armed is not True or self._fault or self._hand_disarm_requested:
-            return "Hand motion requires confirmed ARM and no fault"
-        if self._hand_state.get("busy"):
-            return "Hand busy: wait for the current action"
-        if not consuming and (self._hand_waiting or self._hand_submit_seq == self._hand_seq):
-            return "Hand action pending: wait for a fresh result and observation"
-        return ""
-
-    def _hand_busy(self) -> bool:
-        return (self._hand_waiting or bool(self._hand_state.get("busy"))
-                or (self._hand_submit_seq is not None and self._hand_submit_seq == self._hand_seq))
-
-    def _hand_snapshot(self) -> dict:
-        if self._hand_waiting and time.monotonic() - self._hand_sent_at > GRASP_TIMEOUT_S + 1:
-            self._hand_waiting = False
-            self._hand_pending = None
-            self._hand_request_id = ""
-            self._hand_status = "Unavailable: action result timed out"
-        reason = self._hand_refusal()
-        fresh = bool(self._hand_state.get("available")) and time.monotonic() - self._hand_sample_at <= HAND_STALE_S
-        width = self._hand_state.get("width")
-        if (self._hand_status.startswith("Open accepted") and fresh
-                and self._hand_state.get("measured") and not self._hand_state.get("busy")
-                and self._hand_seq != self._hand_submit_seq and width is not None
-                and abs(float(width) - self._hand_defaults["open_width_m"]) <= .002):
-            self._hand_status = "Open"
-        return {
-            "enabled": not reason,
-            "reason": reason,
-            "status": self._hand_status,
-            "busy": self._hand_busy(),
-            "defaults": self._hand_defaults,
-            "force_min_n": MIN_FORCE_N, "force_max_n": MAX_FORCE_N,
-            "width_max_mm": self._grip_hi * 2000,
-            "measured_width_mm": float(width) * 1000 if fresh and self._hand_state.get("measured") and width is not None else None,
-            "payloads": [
-                {"id": k, "mass_kg": float(v.get("mass_kg", 0.0))}
-                for k, v in sorted(self._payload_table.items())
-            ],
-            "payload_id": self._payload_id,
-        }
+            self.hand.set_state(state)
 
     def request_hand(self, payload: dict) -> None:
         with self._lock:
-            if not isinstance(payload, dict) or set(payload) - {"mode", "width_m", "force_n", "payload_id"}:
-                raise ValueError("Hand action accepts mode, width_m, force_n and payload_id only")
-            if payload.get("mode") == "release" and set(payload) != {"mode"}:
-                raise ValueError("Open uses the configured open width and speed")
-            payload_id = str(payload.get("payload_id", "") or "")
-            if payload_id and payload_id not in self._payload_table:
-                raise ValueError(f"unknown payload {payload_id!r}")
-            payload = {k: v for k, v in payload.items() if k != "payload_id"}
-            reason = self._hand_refusal()
-            if reason:
-                raise ValueError(reason)
-            params = resolve_grasp_parameters(self._hand_cfg, payload)
-            self._hand_request_id = uuid.uuid4().hex
-            self._hand_pending = {
-                "request_id": self._hand_request_id, "target_id": "hand",
-                "mode": payload.get("mode", "close"),
-                "width_m": params["width_m"], "force_n": params["force_n"],
-            }
-            self._hand_submit_seq = self._hand_seq
-            self._hand_waiting = True
-            self._hand_sent_at = time.monotonic()
-            self._hand_status = "Grasp pending" if payload.get("mode", "close") == "close" else "Open pending"
-            self._payload_id = "" if payload.get("mode", "close") == "release" else payload_id
-            self._grip_dirty = False
+            self.hand.request(payload, armed=self._armed, fault=self._fault)
+            self._grip_dirty = False   # the slider lost the jaws to this action
 
     def pop_payload(self) -> dict | None:
-        """The payload declaration owed to the controller, at most once each."""
         with self._lock:
-            pending, self._payload_pending = self._payload_pending, None
-            return pending
+            return self.hand.pop_payload()
 
     def pop_hand(self) -> dict | None:
         with self._lock:
-            pending, self._hand_pending = self._hand_pending, None
-            if pending is None:
-                return None
-            reason = self._hand_refusal(consuming=True)
-            if time.monotonic() - self._hand_sent_at > HAND_STALE_S:
-                reason = "Hand request expired before dispatch"
-            if reason:
-                self._hand_waiting = False
-                self._hand_status = reason
-                self._log.append(f"REFUSED: {reason}")
-                return None
-            return pending
+            return self.hand.pop_request(armed=self._armed, fault=self._fault)
 
     def set_hand_result(self, result: dict) -> None:
         with self._lock:
-            if not self._hand_request_id or result.get("request_id") != self._hand_request_id:
-                return
-            self._hand_waiting = False
-            reason = str(result.get("reason", ""))
-            if result.get("ok"):
-                self._hand_status = "Open accepted; waiting for finger feedback" if reason == "released" else "Held"
-            else:
-                self._hand_status = "Lost" if reason == "object lost" else "Missed" if reason == "no object" else f"Unavailable: {reason}"
-            self._log.append(f"Hand: {self._hand_status}")
-            # A held module's weight is feedforward the controller cannot guess.
-            # Declare on a confirmed hold; retract on anything else -- an open,
-            # a miss, a drop -- because feeding forward a mass that is NOT in
-            # the hand pushes the arm up just as hard as an undeclared one sags.
-            held = bool(result.get("ok")) and reason != "released"
-            entry = self._payload_table.get(self._payload_id) if held else None
-            if not held:
-                self._payload_id = ""
-            self._payload_pending = {
-                "mass_kg": float(entry.get("mass_kg", 0.0)) if entry else 0.0,
-                "com_ee": list(entry.get("com_offset_ee") or ()) or None if entry else None,
-            }
-            if entry:
-                self._log.append(
-                    f"Payload: {self._payload_id} {self._payload_pending['mass_kg']:.4f} kg"
-                )
+            self.hand.set_result(result)
 
     def set_measured(self, q) -> None:
         with self._lock:
@@ -774,7 +579,7 @@ class ControlPanel:
             if dirty and (self._armed is not True or self._fault):
                 self._log.append("REFUSED: Hand motion requires confirmed ARM and no fault")
                 return
-            if dirty and (self._hand_busy() or self._hand_disarm_requested):
+            if dirty and self.hand.owns_jaws():
                 self._log.append("REFUSED: Hand action pending; wait before moving the slider")
                 return
             self._grip = float(np.clip(value, self._grip_lo, self._grip_hi))
@@ -785,7 +590,7 @@ class ControlPanel:
             if not self._grip_dirty:
                 return None
             self._grip_dirty = False
-            if self._armed is not True or self._fault or self._hand_disarm_requested or self._hand_busy():
+            if self._armed is not True or self._fault or self.hand.owns_jaws():
                 return None
             return self._grip
 
@@ -1553,59 +1358,25 @@ def _check_routes() -> None:
 
 
 def _check_payload_declaration() -> None:
-    """A held module's mass reaches the controller; a miss/open retracts it.
+    """The page still offers the selector HandPanel reads back.
 
-    Manual teleop runs no planner, so this panel is the ONLY thing that can
-    tell the controller what the hand is carrying -- the FR3's own model
-    cannot: Desk's end effector and the RT box's --ee-mass are both fixed
-    startup values. Feeding forward a mass that is not in the hand pushes the
-    arm up as hard as an undeclared one sags, so every non-hold retracts.
+    The behaviour itself is HandPanel's, and checked there. What only this
+    file can check is that the console's own page and its POST still speak the
+    same field name -- a renamed input would leave every grasp declaring
+    nothing, silently.
     """
     import re
 
-    panel = object.__new__(ControlPanel)
-    panel._lock = threading.Lock()
-    panel._payload_table = {"row_module": {"mass_kg": 0.5, "com_offset_ee": [0., 0., .06]}}
-    panel._payload_id = ""
-    panel._payload_pending = None
-    panel._log = []
-
-    def result(ok, reason="", rid="r1"):
-        panel._hand_request_id = rid
-        panel._hand_status = ""
-        panel.set_hand_result({"request_id": rid, "ok": ok, "reason": reason})
-        return panel.pop_payload()
-
-    panel._payload_id = "row_module"
-    held = result(True)
-    assert held == {"mass_kg": 0.5, "com_ee": [0., 0., .06]}, held
-    assert panel.pop_payload() is None, "a declaration must be sent once, not resent"
-
-    for ok, reason in ((True, "released"), (False, "no object"), (False, "object lost")):
-        panel._payload_id = "row_module"
-        assert result(ok, reason) == {"mass_kg": 0.0, "com_ee": None}, (ok, reason)
-        assert not panel._payload_id
-
-    # An unnamed payload declares zero rather than carrying the last one over.
-    panel._payload_id = ""
-    assert result(True) == {"mass_kg": 0.0, "com_ee": None}
-
-    for bad in ({"mode": "close", "payload_id": "nope"},
-                {"mode": "release", "payload_id": "row_module"}):
-        try:
-            panel.request_hand(bad)
-        except ValueError:
-            continue
-        raise AssertionError(f"accepted {bad}")
-
-    # The page must actually offer the selector the panel reads back.
     from arm_control.console_assets import CONSOLE_DIR
+
     html = (CONSOLE_DIR / "console.html").read_text()
     js = (CONSOLE_DIR / "console.js").read_text()
     assert 'id="hand-payload"' in html, "no payload selector on the page"
     assert re.search(r'payload\.payload_id\s*=\s*\$\("hand-payload"\)', js), \
         "the grasp POST does not carry the selected payload"
-    print("arm_console: payload declaration reaches the controller on hold only")
+    assert "payload_id" in inspect.getsource(HandPanel.request), \
+        "HandPanel no longer accepts the field the page sends"
+    print("arm_console: page and HandPanel agree on the payload field")
 
 
 def _check_graphs() -> None:
