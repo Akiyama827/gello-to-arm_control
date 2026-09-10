@@ -35,6 +35,48 @@ def _slerp(q0: np.ndarray, q1: np.ndarray, s: float) -> np.ndarray:
     return q0 * np.cos(theta) + basis * np.sin(theta)
 
 
+def _curve_length_upper(trajectory: JointTrajectory) -> float:
+    """Joint-space arc length, conservatively within 1e-4 joint units.
+
+    Hermite knots alone underestimate travel. Convert the flown cubics to
+    Bezier segments: chord sums bound length below, control polygons above.
+    De Casteljau subdivision tightens those bounds without time sampling.
+    The upper bound is safe for pruning alternative IK endpoints. This is
+    the unweighted Euclidean metric used by our OMPL real-vector space;
+    for the FR3 all coordinates are revolute and the unit is radians.
+    """
+    q = trajectory.positions
+    if not np.isfinite(q).all() or not np.isfinite(trajectory.times).all():
+        raise ValueError('path selection requires a finite trajectory')
+    if trajectory.velocities is None:
+        length = float(np.linalg.norm(np.diff(q, axis=0), axis=1).sum())
+        return length + 1e-10 * max(1., length)
+    v = trajectory.velocities
+    if not np.isfinite(v).all():
+        raise ValueError('path selection requires finite velocities')
+    h = np.diff(trajectory.times)[:, None]
+    polygons = np.stack((q[:-1], q[:-1] + h * v[:-1] / 3,
+                         q[1:] - h * v[1:] / 3, q[1:]), axis=1)
+    for _ in range(20):
+        upper = float(np.linalg.norm(np.diff(polygons, axis=1), axis=2).sum())
+        lower = float(np.linalg.norm(polygons[:, -1] - polygons[:, 0], axis=1).sum())
+        if upper - lower <= 1e-4:
+            # Numerical allowance, not an interval-arithmetic certificate.
+            return upper + 1e-10 * max(1., upper)
+        # Only subdivide segments whose gap exceeds their share of the budget.
+        gaps = (np.linalg.norm(np.diff(polygons, axis=1), axis=2).sum(axis=1)
+                - np.linalg.norm(polygons[:, -1] - polygons[:, 0], axis=1))
+        split = gaps > 1e-4 / len(polygons)
+        p = polygons[split]
+        a = (p[:, :-1] + p[:, 1:]) / 2
+        b = (a[:, :-1] + a[:, 1:]) / 2
+        middle = (b[:, 0] + b[:, 1]) / 2
+        polygons = np.concatenate((polygons[~split],
+            np.stack((p[:, 0], a[:, 0], b[:, 0], middle), axis=1),
+            np.stack((middle, b[:, 1], a[:, 2], p[:, 3]), axis=1)))
+    raise ValueError('path length bounds did not converge')
+
+
 def build_collision_stack(
     urdf_path,
     planned_joints: list[str],
@@ -160,10 +202,15 @@ class ArmPlanner:
             )
             lo, hi = self._ik.hard_limits
             span = hi - lo
+            planned_start = np.clip(q_start, lo, hi)
 
             def score(q):
                 margin = float(np.min(np.minimum(q - lo, hi - q) / span))
-                travel = float(np.linalg.norm((q - q_start) / span))
+                # Same start and trivial-hold rule as plan_joint. Endpoint
+                # distance is an admissible length lower bound, not a route
+                # quality score. Bounded joints must never wrap here.
+                travel = (0. if np.allclose(planned_start, q) else
+                          float(np.linalg.norm(q - planned_start)))
                 return max(0., self._ik_limit_margin_fraction - margin), travel
 
             candidates.sort(key=score)
@@ -179,24 +226,52 @@ class ArmPlanner:
                 flush=True,
             )
             return None
+        best = None
+        best_score = (np.inf, np.inf)
+        best_rank = planned = pruned = unsolved = 0
         for rank, q_goal in enumerate(candidates, 1):
+            if self._ik_candidate_attempts and score(q_goal) >= best_score:
+                # Sorted lower bounds: no remaining endpoint can improve the
+                # incumbent under the same margin preference and length metric.
+                pruned = len(candidates) - rank + 1
+                break
+            planned += 1
             trajectory = self.plan_joint(
                 q_goal, q_start, collision_check=collision_check, speed_scale=speed_scale
             )
+            if trajectory is None:
+                unsolved += 1
             if trajectory is not None:
                 if self._ik_candidate_attempts:
+                    expected_goal = (planned_start if np.allclose(planned_start, q_goal)
+                                     else q_goal)
+                    if not np.array_equal(trajectory.positions[0], planned_start) \
+                            or not np.array_equal(trajectory.positions[-1], expected_goal):
+                        raise ValueError('path selection requires fixed trajectory endpoints')
                     margin = float(np.min(np.minimum(q_goal - lo, hi - q_goal) / span))
                     shortfall, travel = score(q_goal)
+                    length = _curve_length_upper(trajectory)
                     print(
                         f'[planner:{self.arm_id}] IK candidate rank={rank}/{len(candidates)} '
-                        f'travel={travel:.6f} margin={margin:.6f} shortfall={shortfall:.6f} '
+                        f'endpoint_lower={travel:.6f} path_length_upper={length:.6f} '
+                        f'margin={margin:.6f} shortfall={shortfall:.6f} '
                         f'q_start={np.round(q_start, 6).tolist()} '
                         f'q_goal={np.round(q_goal, 6).tolist()}',
                         flush=True,
                     )
+                    if (shortfall, length) < best_score:
+                        best, best_score, best_rank = trajectory, (shortfall, length), rank
+                    continue
                 print(f'[planner:{self.arm_id}] stage=cartesian_total elapsed_s={perf_counter() - started:.6f}', flush=True)
                 return trajectory
-        return None
+        if best is not None:
+            print(f'[planner:{self.arm_id}] route_selection=joint_path_length '
+                  f'candidates={len(candidates)} planned={planned} '
+                  f'unsolved={unsolved} pruned={pruned} '
+                  f'selected_rank={best_rank} path_length_upper={best_score[1]:.6f} '
+                  f'duration_s={best.duration_sec:.6f}', flush=True)
+        print(f'[planner:{self.arm_id}] stage=cartesian_total elapsed_s={perf_counter() - started:.6f}', flush=True)
+        return best
 
     def plan_linear(
         self,
@@ -508,10 +583,11 @@ def _self_check() -> None:
     candidate_ik.hard_limits = (np.array([-10., -1., -1.]), np.array([10., 1., 1.]))
     candidate_ik.candidates = [np.array([1., 0., 0.]), np.array([0., .2, 0.])]
     chosen = ranked.plan_cartesian(goal, np.zeros(3), collision_check=False)
-    assert np.allclose(chosen.positions[-1], [1., 0., 0.]), 'travel must use joint ranges'
+    assert np.allclose(chosen.positions[-1], [0., .2, 0.]), \
+        'joint range normalization must not hide a longer route'
     candidate_ik.candidates = [np.array([1., .5, 0.]), np.array([1.5, 0., 0.])]
     chosen = ranked.plan_cartesian(goal, np.zeros(3), collision_check=False)
-    assert np.allclose(chosen.positions[-1], [1.5, 0., 0.]), 'travel must use every joint'
+    assert np.allclose(chosen.positions[-1], [1., .5, 0.]), 'travel must use every joint'
     candidate_ik.hard_limits = _CandidateIK.hard_limits
 
     class _World:
@@ -568,6 +644,42 @@ def _self_check() -> None:
         else:
             raise AssertionError('ranking accepted invalid joint bounds')
     print(f"high_level self-check OK: {len(traj.positions)} samples, bow {bow:.2e} m")
+
+
+def _check_route_selection() -> None:
+    """A nearer endpoint can require a longer route; compare flown curves."""
+    class IK:
+        hard_limits = (np.full(2, -10.), np.full(2, 10.))
+
+        def solve_candidates(self, *args, **kwargs):
+            return [np.array([x, 0.]) for x in (.2, .4, .8)]
+
+    planner = ArmPlanner('selection-check', IK(), None, np.ones(2), np.ones(2),
+                         ik_candidate_attempts=64)
+    visited = []
+
+    def route(goal, start, **kwargs):
+        visited.append(float(goal[0]))
+        if goal[0] == .2:
+            # Even its knot chord is short, but the flown cubic bows away.
+            return JointTrajectory([0., 1.], [start, goal], [[0., 3.], [0., -3.]])
+        return JointTrajectory([0., 1.], [start, goal])
+
+    planner.plan_joint = route
+    chosen = planner.plan_cartesian(np.eye(4), np.zeros(2))
+    assert visited == [.2, .4], 'must evaluate the detour, improve it, then prune .8'
+    assert np.array_equal(chosen.positions[-1], [.4, 0.])
+    bulge = route(np.array([.2, 0.]), np.zeros(2))
+    upper = _curve_length_upper(bulge)
+    samples = np.array([bulge.sample_at(t).position for t in np.linspace(0, 1, 10001)])
+    sampled = np.linalg.norm(np.diff(samples, axis=0), axis=1).sum()
+    assert sampled <= upper <= sampled + 1.01e-4, (sampled, upper)
+    assert abs(_curve_length_upper(JointTrajectory(
+        bulge.times * 7, bulge.positions, bulge.velocities / 7)) - upper) < 1e-12, \
+        'geometric objective changed under uniform time scaling'
+    hold = JointTrajectory([0, 1], [[0.], [0.]], [[.6], [-.6]])
+    assert abs(_curve_length_upper(hold) - .3) < 1e-4, 'missed cubic reversal'
+    print('route selection: completed curve cost, admissible pruning, length bounds OK')
 
 
 
@@ -630,3 +742,4 @@ def _check_curve_certificate() -> None:
 if __name__ == "__main__":
     _check_curve_certificate()
     _self_check()
+    _check_route_selection()
