@@ -48,10 +48,10 @@ def _row(
     return row
 
 
-def main() -> None:
+def main(cfg: dict | None = None) -> None:
     shutdown = ShutdownFlag()
     install_signal_handlers(shutdown)
-    cfg = _load_cfg()
+    cfg = _load_cfg() if cfg is None else cfg
     n = int(cfg.get("num_motors", 7))
     motor_names = list(cfg.get("motor_names") or [f"motor_{i}" for i in range(n)])
     base = Path(str(cfg.get("motor_log_path") or "/tmp/arm_control_motor_state.csv"))
