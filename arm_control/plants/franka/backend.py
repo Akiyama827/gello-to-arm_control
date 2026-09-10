@@ -1,4 +1,4 @@
-"""Franka Research 3 backend — READ-ONLY state + gripper + payload over libfranka.
+"""Franka Research 3 backend — READ-ONLY arm state over libfranka.
 
 THERE IS NO MOTION PATH IN THIS BACKEND, deliberately (user decision
 2026-07-26): the FR3 is driven in TORQUE mode only, and the torque servo law
@@ -10,18 +10,19 @@ that is NOT the servo loop:
 * state streaming (``read_once`` → the bridge's ``motor_state`` shape),
 * health/fault reporting (``robot_mode`` + ``current_errors`` + the
   ``control_command_success_rate`` packet-loss canary),
-* the Franka Hand (its own TCP device — ``grasp()`` has native object
-  detection, so no ``GraspGate``; blocking calls run on a worker thread),
-* payload declaration (``Robot.set_load`` — the FR3 way of carrying a module;
-  never tau_ff, libfranka compensates gravity itself).
-
-Bridge commands that arrive anyway are dropped by the node with a warning —
-see ``nodes/franka_interface.py``.
+THE HAND IS NOT HERE. It is owned by ``rt/src/hand_bridge.cpp`` on the RT
+box and reached through ``end_effectors/franka_adapter.py`` — PC-side
+pylibfranka cannot read it since the network migration (server-push UDP does
+not cross the PC-side NAT: moves worked, every read timed out, bench
+2026-07-28). This file carried a second, direct ``fr.Gripper`` implementation
+until 2026-09-10; it was unreachable from every graph and could not have
+worked. Likewise payload: ``Robot.set_load`` is a NON-REALTIME command,
+illegal once a control session is open, so only the RT box's startup
+``--ee-mass`` can declare a fixed load, and a GRASPED module's weight rides
+the controller's ``tau_ff`` (``JointTrajectoryExecutor.set_payload``).
 """
 from __future__ import annotations
 
-import queue
-import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -63,21 +64,11 @@ class FrankaConfig:
     upper_torque_thresholds: tuple[float, ...] = (40.0,) * N_JOINTS
     lower_force_thresholds: tuple[float, ...] = (20.0,) * 6
     upper_force_thresholds: tuple[float, ...] = (40.0,) * 6
-    # Franka Hand. The row module measures 57 mm across (row_motor.stl bbox) and
-    # the Hand's stroke is 0-80 mm, so it fits with margin.
-    gripper_enabled: bool = True
-    grasp_width_m: float = 0.045
-    grasp_speed_mps: float = 0.05
-    grasp_force_n: float = 40.0
-    grasp_epsilon_inner_m: float = 0.02
-    grasp_epsilon_outer_m: float = 0.02
-    open_width_m: float = 0.075
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_config(cls, cfg) -> "FrankaConfig":
         raw = dict(cfg.get("franka") or {})
-        grip = dict(raw.get("gripper") or {})
 
         def _vec(key, default, n):
             value = raw.get(key, default)
@@ -103,13 +94,6 @@ class FrankaConfig:
             upper_force_thresholds=_vec(
                 "upper_force_thresholds", cls.upper_force_thresholds, 6
             ),
-            gripper_enabled=bool(grip.get("enabled", True)),
-            grasp_width_m=float(grip.get("grasp_width_m", 0.045)),
-            grasp_speed_mps=float(grip.get("speed_mps", 0.05)),
-            grasp_force_n=float(grip.get("force_n", 40.0)),
-            grasp_epsilon_inner_m=float(grip.get("epsilon_inner_m", 0.02)),
-            grasp_epsilon_outer_m=float(grip.get("epsilon_outer_m", 0.02)),
-            open_width_m=float(grip.get("open_width_m", 0.075)),
             raw=raw,
         )
 
@@ -143,15 +127,10 @@ class FrankaHardwareBackend:
             raise ValueError(f"FR3 has {N_JOINTS} joints, got {len(self.joint_names)}")
         self._fr = None
         self.robot = None
-        self.gripper = None
         self._last_state = None
         self._state_errors = 0          # consecutive read_once failures
         self._latched_fault: str | None = None
         self._armed = False
-        # Blocking gripper calls run here; results are polled by the node.
-        self._grip_thread: threading.Thread | None = None
-        self._grip_results: queue.Queue = queue.Queue()
-        self._grip_busy = False
         self.last_close_errors: list = []
 
     @classmethod
@@ -187,14 +166,9 @@ class FrankaHardwareBackend:
             list(cfg.lower_force_thresholds),
             list(cfg.upper_force_thresholds),
         )
-        if cfg.gripper_enabled:
-            try:
-                self.gripper = fr.Gripper(cfg.ip)
-            except Exception as exc:
-                print(f"[franka] gripper unavailable ({exc}) — arm only", flush=True)
         self._last_state = self.robot.read_once()
         print(
-            f"[franka] connected to {cfg.ip} — read-only + gripper "
+            f"[franka] connected to {cfg.ip} — read-only arm state "
             f"(motion runs on the RT machine; "
             f"realtime={'enforced' if cfg.enforce_realtime else 'IGNORED'})",
             flush=True,
@@ -202,7 +176,7 @@ class FrankaHardwareBackend:
 
     def enable_all(self) -> None:
         """Arm: clear any latched reflex. Nothing can move from this process —
-        arming only gates gripper actions and marks the monitor live."""
+        arming only clears a latched reflex and marks the monitor live."""
         if self.robot is None:
             raise FrankaBackendUnavailableError("enable_all() before open()")
         self.robot.automatic_error_recovery()
@@ -224,12 +198,7 @@ class FrankaHardwareBackend:
             self.safe_stop()
         except Exception as exc:
             self.last_close_errors.append(exc)
-        if self.gripper is not None:
-            try:
-                self.gripper.stop()
-            except Exception as exc:
-                self.last_close_errors.append(exc)
-        self.robot = self.gripper = None
+        self.robot = None
 
     # -- feedback -------------------------------------------------------------
     def motor_state(self) -> dict[str, np.ndarray]:
@@ -335,86 +304,6 @@ class FrankaHardwareBackend:
         except Exception as exc:
             print(f"[franka] set_load failed: {exc}", flush=True)
 
-    # -- gripper (blocking calls run off the control thread) ------------------
-    @property
-    def grasp_busy(self) -> bool:
-        return self._grip_busy
-
-    def request_grasp(self, request_id: str, target_id: str, mode: str) -> dict | None:
-        """Start a close/release on a worker thread; result arrives via poll.
-
-        Returns an immediate result only for the failure cases that need no
-        hardware (no gripper configured, or one already in flight).
-        """
-        if self.gripper is None:
-            return {
-                "request_id": request_id, "target_id": target_id,
-                "ok": False, "reason": "no gripper configured",
-            }
-        if self._grip_busy:
-            return {
-                "request_id": request_id, "target_id": target_id,
-                "ok": False, "reason": "gripper busy",
-            }
-        self._grip_busy = True
-        self._grip_thread = threading.Thread(
-            target=self._grasp_worker,
-            args=(request_id, target_id, mode),
-            daemon=True,
-        )
-        self._grip_thread.start()
-        return None
-
-    def _grasp_worker(self, request_id: str, target_id: str, mode: str) -> None:
-        cfg = self.config
-        try:
-            if mode == "release":
-                self.gripper.move(cfg.open_width_m, cfg.grasp_speed_mps)
-                ok, reason = True, "released"
-            else:
-                # grasp() returns the Hand's OWN object-detection verdict — this
-                # is what replaces the DM arm's torque-threshold GraspGate.
-                ok = bool(
-                    self.gripper.grasp(
-                        cfg.grasp_width_m,
-                        cfg.grasp_speed_mps,
-                        cfg.grasp_force_n,
-                        cfg.grasp_epsilon_inner_m,
-                        cfg.grasp_epsilon_outer_m,
-                    )
-                )
-                state = self.gripper.read_once()
-                reason = (
-                    f"grasped (width {state.width * 1e3:.1f} mm)"
-                    if ok
-                    else f"no object at {state.width * 1e3:.1f} mm"
-                )
-        except Exception as exc:
-            ok, reason = False, f"gripper error: {exc}"
-        self._grip_results.put(
-            {"request_id": request_id, "target_id": target_id, "ok": ok, "reason": reason}
-        )
-        self._grip_busy = False
-
-    def poll_grasp_result(self) -> dict | None:
-        try:
-            return self._grip_results.get_nowait()
-        except queue.Empty:
-            return None
-
-    def gripper_state(self) -> dict | None:
-        """Live finger width + the Hand's own grasp flag (for drop detection)."""
-        if self.gripper is None or self._grip_busy:
-            return None  # read_once during a blocking motion would contend
-        try:
-            state = self.gripper.read_once()
-        except Exception:
-            return None
-        return {
-            "width": float(state.width),
-            "is_grasped": bool(state.is_grasped),
-            "temperature": float(getattr(state, "temperature", 0.0)),
-        }
 
 
 def _demo() -> None:
@@ -428,14 +317,12 @@ def _demo() -> None:
                 "ip": "10.0.0.2",
                 "enforce_realtime": False,
                 "upper_torque_thresholds": 35,   # scalar broadcasts to 7
-                "gripper": {"force_n": 25.0, "open_width_m": 0.08},
             }
         }
     )
     assert cfg.ip == "10.0.0.2"
     assert cfg.enforce_realtime is False
     assert cfg.upper_torque_thresholds == (35.0,) * 7
-    assert cfg.grasp_force_n == 25.0 and cfg.open_width_m == 0.08
     # Defaults survive an empty block.
     empty = FrankaConfig.from_config({})
     assert empty.ip == "172.16.0.2" and len(empty.upper_torque_thresholds) == N_JOINTS
