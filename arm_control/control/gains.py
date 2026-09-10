@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 if TYPE_CHECKING:
     from arm_control.plants.dm.backend import DmMotorLimits
 
@@ -41,3 +43,51 @@ def validate_hardware_gains(
                 f"{name}={value:g} is out of DM encode range [{lo:g}, {hi:g}]; "
                 "gains must fit the wire format, not be silently clipped"
             )
+
+
+def validate_torque_limits(
+    limits, n: int | None = None, *, where: str = "torque_limits"
+) -> np.ndarray:
+    """Return ``limits`` as a frozen float vector, or raise.
+
+    One check behind every torque clamp in the stack. A NaN limit is worse than
+    a wrong one: ``abs(tau) > nan`` is False, so the clamp silently never fires,
+    and ``np.clip(tau, -lim, lim)`` with a negative ``lim`` inverts the interval
+    and returns the limit itself. Both must be configuration errors, not runtime
+    surprises. Pass ``n`` to also pin the joint count.
+    """
+    values = np.asarray(limits, dtype=float).copy()
+    if values.ndim != 1 or not values.size:
+        raise ValueError(f"{where} must be a non-empty joint vector")
+    if n is not None and values.size != n:
+        raise ValueError(f"{where} length {values.size} != {n}")
+    if not np.isfinite(values).all() or np.any(values <= 0):
+        raise ValueError(f"{where} must be finite and positive, got {values.tolist()}")
+    values.setflags(write=False)
+    return values
+
+
+def _self_check() -> None:
+    """The NaN/negative limits that used to slip past the clamp must now raise."""
+    ok = validate_torque_limits([9.0, 3.0], 2)
+    assert ok.tolist() == [9.0, 3.0] and not ok.flags.writeable
+    for bad in ([float("nan"), 3.0], [-9.0, 3.0], [0.0, 3.0], [], [[9.0, 3.0]]):
+        try:
+            validate_torque_limits(bad, 2)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted bad torque limits: {bad}")
+    try:
+        validate_torque_limits([9.0, 3.0], 3)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted a length mismatch")
+    # The failure mode this guards: an unvalidated NaN limit clamps NOTHING.
+    tau, lim = np.array([1e6]), np.array([float("nan")])
+    assert not (np.abs(tau) > lim)[0], "premise: NaN comparison is False, so no clamp"
+    print("gains self-check OK")
+
+
+if __name__ == "__main__":
+    _self_check()

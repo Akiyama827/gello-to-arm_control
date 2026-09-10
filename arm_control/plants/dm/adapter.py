@@ -11,6 +11,7 @@ from dora import Node
 
 from arm_control.end_effectors.torque_gripper import GraspController
 from arm_control.end_effectors.grasp import GraspGate
+from arm_control.control.gains import validate_torque_limits
 from arm_control.control.safety import SafetyController
 from arm_control.config import load_robot_config
 from arm_control.messages import (
@@ -69,11 +70,15 @@ def _make_grasp(cfg, backend) -> GraspController | None:
 def _safety_torque_limits(cfg, backend) -> np.ndarray:
     safety = cfg.get("safety") or {}
     raw = safety.get("torque_limits")
-    if raw and len(raw) == backend.num_motors:
-        return np.array([float(v) for v in raw], dtype=np.float64)
-    return np.array(
-        [_DEFAULT_TORQUE_LIMIT_BY_TYPE.get(m.motor_type, 3.0) for m in backend.motors],
-        dtype=np.float64,
+    if not raw:
+        # Absent (or the empty-list spelling of absent) -> documented per-motor-type
+        # default. A value that IS present but malformed -- wrong length, NaN,
+        # non-positive -- is an operator error and raises: silently substituting a
+        # default for the number they typed is how a wrong clamp reaches hardware
+        # unnoticed.
+        raw = [_DEFAULT_TORQUE_LIMIT_BY_TYPE.get(m.motor_type, 3.0) for m in backend.motors]
+    return validate_torque_limits(
+        raw, backend.num_motors, where="safety.torque_limits"
     )
 
 

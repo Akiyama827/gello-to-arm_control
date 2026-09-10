@@ -10,6 +10,7 @@ import math
 
 import numpy as np
 
+from arm_control.control.gains import validate_torque_limits
 from arm_control.motion import JointTrajectory
 
 
@@ -35,10 +36,9 @@ class ExecutionPolicy:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"execution_policy.{field.name} must be finite and positive")
             object.__setattr__(self, field.name, value)
-        limits = np.asarray(self.torque_limits, dtype=float).copy()
-        if limits.ndim != 1 or not limits.size or not np.isfinite(limits).all() or np.any(limits <= 0):
-            raise ValueError("execution_policy torque limits must be a finite positive joint vector")
-        limits.setflags(write=False)
+        limits = validate_torque_limits(
+            self.torque_limits, where="execution_policy.torque_limits"
+        )
         object.__setattr__(self, "torque_limits", limits)
         for name in ("velocity_limits", "acceleration_limits"):
             value = getattr(self, name)

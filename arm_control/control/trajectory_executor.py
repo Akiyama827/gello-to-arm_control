@@ -5,6 +5,7 @@ from typing import Sequence
 
 import numpy as np
 
+from arm_control.control.gains import validate_torque_limits
 from arm_control.dynamics import PinocchioDynamics
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
 
@@ -60,19 +61,16 @@ class JointTrajectoryExecutor:
         gravity_comp: bool = False,
     ) -> None:
         n = len(list(joint_names))
-        for arr, name in (
-            (kp_default, "kp_default"),
-            (kd_default, "kd_default"),
-            (max_torque, "max_torque"),
-        ):
+        for arr, name in ((kp_default, "kp_default"), (kd_default, "kd_default")):
             if np.asarray(arr).shape != (n,):
                 raise ValueError(f"{name} must have shape ({n},)")
+        max_torque = validate_torque_limits(max_torque, n, where="max_torque")
         self.arm_id = str(arm_id)
         self._joints = list(joint_names)
         self._dyn = dynamics
         self._kp = np.asarray(kp_default, dtype=float).copy()
         self._kd = np.asarray(kd_default, dtype=float).copy()
-        self._max_tau = np.asarray(max_torque, dtype=float).copy()
+        self._max_tau = np.array(max_torque, dtype=float)
         # Held-payload feedforward: RNEA knows only the bare arm, so a grasped
         # module's weight otherwise lands on the PD as steady-state sag (the
         # softened contact-phase gains make it centimeters at the EE).

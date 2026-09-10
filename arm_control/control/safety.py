@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from arm_control.control.gains import validate_torque_limits
 from arm_control.node_utils import _zero_command
 
 
@@ -36,11 +37,9 @@ class SafetyController:
         self.temp_limit_c = float(temp_limit_c)
         self.arm_ramp_sec = float(arm_ramp_sec)
         self._armed_at: float | None = None
-        self.torque_limits = np.asarray(torque_limits, dtype=np.float64)
-        if self.torque_limits.size != self.n:
-            raise ValueError(
-                f"torque_limits length {self.torque_limits.size} != {self.n} motors"
-            )
+        self.torque_limits = validate_torque_limits(
+            torque_limits, self.n, where="safety.torque_limits"
+        )
         self.armed = False
         self.latched_fault: str | None = None
         self._last_command_t: float | None = None
