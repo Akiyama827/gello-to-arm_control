@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+
+from arm_control import frames
 import pinocchio as pin
 
 from arm_control.config import RobotConfig
@@ -83,7 +85,10 @@ def main() -> None:
             stack.enter_context(patch.object(preview.rr, "disconnect"))
             visual = stack.enter_context(patch.object(console, "VisualFK"))
             log = stack.enter_context(patch.object(preview, "log_static_scene"))
-            stack.enter_context(patch.object(preview, "RobotGhost", side_effect=StartupComplete))
+            stack.enter_context(patch.object(preview, "RobotGhost"))
+            pin_log = stack.enter_context(patch.object(preview, "log_frame_transform"))
+            measured = stack.enter_context(
+                patch.object(preview, "MeasuredGhost", side_effect=StartupComplete))
             try:
                 with ExitStack() as cleanup:
                     console._run(
@@ -101,6 +106,16 @@ def main() -> None:
                 cfg, geoms=geoms if supplied else None,
             )
             log.assert_called_once_with(cfg, geoms=geoms if supplied else None)
+            # Both ghost roots carry the arm mount. They are authored in the
+            # ARM-BASE frame while the static scene and the planning boundary
+            # are logged in WORLD; unpinned they render mutually rotated and
+            # shifted by the mount, which on a 90-degree mount reads as a
+            # boundary that excludes the robot standing inside it.
+            expected = frames.world_T_arm(cfg if supplied else load.return_value)
+            np.testing.assert_allclose(measured.call_args.kwargs["world_T_arm"], expected)
+            target_pins = [c for c in pin_log.call_args_list if c.args[0] == "target"]
+            assert len(target_pins) == 1, target_pins
+            np.testing.assert_allclose(target_pins[0].args[1], expected)
 
     viz_cfg = {"arm": {"gripper_joints": []}}
     for supplied in (True, False):

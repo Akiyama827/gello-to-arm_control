@@ -39,7 +39,7 @@ from contextlib import ExitStack
 import numpy as np
 from dora import Node
 
-from arm_control import CONTROL_ROOT, REPO_ROOT
+from arm_control import CONTROL_ROOT, REPO_ROOT, frames
 
 from arm_control.config import arm_joints, ee_frame, gripper_joints, load_robot_config
 from arm_control.contracts.impedance import pose_hold_values
@@ -657,6 +657,7 @@ def _run(
         PreviewScene,
         RobotGhost,
         init_preview_stream,
+        log_frame_transform,
         log_static_scene,
         scene_obstacle_geoms,
     )
@@ -751,8 +752,14 @@ def _run(
     # mirror the LIVE width — frozen URDF-default fingers on the live ghost
     # read as a rendering bug (bench-reported, same round as PreviewScene's).
     gj = list(vfk.finger_joints)
+    # Pin the ghosts to the arm's world mount, exactly as planning.stack does.
+    # They are authored in the ARM-BASE frame while the static scene and the
+    # planning boundary are logged in WORLD; unpinned, they render mutually
+    # rotated and shifted by the mount (90 deg and 0.35 m on bench.yaml).
+    world_T_arm = frames.world_T_arm(cfg)
     target_robot = RobotGhost(cfg.urdf_path, planned + gj, "target")  # solid = target
-    ghost = MeasuredGhost(cfg.urdf_path, planned + gj)
+    log_frame_transform("target", world_T_arm)
+    ghost = MeasuredGhost(cfg.urdf_path, planned + gj, world_T_arm=world_T_arm)
     # restarts=1: only the current-target seed, so a Cartesian drag follows the
     # NEAREST IK branch and never jumps the arm to a different fold mid-drag.
     ik = PinocchioIK(cfg.urdf_path, ee_link, planned, restarts=1)
