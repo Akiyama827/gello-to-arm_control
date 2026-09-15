@@ -51,9 +51,14 @@ def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_d
         elif kind == mujoco.mjtGeom.mjGEOM_BOX:
             mesh = trimesh.creation.box(extents=2 * model.geom_size[i])
         elif kind == mujoco.mjtGeom.mjGEOM_PLANE:
-            # A finite visual patch represents the infinite collision plane.
-            mesh = trimesh.creation.box(extents=[8, 8, 0.002])
-            mesh.apply_translation([0, 0, -0.001])
+            # NOT drawn. A plane is infinite, so every finite stand-in is a
+            # slab across the whole scene -- this one was 8 m square and hid
+            # the bench it was supposed to sit under. Both viewers draw their
+            # own ground grid (Rerun's, and core.js's GridHelper), so the
+            # floor is still legible without occluding anything. The plane
+            # stays a COLLISION geom: mujoco_collision treats names starting
+            # `ground` as obstacles, and nothing here touches the model.
+            continue
         else:
             raise ValueError(f"static mesh export: unsupported geom {name!r} type {kind}")
         content = mesh.export(file_type='stl')
@@ -159,14 +164,10 @@ class RerunSceneMirror:
                 rr.Boxes3D(half_sizes=[model.geom_size[i]], colors=[color], fill_mode="solid"),
             )
         elif gtype == mujoco.mjtGeom.mjGEOM_PLANE:
-            rr.log(
-                entity,
-                rr.Boxes3D(
-                    half_sizes=[[1.0, 1.0, 0.002]],
-                    colors=[[90, 90, 90, 120]],
-                    fill_mode="solid",
-                ),
-            )
+            # Skipped for the same reason static_mesh_geoms skips it: a finite
+            # slab standing in for an infinite plane occludes the scene, and
+            # the viewer already draws a ground grid. Collision is unaffected.
+            return False
         else:  # cylinders/spheres/capsules — none in the current scenes
             return False
         return True
