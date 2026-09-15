@@ -61,14 +61,59 @@ def main() -> None:
         raw={"arm": {"joints": ["joint"], "ee_frame": "tcp", "gripper_joints": []}},
     )
     world = SimpleNamespace(lower=np.array([-1.0]), upper=np.array([1.0]))
+
+    # Named pose presets: SERVED in /state (the page builds its dropdown from
+    # there, so dropping the field silently removes the control) and validated
+    # on the way in, because a deployment supplies them and a malformed entry
+    # would otherwise break page build rather than refuse the console.
+    vfk = SimpleNamespace(
+        poses=lambda *_a, **_k: {"ee": {"p": [0.0, 0.0, 0.0], "q": [0.0, 0.0, 0.0, 1.0]},
+                                 "geoms": []},
+        finger_joints=[],
+    )
+    supplied_presets = [
+        {"name": "a - grasp", "xyz_mm": [1.0, 2.0, 3.0], "rpy_deg": [0.0, -90.0, 0.0]},
+        {"name": "b - lift", "xyz_mm": [4.0, 5.0, 6.0], "rpy_deg": [0.0, 0.0, 0.0]},
+    ]
+    panel = console.ControlPanel(["j"], [-1.0], [1.0], port=0, vfk=vfk,
+                                 pose_presets=supplied_presets)
+    try:
+        assert panel._state()["pose_presets"] == supplied_presets
+    finally:
+        panel.close()
+    empty = console.ControlPanel(["j"], [-1.0], [1.0], port=0, vfk=vfk)
+    try:
+        assert empty._state()["pose_presets"] == []
+    finally:
+        empty.close()
+    for bad in ([{"name": "x", "xyz_mm": [1, 2], "rpy_deg": [0, 0, 0]}],
+                [{"name": "", "xyz_mm": [1, 2, 3], "rpy_deg": [0, 0, 0]}],
+                [{"name": "d", "xyz_mm": [1, 2, 3], "rpy_deg": [0, 0, 0]}] * 2,
+                [{"name": "n", "xyz_mm": [float("nan"), 2, 3], "rpy_deg": [0, 0, 0]}],
+                [{"name": "e", "xyz_mm": [1, 2, 3]}]):
+        try:
+            console._pose_presets(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"console accepted a malformed pose preset: {bad}")
+    # The page must actually render them, or the list is served into nothing.
+    page = (Path(console.__file__).parent / "static" / "console.js").read_text()
+    assert "buildPresets(state.pose_presets)" in page
+    markup = (Path(console.__file__).parent / "static" / "console.html").read_text()
+    for element in ('id="preset-select"', 'id="fill-preset"', 'id="preset-row"'):
+        assert element in markup, element
     with patch.object(console, "_run") as run, patch.object(
         console, "install_signal_handlers",
     ):
-        console.main(cfg=cfg, collision_world=world, static_geoms=geoms)
+        presets = [{"name": "p", "xyz_mm": [1.0, 2.0, 3.0], "rpy_deg": [0.0, 0.0, 0.0]}]
+        console.main(cfg=cfg, collision_world=world, static_geoms=geoms,
+                     pose_presets=presets)
         assert run.call_args.kwargs == {
             "cfg": cfg, "collision_world": world, "static_geoms": geoms,
+            "pose_presets": presets,
         }
         console.main()
+        assert run.call_args.kwargs["pose_presets"] is None
 
     # Stop immediately after startup scene logging: no Dora or HTTP connection.
     class StartupComplete(Exception):

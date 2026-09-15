@@ -65,6 +65,36 @@ $("copy-current").onclick = () => {
   $("pose-status").textContent = "Current pose copied to Desired · not applied";
   updateMoveButtons();
 };
+// Presets FILL Desired and nothing else -- same contract as Copy current, so
+// Apply/Plan/Execute still gate the motion. The list is supplied by the
+// deployment; an empty one hides the row entirely.
+const buildPresets = (presets) => {
+  const row = $("preset-row");
+  const select = $("preset-select");
+  select.replaceChildren();
+  if (!presets || !presets.length) {
+    row.hidden = true;
+    return;
+  }
+  for (const [index, preset] of presets.entries()) {
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = preset.name;
+    select.append(option);
+  }
+  row.hidden = false;
+  $("fill-preset").onclick = () => {
+    const preset = presets[Number(select.value)];
+    if (!preset) return;
+    fillPose(preset);
+    poseDirty = true;
+    poseEdits += 1;
+    poseError = "";
+    $("pose-status").textContent = `"${preset.name}" filled into Desired \u00b7 not applied`;
+    updateMoveButtons();
+  };
+};
+
 $("apply-pose").onclick = async () => {
   if (posePosting || posePending) return;
   if (!poseInputs.every((input) => input.reportValidity())) {
@@ -346,6 +376,7 @@ const build = async (state) => {
       `Open: ${hand.defaults.open_width_m * 1000} mm. DISARM blocks new actions; an executing Hand move/grasp may continue. It does not open a held object.`;
   }
   if (state.jog) buildJogPad(state.jog);
+  buildPresets(state.pose_presets);
 
   const strip = $("buttons");
   const gains = $("gains");

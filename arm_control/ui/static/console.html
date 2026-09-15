@@ -74,6 +74,10 @@
           <button id="copy-current" type="button" disabled>Copy current</button>
           <button id="apply-pose" type="button">Apply target</button>
         </div>
+        <div id="preset-row" class="button-pair" hidden>
+          <select id="preset-select" aria-label="Named pose preset"></select>
+          <button id="fill-preset" type="button">Fill from preset</button>
+        </div>
         <p>Copy fills Desired only. Apply sets the target without moving.</p>
         <p id="pose-status" aria-live="polite"></p>
         <div id="buttons" class="command-stack"></div>

@@ -116,6 +116,25 @@ def pose_matrix(payload):
     return T
 
 
+def _pose_presets(raw) -> list:
+    """Validate caller-supplied named poses; refuse rather than half-render."""
+    out = []
+    for entry in list(raw or []):
+        if not isinstance(entry, dict) or set(entry) != {"name", "xyz_mm", "rpy_deg"}:
+            raise ValueError("pose preset needs name, xyz_mm and rpy_deg only")
+        name = entry["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("pose preset name must be a non-empty string")
+        out.append({
+            "name": name,
+            "xyz_mm": [float(v) for v in _finite_values(entry["xyz_mm"], 3)],
+            "rpy_deg": [float(v) for v in _finite_values(entry["rpy_deg"], 3)],
+        })
+    if len({entry["name"] for entry in out}) != len(out):
+        raise ValueError("pose preset names must be unique")
+    return out
+
+
 def pose_fields(ee):
     import pinocchio as pin
 
@@ -146,11 +165,19 @@ class ControlPanel:
         gripper_cfg: dict | None = None,
         gain_presets: dict | None = None,
         payload_table: dict | None = None,
+        pose_presets: list | None = None,
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
         # arm config (gripper_range_m) or its joint_mimics entry — never a
         # robot-shaped constant here.
         self._lock = threading.Lock()
+        # Named base-frame poses the operator can FILL into Desired. They are
+        # a convenience over typing six numbers, not an authority: filling
+        # only populates the inputs, so Apply/Plan/Execute still gate every
+        # motion exactly as a hand-typed pose does. Validated here because the
+        # caller supplies them and a malformed entry would otherwise surface
+        # as an unreadable page rather than a refused console.
+        self._pose_presets = _pose_presets(pose_presets)
         self._vfk = vfk
         self._names = list(names)
         self._lower = [float(v) for v in lower]
@@ -306,6 +333,7 @@ class ControlPanel:
                 },
                 "pose": {'current': None, 'target': None, 'status': self._pose_status,
                          'revision': self._target_revision},
+                "pose_presets": self._pose_presets,
                 "log": list(self._log)[-8:],  # deque: copy THEN slice
                 "plan_version": self._plan["version"],
                 "ident": self._ident,
@@ -634,19 +662,19 @@ def plan_trajectory(
     return collision_checked_retiming(waypoints, vmax, amax, world.in_collision)
 
 
-def main(*, cfg=None, collision_world=None, static_geoms=None) -> None:
+def main(*, cfg=None, collision_world=None, static_geoms=None, pose_presets=None) -> None:
     shutdown = ShutdownFlag()
     install_signal_handlers(shutdown)
     with ExitStack() as cleanup:
         _run(
-            shutdown, cleanup, cfg=cfg,
-            collision_world=collision_world, static_geoms=static_geoms,
+            shutdown, cleanup, cfg=cfg, collision_world=collision_world,
+            static_geoms=static_geoms, pose_presets=pose_presets,
         )
 
 
 def _run(
     shutdown: ShutdownFlag, cleanup: ExitStack, *,
-    cfg=None, collision_world=None, static_geoms=None,
+    cfg=None, collision_world=None, static_geoms=None, pose_presets=None,
 ) -> None:
     import pinocchio as pin
     import rerun as rr
@@ -816,6 +844,7 @@ def _run(
         gripper_cfg=dict((cfg.get("franka") or {}).get("gripper") or {}),
         gain_presets={name: gains for name, gains in gain_presets.items() if name not in pose_hold_presets},
         payload_table=dict(cfg.get("module_grasps") or {}),
+        pose_presets=pose_presets,
     )
     cleanup.callback(panel.close)
     # The legend, stated once, the same on the page and in Rerun. It used to
