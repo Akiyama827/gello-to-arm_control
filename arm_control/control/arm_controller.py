@@ -168,7 +168,7 @@ class ArmController:
         self._needs_health = bool(plant_reports_health)
         self.bridge_armed = not self._needs_health
         self.ready_sent = False
-        self.frozen = False         # holding forever (milestone reached)
+        self.frozen = False         # milestone hold / failed settle; cancel clears
         self.stopped = False
 
         # The one loaded plan and whether it has been released to run.
@@ -182,29 +182,56 @@ class ArmController:
         return self._plant_t
 
     # -- inputs --------------------------------------------------------------
+    def _refuse_plan(self, plan, reason: str, *, report: bool) -> None:
+        """Say WHY, always, on the one path an operator can actually read.
+
+        A plan that vanishes without a word is the worst failure this class
+        has: the console still shows its own "plan OK" (it planned locally),
+        and the refusal only surfaces seconds later as Execute reporting
+        "loaded plan is None" -- which names the symptom and not one word of
+        the cause. Measured on the bench 2026-09-15: a settling timeout froze
+        the controller, every later plan was dropped by the `frozen` guard,
+        and no log anywhere said so.
+
+        ``report`` keeps the leg_result contract exactly as it was. Emitting
+        one where none was emitted before would tell a waiting planner that
+        ITS leg failed, so the extra events stay out of this fix; stdout costs
+        nothing and is where the evidence was missing.
+        """
+        print(f"[arm_controller] REFUSED plan {plan['plan_id']} "
+              f"({plan['phase']}): {reason}", flush=True)
+        if report:
+            self.node.send_output("controller_event", pack_controller_event(
+                kind="leg_result", plan_id=plan["plan_id"], ok=False, reason=reason))
+
     def on_plan(self, value) -> None:
         """Load one leg. Refused if another is mid-flight (never swapped)."""
         plan = unpack_plan(value)
         if self._pose_hold is not None:
-            self.node.send_output("controller_event", pack_controller_event(
-                kind="leg_result", plan_id=plan["plan_id"], ok=False,
-                reason="Soft pose hold active; select Track before planning"))
+            self._refuse_plan(
+                plan, "Soft pose hold active; select Track before planning",
+                report=True)
             return
         if self.stopped or self.frozen:
+            # Terminal states, and the reason they are terminal is why this has
+            # to speak: `stop` latches and `hold`/a failed settle freeze, so
+            # EVERY later plan lands here until the operator cancels (which now
+            # clears `frozen`) or the graph restarts.
+            self._refuse_plan(
+                plan,
+                "controller is stopped" if self.stopped else
+                "controller is frozen (hold or failed settle) - press Stop to clear",
+                report=False)
             return
         if self._running:
-            print(
-                f"[arm_controller] REFUSED plan {plan['plan_id']} "
-                f"({plan['phase']}): {self._plan['plan_id']} is still executing",
-                flush=True,
-            )
+            self._refuse_plan(
+                plan, f"{self._plan['plan_id']} is still executing", report=False)
             return
         if self.execution_policy is not None:
             reason = self._observation_error() or self.execution_policy.plan_error(
                 plan, self.last_state.position, self.n_arm)
             if reason:
-                self.node.send_output("controller_event", pack_controller_event(
-                    kind="leg_result", plan_id=plan["plan_id"], ok=False, reason=reason))
+                self._refuse_plan(plan, reason, report=True)
                 return
         # Checked here as well as in set_gains: this path must REPORT a bad
         # law back to the planner, not raise inside a Dora handler. Outside
@@ -212,10 +239,7 @@ class ArmController:
         # policy are exactly the ones with no other admission check.
         reason = gain_error(plan["kp"], plan["kd"])
         if reason:
-            print(f"[arm_controller] REFUSED plan {plan['plan_id']}: {reason}",
-                  flush=True)
-            self.node.send_output("controller_event", pack_controller_event(
-                kind="leg_result", plan_id=plan["plan_id"], ok=False, reason=reason))
+            self._refuse_plan(plan, reason, report=True)
             return
         traj = JointTrajectory(
             times=plan["times"],
@@ -570,11 +594,23 @@ class ArmController:
         """Abort the current leg and hold, still ARMED and still runnable.
 
         None of the three existing stops means this. ``stop`` is terminal (it
-        disarms and latches). ``hold`` freezes forever -- it is the milestone
-        signal, and a frozen controller refuses every later plan. Disarming is
-        a lifecycle reset that makes the plant go limp. An operator pressing
-        Stop on a console means none of those: put the arm down where it is,
-        forget the plan, and let me try again without re-arming.
+        disarms and latches). ``hold`` freezes -- it is the milestone signal.
+        Disarming is a lifecycle reset that makes the plant go limp. An
+        operator pressing Stop on a console means none of those: put the arm
+        down where it is, forget the plan, and let me try again without
+        re-arming.
+
+        Which is why cancel CLEARS ``frozen`` (2026-09-15). It used to freeze
+        forever with nothing to undo it -- ``frozen = False`` appeared only in
+        __init__ -- so one failed settle wedged a manual session until the
+        graph was restarted, and every plan after it was dropped in silence.
+        "Let me try again" cannot mean "restart the process".
+
+        ``stopped`` is deliberately NOT cleared here: it latches on purpose and
+        has already disarmed the plant, so recovering from it is an explicit
+        re-arm, not a cancel. Clearing ``frozen`` cannot start motion by
+        itself either -- it only lets a LATER plan be admitted, which still
+        needs Plan, Execute, ARM and a fresh observation to move anything.
 
         Dropping ``_hold_anchor`` is what makes it land in the right place. The
         anchor normally follows the last COMMANDED target so a settled hold
@@ -590,13 +626,15 @@ class ArmController:
             self._report_mode()
         if self._running:
             self._finish_leg(ok=False, reason=reason)
+        was_frozen, self.frozen = self.frozen, False
         self._plan = None
         self._pending_traj = None
         self._running = False
         self.executor.clear_trajectory()
         self._jog.clear()
         self._hold_anchor = None
-        print(f"[arm_controller] cancelled: {reason}", flush=True)
+        print(f"[arm_controller] cancelled: {reason}"
+              f"{' (cleared frozen hold)' if was_frozen else ''}", flush=True)
 
     def _leg_done(self, state: JointState) -> bool:
         """Has this leg finished? The RULE arrives with the plan.
