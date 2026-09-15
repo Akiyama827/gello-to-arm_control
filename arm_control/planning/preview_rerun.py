@@ -405,9 +405,26 @@ class DeferredPreview:
 
 
 def log_static_scene(cfg, *, geoms=None) -> None:
-    """Draw supplied fixed meshes, or resolve them from config."""
+    """Draw supplied fixed meshes, or resolve them from config.
+
+    Geom poses are ARM-BASE frame by contract -- both `static_scene_geoms`
+    and WorkcellScene.static_geoms() document that, so the teleop page can
+    consume them without another transform. The Rerun recording's global
+    frame is WORLD (the sim mirror logs world poses, and the planning
+    boundary is logged in world), so this subtree needs the same pin the
+    `measured` and `preview` roots already carry. Without it the fixtures
+    render shifted AND rotated by the arm's mount: on bench.yaml the docking
+    base drew at (+0.392, -0.062) instead of (-0.025, +0.550), which put it
+    outside a keep-in boundary it is comfortably inside.
+    """
+    from arm_control import frames
+
     if geoms is None:
         geoms = static_scene_geoms(cfg)
+    if geoms:
+        # Only when there is something to place: an empty scene must stay
+        # silent, as the UI scene-injection check requires.
+        log_frame_transform("scene", frames.world_T_arm(cfg))
     for body, mesh_name, mesh_path, T in geoms:
         entity = f"scene/{body}/{mesh_name}"
         rr.log(entity, rr.Asset3D(path=mesh_path), static=True)
