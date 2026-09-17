@@ -93,15 +93,30 @@ double act_from = 0.0, act_goal = 0.0, act_speed = 0.0, act_t0 = 0.0;
 // This 10 um envelope is not a vendor accuracy rating or a command allowance.
 constexpr double width_measurement_tolerance_m = 1e-5;
 
+// The OPEN end needs a much wider allowance than the closed end. Full stroke
+// is whatever the homing sweep measured, and this Hand reports 80.76 mm there
+// -- 760 um past the nominal 80 mm. The closed-end 10 um figure is endpoint
+// noise and does not transfer. real_w is clamped to [0, .08] regardless, so
+// accepting an overshoot costs no accuracy, whereas rejecting it withheld
+// STATE for the whole session and rendered the fingers as CLOSED.
+constexpr double width_open_tolerance_m = 2e-3;
+
 // Called under mx. Only a new device timestamp can refresh measured freshness.
 void observe_state(const franka::GripperState& st) {
   if (admission.stopping) return; // Never attest freshness during stop dispatch.
   const auto stamp = st.time.toMSec();
   if (seen_robot_sample && stamp <= robot_sample_time) return;
   if (!std::isfinite(st.width) || st.width < -width_measurement_tolerance_m ||
-      st.width > .08 + width_measurement_tolerance_m) {
-    if (have_real) {
-      std::printf("[hand] rejected measured width %.12g m at device time %llu ms\n",
+      st.width > .08 + width_open_tolerance_m) {
+    // Throttled, NOT gated on have_real: the first bad sample clears the
+    // very flag such a gate would test, so a Hand that never once reports a
+    // usable width stays completely silent -- which is the failure that is
+    // hardest to diagnose, because STATE is withheld and nothing is logged.
+    static double last_reject_print = -1e9;
+    if (mono_s() - last_reject_print > 2.0) {
+      last_reject_print = mono_s();
+      std::printf("[hand] rejected measured width %.12g m at device time %llu ms"
+                  " (no STATE is sent until a sample is usable)\n",
                   st.width, (unsigned long long)stamp);
     }
     have_real = false;

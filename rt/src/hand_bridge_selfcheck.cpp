@@ -88,7 +88,9 @@ int main() {
   assert(sample_seq == first_seq + 1);
   // Actual closed-Hand observation: -1.97 um is endpoint noise, not stale data.
   uint64_t stamp = 12;
-  for (double width : {-1.97000008484e-6, -1e-5, .080002, .08001}) {
+  // .0807588398457 is a real reading from this Hand at full open.
+  for (double width : {-1.97000008484e-6, -1e-5, .080002, .08001,
+                       .0807588398457, .082}) {
     sample.width = width;
     sample.time = franka::Duration(stamp++);
     const auto seq = sample_seq;
@@ -98,7 +100,7 @@ int main() {
     observe_state(sample);
     assert(sample_seq == seq + 1); // Normalization must not refresh duplicates.
   }
-  for (double width : {-1.01e-5, .0800101,
+  for (double width : {-1.01e-5, .0820101,
                        std::numeric_limits<double>::quiet_NaN(),
                        std::numeric_limits<double>::infinity()}) {
     sample.width = width;
