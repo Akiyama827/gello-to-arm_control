@@ -44,6 +44,17 @@ if(WITH_FRANKA)
   # Franka Hand daemon for the box: the Hand's state stream is server-push
   # UDP, which cannot cross the PC-side NAT — the Hand must be owned from
   # the robot LAN, like the torque loop. See src/hand_bridge.cpp.
+  # Read-only kinematics probe: no control path, so nothing to deploy to the
+  # box -- it runs wherever libfranka can reach the FCI.
+  add_executable(flange_probe src/flange_probe.cpp)
+  target_link_libraries(flange_probe PRIVATE Franka::Franka Eigen3::Eigen)
+  # Same deployed layout as arm_rt_server: the box has no toolchain and no
+  # root-installed libfranka, so it must find its shared libs in ./lib.
+  set_target_properties(flange_probe PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib"
+    INSTALL_RPATH "\$ORIGIN/lib")
+  target_link_options(flange_probe PRIVATE -Wl,--disable-new-dtags)
+
   add_executable(hand_bridge src/hand_bridge.cpp)
   add_executable(hand_bridge_selfcheck src/hand_bridge_selfcheck.cpp)
   target_link_libraries(hand_bridge_selfcheck PRIVATE Franka::Franka Threads::Threads)
