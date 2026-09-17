@@ -531,6 +531,7 @@ def main(*, cfg=None, static_geoms=None) -> None:
     from arm_control.config import gripper_joints as _gj
     render_model = _build_render_model(urdf_path, joint_names, extra_joints=_gj(cfg))
     finger_joints: list[str] = []
+    _gripper_unknown = False
     if render_model is not None:
         joint_names = render_model[5]  # motors + URDF-present finger joints
         finger_joints = [j for j in _gj(cfg) if j in joint_names]
@@ -593,9 +594,28 @@ def main(*, cfg=None, static_geoms=None) -> None:
 
         elif eid == "gripper_state":
             payload = unpack_json_message(event["value"], expected_schema="gripper_state")
-            half = float(payload.get("width", 0.0)) / 2.0
-            finger_values = {j: half for j in finger_joints}
-            _last_fk_q = None  # force a re-render even with a motionless arm
+            # A MISSING width is not zero. gripper_state publishes at 10 Hz
+            # whether or not the Hand is reporting, and `width` is absent
+            # until hand_bridge has actually reached the Hand -- so defaulting
+            # it to 0.0 drew a confidently CLOSED gripper for "I have no idea",
+            # which is indistinguishable on screen from a real closed grip.
+            # Leave the fingers wherever they were and say so once.
+            width = payload.get("width")
+            if width is None:
+                if not _gripper_unknown:
+                    _gripper_unknown = True
+                    print("[viz] no Hand width yet — hand_bridge is reachable but "
+                          "has not reported a STATE line, so the fingers are "
+                          "UNKNOWN, not closed. Check the bridge's own link to "
+                          "the Hand: journalctl -u arm-hand-bridge", flush=True)
+            else:
+                if _gripper_unknown:
+                    _gripper_unknown = False
+                    print("[viz] Hand width received; fingers are live again",
+                          flush=True)
+                half = float(width) / 2.0
+                finger_values = {j: half for j in finger_joints}
+                _last_fk_q = None  # force a re-render even with a motionless arm
 
         elif eid == "can_bus_status":
             payload = unpack_json_message(event["value"], expected_schema="can_bus_status")
