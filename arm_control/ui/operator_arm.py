@@ -29,7 +29,7 @@ from dora import Node
 
 
 from arm_control.messages import pack_json_message
-from arm_control.node_utils import next_event_gil_friendly
+from arm_control.node_utils import instance_scoped, next_event_gil_friendly
 
 _PANEL_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>operator gate</title><style>
@@ -220,7 +220,8 @@ class OperatorPanel:
 
 
 def _trigger_file() -> Path:
-    return Path(os.environ.get("ARM_OPERATOR_ARM_FILE", "/tmp/arm_operator_arm"))
+    explicit = os.environ.get("ARM_OPERATOR_ARM_FILE")
+    return Path(explicit) if explicit else instance_scoped(Path("/tmp/arm_operator_arm"))
 
 
 def _file_mtime(path: Path) -> float | None:

@@ -29,6 +29,17 @@ class ShutdownFlag:
         self.stop_requested = True
 
 
+def instance_scoped(path: Path) -> Path:
+    """``path`` suffixed with ``.<ARM_ID>`` when the graph names its instance.
+
+    Operator trigger files are motion authority. Two arm graphs on one host
+    must not both act on one ``touch``; a graph without ARM_ID keeps the
+    unsuffixed name it always had.
+    """
+    arm = os.environ.get("ARM_ID", "").strip()
+    return path.with_name(f"{path.name}.{arm}") if arm else path
+
+
 def install_signal_handlers(flag: ShutdownFlag):
     def _handler(signum, frame) -> None:
         flag.request_stop()

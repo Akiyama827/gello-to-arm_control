@@ -67,6 +67,7 @@ from arm_control.messages import (
 from arm_control.node_utils import (
     ShutdownFlag,
     install_signal_handlers,
+    instance_scoped,
     next_event_gil_friendly,
 )
 
@@ -129,7 +130,7 @@ def cancel_grasp_on_authority_loss(client, fsm, authorized):
 
 # User-private runtime dir, not /tmp: this file triggers a PHYSICAL open-close
 # sweep of the jaws — it must not be any local user's to touch.
-HOME_FILE = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "arm_gripper_home"
+HOME_FILE = instance_scoped(Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "arm_gripper_home")
 
 
 class BridgeClient(threading.Thread):

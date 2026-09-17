@@ -40,6 +40,7 @@ from arm_control.node_utils import (
     ShutdownFlag,
     _load_mode_config,
     install_signal_handlers,
+    instance_scoped,
     resolve_gains,
 )
 
@@ -47,8 +48,8 @@ from arm_control.node_utils import (
 # a world-writable trigger is motion authority for ANY local process/user,
 # and a foreign pre-created /tmp file even crashes the unlink at startup.
 _RUN_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
-GO_FILE = _RUN_DIR / "arm_replay_go"
-STOP_FILE = _RUN_DIR / "arm_replay_stop"
+GO_FILE = instance_scoped(_RUN_DIR / "arm_replay_go")      # .<ARM_ID> when set
+STOP_FILE = instance_scoped(_RUN_DIR / "arm_replay_stop")
 MAX_CSV_BYTES = 20 * 1024 * 1024  # a recording is minutes of 50 Hz rows, not GB
 
 
