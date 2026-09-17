@@ -24,6 +24,7 @@ import os
 from dora import Node
 
 
+from arm_control.model_bundle import model_token, pose_provenance
 from arm_control.config import arm_joints, load_robot_config
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.execution_policy import build_execution_policy
@@ -71,6 +72,8 @@ def main() -> None:
         execution_policy=policy,
         settle_timeout_s=float((cfg.get('arm') or {}).get('settle_timeout_s', 5.0)),
         settle_dwell_s=float((cfg.get('arm') or {}).get('settle_dwell_s', 0.2)),
+        model_token=model_token(cfg),
+        pose_provenance=pose_provenance(cfg),
         # A bare sim plant (mujoco_interface with no sim_bridge) publishes no
         # motor_health, so the controller would wait forever for an armed edge
         # that cannot come. The GRAPH knows whether a bridge is in the path, so

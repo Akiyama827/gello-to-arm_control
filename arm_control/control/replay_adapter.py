@@ -30,6 +30,7 @@ import numpy as np
 from dora import Node
 
 from arm_control.config import arm_joints, load_robot_config
+from arm_control.model_bundle import model_token
 from arm_control.messages import (
     pack_control_update,
     pack_plan,
@@ -256,6 +257,7 @@ def main() -> None:
                 velocities=vs,
                 kp=plan_kp,
                 kd=plan_kd,
+                model_token=model_token(cfg),
             ),
         )
         print(f"[trajectory_replay] sent {csv_path.name}: {summary}", flush=True)

@@ -350,9 +350,44 @@ def _self_check() -> None:
     print("arm_controller self-check ok")
 
 
+def _check_model_binding() -> None:
+    """A model-bound controller runs only legs planned against its model."""
+    from arm_control.contracts.motion import pack_plan
+
+    def plan(plan_id, token):
+        q = np.zeros((2, 7))
+        return pack_plan(plan_id=plan_id, phase="move", gated=True, times=[0.0, 1.0],
+                         positions=q, velocities=q, kp=np.full(7, 1200.0),
+                         kd=np.full(7, 30.0), model_token=token)
+
+    token = "fr3_2:fr3_2-nominal:r1:b4e9dc7c154f:75bb84ae692c"
+    c = _controller(model_token=token)
+    for bad in (None, token.replace(":r1:", ":r2:"), token.replace("fr3_2", "fr3_1")):
+        c.on_plan(plan("stale", bad))
+        assert c._plan is None, f"plan with model {bad!r} was loaded"
+    refused = [e for e in c.node.sent if e[0] == "controller_event"]
+    assert len(refused) == 3, "each refused leg must be reported back to its planner"
+    c.on_plan(plan("fresh", token))
+    assert c._plan is not None and c._plan["plan_id"] == "fresh"
+    # Unbound controllers (sims, legacy entries) keep accepting untagged legs.
+    u = _controller()
+    u.on_plan(plan("legacy", None))
+    assert u._plan is not None
+
+    # Soft closes on the RT vendor model: refused under a calibrated bundle.
+    cal = _controller(pose_provenance="calibrated")
+    cal.supports_pose_hold = True
+    cal._set_pose_hold(dict(id=1, kc=[100.0] * 6, dc=[10.0] * 6,
+                            nullspace_kp=0.0, nullspace_kd=1.0))
+    assert cal._pose_hold is None
+    print("arm_controller model binding: foreign/stale/untagged legs refused and "
+          "reported, matching leg loaded, calibrated Soft refused: ok")
+
+
 def main() -> None:
     _check_clock_policies()
     _self_check()
+    _check_model_binding()
 
 
 if __name__ == "__main__":

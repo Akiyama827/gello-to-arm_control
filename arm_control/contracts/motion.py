@@ -73,6 +73,7 @@ def pack_plan(
     cartesian_poses=None,
     cartesian=None,
     completion=None,
+    model_token: str | None = None,
 ) -> pa.Array:
     """One planned leg, planner -> controller.
 
@@ -93,6 +94,10 @@ def pack_plan(
     ``goal_q`` is given) it stopped within ``residual_max`` of it. The caller
     picks those numbers because the caller is the one that knows why this leg
     cannot be judged on joint residual.
+
+    ``model_token`` names the kinematic model and scene the leg was planned
+    against (``arm_control.model_bundle.model_token``). A controller bound to a
+    token refuses a leg carrying another one, or none.
     """
     times = np.asarray(times, dtype=float).ravel()
     q = np.asarray(positions, dtype=float).reshape(len(times), -1)
@@ -107,6 +112,7 @@ def pack_plan(
         "kp": np.asarray(kp, dtype=float).ravel().tolist(),
         "kd": np.asarray(kd, dtype=float).ravel().tolist(),
         "completion": _completion_body(completion),
+        "model_token": None if model_token is None else str(model_token),
         # FK of every sample, precomputed in WORLD. The controller owns no
         # kinematics by design, and the Cartesian impedance target is exactly
         # FK(q_des) -- so it ships with the samples rather than being re-derived

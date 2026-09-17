@@ -42,6 +42,7 @@ from dora import Node
 from arm_control import CONTROL_ROOT, REPO_ROOT, frames
 
 from arm_control.config import arm_joints, ee_frame, gripper_joints, load_robot_config
+from arm_control.model_bundle import model_token, pose_provenance
 from arm_control.contracts.impedance import pose_hold_values
 from arm_control.contracts.gripper import pack_grasp_request, unpack_grasp_result
 from arm_control.ui.hand_panel import HandPanel
@@ -821,6 +822,8 @@ def _run(
     # the config path is the fallback so a single-arm graph needs no env at all.
     arm_id = os.environ.get("ARM_ID", "").strip()
     ident = arm_id or os.environ.get("ARM_CONTROL_CONFIG", "") or "unknown config"
+    # Never let a nominal and a calibrated arm read the same on the page.
+    ident = f"{ident} [{pose_provenance(cfg)} model]"
     # The panel's address is a per-INSTANCE fact, so it lives with the robot,
     # not with the mode. It used to sit in the mode config, where it only
     # avoided a collision because the two arms happened to run different modes
@@ -1169,6 +1172,7 @@ def _run(
                         velocities=pending.velocities,
                         kp=plan_kp,
                         kd=plan_kd,
+                        model_token=model_token(cfg),
                     ),
                 )
                 # An Execute click that queued up DURING the solve would fire

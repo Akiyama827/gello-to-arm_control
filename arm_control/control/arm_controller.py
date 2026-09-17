@@ -75,8 +75,14 @@ class ArmController:
         execution_policy=None,
         settle_timeout_s: float = 5.0,
         settle_dwell_s: float = 0.2,
+        model_token: str | None = None,
+        pose_provenance: str = "unbound",
     ) -> None:
         self.node = node
+        # Model binding (arm_control.model_bundle). None = unbound graph (sims,
+        # legacy entries): plans are not checked against a model.
+        self.model_token = model_token
+        self.pose_provenance = str(pose_provenance)
         self.executor = executor
         self._settling = LegSettling(timeout_s=settle_timeout_s, dwell_s=settle_dwell_s)
         self._completion_sample_at = None
@@ -226,6 +232,14 @@ class ArmController:
         if self._running:
             self._refuse_plan(
                 plan, f"{self._plan['plan_id']} is still executing", report=False)
+            return
+        if self.model_token is not None and plan.get("model_token") != self.model_token:
+            # Planned against another bundle, revision or scene (or unbound):
+            # its joint targets and collision clearance were computed for a
+            # model this controller is not running.
+            self._refuse_plan(
+                plan, f"plan model {plan.get('model_token')!r} != controller model "
+                      f"{self.model_token!r}; re-plan", report=True)
             return
         if self.execution_policy is not None:
             reason = self._observation_error() or self.execution_policy.plan_error(
@@ -530,6 +544,12 @@ class ArmController:
             if self.execution_policy is not None and self._observation_error():
                 raise ValueError("Soft needs fresh, healthy measured state")
             spec = unpack_pose_hold_values(pose_hold_values(spec))
+            if self.pose_provenance == "calibrated":
+                # The RT pose hold closes on the plant's own (vendor) task
+                # model; no calibrated RT task space exists. Mixing a
+                # calibrated PC model with vendor feedback is refused.
+                raise ValueError("Soft uses the RT vendor task model; unavailable "
+                                 "while a calibrated model bundle is active")
             if (not self.supports_pose_hold or not self.armed or not self.ready_sent
                     or self.stopped or self.frozen):
                 raise ValueError("Soft needs an armed, ready, capable plant")
