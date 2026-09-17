@@ -1,0 +1,80 @@
+# 主从遥操作示例配置：小臂(leader) -> 大臂(follower)。
+#
+# 默认用 FakeLeader + FakeFollower 跑通整条"采集->换算->下发"链路，不需要硬件。
+# 换真机时改 leader.kind / follower.kind，并按你的机械臂填 mapping 与 safety。
+#
+# 关节顺序：大臂 Joint1..Joint6（与 examples/profiles/motion.yaml 一致）。
+# 换算语义：big_i = offset_i + scale_i * sign_i * leader[src_i]
+
+leader:
+  kind: fake            # fake | s288 | gello
+  n_arm_joints: 6
+  with_gripper: true
+  # --- 真机 s288 时取消注释并填你的总线/标定 ---
+  # kind: s288
+  # port: /dev/ttyUSB0
+  # motor_ids: [1, 2, 3, 4, 5, 6, 7]
+  # gripper_index: 6
+  # joint_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  # joint_signs:   [1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
+  # gripper_open_rad: 0.8
+  # gripper_close_rad: 0.0
+  # alpha: 0.99
+  # start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+  # use_fake_bus: true   # 没接硬件时先置 true 走仿真总线
+
+follower:
+  kind: fake            # dry_run | fake | dora | rt
+  n_arm_joints: 6
+  # --- 走 Dora（arm_control 原生通道）时 ---
+  # kind: dora
+  # --- 直连远程 RT 时 ---
+  # kind: rt
+  # joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+  # host: 172.16.1.2
+  # udp_port: 47800
+  # tcp_port: 47801
+  # gripper_slot: false
+  # kp: [20, 20, 20, 20, 20, 20, 20]
+  # kd: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+
+mapping:
+  auto_align: true      # 启动时把大臂当前位形对齐到小臂当前姿态，避免跳变
+  alpha: 0.9            # 大臂目标指数平滑
+  ramp_s: 0.0
+  joints:
+    # src/sign/offset/scale 按两臂实际连杆与零位标定；lower/upper 是大臂硬行程。
+    # scale < 1 表示"小臂大行程 -> 大臂小行程"（体积不同时常见）。
+    - {src: 0, sign:  1.0, offset: 0.0, scale: 0.8, lower: -2.9, upper: 2.9, max_rate: 1.5}
+    - {src: 1, sign: -1.0, offset: 0.0, scale: 0.8, lower: -1.8, upper: 1.8, max_rate: 1.5}
+    - {src: 2, sign: -1.0, offset: 0.0, scale: 0.8, lower: -2.9, upper: 2.9, max_rate: 2.0}
+    - {src: 3, sign: -1.0, offset: 0.0, scale: 1.0, lower: -3.0, upper: 3.0, max_rate: 2.0}
+    - {src: 4, sign:  1.0, offset: 0.0, scale: 1.0, lower: -2.9, upper: 2.9, max_rate: 2.5}
+    - {src: 5, sign:  1.0, offset: 0.0, scale: 1.0, lower: -3.0, upper: 3.0, max_rate: 2.5}
+  gripper:
+    src: -1             # 小臂夹爪在状态向量最后一位，1=张开 0=闭合
+    open_width_m: 0.075 # 大臂手指张开宽度
+    closed_width_m: 0.0
+    max_rate_m_s: 0.15
+
+safety:
+  joint_lower: [-2.9, -1.8, -2.9, -3.0, -2.9, -3.0]
+  joint_upper: [ 2.9,  1.8,  2.9,  3.0,  2.9,  3.0]
+  limits:
+    joint_margin_rad: 0.05
+    max_step_rad: 0.30          # 单 tick 目标跳变 > 0.30 rad 视为异常，停机
+    max_target_vel_rad_s: 2.0
+    feedback_required: true     # 遥操作必须有大臂回读
+    feedback_timeout_s: 0.30
+    track_err_rad: 0.15         # 命令-实测误差持续超阈 -> 停机
+    track_err_hold_s: 0.30
+    track_vel_rad_s: 3.0
+    leader_timeout_s: 0.30
+    collision_stop_m: 0.010     # 两臂最近距离 <= 1cm -> 停机
+    collision_warn_m: 0.050     # <= 5cm -> 限速
+    collision_every_n: 1
+    collision_slow_scale: 0.25
+
+loop:
+  hz: 100
+  log_period_s: 1.0

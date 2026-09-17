@@ -1,0 +1,322 @@
+"""大机械臂（follower / 被控设备）抽象与三种下发后端。
+
+arm_control 里所有运动都走 Dora（`plan` / `jog` / `control` / `gripper`），
+所以默认后端是 `DoraJogFollower`：每 tick 发一条 `jog`（单帧关节目标，
+0.2s 不过期即停，天然安全）+ `gripper`。另提供：
+
+    DryRunFollower   不接硬件，只记录/打印（默认，用来先验证映射）
+    DoraJogFollower  通过 Dora 节点把 jog + gripper 发给 arm_controller
+    RtFollower       绕开 Dora，直连远程 RT 服务器（RtBackend.apply_command）
+    FakeFollower     仿真大臂，用于回路自检
+
+统一接口：`send(arm_q_rad, gripper_width_m)`；`read_state()` 返回大臂当前
+(arm_q, gripper_width)，供启动 auto_align 使用。
+"""
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Optional, Protocol, Sequence
+
+import numpy as np
+
+
+class FollowerArm(Protocol):
+    num_arm_joints: int
+
+    def open(self) -> None:
+        ...
+
+    def read_state(self) -> tuple[np.ndarray, float]:
+        ...
+
+    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+        ...
+
+    def safe_stop(self) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+# --------------------------------------------------------------------------- #
+# 空跑
+# --------------------------------------------------------------------------- #
+class DryRunFollower:
+    """只记录目标、不碰硬件；打印限频。默认后端。"""
+
+    def __init__(
+        self,
+        num_arm_joints: int = 6,
+        log_period_s: float = 1.0,
+        verbose: bool = True,
+    ) -> None:
+        self.num_arm_joints = int(num_arm_joints)
+        self._log_period_s = float(log_period_s)
+        self._verbose = bool(verbose)
+        self._last_log = 0.0
+        self._last_cmd: Optional[tuple[np.ndarray, float]] = None
+        self._sent = 0
+
+    def open(self) -> None:
+        if self._verbose:
+            print("[follower:dry-run] 已就绪（不驱动任何硬件）")
+
+    def read_state(self) -> tuple[np.ndarray, float]:
+        return np.zeros(self.num_arm_joints), 0.0
+
+    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+        q = np.asarray(arm_q, dtype=float)
+        if q.shape != (self.num_arm_joints,):
+            raise ValueError(f"大臂目标长度应为 {self.num_arm_joints}，得到 {q.shape}")
+        self._last_cmd = (q, float(gripper_width_m))
+        self._sent += 1
+        now = time.monotonic()
+        if self._verbose and now - self._last_log >= self._log_period_s:
+            self._last_log = now
+            qs = ", ".join(f"{v:+.3f}" for v in q)
+            print(
+                f"[follower:dry-run] #{self._sent:6d}  q=[{qs}]  "
+                f"gripper={gripper_width_m * 1000:.1f}mm"
+            )
+
+    def safe_stop(self) -> None:
+        self._last_cmd = None
+
+    def close(self) -> None:
+        self.safe_stop()
+
+
+# --------------------------------------------------------------------------- #
+# 仿真
+# --------------------------------------------------------------------------- #
+class FakeFollower:
+    """一阶跟踪的假大臂，读回自身位形，用于端到端自检。"""
+
+    def __init__(
+        self,
+        num_arm_joints: int = 6,
+        gripper_open_m: float = 0.075,
+        time_constant_s: float = 0.08,
+    ) -> None:
+        self.num_arm_joints = int(num_arm_joints)
+        self._q = np.zeros(self.num_arm_joints)
+        self._q_cmd = np.zeros(self.num_arm_joints)
+        self._grip = 0.0
+        self._grip_cmd = 0.0
+        self._tau = max(float(time_constant_s), 1e-3)
+        self._last_t = time.monotonic()
+
+    def open(self) -> None:
+        pass
+
+    def _step(self) -> None:
+        now = time.monotonic()
+        dt = max(now - self._last_t, 0.0)
+        self._last_t = now
+        a = min(dt / self._tau, 1.0) if dt > 0 else 0.0
+        self._q = self._q + (self._q_cmd - self._q) * a
+        self._grip = self._grip + (self._grip_cmd - self._grip) * a
+
+    def read_state(self) -> tuple[np.ndarray, float]:
+        self._step()
+        return self._q.copy(), float(self._grip)
+
+    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+        self._step()
+        q = np.asarray(arm_q, dtype=float)
+        if q.shape != (self.num_arm_joints,):
+            raise ValueError(f"大臂目标长度应为 {self.num_arm_joints}，得到 {q.shape}")
+        self._q_cmd = q
+        self._grip_cmd = float(gripper_width_m)
+
+    def safe_stop(self) -> None:
+        self._q_cmd = self._q.copy()
+
+    def close(self) -> None:
+        self.safe_stop()
+
+
+# --------------------------------------------------------------------------- #
+# Dora（arm_control 的原生通道）
+# --------------------------------------------------------------------------- #
+@dataclass
+class DoraJogFollower:
+    """通过 Dora 节点下发：`jog`（臂）+ `gripper`（夹爪）+ `control`（使能）。
+
+    对应 `dataflows/real_motion.yml` 里 arm_console 输出的三个 topic。`jog` 是
+    单帧目标，`jog_timeout_s`（默认 0.2s）内未刷新即自动停，所以 leader 断流
+    时大臂会保持而不是失控。默认在 `open()` 时发 `control(arm=True)` 使能。
+    """
+
+    num_arm_joints: int = 6
+    kp: Optional[Sequence[float]] = None
+    kd: Optional[Sequence[float]] = None
+    reason: str = "leader-follower"
+    auto_arm: bool = True
+    node: object = field(default=None, repr=False)
+
+    _sent: int = field(default=0, init=False)
+    _opened: bool = field(default=False, init=False)
+
+    def _ensure_node(self):
+        if self.node is None:
+            from dora import Node
+
+            self.node = Node()
+        return self.node
+
+    def open(self) -> None:
+        node = self._ensure_node()
+        if self.auto_arm:
+            from arm_control.messages import pack_control_update
+
+            node.send_output("control", pack_control_update(arm=True))
+            print("[follower:dora] 已发送 control(arm=True)")
+        self._opened = True
+
+    def read_state(self) -> tuple[np.ndarray, float]:
+        # Dora 的 jog 通道不回读；回读不是本回路成立的前提。启动对齐在
+        # 部署侧完成（或把 motor_state 接进来后扩展）。这里返回零点并
+        # 由 loop 决定是否 auto_align。
+        return np.zeros(self.num_arm_joints), 0.0
+
+    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+        from arm_control.messages import pack_jog, pack_motor_command
+
+        node = self._ensure_node()
+        q = np.asarray(arm_q, dtype=float)
+        if q.shape != (self.num_arm_joints,):
+            raise ValueError(f"大臂目标长度应为 {self.num_arm_joints}，得到 {q.shape}")
+        node.send_output("jog", pack_jog(q=q, reason=self.reason))
+        # 夹爪走 gripper topic：arm_controller.on_gripper 取 position[0]（米）。
+        zeros = np.zeros(2)
+        node.send_output(
+            "gripper",
+            pack_motor_command(
+                [float(gripper_width_m), float(gripper_width_m)],
+                zeros,
+                zeros,
+                zeros,
+                zeros,
+            ),
+        )
+        self._sent += 1
+
+    def safe_stop(self) -> None:
+        # jog 自然过期即停；显式 cancel 取消当前 leg 并保持 ARMED。
+        if not self._opened:
+            return
+        try:
+            from arm_control.messages import pack_control_update
+
+            self._ensure_node().send_output(
+                "control", pack_control_update(cancel=True, reason="leader-stale")
+            )
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if not self._opened:
+            return
+        try:
+            from arm_control.messages import pack_control_update
+
+            self._ensure_node().send_output(
+                "control", pack_control_update(cancel=True, arm=False, reason="leader-follower-exit")
+            )
+            print("[follower:dora] 已发送 control(cancel, arm=False)")
+        except Exception:
+            pass
+        self._opened = False
+
+
+# --------------------------------------------------------------------------- #
+# 远程 RT（低延迟备选）
+# --------------------------------------------------------------------------- #
+@dataclass
+class RtFollower:
+    """直连远程 RT 服务器（`RtBackend`），100Hz 流式发 MIT 词。
+
+    `joint_names` 必须与部署 `arm.joints` 完全一致（含夹爪电机槽则把
+    `gripper_slot=True`）。RT 服务器自带 staleness->hold、fault latch、力矩
+    限幅，因此这里只需持续发帧；停发超过 hold_ms 会 HOLD、超过 fault_ms 会
+    LATCH（需 DISARM->ARM 恢复）。
+    """
+
+    joint_names: Sequence[str]
+    host: str = "127.0.0.1"
+    udp_port: int = 47800
+    tcp_port: int = 47801
+    kp: Optional[Sequence[float]] = None
+    kd: Optional[Sequence[float]] = None
+    gripper_slot: bool = False
+    pose_hold: Optional[dict] = None
+
+    num_arm_joints: int = field(init=False)
+
+    _backend: object = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.joint_names = list(self.joint_names)
+        self.num_arm_joints = len(self.joint_names) - (1 if self.gripper_slot else 0)
+
+    def open(self) -> None:
+        from arm_control.plants.remote_rt.client import RtBackend, RtConfig
+
+        self._backend = RtBackend(
+            RtConfig(host=self.host, udp_port=self.udp_port, tcp_port=self.tcp_port),
+            list(self.joint_names),
+        )
+        self._backend.open()
+        self._backend.enable_all()
+        print(f"[follower:rt] 已连接 {self.host} 并使能 {len(self.joint_names)} 关节")
+
+    def _gains(self) -> tuple[np.ndarray, np.ndarray]:
+        n = len(self.joint_names)
+        kp = (
+            np.asarray(self.kp, dtype=float)
+            if self.kp is not None
+            else np.full(n, 20.0)
+        )
+        kd = (
+            np.asarray(self.kd, dtype=float)
+            if self.kd is not None
+            else np.full(n, 0.5)
+        )
+        return kp, kd
+
+    def read_state(self) -> tuple[np.ndarray, float]:
+        if self._backend is None:
+            return np.zeros(self.num_arm_joints), 0.0
+        st = self._backend.motor_state()["position"]
+        arm = np.asarray(st, dtype=float)[: self.num_arm_joints]
+        grip = float(st[self.num_arm_joints]) if self.gripper_slot else 0.0
+        return arm, grip
+
+    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+        assert self._backend is not None, "RtFollower.open() 未调用"
+        kp, kd = self._gains()
+        q = np.asarray(arm_q, dtype=float)
+        if self.gripper_slot:
+            q = np.concatenate([q, [float(gripper_width_m)]])
+        command = {
+            "position": q,
+            "velocity": np.zeros(len(q)),
+            "torque": np.zeros(len(q)),
+            "kp": kp,
+            "kd": kd,
+        }
+        if self.pose_hold is not None:
+            command["pose_hold"] = self.pose_hold
+        self._backend.apply_command(command)
+
+    def safe_stop(self) -> None:
+        if self._backend is not None:
+            self._backend.safe_stop()
+
+    def close(self) -> None:
+        if self._backend is not None:
+            self._backend.close()
+            self._backend = None
