@@ -50,7 +50,10 @@ class JogPanel:
     def set_speeds(self, payload) -> None:
         if not isinstance(payload, dict) or set(payload) != {"speed_m_s", "joint_speed_rad_s"}:
             raise ValueError("provide Cartesian and joint jog speeds only")
-        values = [float(payload["speed_m_s"]), float(payload["joint_speed_rad_s"])]
+        try:
+            values = [float(payload["speed_m_s"]), float(payload["joint_speed_rad_s"])]
+        except TypeError as error:  # None from a blank field is a refusal, not a crash
+            raise ValueError("jog speeds must be numbers") from error
         if not all(v == v and abs(v) != float("inf") for v in values):
             raise ValueError("jog speeds must be finite")
         if any(v <= 0 or v > hi for v, hi in zip(values, self._max)):
@@ -102,6 +105,8 @@ class JogPanel:
     def snapshot(self) -> dict:
         return {
             "axes": list(JOG_AXES),
+            # The page builds the joint pad from this count; without it the pad hides.
+            "joints": self._n_joints,
             "held": None if self._held is None else list(self._held),
             "note": self._note,
             "speed_m_s": self._speed_m_s,
@@ -151,6 +156,7 @@ def _self_check() -> None:
         raise AssertionError(f"accepted axis {bad!r}")
     p.set("j6", -1, True, control_mode="joint")
     assert p.held() == ("j6", -1)
+    assert p.snapshot()["joints"] == 7, "the page hides the joint pad without it"
 
     # Speeds are bounded by the configured maxima, in both directions.
     p = pad()
