@@ -27,6 +27,8 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <string>
+#include <vector>
 
 #include "arm_rt/servo_law.hpp"
 #include "arm_rt/pose_hold.hpp"
@@ -88,6 +90,29 @@ void rt_loop(ServerCtx& ctx) {
     return;
   }
   const int n = backend->n();
+  // Identity: joint order is provisioned per deployment; the fake backend
+  // alone may default it (j0..j{n-1}) so loopback tests need no registry.
+  std::vector<std::string> joints = ctx.cfg.joint_names;
+  if (joints.empty() && ctx.cfg.backend == "fake")
+    for (int j = 0; j < n; ++j) joints.push_back("j" + std::to_string(j));
+  if (int(joints.size()) != n) {
+    std::fprintf(stderr, "[rt] --joint-names lists %zu joints, %s backend drives %d\n",
+                 joints.size(), backend->name(), n);
+    ctx.failed.store(true);
+    ctx.shutdown.store(true);
+    return;
+  }
+  {
+    std::string joined;
+    for (size_t j = 0; j < joints.size(); ++j) joined += (j ? "\n" : "") + joints[j];
+    ctx.joint_order_hash = fnv1a64(joined.data(), joined.size());
+    std::snprintf(ctx.instance_id, sizeof(ctx.instance_id), "%s", ctx.cfg.instance_id.c_str());
+    std::snprintf(ctx.model_id, sizeof(ctx.model_id), "%s", backend->task_model());
+    ctx.identity_hash = identity_hash(ctx.instance_id, ctx.joint_order_hash);
+    std::printf("[rt] instance '%s' joints [%s] identity %016llx task model %s\n",
+                ctx.instance_id, ctx.cfg.joint_names.empty() ? "default" : "provisioned",
+                (unsigned long long)ctx.identity_hash, ctx.model_id);
+  }
   double tau_limits[MAX_JOINTS] = {};
   std::printf("[rt] effective torque limits (N.m):");
   for (int j = 0; j < n; ++j) {
@@ -144,6 +169,7 @@ void rt_loop(ServerCtx& ctx) {
   }
   uint32_t state_seq = 0;
   uint32_t last_cmd_seq = 0;
+  uint32_t stop_epoch = 0;
   uint32_t last_active_mask = backend->active_mask();
 
   bool plant_ok = true;  // false after any backend failure; reset only by ARM
@@ -196,6 +222,10 @@ void rt_loop(ServerCtx& ctx) {
       ctx.active_mask.store(requested, std::memory_order_release);
     }
     const uint64_t now = mono_ns();
+    // Read the DISARM generation BEFORE the armed level: the control thread
+    // clears `armed` first and bumps the generation second, so a generation
+    // seen here is always covered by the level read below.
+    const uint64_t disarm_gen = ctx.disarm_gen.load(std::memory_order_acquire);
     const bool armed = ctx.armed.load(std::memory_order_acquire);
     bool faulted = ctx.fault.load(std::memory_order_acquire);
 
@@ -314,6 +344,9 @@ void rt_loop(ServerCtx& ctx) {
       if (prev_armed) backend->stop();
       holding = false;
       std::memset(tau_out, 0, sizeof(tau_out));
+      // Disarmed at this sample and any stop() returned: the request is done
+      // as far as this process can know. Not a claim about the robot's brakes.
+      stop_epoch = uint32_t(disarm_gen);
     }
     prev_armed = armed;
 
@@ -330,6 +363,10 @@ void rt_loop(ServerCtx& ctx) {
             (ps.wrench_valid ? FLAG_WRENCH_VALID : 0u),
         ctx.online_mask.load(std::memory_order_acquire));
     out.fault_code = ctx.fault_code.load(std::memory_order_acquire);
+    out.session_id = ctx.session_id.load(std::memory_order_acquire);
+    out.identity_hash = ctx.identity_hash;
+    out.arm_epoch = uint32_t(seen_gen);
+    out.stop_epoch = stop_epoch;
     std::memcpy(out.q, ps.q, sizeof(out.q));
     std::memcpy(out.dq, ps.dq, sizeof(out.dq));
     std::memcpy(out.tau, ps.tau, sizeof(out.tau));

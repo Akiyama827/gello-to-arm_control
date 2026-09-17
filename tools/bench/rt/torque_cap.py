@@ -34,13 +34,16 @@ def main(binary: Path) -> None:
     )
     assert missing.returncode == 2 and "needs a value" in missing.stderr, missing
 
+    # v5 hardware backends need provisioned identity; supply one so these
+    # probes reach the DM factory they are testing.
+    identity = ["--instance-id", "cap_check", "--joint-names", "j0"]
     # Invalid wire maps must fail before the DM factory opens any CAN socket.
     for entry in ("1:4340:0x11:12.5:20", "1:4340:0x11:12.5:nan:28",
                   "1:4340:0x11:12.5:0:28", "1:4340:0x11:12.5:20:28junk",
                   "1:4340:0x800:12.5:20:28", "1:4340:0x11:8e307:20:28"):
         result = subprocess.run(
             [str(binary), "--backend", "dm", "--dm-spec", f"wire_check_no;{entry}",
-             *local, "--tau-max", "27"],
+             *identity, *local, "--tau-max", "27"],
             capture_output=True, text=True, timeout=3,
         )
         assert result.returncode != 0 and "dm backend:" in result.stderr, result
@@ -50,7 +53,7 @@ def main(binary: Path) -> None:
     # torque. Factory admission must reject it BEFORE opening a CAN socket.
     tiny = subprocess.run(
         [str(binary), "--backend", "dm", "--dm-spec", "cap_check_none;1:4340",
-         *local, "--tau-max", "0.000001"],
+         *identity, *local, "--tau-max", "0.000001"],
         capture_output=True, text=True, timeout=3,
     )
     assert tiny.returncode != 0 and "representable" in tiny.stderr, tiny

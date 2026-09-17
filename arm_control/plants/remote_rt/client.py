@@ -20,7 +20,17 @@ Config (the arm's hardware fragment)::
       host: 172.16.1.2
       udp_port: 47800
       tcp_port: 47801
+      instance_id: fr3_1        # must equal the server's --instance-id
       state_timeout_s: 0.5
+
+Admission (protocol v5): HELLO, then the server's IDENTITY; this client checks
+instance id, joint count and joint ORDER against its own config and CLAIMs
+them. The server refuses ARM without an accepted claim and admits only
+commands carrying this session id and the current ARM epoch. That is flow
+binding against wiring/config mistakes, not authentication.
+
+``RtObserver`` is the separate read-only path: a UDP lease, no TCP session,
+nothing that can arm, disarm, command or steal the commander's stream.
 """
 from __future__ import annotations
 
@@ -40,6 +50,86 @@ class RtLinkError(RuntimeError):
     """Server unreachable, refused, or speaking a different protocol."""
 
 
+def epoch_reached(value: int, target: int) -> bool:
+    """32-bit generation comparison with wraparound (value >= target)."""
+    return ((int(value) - int(target)) & 0xFFFFFFFF) < 0x80000000
+
+
+class RtObserver:
+    """Read-only copy of one RT server's state stream.
+
+    UDP lease only: it opens no control session, sends no command packet, and
+    closing it sends nothing (the lease simply expires). States whose identity
+    hash is not the expected instance/joint order are dropped and counted.
+    """
+
+    def __init__(self, host: str, udp_port: int, instance_id: str,
+                 joint_names: list[str], *, lease_ms: int = 1000) -> None:
+        if not rtp.valid_id(instance_id):
+            raise ValueError(f"observer needs a provisioned instance id, got {instance_id!r}")
+        self.host, self.udp_port, self.lease_ms = host, int(udp_port), int(lease_ms)
+        self.instance_id = instance_id
+        self.joint_names = list(joint_names)
+        self.expected_identity = rtp.identity_hash(
+            instance_id, rtp.joint_order_hash(self.joint_names))
+        self.identity_mismatches = 0
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._state: rtp.State | None = None
+        self._rx_t = 0.0      # content (new state_seq) arrival
+        self._link_t = 0.0    # any datagram arrival
+
+    def open(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.connect((self.host, self.udp_port))
+        self._sock.settimeout(0.05)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def latest_state(self) -> tuple[rtp.State | None, float]:
+        with self._lock:
+            return self._state, self._rx_t
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._sock is not None:
+            self._sock.close()
+        self._sock = None
+
+    def _loop(self) -> None:
+        renew = 0.0
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if now >= renew:
+                try:
+                    self._sock.send(rtp.pack_observe(self.lease_ms))
+                except OSError:
+                    pass
+                renew = now + self.lease_ms / 3000.0
+            try:
+                data = self._sock.recv(rtp.STATE_SIZE)
+            except (socket.timeout, OSError):
+                continue
+            try:
+                state = rtp.unpack_state(data)
+            except ValueError:
+                continue
+            if state.identity_hash != self.expected_identity or state.n != len(self.joint_names):
+                self.identity_mismatches += 1
+                continue
+            with self._lock:
+                t = time.monotonic()
+                self._link_t = t
+                if self._state is None or state.state_seq != self._state.state_seq:
+                    self._rx_t = t
+                self._state = state
+
+
 @dataclass(frozen=True)
 class RtConfig:
     host: str = "127.0.0.1"
@@ -52,6 +142,12 @@ class RtConfig:
     # that server has no staleness reflex at all — the HELLO now carries the
     # server's launch flags exactly so this check can exist.
     max_fault_ms: float = 0.0
+    # Provisioned instance this config is FOR. Required: an empty id cannot be
+    # claimed, so a config without one cannot command anything.
+    instance_id: str = ""
+    # Expected RT task-space model id ("" = not relied on). Pose hold with a
+    # calibrated PC model must pin this; see the capability gate in apply_command.
+    task_model: str = ""
 
     @classmethod
     def from_config(cls, cfg) -> "RtConfig":
@@ -63,6 +159,8 @@ class RtConfig:
             state_timeout_s=float(raw.get("state_timeout_s", 0.5)),
             ack_timeout_s=float(raw.get("ack_timeout_s", 2.0)),
             max_fault_ms=float(raw.get("max_fault_ms", 0.0)),
+            instance_id=str(raw.get("instance_id", "")),
+            task_model=str(raw.get("task_model", "")),
         )
 
 
@@ -91,6 +189,11 @@ class RtBackend:
         self._send_lock = threading.Lock()  # node thread + _ctl_loop PONG
         self._active_mask = 0
         self.supports_pose_hold = False
+        self.identity: rtp.Identity | None = None
+        self.session_id = 0
+        self._arm_epoch = 0
+        self._expected_identity = 0
+        self._stream_fault = ""
 
     @classmethod
     def from_config(cls, cfg) -> "RtBackend":
@@ -115,14 +218,44 @@ class RtBackend:
             ) from exc
         self._tcp.settimeout(0.2)
         try:
-            hello = self._recv_control(deadline_s=cfg.ack_timeout_s)
-        except ValueError as exc:
+            self._admit()
+        except (RtLinkError, ValueError) as exc:
             self._tcp.close()
             self._tcp = None
+            if isinstance(exc, ValueError):
+                raise RtLinkError(
+                    f"RT protocol mismatch; client requires version {rtp.VERSION}: {exc}"
+                ) from exc
+            raise
+        self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp.connect((cfg.host, cfg.udp_port))
+        self._udp.settimeout(0.2)
+        self._stop.clear()
+        self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+        self._rx_thread.start()
+        self._ctl_thread = threading.Thread(target=self._ctl_loop, daemon=True)
+        self._ctl_thread.start()
+        # Teach the state-stream address. Content is ignored: the server admits
+        # a disarmed session's datagram ONLY as its return address.
+        self._send_command_raw(np.zeros(self.n), np.zeros(self.n), np.zeros(self.n),
+                               np.zeros(self.n), np.zeros(self.n))
+        print(
+            f"[rt_link] connected to {cfg.host} — instance '{self.identity.instance_id}', "
+            f"backend '{self.backend_name}', {self.n} joints, session "
+            f"{self.session_id:016x}",
+            flush=True,
+        )
+
+    def _admit(self) -> None:
+        """HELLO -> IDENTITY -> CLAIM. Raises before any UDP is sent."""
+        cfg = self.config
+        if not rtp.valid_id(cfg.instance_id):
             raise RtLinkError(
-                f'RT protocol mismatch; client requires version {rtp.VERSION}: {exc}'
-            ) from exc
-        if hello is None or hello.ctl_type != rtp.CTL_HELLO:
+                f"rt.instance_id {cfg.instance_id!r} is not a provisioned instance id; "
+                "refusing to claim an RT server without knowing which arm it must be"
+            )
+        hello = self._await_control({rtp.CTL_HELLO}, cfg.ack_timeout_s)
+        if hello is None:
             raise RtLinkError("no HELLO from server (protocol/version mismatch?)")
         if hello.arg != self.n:
             raise RtLinkError(
@@ -146,24 +279,37 @@ class RtBackend:
                 "server (no command deadman); restart arm_rt_server with its "
                 "normal flags before running a commander graph"
             )
-        self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._udp.connect((cfg.host, cfg.udp_port))
-        self._udp.settimeout(0.2)
-        self._stop.clear()
-        self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
-        self._rx_thread.start()
-        self._ctl_thread = threading.Thread(target=self._ctl_loop, daemon=True)
-        self._ctl_thread.start()
-        # Prime the state stream: the server replies to the source address of
-        # the last command datagram, so send one zero-authority packet now
-        # (content is ignored while disarmed; the ADDRESS is the payload).
-        self._send_command_raw(np.zeros(self.n), np.zeros(self.n), np.zeros(self.n),
-                               np.zeros(self.n), np.zeros(self.n))
-        print(
-            f"[rt_link] connected to {cfg.host} — backend '{self.backend_name}', "
-            f"{self.n} joints",
-            flush=True,
-        )
+        frame = self._await_control({rtp.CTL_IDENTITY}, cfg.ack_timeout_s)
+        if frame is None:
+            raise RtLinkError("no IDENTITY from server")
+        ident = rtp.unpack_identity(frame.raw)
+        want_hash = rtp.joint_order_hash(self.joint_names)
+        problems = []
+        if ident.instance_id != cfg.instance_id:
+            problems.append(f"server is instance '{ident.instance_id}', "
+                            f"config is for '{cfg.instance_id}'")
+        if ident.n != self.n:
+            problems.append(f"server drives {ident.n} joints, config has {self.n}")
+        if ident.joint_order_hash != want_hash:
+            problems.append("server's provisioned joint order differs from "
+                            f"{self.joint_names}")
+        if ident.identity_hash != rtp.identity_hash(ident.instance_id, ident.joint_order_hash):
+            problems.append("server identity hash is inconsistent")
+        if cfg.task_model and ident.model_id != cfg.task_model:
+            problems.append(f"server task model '{ident.model_id}', expected "
+                            f"'{cfg.task_model}'")
+        if problems:
+            raise RtLinkError("RT identity refused: " + "; ".join(problems))
+        claim = rtp.Identity(cfg.instance_id, cfg.task_model, ident.session_id, want_hash,
+                             rtp.identity_hash(cfg.instance_id, want_hash), 0, self.n)
+        self._send_control(rtp.CTL_CLAIM, text=rtp.pack_identity(claim))
+        status = self._await_control({rtp.CTL_STATUS}, cfg.ack_timeout_s)
+        if status is None or not status.arg & rtp.FLAG_CLAIMED:
+            raise RtLinkError(f"RT claim refused: {status.text if status else 'no ack'}")
+        self.identity = ident
+        self.session_id = ident.session_id
+        self._expected_identity = ident.identity_hash
+        self.supports_pose_hold = bool(ident.capabilities & rtp.CAP_POSE_HOLD)
 
     def enable_all(self) -> None:
         """Arm. The server holds the current pose until commands flow."""
@@ -175,6 +321,9 @@ class RtBackend:
         # server keeps its ARMED flag while fault-HOLDING a latched arm.
         if status.arg & rtp.FLAG_FAULTED or not status.arg & rtp.FLAG_ARMED:
             raise RtLinkError(f"arm refused: {status.text or 'latched fault'}")
+        if status.seq == 0:
+            raise RtLinkError("arm ack carries no ARM epoch (pre-v5 server?)")
+        self._arm_epoch = status.seq
 
     def safe_stop(self) -> bool:
         """Disarm (also clears a server-side fault latch, matching the bench
@@ -192,13 +341,18 @@ class RtBackend:
         except RtLinkError as exc:
             print(f"[rt_link] disarm: {exc}", flush=True)
             return False
+        acked = time.monotonic()
+        self._arm_epoch = 0  # no further command of the old epoch is admissible
         if status.arg & rtp.FLAG_ARMED:
             print("[rt_link] disarm ack still shows ARMED", flush=True)
             return False
-        deadline = time.monotonic() + 0.5
+        # The ack is RECEIPT. Completion is a state sample produced after it
+        # whose stop epoch covers this request's DISARM generation.
+        deadline = acked + 0.5
         while time.monotonic() < deadline:
             state, rx_t = self.latest_state()
-            if state is not None and rx_t > 0 and not state.armed:
+            if (state is not None and rx_t > acked and not state.armed
+                    and epoch_reached(state.stop_epoch, status.seq)):
                 # Confirmed drop clears the client-side latch too — the server
                 # cleared its own on DISARM, and a stale fault string here
                 # keeps the panel demanding a recovery cycle the operator
@@ -263,6 +417,8 @@ class RtBackend:
             n=self.n,
             seq=self._cmd_seq,
             t_mono_ns=time.monotonic_ns(),
+            session_id=self.session_id,
+            arm_epoch=self._arm_epoch,
             q_des=q[: self.n],
             qd_des=qd[: self.n],
             tau_ff=tau[: self.n],
@@ -330,7 +486,7 @@ class RtBackend:
             )
         else:
             stale_msg = ""
-        fault = self._latched_fault or stale_msg
+        fault = self._latched_fault or self._stream_fault or stale_msg
         return {
             # The server's flag VERBATIM. "I cannot see the server" must
             # never be reported as "the arm is not armed" — an armed arm
@@ -348,6 +504,12 @@ class RtBackend:
             "sent_cmd_seq": self._cmd_seq,
             "online_mask": state.online_mask if state else 0,
             "active_mask": self._active_mask,
+            "instance_id": self.config.instance_id,
+            "session_id": f"{self.session_id:016x}",
+            "arm_epoch": self._arm_epoch,
+            "stop_epoch": state.stop_epoch if state else 0,
+            "state_seq": state.state_seq if state else 0,
+            "state_t_mono_ns": state.t_mono_ns if state else 0,
         }
 
     # -- internals ------------------------------------------------------------
@@ -362,6 +524,10 @@ class RtBackend:
             try:
                 state = rtp.unpack_state(data)
             except ValueError:
+                continue
+            if state.identity_hash != self._expected_identity or state.n != self.n:
+                # Not the arm this session claimed: never let it reach the graph.
+                self._stream_fault = "rt state stream identity mismatch"
                 continue
             with self._state_lock:
                 # CONTENT freshness, not arrival freshness: the server
@@ -413,7 +579,7 @@ class RtBackend:
                     )
                     return
 
-    def _send_control(self, ctl_type: int, text: str = "", arg: int = 0) -> None:
+    def _send_control(self, ctl_type: int, text: str | bytes = "", arg: int = 0) -> None:
         pkt = rtp.pack_control(
             ctl_type=ctl_type,
             seq=0,
@@ -442,6 +608,19 @@ class RtBackend:
         except queue.Empty as exc:
             raise RtLinkError("no STATUS ack from server") from exc
 
+    def _await_control(self, wanted: set[int], deadline_s: float) -> rtp.Control | None:
+        """Pre-thread handshake read: answers PINGs, returns the first wanted frame."""
+        deadline = time.monotonic() + deadline_s
+        while time.monotonic() < deadline:
+            msg = self._recv_control(deadline_s=max(0.0, deadline - time.monotonic()))
+            if msg is None:
+                return None
+            if msg.ctl_type == rtp.CTL_PING:
+                self._send_control(rtp.CTL_PONG)
+            elif msg.ctl_type in wanted:
+                return msg
+        return None
+
     def _recv_control(self, deadline_s: float) -> rtp.Control | None:
         deadline = time.monotonic() + deadline_s
         buf = b""
@@ -461,8 +640,10 @@ def _demo() -> None:
     server, exercising exactly the paths that are dangerous to discover on
     hardware — staleness hold, fault latch, latch-refuses-arm, DISARM+ARM
     recovery. Skips (loudly, rc 0) if the server binary is not built."""
+    import dataclasses
     import os
     import shutil
+    import struct
     import subprocess
     import sys
     from pathlib import Path
@@ -505,10 +686,49 @@ def _demo() -> None:
         # Remote servers run default ports and default thresholds (100/1000 ms
         # — the fault-latch wait below covers both 600 and 1000 ms).
         host, udp, tcp = remote, 47800, 47801
-    backend = RtBackend(RtConfig(host=host, udp_port=udp, tcp_port=tcp), ["j0", "j1", "j2"])
+    joints = ["j0", "j1", "j2"]
+
+    def config(instance="fake"):
+        return RtConfig(host=host, udp_port=udp, tcp_port=tcp, instance_id=instance)
+
+    backend = RtBackend(config(), joints)
     try:
         time.sleep(0.3)
+        # Admission refuses the wrong arm and the wrong joint order before any
+        # UDP is sent -- a swapped deployment config cannot claim this server.
+        for bad, names, why in ((config("fr3_2"), joints, "instance"),
+                                (config(), ["j1", "j0", "j2"], "joint order"),
+                                (config(""), joints, "provisioned")):
+            try:
+                RtBackend(bad, names).open()
+            except RtLinkError as exc:
+                assert why in str(exc), exc
+            else:
+                raise AssertionError(f"{why} mismatch was admitted")
+        # The SERVER enforces the claim too: a client that skips its own checks
+        # (or predates them) gets neither a claim nor ARM.
+        raw = RtBackend(config(), joints)
+        raw._tcp = socket.create_connection((host, tcp), timeout=2.0)
+        raw._tcp.settimeout(0.2)
+        raw._await_control({rtp.CTL_HELLO}, 2.0)
+        ident = rtp.unpack_identity(raw._await_control({rtp.CTL_IDENTITY}, 2.0).raw)
+        for field, value, reason in (
+                ("instance_id", "fr3_2", "instance id"),
+                ("joint_order_hash", ident.joint_order_hash ^ 1, "joint order"),
+                ("session_id", ident.session_id ^ 1, "session"),
+                ("capabilities", rtp.CAP_CALIBRATED_TASK_SPACE, "capability")):
+            wrong = dataclasses.replace(ident, **{field: value})
+            raw._send_control(rtp.CTL_CLAIM, text=rtp.pack_identity(wrong))
+            ack = raw._await_control({rtp.CTL_STATUS}, 2.0)
+            assert not ack.arg & rtp.FLAG_CLAIMED and reason in ack.text, (field, ack)
+        raw._send_control(rtp.CTL_ARM)
+        ack = raw._await_control({rtp.CTL_STATUS}, 2.0)
+        assert not ack.arg & rtp.FLAG_ARMED and "CLAIM" in ack.text, ack
+        raw._tcp.close()
+        time.sleep(0.3)  # let the server retire that session
+
         backend.open()
+        assert backend.session_id and backend.identity.instance_id == "fake"
         assert backend.backend_name == "fake"
         assert not backend.supports_pose_hold
         assert not backend._control_roundtrip(rtp.CTL_STATUS).arg & rtp.FLAG_ARMED
@@ -549,22 +769,52 @@ def _demo() -> None:
         # Staleness -> HOLD (stop commanding past hold-ms, before fault-ms).
         # Unsupported pose hold, oversized joint commands and replays must neither
         # change the accepted command nor refresh its deadman.
-        replay = rtp.pack_command(n=3, seq=backend._cmd_seq,
-            t_mono_ns=time.monotonic_ns(), q_des=target, qd_des=np.zeros(3),
-            tau_ff=np.zeros(3), kp=kp, kd=kd)
-        unsupported = rtp.pack_command(n=3, seq=backend._cmd_seq + 1,
-            t_mono_ns=time.monotonic_ns(), q_des=target, qd_des=np.zeros(3),
-            tau_ff=np.zeros(3), kp=kp, kd=kd,
+        bound = dict(n=3, t_mono_ns=time.monotonic_ns(), q_des=target,
+                     qd_des=np.zeros(3), tau_ff=np.zeros(3), kp=kp, kd=kd,
+                     session_id=backend.session_id, arm_epoch=backend._arm_epoch)
+        replay = rtp.pack_command(seq=backend._cmd_seq, **bound)
+        unsupported = rtp.pack_command(seq=backend._cmd_seq + 1, **bound,
             pose_hold=dict(id=1, kc=[100.]*6, dc=[10.]*6,
                            nullspace_kp=0., nullspace_kd=3.))
-        for i in range(30):
-            backend._udp.send((replay, replay + b"invalid", unsupported)[i % 3])
+        # Fresh sequence numbers, but another session or a stale ARM epoch.
+        foreign = rtp.pack_command(seq=backend._cmd_seq + 2,
+                                   **(bound | dict(session_id=backend.session_id ^ 1)))
+        stale_epoch = rtp.pack_command(seq=backend._cmd_seq + 3,
+                                       **(bound | dict(arm_epoch=backend._arm_epoch - 1)))
+        nan = bytearray(rtp.pack_command(seq=backend._cmd_seq + 4, **bound))
+        struct.pack_into("<d", nan, 32, float("nan"))
+        rejected = (replay, replay + b"invalid", unsupported, foreign, stale_epoch, bytes(nan))
+        for i in range(36):
+            backend._udp.send(rejected[i % len(rejected)])
             time.sleep(.01)
         state, _ = backend.latest_state()
         assert state.holding and not state.faulted, backend.motor_health()
         assert np.array_equal(backend.motor_state()['velocity_cmd'], np.zeros(3))
         assert state.last_cmd_seq == backend._cmd_seq
         held = np.asarray(state.q)
+
+        # A passive observer sees the same arm and changes nothing; one that
+        # expects another instance gets no state at all.
+        observer = RtObserver(host, udp, "fake", joints, lease_ms=500)
+        stranger = RtObserver(host, udp, "fr3_2", joints, lease_ms=500)
+        observer.open()
+        stranger.open()
+        track = {"position": target, "velocity": np.zeros(3),
+                 "torque": np.zeros(3), "kp": kp, "kd": kd}
+        for _ in range(30):
+            backend.apply_command(track)
+            time.sleep(0.01)
+        seen, _ = observer.latest_state()
+        assert seen is not None and seen.armed and seen.session_id == backend.session_id
+        assert stranger.latest_state()[0] is None and stranger.identity_mismatches > 0
+        observer.close()
+        stranger.close()
+        for _ in range(10):
+            backend.apply_command(track)
+            time.sleep(0.01)
+        state, _ = backend.latest_state()
+        assert state.armed and not state.faulted and not state.holding
+        assert state.last_cmd_seq == backend._cmd_seq, backend.motor_health()
 
         # Resume -> tracking again.
         for _ in range(30):
@@ -603,6 +853,7 @@ def _demo() -> None:
         # and never exercise the sub-tick pair.
         backend._control_roundtrip(rtp.CTL_DISARM)
         backend.enable_all()
+        old_epoch = backend._arm_epoch
         target2 = np.array([0.1, 0.2, -0.2])
         for _ in range(120):
             backend.apply_command(
@@ -614,18 +865,48 @@ def _demo() -> None:
         err2 = float(np.max(np.abs(np.asarray(state.q) - target2)))
         assert state.armed and not state.faulted and not state.holding
         assert err2 < 0.05, f"no tracking after fast re-arm (err {err2:.3f} rad)"
+
+        # Session restart isolation: after a confirmed stop and reconnect, the
+        # old session's packets (right epoch number, fresh seq) are not admitted.
+        old_session = backend.session_id
+        assert backend.safe_stop(), "disarm not confirmed by stop epoch"
+        backend.close()
+        backend = RtBackend(config(), joints)
+        backend.open()
+        assert backend.session_id != old_session
+        backend.enable_all()
+        time.sleep(0.05)
+        before, _ = backend.latest_state()
+        ghost = rtp.pack_command(n=3, seq=10**6, t_mono_ns=0, q_des=target,
+                                 qd_des=np.zeros(3), tau_ff=np.zeros(3), kp=kp, kd=kd,
+                                 session_id=old_session, arm_epoch=backend._arm_epoch)
+        for _ in range(20):
+            backend._udp.send(ghost)
+            time.sleep(0.01)
+        after, _ = backend.latest_state()
+        assert after.last_cmd_seq == before.last_cmd_seq and after.holding, backend.motor_health()
+        assert old_epoch != backend._arm_epoch
         print(
             f"rt_backend: ok (tracked to {err * 1e3:.1f} mrad, hold at "
             f"{np.round(held, 3).tolist()}, fault latch + DISARM/ARM recovery)"
         )
     finally:
         backend.close()
+        log = ""
         if server is not None:
             server.terminate()
             try:
-                server.wait(timeout=3)
+                log = server.communicate(timeout=3)[0]
             except subprocess.TimeoutExpired:
                 server.kill()
+    if server is not None:
+        # Each rejection must have happened for ITS reason, not a neighbour's.
+        for reason in ("claim refused: instance id mismatch",
+                       "claim refused: joint order mismatch",
+                       "claim refused: wrong session",
+                       "is not the claimed control session",
+                       "from ARM epoch"):
+            assert reason in log, f"server never logged {reason!r}"
     _ = shutil, sys  # keep imports honest if asserts are stripped
 
 

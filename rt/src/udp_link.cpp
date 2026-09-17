@@ -37,6 +37,9 @@ void udp_rx_thread(ServerCtx& ctx) {
   ctx.udp_fd.store(fd);
 
   PoseHoldCommandPacket received{}, decoded{};
+  uint64_t warned_session = 0;
+  uint32_t warned_epoch = 0;
+  bool have_warned_session = false, have_warned_epoch = false;
   sockaddr_in src = {};
   socklen_t srclen = sizeof(src);
   uint32_t dropped_ip = 0;
@@ -47,8 +50,30 @@ void udp_rx_thread(ServerCtx& ctx) {
   uint16_t seq_port = 0;
   bool have_seq = false;
   while (!ctx.shutdown.load()) {
+    srclen = sizeof(src);
     const ssize_t got = recvfrom(fd, &received, sizeof(received), MSG_TRUNC,
                                  reinterpret_cast<sockaddr*>(&src), &srclen);
+    if (got == ssize_t(sizeof(ObserveRequest))) {
+      // Read-only subscription: never touches the command peer, the deadman,
+      // the flow pin or the seqlock. A full table refuses newcomers.
+      ObserveRequest req{};
+      std::memcpy(&req, &received, sizeof(req));
+      if (req.magic != MAGIC_OBS || req.version != VERSION ||
+          req.lease_ms < 100 || req.lease_ms > 5000) continue;
+      const uint64_t now = mono_ns();
+      std::lock_guard<std::mutex> lock(ctx.obs_mu);
+      Observer* slot = nullptr;
+      for (auto& o : ctx.observers) {
+        if (o.expiry_ns > now && o.addr.sin_addr.s_addr == src.sin_addr.s_addr &&
+            o.addr.sin_port == src.sin_port) { slot = &o; break; }
+      }
+      if (!slot)
+        for (auto& o : ctx.observers)
+          if (o.expiry_ns <= now) { slot = &o; slot->addr = src; break; }
+      if (slot) slot->expiry_ns = now + uint64_t(req.lease_ms) * 1'000'000ull;
+      else std::fprintf(stderr, "[rt] observer table full; lease refused\n");
+      continue;
+    }
     if(got<0 || !decode_command(&received,size_t(got),ctx.supports_pose_hold.load(),decoded)) continue;
     const auto& pkt=decoded.command;
     // Wrong joint count is dropped HERE, before the rx-stamp: the servo
@@ -62,6 +87,31 @@ void udp_rx_thread(ServerCtx& ctx) {
         warned_n = pkt.n;
         std::fprintf(stderr, "[rt] dropping commands with n=%u (server n=%d)\n",
                      pkt.n, want_n);
+      }
+      continue;
+    }
+    // Session binding: a command belongs to the CURRENT, CLAIMED control
+    // session or it is nothing -- not authority, not a state-stream address,
+    // not a deadman refresh. Replaces trusting whichever datagram came first.
+    const uint64_t session = ctx.session_id.load(std::memory_order_acquire);
+    if (session == 0 || pkt.session_id != session ||
+        !ctx.claim_ok.load(std::memory_order_acquire)) {
+      if (!have_warned_session || warned_session != pkt.session_id) {
+        have_warned_session = true;
+        warned_session = pkt.session_id;
+        std::fprintf(stderr, "[rt] dropping commands: session %016llx is not the "
+                             "claimed control session\n",
+                     (unsigned long long)pkt.session_id);
+      }
+      continue;
+    }
+    if (!ctx.armed.load(std::memory_order_acquire)) {
+      // Disarmed: the session may teach its state-stream address, nothing else.
+      // Nothing is written to the servo's buffer while there is no authority.
+      if (src.sin_addr.s_addr == ctx.ctl_peer_ip.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(ctx.peer_mu);
+        ctx.peer = src;
+        ctx.have_peer = true;
       }
       continue;
     }
@@ -99,6 +149,15 @@ void udp_rx_thread(ServerCtx& ctx) {
       }
     }
     const uint64_t epoch=ctx.arm_gen.load(std::memory_order_acquire);
+    if (pkt.arm_epoch != uint32_t(epoch)) {
+      if (!have_warned_epoch || warned_epoch != pkt.arm_epoch) {
+        have_warned_epoch = true;
+        warned_epoch = pkt.arm_epoch;
+        std::fprintf(stderr, "[rt] dropping commands from ARM epoch %u (current %u)\n",
+                     pkt.arm_epoch, uint32_t(epoch));
+      }
+      continue;
+    }
     if(epoch!=seq_epoch || src.sin_addr.s_addr!=seq_ip || src.sin_port!=seq_port)
       have_seq=false;
     if(have_seq && (pkt.seq-last_seq==0 || pkt.seq-last_seq>=0x80000000u)) continue;
@@ -143,14 +202,29 @@ void state_tx_thread(ServerCtx& ctx) {
     }
     unchanged = 0;
     sent_version = v;
-    sockaddr_in peer;
+    sockaddr_in peer{};
+    bool have_peer = false;
     {
       std::lock_guard<std::mutex> lock(ctx.peer_mu);
-      if (!ctx.have_peer) continue;
+      have_peer = ctx.have_peer;
       peer = ctx.peer;
     }
-    sendto(ufd, &pkt, sizeof(pkt), MSG_DONTWAIT,
-           reinterpret_cast<sockaddr*>(&peer), sizeof(peer));
+    if (have_peer)
+      sendto(ufd, &pkt, sizeof(pkt), MSG_DONTWAIT,
+             reinterpret_cast<sockaddr*>(&peer), sizeof(peer));
+    Observer copy[MAX_OBSERVERS];
+    {
+      std::lock_guard<std::mutex> lock(ctx.obs_mu);
+      std::memcpy(copy, ctx.observers, sizeof(copy));
+    }
+    const uint64_t now = mono_ns();
+    for (const auto& o : copy) {
+      if (o.expiry_ns <= now) continue;
+      if (have_peer && o.addr.sin_addr.s_addr == peer.sin_addr.s_addr &&
+          o.addr.sin_port == peer.sin_port) continue;
+      sendto(ufd, &pkt, sizeof(pkt), MSG_DONTWAIT,
+             reinterpret_cast<const sockaddr*>(&o.addr), sizeof(o.addr));
+    }
   }
 }
 

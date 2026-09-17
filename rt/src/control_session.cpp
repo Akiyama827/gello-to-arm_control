@@ -16,6 +16,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <random>
 
 #include "server.hpp"
 
@@ -34,11 +35,12 @@ bool send_frame(int fd, const ControlPacket& pkt) {
   return true;
 }
 
-ControlPacket make(uint16_t type, uint32_t arg, const char* text) {
+ControlPacket make(uint16_t type, uint32_t arg, const char* text, uint32_t seq = 0) {
   ControlPacket pkt = {};
   pkt.magic = MAGIC_CTL;
   pkt.version = VERSION;
   pkt.type = type;
+  pkt.seq = seq;
   pkt.arg = arg;
   pkt.t_mono_ns = mono_ns();
   if (text) std::snprintf(pkt.text, sizeof(pkt.text), "%s", text);
@@ -49,10 +51,57 @@ uint32_t flags_snapshot(const ServerCtx& ctx) {
   uint32_t f = 0;
   if (ctx.armed.load()) f |= FLAG_ARMED;
   if (ctx.fault.load()) f |= FLAG_FAULTED;
+  if (ctx.claim_ok.load()) f |= FLAG_CLAIMED;
   return with_online_mask(f, ctx.online_mask.load());
 }
 
-void serve_client(ServerCtx& ctx, int fd) {
+uint32_t capabilities(const ServerCtx& ctx) {
+  // CAP_CALIBRATED_TASK_SPACE is never advertised: no backend evaluates a
+  // deployment-approved model in the servo (see protocol.hpp).
+  return CAP_OBSERVER | (ctx.supports_pose_hold.load() ? CAP_POSE_HOLD : 0u);
+}
+
+IdentityPayload identity(const ServerCtx& ctx, uint64_t session) {
+  IdentityPayload id{};
+  std::memcpy(id.instance_id, ctx.instance_id, ID_CHARS);
+  std::memcpy(id.model_id, ctx.model_id, ID_CHARS);
+  id.session_id = session;
+  id.joint_order_hash = ctx.joint_order_hash;
+  id.identity_hash = ctx.identity_hash;
+  id.capabilities = capabilities(ctx);
+  id.n = uint32_t(ctx.backend_n.load());
+  return id;
+}
+
+// Why a CLAIM does not match, or nullptr. Every field a commander relies on
+// is compared; the claim cannot ask for less than it will use.
+const char* claim_mismatch(const ServerCtx& ctx, const IdentityPayload& want,
+                           uint64_t session) {
+  if (want.session_id != session) return "claim refused: wrong session";
+  char instance[ID_CHARS] = {};
+  std::memcpy(instance, want.instance_id, ID_CHARS);
+  instance[ID_CHARS - 1] = '\0';
+  if (std::memcmp(instance, ctx.instance_id, ID_CHARS) != 0)
+    return "claim refused: instance id mismatch";
+  if (want.n != uint32_t(ctx.backend_n.load())) return "claim refused: joint count mismatch";
+  if (want.joint_order_hash != ctx.joint_order_hash)
+    return "claim refused: joint order mismatch";
+  if (want.model_id[0] != '\0' &&
+      std::strncmp(want.model_id, ctx.model_id, ID_CHARS) != 0)
+    return "claim refused: task model mismatch";
+  if (want.capabilities & ~capabilities(ctx))
+    return "claim refused: required capability not offered";
+  return nullptr;
+}
+
+uint64_t fresh_session() {
+  static std::random_device rd;
+  uint64_t v = 0;
+  while (v == 0) v = (uint64_t(rd()) << 32) ^ uint64_t(rd());
+  return v;
+}
+
+void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   const int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   // A peer that stops draining must not wedge this thread mid-send forever
@@ -80,6 +129,12 @@ void serve_client(ServerCtx& ctx, int fd) {
                 ctx.backend_name, ctx.cfg.hold_ms, ctx.cfg.fault_ms,
                 ctx.active_mask.load(), capability);
   send_frame(fd, make(CTL_HELLO, uint32_t(ctx.backend_n.load()), hello));
+  {
+    ControlPacket idf = make(CTL_IDENTITY, uint32_t(ctx.backend_n.load()), nullptr);
+    const IdentityPayload id = identity(ctx, session);
+    std::memcpy(idf.text, &id, sizeof(id));
+    send_frame(fd, idf);
+  }
 
   // Session deadman: the client answers CTL_PING with CTL_PONG, so a healthy
   // idle link always has traffic. A yanked cable / dead PC leaves a half-open
@@ -124,8 +179,28 @@ void serve_client(ServerCtx& ctx, int fd) {
         // Read-only inspection; never changes authority or clears a fault.
         send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "status"));
         break;
+      case CTL_CLAIM: {
+        IdentityPayload want{};
+        std::memcpy(&want, rx.text, sizeof(want));
+        const char* why = claim_mismatch(ctx, want, session);
+        if (why) {
+          // A failed claim never revokes an earlier successful one mid-flight
+          // (it cannot change who is armed); it only reports the refusal.
+          std::fprintf(stderr, "[rt] %s\n", why);
+          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), why));
+        } else {
+          ctx.claim_ok.store(true);
+          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "claim accepted"));
+        }
+        break;
+      }
       case CTL_ARM:
-        if (ctx.fault.load()) {
+        if (!ctx.claim_ok.load()) {
+          // Flags as they are: without FLAG_ARMED set by this request, the
+          // client's ack rule already reads this as a refusal.
+          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx),
+                              "refused: no accepted CLAIM on this session"));
+        } else if (ctx.fault.load()) {
           // Refused: flags still show ARMED when the server is fault-holding
           // (authority is deliberately retained) — the FAULTED bit is the
           // refusal, and clients must check it, not just ARMED.
@@ -136,7 +211,8 @@ void serve_client(ServerCtx& ctx, int fd) {
           // and re-open the live torque session mid-flight — the arm_gen edge
           // makes the RT loop run backend->stop() + session re-open inside
           // one tick, a multi-ms gap libfranka can reject under load.
-          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "already armed"));
+          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "already armed",
+                              uint32_t(ctx.arm_gen.load())));
         } else {
           // The staleness clock starts AT ARM, not at the first command
           // (same semantics as the bench bridges): without this, re-arming
@@ -153,12 +229,13 @@ void serve_client(ServerCtx& ctx, int fd) {
           ctx.cmd_owner_port.store(0);
           // Generation bump makes this ARM visible to the RT loop even if a
           // DISARM->ARM pair fits between two 1 kHz samples of `armed`.
-          ctx.arm_gen.fetch_add(1);
+          const uint64_t gen = ctx.arm_gen.fetch_add(1) + 1;
           ctx.armed.store(true);
-          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "armed"));
+          // seq = the ARM epoch every command of this authority must carry.
+          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "armed", uint32_t(gen)));
         }
         break;
-      case CTL_DISARM:
+      case CTL_DISARM: {
         ctx.armed.store(false);
         ctx.fault.store(false);
         ctx.fault_code.store(0);
@@ -167,8 +244,13 @@ void serve_client(ServerCtx& ctx, int fd) {
         // (its CAS fails) and simply re-fires on the next tick if the cause
         // persists — better than letting it scribble a half-cleared slot.
         ctx.fault_claim.store(false);
-        send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "disarmed"));
+        // AFTER armed=false (rt_loop reads the generation first). The ack is
+        // RECEIPT; completion is StatePacket.stop_epoch reaching this value.
+        const uint64_t dg = ctx.disarm_gen.fetch_add(1) + 1;
+        send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "disarm requested",
+                            uint32_t(dg)));
         break;
+      }
       case CTL_SET_ACTIVE: {
         const int n = ctx.backend_n.load();
         const uint32_t configured = n >= 16 ? 0xFFFFu : ((1u << n) - 1u);
@@ -204,6 +286,14 @@ void serve_client(ServerCtx& ctx, int fd) {
   }
   if (ctx.armed.load()) {
     ctx.latch(FAULT_CTL_LOST, "control session lost while armed");
+  }
+  // The session is over: its commands are no longer admissible and the state
+  // stream stops going to its address. Observers keep their own leases.
+  ctx.claim_ok.store(false);
+  ctx.session_id.store(0);
+  {
+    std::lock_guard<std::mutex> lock(ctx.peer_mu);
+    ctx.have_peer = false;
   }
   close(fd);
 }
@@ -251,8 +341,12 @@ void control_thread(ServerCtx& ctx) {
     // The control client's address is the ONLY source udp_rx will accept
     // commands from while armed (see server.hpp: ctl_peer_ip).
     ctx.ctl_peer_ip.store(peer.sin_addr.s_addr);
-    std::printf("[rt] control client connected\n");
-    serve_client(ctx, client);
+    const uint64_t session = fresh_session();
+    ctx.claim_ok.store(false);
+    ctx.session_id.store(session);
+    std::printf("[rt] control client connected (session %016llx)\n",
+                (unsigned long long)session);
+    serve_client(ctx, client, session);
     std::printf("[rt] control client disconnected\n");
   }
   close(fd);

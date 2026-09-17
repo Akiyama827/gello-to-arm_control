@@ -48,12 +48,13 @@ for key, value in [("id", 0), ("id", 1.5), ("id", 2**32),
     native = [float(bad["id"]), *bad["kc"], *bad["dc"], bad["nullspace_kp"], bad["nullspace_kd"]]
     rejected(lambda native=native: hold.torque(**(args | {"spec": native})))
 command = dict(n=7, seq=42, t_mono_ns=protocol._GOLDEN_T,
+               session_id=protocol._GOLDEN_SESSION, arm_epoch=3,
                q_des=[.1*j for j in range(7)], qd_des=[.01*j for j in range(7)],
                tau_ff=list(range(7)), kp=[100.+j for j in range(7)], kd=[.5*j for j in range(7)])
 joint = protocol.pack_command(**command)
 soft = protocol.pack_command(**command, pose_hold=spec)
-assert len(joint)==664 and len(soft)==784
-assert soft.hex()==protocol.golden_lines()[4].split()[1]
+assert len(joint)==protocol.CMD_SIZE==672 and len(soft)==protocol.POSE_HOLD_CMD_SIZE==792
+assert soft.hex()==dict(line.split(" ", 1) for line in protocol.golden_lines())["POSE_HOLD"]
 assert struct.unpack_from("<H",joint,4)[0]==protocol.VERSION
 assert struct.unpack_from("<H",soft,4)[0]==protocol.POSE_HOLD_VERSION
 for key, value in [("q_des", [0.]*6), ("kd", [-1.]*7), ("tau_ff", [float("inf")]*7)]:

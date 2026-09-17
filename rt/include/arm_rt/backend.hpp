@@ -61,6 +61,11 @@ public:
 
   virtual bool supports_pose_hold() const { return false; }
 
+  // The kinematic model the RT side evaluates for task-space feedback (pose
+  // hold's pose/Jacobian). "none" when the backend has no geometry. This is
+  // reported, never a claim of calibration (see CAP_CALIBRATED_TASK_SPACE).
+  virtual const char* task_model() const { return "none"; }
+
   // Fixed slots are configured once. A backend may report a subset online
   // and activate a subset for torque; conventional arms keep all slots live.
   virtual uint32_t online_mask() const {

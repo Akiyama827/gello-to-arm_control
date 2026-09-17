@@ -141,10 +141,44 @@ UDP fast path, both directions latest-wins with sequence numbers:
 word, typically 100 Hz from the executor) and `StatePacket` (q, dq, tau, the servo's
 post-limiter `tau_cmd` (DM: sampled prediction), selected targets `q_cmd` and
 `qd_cmd`, flags, plus reserved
-FT-sensor fields), streamed at `--state-hz` to the source address of the last
-command. TCP control channel, fixed 128-byte frames: HELLO (n + backend
-name), ARM, DISARM, PING/PONG, STATUS, FAULT. Clocks are NOT assumed synced —
-freshness is arrival-time based, timestamps are diagnostics.
+FT-sensor fields), streamed at `--state-hz` to the claimed session's address
+and to observer leases. TCP control channel, fixed 128-byte frames: HELLO
+(n + backend name + launch flags), IDENTITY, CLAIM, ARM, DISARM, PING/PONG,
+STATUS, FAULT. Clocks are NOT assumed synced — freshness is arrival-time
+based, timestamps are diagnostics.
+
+## Identity, session binding and observers (protocol v5)
+
+One `arm_rt_server` process owns one plant. A second FR3 is a second process
+with its own ports, `--rt-cpu`, backend session, command epoch, watchdog and
+fault latch; nothing is shared between instances except the host.
+
+- `--instance-id` and `--joint-names` are required for `franka` and `dm`.
+  They are provisioned deployment data, printed at startup and hashed into
+  every state packet. They are a configured label, not proof of which robot
+  is cabled to the FCI port.
+- After HELLO the server sends `IDENTITY` (instance id, task model id, a fresh
+  random 64-bit session id, joint-order hash, capabilities). The client checks
+  them against its own config and sends `CLAIM`; the server compares instance,
+  joint count and order, session, requested capabilities and (when named)
+  task model. ARM is refused without an accepted claim on this session.
+- Every command carries `session_id` and `arm_epoch` (the ARM ack's `seq`).
+  A datagram from another/expired session or another epoch is dropped
+  before it can refresh the deadman, teach a state address or reach the
+  servo buffer; the IP pin, first-sender port pin, replay window and
+  finite-value checks remain. While disarmed a claimed session's datagram
+  only teaches its state-stream address. This is flow binding, not security.
+- `ObserveRequest` (16 bytes) leases a read-only copy of the state stream for
+  100–5000 ms, up to 4 observers. It grants nothing, refreshes no deadman,
+  never changes the commander's address and needs no TCP session; closing an
+  observer sends nothing. `RtObserver` checks `identity_hash` and drops
+  states from any other instance.
+- DISARM's ack `seq` is its generation. `StatePacket.stop_epoch` reaches it
+  only after the servo sampled the disarm and `backend->stop()` returned;
+  `safe_stop()` requires a state received after the ack with that epoch.
+  That is process-level confirmation, not a physical standstill measurement.
+- `CAP_CALIBRATED_TASK_SPACE` is never advertised: pose hold uses the
+  backend's own model (`libfranka-vendor` on the FR3), not a PC calibration.
 
 Parity between `protocol.hpp` and the Python protocol is enforced, not hoped
 for: `./build/protocol_selfcheck` and `python -m arm_control.plants.remote_rt.protocol
@@ -152,20 +186,20 @@ for: `./build/protocol_selfcheck` and `python -m arm_control.plants.remote_rt.pr
 arm_control.plants.remote_rt.client` diffs them automatically before its loopback
 test. Any layout change edits both files in one commit and bumps `VERSION`.
 
-State/control and ordinary joint commands use version 3; StatePacket is 864
-bytes. `qd_cmd` echoes the RT-selected desired velocity, including zero in
+State/control and ordinary joint commands use version 5; CommandPacket is
+672 bytes and StatePacket 888. `qd_cmd` echoes the RT-selected desired velocity, including zero in
 initial/stale/fault holds, Cartesian pose hold and disarm. It is not measured
 joint velocity or proof that a plant accepted/tracked the target. CTL_STATUS
 requests report current flags without changing authority or clearing a fault.
 
-Cartesian Soft uses a separate 784-byte command version 4: the unchanged
-664-byte joint-command prefix, followed by 15 doubles
+Cartesian Soft uses a separate 792-byte command version 6: the unchanged
+672-byte joint-command prefix, followed by 15 doubles
 `[id, kc[6], dc[6], nullspace_kp, nullspace_kd]`. Only Franka advertises
-`pose_hold=4` in HELLO;
+`CAP_POSE_HOLD` in IDENTITY;
 the client rejects Soft without that capability and rejects legacy Cartesian
 tails. Unsupported versions, invalid gains and replayed sequences do not renew
 the command deadman.
-Legacy v1/v2 peers are rejected. Deploy PC clients and every arm/base RT
+Legacy v1–v4 peers are rejected. Deploy PC clients and every arm/base RT
 instance together; the base uses the same wire contract as Franka.
 
 `PoseHold` captures measured EE pose and nullspace joint posture on each new
@@ -237,7 +271,8 @@ review-caught, all in the stale-authority class):
   than one servo tick still triggers every per-epoch reset (gains, hold
   pose, plant retry, backend stop).
 - **While armed, UDP commands are accepted only from the control client's
-  IP** — nothing else can steal the state stream or inject authority.
+  IP, its pinned port, its session id and the current ARM epoch** — nothing
+  else can steal the state stream or inject authority (v5; see above).
 - **The control session has a real deadman** — the server PINGs at 4 Hz and
   treats ~1.2 s of silence as session loss (a half-open socket from a dead
   PC otherwise takes the kernel's 2-hour keepalive to notice).
@@ -250,7 +285,11 @@ review-caught, all in the stale-authority class):
 0. **Loopback on the PC** (no hardware): `python -m
    arm_control.plants.remote_rt.client` — protocol parity, tracking through the
    compiled law, staleness→hold, fault latch, refused ARM, DISARM/ARM
-   recovery. GREEN 2026-07-27; keep it green.
+   recovery, server-side claim refusal, foreign-session/stale-epoch/NaN
+   rejection, passive observers, stop-epoch confirmation and session restart
+   isolation. The original subset was GREEN 2026-07-27; the v5 additions are
+   offline-verified against the fake backend only. Keep it green.
+   `tools/bench/rt/check_two_instances.py` runs two fake instances at once.
 1. **Fake on the RT box**: same demo with `rt.host` pointed at the box.
    Proves the link, the kernel, and the service unit. Quantify with
    `python tools/bench/rt/timing.py --host <box>` — it listens to the

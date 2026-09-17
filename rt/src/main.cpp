@@ -33,13 +33,18 @@ void on_signal(int) {
 
 void usage(const char* argv0) {
   std::printf(
-      "usage: %s [--backend fake|franka|dm] [--n N] [--udp-port P] [--tcp-port P]\n"
+      "usage: %s [--backend fake|franka|dm] [--instance-id ID] [--joint-names A,B,..]\n"
+      "          [--n N] [--udp-port P] [--tcp-port P]\n"
       "          [--state-hz HZ] [--hold-ms MS] [--fault-ms MS] [--slew NM]\n"
       "          [--hold-kp V] [--hold-kd V] [--franka-ip IP] [--can-if IF]\n"
       "          [--ee-mass KG] [--ee-com X,Y,Z] [--tau-max NM]\n"
       "          [--dm-spec IF;ID:TYPE[:MST[:PMAX:VMAX:TMAX]],...] [--rt-priority N]\n"
       "          [--active-mask MASK] [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
       "\n"
+      "  --instance-id  provisioned arm instance id ([A-Za-z0-9_.-], <32 chars);\n"
+      "             required for franka/dm. Commanders CLAIM it before ARM.\n"
+      "  --joint-names  comma-separated joint order the backend's slots mean;\n"
+      "             required for franka/dm, count must equal the backend's.\n"
       "  --ee-mass  payload past the flange (wrist camera + mount, carried\n"
       "             module) in kg, ADDED to Desk's end-effector config.\n"
       "  --ee-com   that payload's centre of mass in the FLANGE frame, metres.\n"
@@ -78,6 +83,25 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     if (!std::strcmp(argv[i], "--backend")) cfg.backend = next("--backend");
+    else if (!std::strcmp(argv[i], "--instance-id")) cfg.instance_id = next("--instance-id");
+    else if (!std::strcmp(argv[i], "--joint-names")) {
+      std::string list = next("--joint-names");
+      cfg.joint_names.clear();
+      size_t start = 0;
+      while (start <= list.size()) {
+        const size_t comma = list.find(',', start);
+        const std::string name = list.substr(start, comma == std::string::npos
+                                                        ? std::string::npos
+                                                        : comma - start);
+        if (name.empty()) {
+          std::fprintf(stderr, "--joint-names has an empty entry\n");
+          return 2;
+        }
+        cfg.joint_names.push_back(name);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
+    }
     else if (!std::strcmp(argv[i], "--n")) cfg.n = std::atoi(next("--n"));
     else if (!std::strcmp(argv[i], "--udp-port")) cfg.udp_port = parse_port("--udp-port", next("--udp-port"));
     else if (!std::strcmp(argv[i], "--tcp-port")) cfg.tcp_port = parse_port("--tcp-port", next("--tcp-port"));
@@ -134,6 +158,27 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--rt-cpu")) cfg.rt_cpu = std::atoi(next("--rt-cpu"));
     else {
       usage(argv[0]);
+      return 2;
+    }
+  }
+  // Identity is provisioned deployment data. A hardware server without it
+  // would accept any commander's claim -- refuse to start instead.
+  if (cfg.backend != "fake" && (cfg.instance_id.empty() || cfg.joint_names.empty())) {
+    std::fprintf(stderr, "--instance-id and --joint-names are required for --backend %s\n",
+                 cfg.backend.c_str());
+    return 2;
+  }
+  if (cfg.backend == "fake" && cfg.instance_id.empty()) cfg.instance_id = "fake";
+  {
+    char probe[arm_rt::ID_CHARS] = {};
+    if (cfg.instance_id.size() >= sizeof(probe)) {
+      std::fprintf(stderr, "--instance-id must be shorter than %d chars\n", arm_rt::ID_CHARS);
+      return 2;
+    }
+    std::memcpy(probe, cfg.instance_id.data(), cfg.instance_id.size());
+    if (!arm_rt::valid_id(probe)) {
+      std::fprintf(stderr, "--instance-id must be 1..31 of [A-Za-z0-9_.-] (got '%s')\n",
+                   cfg.instance_id.c_str());
       return 2;
     }
   }

@@ -33,6 +33,25 @@ from arm_control.messages import (
 from arm_control.node_utils import ShutdownFlag, install_signal_handlers
 
 
+def sample_metadata(backend: RtBackend, rx_t: float) -> dict:
+    """Source provenance for one published measured-state message.
+
+    ``source_seq``/``source_t_ns`` are the RT server's own sample counter and
+    CLOCK_MONOTONIC stamp (clock domain ``rt:<instance>``; never compare it with
+    a PC clock). ``rx_mono_s`` is when this content first arrived on the PC, so
+    a republished sample keeps its original arrival time.
+    """
+    state, _ = backend.latest_state()
+    return {
+        "arm_id": backend.config.instance_id,
+        "session": f"{backend.session_id:016x}",
+        "source_seq": int(state.state_seq) if state else -1,
+        "source_t_ns": str(state.t_mono_ns) if state else "",
+        "source_clock": f"rt:{backend.config.instance_id}",
+        "rx_mono_s": float(rx_t),
+    }
+
+
 def main() -> None:
     cfg = load_robot_config()
     rate_hz = float(cfg.get("hardware_update_rate_hz", cfg.update_rate_hz))
@@ -187,10 +206,11 @@ def main() -> None:
             # keep commanding against a dead picture of the arm.
             if health["state_fresh"]:
                 state = backend.motor_state()
-                node.send_output("motor_state", _pack(state))
+                meta = sample_metadata(backend, backend.latest_state()[1])
+                node.send_output("motor_state", _pack(state), meta)
                 if now - last_viz >= viz_period:
                     last_viz = now
-                    node.send_output("motor_state_viz", _pack(state))
+                    node.send_output("motor_state_viz", _pack(state), meta)
             edge = (health["armed"], health["latched_fault"], health["any_fault"])
             if edge != health_prev or step_count % max(1, int(rate_hz / 2.0)) == 0:
                 node.send_output("motor_health", pack_json_message("motor_health", health))
@@ -202,11 +222,18 @@ def main() -> None:
                     pack_json_message(
                         "model_revision",
                         {
+                            # Transport revision only. Geometry/calibration
+                            # revisions come from the model bundle, never from
+                            # this plant bridge.
                             "revision": 0,
                             "backend": f"rt:{backend.backend_name}",
                             "joint_names": joints,
                             "ee_frame": end_frame,
                             "num_motors": backend.num_motors,
+                            "instance_id": backend.identity.instance_id,
+                            "session": f"{backend.session_id:016x}",
+                            "rt_task_model": backend.identity.model_id,
+                            "rt_capabilities": backend.identity.capabilities,
                         },
                     ),
                 )

@@ -110,6 +110,9 @@ public:
   // the tick ever changes rather than being a second place to edit.
   double tau_slew_max() const override { return 1000.0 * tick_s(); }
   bool supports_pose_hold() const override { return true; }
+  // Pose/Jacobian come from the model library libfranka downloads from THIS
+  // robot's control box: the vendor model, independent of any PC-side URDF.
+  const char* task_model() const override { return "libfranka-vendor"; }
 
   bool read(PlantState& out) override {
     try {

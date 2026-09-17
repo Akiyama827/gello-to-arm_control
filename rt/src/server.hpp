@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "arm_rt/backend.hpp"
 #include "arm_rt/protocol.hpp"
@@ -32,6 +33,11 @@ constexpr uint32_t FAULT_PLANT = 3;     // backend read/write failed
 
 struct ServerConfig {
   std::string backend = "fake";
+  // Provisioned identity, checked by every commander's CLAIM before ARM and
+  // stamped into the state stream for observers. A configured label, not an
+  // attestation of which robot is on the other end of the FCI cable.
+  std::string instance_id;               // required except for the fake backend
+  std::vector<std::string> joint_names;  // required except for the fake backend
   std::string franka_ip = "172.16.0.3";
   // Extra payload bolted past the flange (wrist camera + its mount, a carried
   // module), declared to the robot with Robot::setLoad so its own gravity
@@ -65,8 +71,33 @@ struct ServerConfig {
   uint32_t bind_addr = 0;   // network order; 0 = INADDR_ANY
 };
 
+constexpr int MAX_OBSERVERS = 4;
+
+struct Observer {
+  sockaddr_in addr{};
+  uint64_t expiry_ns = 0;  // 0 = free slot
+};
+
 struct ServerCtx {
   ServerConfig cfg;
+
+  // Identity, fixed once the backend is up (read-only afterwards).
+  char instance_id[ID_CHARS] = {};
+  char model_id[ID_CHARS] = {};
+  uint64_t joint_order_hash = 0;
+  uint64_t identity_hash = 0;
+
+  // Current control session. 0 = no client; a fresh random value per accepted
+  // TCP connection. Commands must carry it, and it must have passed CLAIM.
+  std::atomic<uint64_t> session_id{0};
+  std::atomic<bool> claim_ok{false};
+  // DISARM generation: bumped AFTER `armed` is cleared, so a servo tick that
+  // reads this value first and `armed` second can only report a stop epoch
+  // that covers the request (see rt_loop).
+  std::atomic<uint64_t> disarm_gen{0};
+
+  std::mutex obs_mu;
+  Observer observers[MAX_OBSERVERS];
 
   SeqLock<PoseHoldCommandPacket> cmd_in;
   SeqLock<StatePacket> state_out;

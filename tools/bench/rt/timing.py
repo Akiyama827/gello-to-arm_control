@@ -7,9 +7,9 @@ so ``t - seq * tick`` is the wakeup latency (up to a constant); its spread is
 the loop's timing precision, measured on the server's own clock — the wire
 only decides which ticks we get to see (state-hz samples of the 1 kHz loop).
 
-Read-only instrument by construction: the one packet it sends (to teach the
-server our address) carries kp = kd = tau_ff = 0, and the bench aborts if the
-server reports ARMED.
+Read-only instrument by construction: it holds a protocol-v5 OBSERVER lease
+(no control session, no command packet), so it is safe beside an armed
+commander and cannot steal that commander's state stream.
 
 Usage (rung 1 has the service on the box, rung 0 a local server):
 
@@ -43,18 +43,14 @@ def _pct(sorted_vals: list[int], p: float) -> int:
 
 def collect(host: str, port: int, seconds: float) -> list[tuple[int, int, int]]:
     """Return (state_seq, t_server_ns, t_arrival_pc_ns) samples."""
-    zeros = [0.0] * 7
-    prime = rtp.pack_command(
-        n=7, seq=1, t_mono_ns=0, q_des=zeros, qd_des=zeros,
-        tau_ff=zeros, kp=zeros, kd=zeros,
-    )
+    lease = rtp.pack_observe(2000)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(1.0)
     samples: list[tuple[int, int, int]] = []
     deadline = time.monotonic() + seconds
     try:
         for attempt in range(5):
-            sock.sendto(prime, (host, port))
+            sock.sendto(lease, (host, port))
             try:
                 data, _ = sock.recvfrom(rtp.STATE_SIZE)
                 break
@@ -62,10 +58,14 @@ def collect(host: str, port: int, seconds: float) -> list[tuple[int, int, int]]:
                 if attempt == 4:
                     raise SystemExit(f"no state stream from {host}:{port}")
         st = rtp.unpack_state(data)
-        if st.armed:
-            raise SystemExit("server is ARMED — bench is read-only, refusing")
+        print(f"observing identity {st.identity_hash:016x} "
+              f"({'ARMED' if st.armed else 'disarmed'}; this bench never commands)")
         samples.append((st.state_seq, st.t_mono_ns, time.monotonic_ns()))
+        renew = time.monotonic() + 0.5
         while time.monotonic() < deadline:
+            if time.monotonic() >= renew:
+                sock.sendto(lease, (host, port))
+                renew = time.monotonic() + 0.5
             try:
                 data, _ = sock.recvfrom(rtp.STATE_SIZE)
             except socket.timeout:

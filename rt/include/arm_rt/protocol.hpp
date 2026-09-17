@@ -30,17 +30,30 @@ namespace arm_rt {
 constexpr uint32_t MAGIC_CMD = 0x444D4341;   // bytes "ACMD" on the wire
 constexpr uint32_t MAGIC_STATE = 0x41545341; // bytes "ASTA"
 constexpr uint32_t MAGIC_CTL = 0x4C544341;   // bytes "ACTL"
-// v3 adds selected desired velocity to state; v4 is its pose-hold command.
-// Reject v1/v2 peers rather than mixing layouts or command authority epochs.
-constexpr uint16_t VERSION = 3;
-constexpr uint16_t POSE_HOLD_VERSION = 4;
+constexpr uint32_t MAGIC_OBS = 0x53424F41;   // bytes "AOBS"
+// v5 binds every command to a control SESSION and ARM epoch, adds the
+// IDENTITY/CLAIM admission frames, the passive observer lease and the
+// servo-confirmed stop epoch. v6 is its pose-hold command. v3/v4 (and older)
+// peers are rejected: their commands carry no session and cannot be admitted.
+constexpr uint16_t VERSION = 5;
+constexpr uint16_t POSE_HOLD_VERSION = 6;
 constexpr int MAX_JOINTS = 16;
+constexpr int ID_CHARS = 32;  // instance/model id fields, NUL-padded
+
+// IDENTITY.capabilities bits
+constexpr uint32_t CAP_POSE_HOLD = 1u << 0;     // v6 Cartesian pose hold
+constexpr uint32_t CAP_OBSERVER = 1u << 1;      // UDP observer lease
+// Task-space feedback uses a kinematic model the deployment has approved for
+// THIS instance. No backend sets it today: libfranka's own model is not a
+// calibrated model, and pose hold must not be sold as precision control.
+constexpr uint32_t CAP_CALIBRATED_TASK_SPACE = 1u << 2;
 
 // StatePacket.flags bits
 constexpr uint32_t FLAG_ARMED = 1u << 0;
 constexpr uint32_t FLAG_FAULTED = 1u << 1;
 constexpr uint32_t FLAG_HOLDING = 1u << 2;      // staleness hold active
 constexpr uint32_t FLAG_WRENCH_VALID = 1u << 3; // reserved FT-sensor fields live
+constexpr uint32_t FLAG_CLAIMED = 1u << 4;      // this control session's CLAIM matched
 constexpr uint32_t ONLINE_MASK_SHIFT = 16;
 constexpr uint32_t ONLINE_MASK_BITS = 0xFFFFu << ONLINE_MASK_SHIFT;
 
@@ -62,19 +75,28 @@ enum CtlType : uint16_t {
   CTL_STATUS = 6, // server -> client: arg = flags snapshot, text = note
   CTL_FAULT = 7,  // server -> client event: arg = fault code, text = reason
   CTL_SET_ACTIVE = 8, // client -> server: arg = desired fixed-slot mask
+  CTL_IDENTITY = 9,   // server -> client after HELLO: text = IdentityPayload
+  CTL_CLAIM = 10,     // client -> server: text = expected IdentityPayload;
+                      // STATUS answers with FLAG_CLAIMED set or a refusal
 };
+// ACK correlation (ControlPacket.seq of the STATUS reply):
+//   ARM    -> the ARM generation every command of this epoch must carry
+//   DISARM -> the DISARM generation StatePacket.stop_epoch must reach
 
 #pragma pack(push, 1)
 
 // PC -> RT, UDP, latest-wins. The full bridge contract word — the same
 // (q_des, qd_des, tau_ff, kp, kd) the Dora graph's motor_command carries.
+// A session/epoch pair is flow BINDING, not authentication: anything on the
+// direct link that learns both can still forge a packet.
 struct CommandPacket {
   uint32_t magic;      // MAGIC_CMD
   uint16_t version;    // VERSION
   uint16_t n;          // valid joints
   uint32_t seq;        // sender-monotonic; server keeps the freshest only
-  uint32_t flags;      // reserved, 0
+  uint32_t arm_epoch;  // ARM ack seq this command belongs to; 0 while disarmed
   uint64_t t_mono_ns;  // sender clock, diagnostics only (clocks NOT synced)
+  uint64_t session_id; // IDENTITY.session_id of the sender's control session
   double q_des[MAX_JOINTS];
   double qd_des[MAX_JOINTS];
   double tau_ff[MAX_JOINTS];
@@ -97,6 +119,12 @@ struct StatePacket {
   uint64_t t_mono_ns;    // server clock
   uint32_t flags;        // FLAG_*
   uint32_t fault_code;   // 0 = none
+  uint64_t session_id;   // control session holding the server (0 = none)
+  uint64_t identity_hash;// identity_hash(instance id, joint order) — lets a
+                         // passive observer check WHICH arm this is
+  uint32_t arm_epoch;    // ARM generation the servo acted on this tick
+  uint32_t stop_epoch;   // latest DISARM generation the servo has COMPLETED
+                         // (disarmed at the sample, backend stop returned)
   double q[MAX_JOINTS];
   double dq[MAX_JOINTS];
   double tau[MAX_JOINTS];     // measured (fake: applied)
@@ -118,13 +146,68 @@ struct ControlPacket {
   char text[104];     // NUL-terminated where used
 };
 
+// CTL_IDENTITY / CTL_CLAIM body, carried in ControlPacket.text. Fixed layout
+// so identity never has to be parsed out of free text.
+struct IdentityPayload {
+  char instance_id[ID_CHARS];  // deployment-provisioned arm instance id
+  char model_id[ID_CHARS];     // model the RT side uses for task space
+  uint64_t session_id;         // nonzero, fresh per accepted TCP session
+  uint64_t joint_order_hash;   // fnv1a64 of joint names joined by '\n'
+  uint64_t identity_hash;      // identity_hash(instance_id, joint_order_hash)
+  uint32_t capabilities;       // CAP_*
+  uint32_t n;                  // joints
+  uint8_t reserved[8];
+};
+
+// PC -> RT, UDP: ask for (or renew) a read-only copy of the state stream at
+// this datagram's source address. Grants nothing, refreshes no deadman.
+struct ObserveRequest {
+  uint32_t magic;     // MAGIC_OBS
+  uint16_t version;   // VERSION
+  uint16_t reserved;
+  uint32_t lease_ms;  // 100..5000
+  uint32_t reserved2;
+};
+
 #pragma pack(pop)
 
-static_assert(sizeof(CommandPacket) == 24 + 5 * 8 * MAX_JOINTS, "cmd layout");
-static_assert(sizeof(CommandPacket) == 664, "cmd size");
-static_assert(sizeof(PoseHoldCommandPacket) == 784, "pose hold cmd size");
-static_assert(sizeof(StatePacket) == 864, "state size");
+static_assert(sizeof(CommandPacket) == 32 + 5 * 8 * MAX_JOINTS, "cmd layout");
+static_assert(sizeof(CommandPacket) == 672, "cmd size");
+static_assert(sizeof(PoseHoldCommandPacket) == 792, "pose hold cmd size");
+static_assert(sizeof(StatePacket) == 888, "state size");
 static_assert(sizeof(ControlPacket) == 128, "ctl size");
+static_assert(sizeof(IdentityPayload) == 104, "identity size");
+static_assert(sizeof(ObserveRequest) == 16, "observe size");
+
+constexpr uint64_t FNV_OFFSET = 0xcbf29ce484222325ull;
+constexpr uint64_t FNV_PRIME = 0x100000001b3ull;
+
+inline uint64_t fnv1a64(const void* data, size_t size, uint64_t h = FNV_OFFSET) {
+  const auto* b = static_cast<const unsigned char*>(data);
+  for (size_t i = 0; i < size; ++i) { h ^= b[i]; h *= FNV_PRIME; }
+  return h;
+}
+
+// Over the NUL-padded 32-byte instance id, then the joint-order hash as 8
+// little-endian bytes. Both ends compute it; neither parses the other's text.
+inline uint64_t identity_hash(const char instance_id[ID_CHARS], uint64_t joint_order_hash) {
+  uint64_t h = fnv1a64(instance_id, ID_CHARS);
+  unsigned char le[8];
+  for (int i = 0; i < 8; ++i) le[i] = uint8_t(joint_order_hash >> (8 * i));
+  return fnv1a64(le, sizeof(le), h);
+}
+
+// Instance ids are provisioned names, not free text: 1..31 of [A-Za-z0-9_.-].
+inline bool valid_id(const char* s) {
+  size_t k = 0;
+  for (; k < size_t(ID_CHARS) && s[k]; ++k) {
+    const char c = s[k];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-'))
+      return false;
+  }
+  return k >= 1 && k < size_t(ID_CHARS);
+}
 
 inline bool valid_pose_hold_spec(const double* s) {
   for (int i=0; i<15; ++i) if (!std::isfinite(s[i])) return false;
