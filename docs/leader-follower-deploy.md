@@ -1,8 +1,10 @@
 # 小臂 → FR3 遥操作：交付文件清单与部署步骤
 
 本文档是 [leader-follower.md](leader-follower.md)（设计与原理）的**操作版**：一份
-照着做就能上线的清单。硬件约定见设计文档——小臂 = 8 个宇树 S288（7 臂关节 +
-1 夹爪，官方 `unitree_actuator_sdk`），大臂 = FR3（`fr3_joint1..7` + Franka Hand）。
+照着做就能上线的清单。日常怎么跑、怎么看可视化见
+[使用说明书](leader-follower-usage.md)。硬件约定见设计文档——小臂 = 8 个宇树 S288
+（7 臂关节 + 1 夹爪，官方 `unitree_actuator_sdk`），大臂 = FR3（`fr3_joint1..7` +
+Franka Hand）。
 
 ---
 
@@ -31,6 +33,7 @@
 | `tools/assets/fetch_fr3_description.py` | 自动获取并 staging FR3 描述到 `franka/` | 否 |
 | `tools/bench/check_leader_follower.py` | 离线自检（无硬件） | 否 |
 | `docs/leader-follower.md` | 设计与原理 | 否 |
+| `docs/leader-follower-usage.md` | 使用说明书（怎么跑/看可视化/FAQ） | 否 |
 | `docs/leader-follower-deploy.md` | 本文档 | 否 |
 
 ### 1.2 部署侧需新增
