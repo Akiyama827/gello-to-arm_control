@@ -145,6 +145,7 @@ class _VisualMirror:
                     triangle_indices=self._m.mesh_face[f0 : f0 + nf],
                     albedo_factor=color,
                 ),
+                static=True,  # 几何是 timeless：否则会落在 log_time 时间轴，切到 tick 就不显示
             )
         else:
             rr.log(
@@ -152,6 +153,7 @@ class _VisualMirror:
                 rr.Boxes3D(
                     half_sizes=[self._m.geom_size[i]], colors=[color], fill_mode="solid"
                 ),
+                static=True,
             )
 
     def update(self) -> None:
@@ -272,8 +274,8 @@ def main(argv=None) -> int:
     }
     mirror = _VisualMirror(model, data, prefix="follower")
 
-    # 地面网格（Rerun 自带）
-    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    # 坐标约定放在根实体上（两只臂都在根下），静态、任何时间轴都生效
+    rr.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
 
     # --- 遥操作装配 ---
     guard = None
@@ -315,8 +317,8 @@ def main(argv=None) -> int:
         mirror.update()
 
         pts = leader_fk(st.leader, _LEADER_SCALE, _LEADER_BASE)
-        rr.log("leader/skeleton", rr.LineStrips3D([pts], colors=[_LEADER_COLOR], radii=0.012))
-        rr.log("leader/joints", rr.Points3D(pts, radii=0.022, colors=[_LEADER_COLOR]))
+        rr.log("leader/skeleton", rr.LineStrips3D([pts], colors=[_LEADER_COLOR], radii=0.022))
+        rr.log("leader/joints", rr.Points3D(pts, radii=0.032, colors=[_LEADER_COLOR]))
 
         for i in range(st.leader.size):
             rr.log(f"plots/leader/q{i + 1}", rr.Scalars(float(st.leader[i])))
