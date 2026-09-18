@@ -169,10 +169,12 @@ PYTHONPATH=. python -B examples/leader_follower_teleop.py --collision-demo --dur
 真机 Dora 图（需部署配置：`leader.kind: s288` + `follower.kind: dora`）：
 
 ```bash
-LEADER_FOLLOWER_CONFIG=$PWD/deploy/leader_follower.yaml \
+LEADER_FOLLOWER_CONFIG=$PWD/configs/entries/leader_follower.yaml \
 ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
   dora run libs/arm_control/dataflows/leader_teleop_franka.yml
 ```
+
+部署清单与步骤见 [leader-follower-deploy.md](leader-follower-deploy.md)。
 
 ## 进度
 

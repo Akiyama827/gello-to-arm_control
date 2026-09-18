@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 from typing import Optional, Sequence
 
 from .config import config_from_yaml, build_pipeline
@@ -26,7 +27,10 @@ from .dora_feedback import DoraFollowerFeedback
 from .loop import TeleopLoop
 from .safety import CollisionGuard, NoCollisionGuard
 
-DEFAULT_CONFIG = "examples/configs/leader_follower.yaml"
+# dora 会把节点 cwd 重定位到 dataflow 所在目录，所以默认路径要基于本文件
+# 定位到 repository 根，而不是 cwd。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG = str(_REPO_ROOT / "examples" / "configs" / "leader_follower.yaml")
 
 
 def build_dora_node(
@@ -84,6 +88,15 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
         help="跳过启动回读等待（仅用于确认接线，真机不要用）",
     )
     args = parser.parse_args(argv)
+
+    if not Path(args.config).is_file():
+        print(
+            f"[leader_teleop] 拒绝启动：找不到配置文件 {args.config!r}。\n"
+            "  请用 LEADER_FOLLOWER_CONFIG 指向真机部署配置（leader.kind=s288,\n"
+            "  follower.kind=dora），不要依赖 fake/fake 示例。",
+            file=sys.stderr,
+        )
+        return 2
 
     cfg = config_from_yaml(args.config)
     if getattr(cfg.follower, "kind", "") != "dora":
