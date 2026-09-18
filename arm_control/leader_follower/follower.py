@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Protocol, Sequence
+from typing import Callable, Optional, Protocol, Sequence
 
 import numpy as np
 
@@ -173,6 +173,11 @@ class DoraJogFollower:
     reason: str = "leader-follower"
     auto_arm: bool = True
     node: object = field(default=None, repr=False)
+    # 启动对齐用的实测位形来源：返回 (arm_q[n], gripper_finger_m)。接上
+    # `motor_state` 回读后由节点注入；不接则回退到零点（部署侧自行对齐）。
+    state_provider: Optional[Callable[[], tuple[np.ndarray, float]]] = field(
+        default=None, repr=False
+    )
 
     _sent: int = field(default=0, init=False)
     _opened: bool = field(default=False, init=False)
@@ -194,9 +199,12 @@ class DoraJogFollower:
         self._opened = True
 
     def read_state(self) -> tuple[np.ndarray, float]:
-        # Dora 的 jog 通道不回读；回读不是本回路成立的前提。启动对齐在
-        # 部署侧完成（或把 motor_state 接进来后扩展）。这里返回零点并
-        # 由 loop 决定是否 auto_align。
+        # `jog` 通道本身不回读；若节点注入了 `state_provider`（订阅
+        # `plant_interface/motor_state` + `franka_gripper/gripper_state`），
+        # 就用实测位形做启动对齐基准；否则回退零点，由部署侧自行对齐。
+        if self.state_provider is not None:
+            arm, finger = self.state_provider()
+            return np.asarray(arm, dtype=float).ravel(), float(finger)
         return np.zeros(self.num_arm_joints), 0.0
 
     def send(self, arm_q: Sequence[float], gripper_finger_m: float) -> None:

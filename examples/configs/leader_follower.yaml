@@ -37,6 +37,7 @@ follower:
   initial_finger_m: 0.04
   # --- 走 Dora（arm_control 原生通道；FR3 推荐）时 ---
   # kind: dora
+  # auto_arm: true   # 节点 open() 发 control(arm=True)；保留操作台门则设 false
   # --- 直连远程 RT 时（只驱动 7 臂关节，夹爪不经此通道）---
   # kind: rt
   # joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]

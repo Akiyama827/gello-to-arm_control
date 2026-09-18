@@ -74,6 +74,9 @@ class FollowerConfig:
     gripper_slot: bool = False
     kp: Sequence[float] = ()
     kd: Sequence[float] = ()
+    # dora：open() 时是否自动发 control(arm=True)。真机上若希望保留操作台
+    # 的 ARM/DISARM 门，设为 False，由操作台显式使能。
+    auto_arm: bool = True
 
 
 @dataclass
@@ -282,7 +285,9 @@ def build_follower(cfg: FollowerConfig):
             initial_finger_m=cfg.initial_finger_m,
         )
     if cfg.kind == "dora":
-        return follower_mod.DoraJogFollower(num_arm_joints=cfg.n_arm_joints)
+        return follower_mod.DoraJogFollower(
+            num_arm_joints=cfg.n_arm_joints, auto_arm=cfg.auto_arm
+        )
     if cfg.kind == "rt":
         names = list(cfg.joint_names) or list(FR3_JOINTS[: cfg.n_arm_joints])
         return follower_mod.RtFollower(

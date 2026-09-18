@@ -38,7 +38,11 @@ DryRunFollower / DoraJogFollower / RtFollower / FakeFollower （下发 FR3）
 | `follower.py` | 大臂四种下发后端 |
 | `safety.py` | 碰撞守卫 + 安全监视器 + `SafetyStop` |
 | `loop.py` | 实时主循环 `TeleopLoop` |
+| `dora_feedback.py` | 大臂回读 `DoraFollowerFeedback`（motor_state/health/controller_event/gripper_state） |
+| `node.py` | Dora 节点入口：一个 `Node` 同时发 jog/control/gripper、收回读 |
 | `config.py` | YAML 配置与装配 |
+| `nodes/leader_teleop.py` | 上述节点的 Dora 可执行薄壳 |
+| `dataflows/leader_teleop_franka.yml` | 真机 FR3 遥操作 Dora 图（本节点作为唯一运动源） |
 | `examples/leader_follower_teleop.py` | 可运行示例（默认全仿真） |
 | `examples/configs/leader_follower.yaml` | 示例配置 |
 | `tools/bench/check_leader_follower.py` | 离线自检 |
@@ -87,10 +91,36 @@ FR3 在 `real_franka_motion.yml` 里由 `arm_console` 产出三个 topic，我�
 - `franka_gripper` 取 `gripper` 消息的 `position[0]` 作为**单指位移**，内部
   `width = 2 * finger`；FR3 行程是 `gripper_range_m: [0.0, 0.04]`（单指）。
   所以 `GripperMapping.open_finger_m` 用 **0.04**，不是整手 0.075/0.08。
-- 部署时需把 `real_franka_motion.yml` 里 `arm_controller`/`franka_gripper` 的
-  `jog`/`control`/`gripper` 输入从 `arm_console/*` 改接到遥操作节点。
+- 部署时把 `real_franka_motion.yml` 里 `arm_controller`/`franka_gripper` 的
+  `jog`/`control`/`gripper` 输入从 `arm_console/*` 改接到遥操作节点。已经落成
+  `dataflows/leader_teleop_franka.yml`：`leader_teleop` 作**唯一运动源**，
+  产出的三个 topic 与 `arm_console` 完全同格式；`arm_console` 不再入图。
 - RT 直连后端（`RtFollower`）只发 7 个臂关节，**不驱动 Franka Hand**；要连夹爪
   一起遥操作必须走 Dora 的 `DoraJogFollower`。
+
+### 大臂回读（跟踪误差门的前提）
+
+`jog` 是单向通道，所以 `DoraFollowerFeedback`（`dora_feedback.py`）在同一个
+Dora `Node` 上收反馈，喂给安全层：
+
+| topic | 用途 |
+|---|---|
+| `plant_interface/motor_state` | 实测关节位置/速度 -> 跟踪误差、速度异常、启动对齐基准 |
+| `plant_interface/motor_health` | `armed` / `latched_fault` -> 失能/故障位停机 |
+| `arm_controller/controller_event` | `kind=fault` -> 控制器停止，粘住不自动清除 |
+| `franka_gripper/gripper_state` | 夹爪开度（仅记录；`width` 为整手，单指 = `width/2`） |
+
+要点：
+
+- 每 tick `feedback()` 用 `try_recv()` 非阻塞吸干已到达事件，只留最新一条。
+- **新鲜度用样本自带的到达时刻 `timestamp`，不是"这一 tick 调用过"。** 否则
+  调用方每 tick 递回同一个缓存样本就能骗过 `feedback_timeout_s`。
+- 启动先 `prime()` 等到首帧 `motor_state`，拿**实测**位形做 `auto_align`；
+  FR3 的零位不合法（`fr3_joint4` 约 `[-3.0421, -0.1518]`），不能拿零点对齐。
+- 图配置里 `follower.auto_arm: true` 时节点 `open()` 发 `control(arm=True)`、
+  退出/安全停机发 `control(cancel, arm=False)`；RT 服务器保留正常 deadman，
+  节点一停大臂即被驻停。**停节点就是 DISARM**。若要保留操作台 ARM/DISARM 门，
+  跑 `real_franka_motion.yml` 并把 `follower.auto_arm` 设为 `false`。
 
 ## S288 参数（来源：Unitree 官网 DigitalServo 页，2026 查得）
 
@@ -119,9 +149,11 @@ FR3 在 `real_franka_motion.yml` 里由 `arm_console` 产出三个 topic，我�
   把小臂作为场景 actor = 高保真两臂碰撞）
 - `SphereCollisionGuard`：纯 numpy 两臂球体近似，开箱可用
 
-> 注意：`DoraJogFollower` 的 `jog` 通道不回读。要启用跟踪误差门，必须另接订阅
-> `plant_interface/motor_state`（臂的实测位形）与 `arm_controller/controller_event`
-> （fault/leg_result）的反馈实现；否则应设置 `feedback_required: false` 并明确接受该保护缺失。
+> 注意：`DoraJogFollower` 的 `jog` 通道本身不回读，但 Dora 节点用
+> `DoraFollowerFeedback` 另接 `plant_interface/motor_state` +
+> `plant_interface/motor_health` + `arm_controller/controller_event`，跟踪误差、
+> 反馈陈旧、故障位、失能都能判。若确实没有回读，必须设 `feedback_required: false`
+> 并明确接受该保护缺失。
 
 ## 运行
 
@@ -134,7 +166,30 @@ PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --collision-demo --duration 10
 ```
 
-## 待办：大臂不必逐关节复刻，可做路径优化（用户 2026-09-18 需求）
+真机 Dora 图（需部署配置：`leader.kind: s288` + `follower.kind: dora`）：
+
+```bash
+LEADER_FOLLOWER_CONFIG=$PWD/deploy/leader_follower.yaml \
+ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
+  dora run libs/arm_control/dataflows/leader_teleop_franka.yml
+```
+
+## 进度
+
+已完成：
+
+- S288 规格与官方 SDK 总线、关节空间换算、FR3 三种下发后端、安全层与主循环。
+- FR3 回读 `DoraFollowerFeedback` + Dora 节点入口 + 真机图
+  `dataflows/leader_teleop_franka.yml`（本节点作唯一运动源，含跟踪误差/陈旧/故障/失能停机）。
+
+上线前仍需：
+
+- 按实际 URDF 核对 FR3 关节限位；标定 `joint_signs`/`joint_offsets`。
+- 实测确认官方 SDK 的 `MotorType` 枚举名（无 `S288` 则需换名/自实现后备总线）。
+- 高保真两臂碰撞：把 `MuJoCoCollisionWorld`（小臂作为场景 actor）包成
+  `CallableCollisionGuard` 注入 `build_dora_node(collision_guard=...)`。
+
+## 大臂不必逐关节复刻，可做路径优化（用户 2026-09-18 需求）
 
 需求：**在"效果一样"（末端位姿/任务等价）的前提下，大臂可以走优化过的路径，
 不必严格复刻小臂的逐关节动作。**

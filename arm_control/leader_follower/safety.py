@@ -355,7 +355,15 @@ class SafetyMonitor:
                     )
             return SafetyVerdict(True)
         self._seen_feedback = True
-        self._last_feedback_t = now
+        # 用样本自带的到达时刻判新鲜度，而不是"这一 tick 调用了就算新鲜"：
+        # 否则调用方每 tick 递回同一个缓存样本，反馈陈旧门永远不会触发。
+        t = float(sample.timestamp) if sample.timestamp else now
+        self._last_feedback_t = t
+        if now - t > self.limits.feedback_timeout_s:
+            return SafetyVerdict(
+                False,
+                f"大臂反馈陈旧 {now - t:.2f}s（阈值 {self.limits.feedback_timeout_s:.2f}s）",
+            )
 
         q = np.asarray(sample.arm_q, dtype=float).ravel()
         if q.size != self._n or not np.all(np.isfinite(q)):

@@ -12,6 +12,8 @@
     follower   大臂三种下发后端
     safety     碰撞预警停机 + "没按预期运行"停机
     loop       实时主循环
+    dora_feedback  大臂回读（motor_state/health/controller_event）
+    node       Dora 节点入口
     config     YAML 配置与装配
 
 注意：`follower` 子模块与包同名，导入时请用 `from arm_control.leader_follower
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 from .mapping import GripperMapping, JointMapping, Retargeter
 from .loop import FollowerFeedback, TeleopLoop, TeleopStats
+from .dora_feedback import DoraFollowerFeedback
 from .safety import (
     CallableCollisionGuard,
     CollisionGuard,
@@ -41,6 +44,7 @@ __all__ = [
     "TeleopLoop",
     "TeleopStats",
     "FollowerFeedback",
+    "DoraFollowerFeedback",
     "CollisionGuard",
     "NoCollisionGuard",
     "CallableCollisionGuard",

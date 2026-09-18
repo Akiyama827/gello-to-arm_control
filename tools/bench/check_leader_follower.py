@@ -144,6 +144,115 @@ def check_dora_follower_messages() -> None:
     print("dora: jog/control/gripper 消息格式（FR3，单指米）OK")
 
 
+def check_dora_feedback() -> None:
+    """校验 FR3 回读：motor_state/health/event/gripper_state -> 安全层。"""
+    from arm_control.leader_follower.dora_feedback import DoraFollowerFeedback
+    from arm_control.leader_follower.follower import DoraJogFollower
+    from arm_control.messages import (
+        pack_controller_event,
+        pack_json_message,
+        pack_motor_state,
+    )
+
+    class FakeNode:
+        def __init__(self, events):
+            self._events = list(events)
+            self.sent = []
+
+        def try_recv(self):
+            return self._events.pop(0) if self._events else None
+
+        def next(self, timeout=None):
+            return self._events.pop(0) if self._events else None
+
+        def send_output(self, name, value=None):
+            self.sent.append((name, value))
+
+    n = 7
+    q = np.linspace(-1.0, 1.0, n)
+    dq = np.full(n, 0.1)
+    pos_cmd = q + 0.2
+    zeros = np.zeros(n)
+    motor_state = pack_motor_state(q, dq, pos_cmd, zeros, zeros, 100.0, 2.0, zeros)
+    health = pack_json_message("motor_health", {"armed": True, "latched_fault": ""})
+    grip = pack_json_message("gripper_state", {"width": 0.06, "is_grasped": False})
+    event_ok = pack_controller_event(kind="ready", q=q)
+
+    node = FakeNode(
+        [
+            {"type": "INPUT", "id": "motor_state", "value": motor_state},
+            {"type": "INPUT", "id": "motor_health", "value": health},
+            {"type": "INPUT", "id": "gripper_state", "value": grip},
+            {"type": "INPUT", "id": "controller_event", "value": event_ok},
+        ]
+    )
+    fb = DoraFollowerFeedback(node, n)
+    sample = fb.sample()
+    assert sample is not None, "有 motor_state 时应给出样本"
+    assert np.allclose(sample.arm_q, q), sample.arm_q
+    assert np.allclose(sample.arm_dq, dq), sample.arm_dq
+    assert sample.armed is True and not sample.fault, sample
+    assert abs(sample.gripper_width_m - 0.06) < 1e-9
+    # 启动对齐取实测位形，夹爪给单指米
+    arm, finger = fb.latest_arm_state()
+    assert np.allclose(arm, q) and abs(finger - 0.03) < 1e-9
+
+    # follower.read_state 注入 state_provider 后应返回实测，而非零点
+    follower = DoraJogFollower(
+        num_arm_joints=n, node=node, state_provider=fb.latest_arm_state
+    )
+    arm2, grip2 = follower.read_state()
+    assert np.allclose(arm2, q), arm2
+    assert abs(grip2 - 0.03) < 1e-9
+
+    # 缓存样本不能骗过"反馈陈旧"门：时间前进 -> 用样本自带 timestamp 判停
+    mon = SafetyMonitor(
+        limits=SafetyLimits(feedback_timeout_s=0.2),
+        joint_lower=[-1.5] * n,
+        joint_upper=[1.5] * n,
+    )
+    now = time.monotonic()
+    assert mon.check_feedback(sample, now), "刚到的样本应通过"
+    assert not mon.check_feedback(sample, now + 0.25), "缓存样本应变陈旧并停机"
+
+    # 控制器 fault 事件与失能都要能被安全层看到
+    node_fault = FakeNode(
+        [
+            {"type": "INPUT", "id": "motor_state", "value": motor_state},
+            {
+                "type": "INPUT",
+                "id": "controller_event",
+                "value": pack_controller_event(kind="fault", ok=False, reason="rt fault"),
+            },
+        ]
+    )
+    fb_fault = DoraFollowerFeedback(node_fault, n)
+    bad = fb_fault.sample()
+    assert bad is not None and bad.fault and "rt fault" in bad.fault_reason, bad
+    assert not mon.check_feedback(bad, time.monotonic()), "fault 样本应停机"
+
+    node_disarm = FakeNode(
+        [
+            {"type": "INPUT", "id": "motor_state", "value": motor_state},
+            {
+                "type": "INPUT",
+                "id": "motor_health",
+                "value": pack_json_message("motor_health", {"armed": False}),
+            },
+        ]
+    )
+    fb_disarm = DoraFollowerFeedback(node_disarm, n)
+    dis = fb_disarm.sample()
+    assert dis is not None and dis.armed is False, dis
+    assert not mon.check_feedback(dis, time.monotonic()), "失能样本应停机"
+
+    # dora STOP -> 故障样本
+    fb_stop = DoraFollowerFeedback(FakeNode([{"type": "STOP"}]), n)
+    stopped = fb_stop.sample()
+    assert stopped is not None and stopped.fault, stopped
+    print("dora: 回读(motor_state/health/event/gripper) + 陈旧/故障/失能停机 OK")
+
+
 def check_mapping() -> None:
     joints = [
         JointMapping(src_index=0, sign=1.0, scale=0.5, lower=-1.0, upper=1.0, max_rate=1.0),
@@ -330,6 +439,7 @@ if __name__ == "__main__":
     check_s288_units_and_codec()
     check_s288_leader_8motors()
     check_dora_follower_messages()
+    check_dora_feedback()
     check_mapping()
     check_safety_gates()
     check_collision()
