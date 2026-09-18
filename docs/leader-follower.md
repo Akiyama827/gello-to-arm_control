@@ -209,7 +209,8 @@ PYTHONPATH=. python -B examples/leader_follower_viewer.py --headless --duration 
 * **曲线**：每个关节的 `leader / follower 指令 / follower 实测 / 跟踪误差`，
   外加夹爪位置与两臂最近距离。在 Rerun 里会自动聚成 Time series 视图。
 
-需要先把真实 FR3 描述 staging 到 `franka/`（该目录被 gitignore，网格较大）：
+真实 FR3 描述**已随仓库分发**在 `franka/`（约 12MB，Apache-2.0），克隆后无需联网。
+仅当需要重新生成/更新时才执行：
 
 ```bash
 pip install -e '.[assets]'

@@ -20,14 +20,15 @@ git clone https://github.com/Akiyama827/gello-to-arm_control.git arm_control   #
 cd arm_control
 python3 -m venv .venv && source .venv/bin/activate            # fish: source .venv/bin/activate.fish
 pip install -e '.[sim,viz,assets]'                            # 想锁版本：pip install -r requirements.txt
-python tools/assets/fetch_fr3_description.py                  # 拉真实 FR3 网格（需联网；只跑胶囊版可跳过）
 PYTHONPATH=. python -B tools/bench/check_leader_follower.py   # 离线自检，应打印“全部通过”
 PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 孪生小臂 + 曲线
 ```
 
 - 需要 **Python ≥ 3.10**（3.12 验证）和图形界面；无显示环境用 `--headless` / `--save`。
-- 不装 FR3 资产也能玩胶囊版：`PYTHONPATH=. python -B examples/leader_follower_viewer.py`。
-- 交互拖拽版：`PYTHONPATH=. python -B examples/leader_follower_interactive.py`（需 FR3 资产）。
+- **真实 FR3 资产已随仓库分发**（`franka/`，约 12MB），克隆后**无需联网**即可跑真实 FR3 的
+  3D 查看器；需要更新时再跑 `python tools/assets/fetch_fr3_description.py`。
+- 交互拖拽版：`PYTHONPATH=. python -B examples/leader_follower_interactive.py`。
+- 胶囊示意臂（无需任何 FR3 资产）：`PYTHONPATH=. python -B examples/leader_follower_viewer.py`。
 - 接**真机**还需厂商工具链（`unitree_actuator_sdk` / `pylibfranka` / `dmcan`）与 C++ 实时核心，
   见 [部署文档 docs/leader-follower-deploy.md](docs/leader-follower-deploy.md)。
 

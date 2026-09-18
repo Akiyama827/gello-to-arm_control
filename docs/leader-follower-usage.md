@@ -52,16 +52,15 @@ pip install -e '.[sim,viz,assets]'
 #    想锁版本复现：pip install -r requirements.txt
 #    （用 requirements.txt 时未安装本包，运行时记得带 PYTHONPATH=.）
 
-# 3) staging 真实 FR3 描述（约 27MB，落在 franka/，已被 gitignore）
-python tools/assets/fetch_fr3_description.py
-#    之后可用 --check 复查：
-#    python tools/assets/fetch_fr3_description.py --check
+# 3) 真实 FR3 描述已随仓库分发（franka/，约 12MB，Apache-2.0），一般无需操作。
+#    只有想重新生成/更新时才需要（这一步会联网 clone franka_description）：
+#    python tools/assets/fetch_fr3_description.py
+#    python tools/assets/fetch_fr3_description.py --check   # 只检查是否就绪
 ```
 
-> 第 3 步只有看**真实 FR3 外形**的两个查看器（`leader_follower_rerun.py`、
-> `leader_follower_interactive.py`）需要；命令行示例和胶囊版
-> `leader_follower_viewer.py` 都不需要。该步会联网 `git clone`
-> `franka_description`，离线机器请提前把 `franka/` 放到仓库根目录。
+> 真实 FR3 资产（`franka/`）**已随仓库分发**，克隆后**无需联网**即可跑所有查看器。
+> 第 3 步只是可选的"重新生成"；命令行示例和胶囊版 `leader_follower_viewer.py`
+> 完全不依赖 FR3 资产。
 
 ---
 

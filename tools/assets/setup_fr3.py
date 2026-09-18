@@ -262,6 +262,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    # 许可/版权文件（Apache-2.0）一并带到 DEST：这些资产会随仓库分发，需要保留
+    # 上游的 LICENSE / NOTICE。
+    for name in ("LICENSE", "NOTICE"):
+        for src in sources:
+            candidate = src / name
+            same = False
+            try:
+                same = candidate.resolve() == (DEST / name).resolve()
+            except OSError:
+                same = False
+            if candidate.is_file() and not same:
+                shutil.copy2(candidate, DEST / name)
+                print(f"[fr3] copied {name}")
+                break
+
     # COLLADA -> OBJ, and repoint the URDF at the results. Must run AFTER the
     # meshes are staged (it converts the staged copies in place) and the URDF is
     # rewritten again below with the new extensions.

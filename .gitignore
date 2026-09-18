@@ -2,12 +2,12 @@
 # THIS repo are kept; assembler/*.sdf, modules/*.sdf, isaac_assets/ and rl/*
 # went with the project.
 
-# Staged FR3 description (tools/assets/setup_fr3.py). Not vendored: it comes
-# from franka_description (Apache-2.0) or a local Isaac install, and the meshes
-# are large. Run the script to (re)create it.
-# LEADING SLASH IS LOAD-BEARING: unanchored `franka/` also matches
-# a deployment's configs/robots/franka/ directory, which is tracked config.
-/franka/
+# FR3 description (tools/assets/fetch_fr3_description.py).
+# VENDORED ON PURPOSE: the ~12MB of URDF + meshes are tracked so a fresh clone
+# can run the real-FR3 3D viewers without network access. They come from
+# franka_description (Apache-2.0, Copyright 2023 Franka Robotics GmbH); the
+# LICENSE/NOTICE live in franka/. Regenerate/update with the script.
+# Do NOT re-add `/franka/` to .gitignore unless the assets move to a release.
 
 # Planning cache (arm_control/planning/stack.py -> $ARM_CONTROL_ROOT/.cache/planning).
 .cache/
