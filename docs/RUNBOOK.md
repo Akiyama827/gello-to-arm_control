@@ -37,7 +37,26 @@ PYTHONPATH=. python -B nodes/arm_console.py --self-check
 PYTHONPATH=. python -B examples/run_console.py --self-check
 PYTHONPATH=. python -B examples/run_console.py --check
 PYTHONPATH=. python -B tools/assets/setup_fr3.py --check
+PYTHONPATH=. python -B -m arm_control.model_bundle
+PYTHONPATH=. python -B -m arm_control.mukca
+PYTHONPATH=. python -B -m arm_control.kinematic_fit --self-check
+PYTHONPATH=. python -B tools/bench/check_rt_telemetry.py
+PYTHONPATH=. python -B tools/bench/check_arm_controller.py
 ```
+
+With a built `arm_rt_server` (fake backend, no hardware):
+
+```bash
+PYTHONPATH=. python -B -m arm_control.plants.remote_rt.client   # loopback rung
+PYTHONPATH=. python -B tools/bench/rt/check_two_instances.py <build>/arm_rt_server
+PYTHONPATH=. python -B tools/bench/rt/torque_cap.py <build>/arm_rt_server
+```
+
+`check_two_instances.py` runs two fake instances at once: simultaneous
+tracking, refusal of a config aimed at the other instance's ports, an
+identity-filtered observer, and per-instance fault latch and stop epoch.
+`arm_control.mukca_casadi` is NOT exercised here: it needs the offline solver
+environment (CasADi + forwardkinematics) that control deliberately lacks.
 
 Asset-status checks can report missing staged files without failing their
 process. Read the output; exit zero is not evidence that a simulation launched.

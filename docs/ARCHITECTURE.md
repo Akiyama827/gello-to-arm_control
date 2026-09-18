@@ -75,6 +75,24 @@ Intentional public compatibility aliases remain:
 These are package-level re-exports, not node-source APIs. Removing them requires
 an explicit consumer migration, not a directory-cleanup sweep.
 
+## Instances, models and calibration
+
+One `arm_rt_server` process owns one physical plant. Protocol v5 makes that
+explicit on the wire: the server is provisioned with an instance id and joint
+order, sends an `IDENTITY` frame, and refuses ARM until the session's `CLAIM`
+matches; every command carries the session id and ARM epoch. Observers take a
+read-only UDP lease and can never acquire or revoke authority. See
+[the RT reference](../rt/README.md).
+
+`model_bundle.py` is the generic, versioned model contract (instance, joint
+order, frames, nominal and model URDF hashes, tool, base, parameterization,
+datasets, status) plus the one transformation chain and a joint-coordinate
+conversion applied exactly once. It loads no consumer configuration and fits
+nothing. `mukca.py` holds the two-socket calibration data model, the reference
+objective and the evaluators; `mukca_casadi.py` is its OFFLINE solver and is
+imported only by offline tools -- no CasADi, IPOPT or GUI import exists on any
+control or RT path.
+
 ## Configuration and assets
 
 `examples/configs/` contains minimal reusable examples, not measured deployment
