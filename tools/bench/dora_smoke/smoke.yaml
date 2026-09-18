@@ -1,0 +1,39 @@
+# 冒烟测试用遥操作配置：fake 小臂 + dora 大臂（不接硬件）。
+leader:
+  kind: fake
+  n_arm_joints: 7
+  with_gripper: true
+  fake_amplitude: 0.3
+  fake_period_s: 2.0
+
+follower:
+  kind: dora
+  n_arm_joints: 7
+  auto_arm: false
+
+mapping:
+  auto_align: true
+  alpha: 1.0
+  joints:
+    - {src: 0, lower: -3.0, upper: 3.0, max_rate: 5.0}
+    - {src: 1, lower: -3.0, upper: 3.0, max_rate: 5.0}
+    - {src: 2, lower: -3.0, upper: 3.0, max_rate: 5.0}
+    - {src: 3, lower: -3.0, upper: 3.0, max_rate: 5.0}
+    - {src: 4, lower: -3.0, upper: 3.0, max_rate: 5.0}
+    - {src: 5, lower: -3.0, upper: 3.0, max_rate: 5.0}
+    - {src: 6, lower: -3.0, upper: 3.0, max_rate: 5.0}
+  gripper: {src: -1, open_finger_m: 0.04, closed_finger_m: 0.0}
+
+safety:
+  joint_lower: [-3.0, -3.0, -3.0, -3.0, -3.0, -3.0, -3.0]
+  joint_upper: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+  limits:
+    feedback_required: true
+    feedback_timeout_s: 0.5
+    track_err_rad: 0.3
+    track_err_hold_s: 0.5
+
+loop:
+  hz: 100
+  duration_s: 3.0
+  log_period_s: 0.5

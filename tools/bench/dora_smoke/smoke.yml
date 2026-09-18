@@ -1,0 +1,32 @@
+# Dora 端到端冒烟测试：fake 小臂 + 回显 motor_state 的假 plant。
+#
+# 验证 `leader_teleop` 节点在真实 Dora 图里能：收回读 -> auto_align ->
+# 100Hz 下发 jog -> 退出时 DISARM，且安全层不误报。不接任何硬件。
+#
+# 必须先激活 venv（dora CLI 靠 VIRTUAL_ENV 找节点用的 Python）：
+#     source <repo>/.venv/bin/activate.fish     # fish
+#     source <repo>/.venv/bin/activate          # bash/zsh
+#     dora run tools/bench/dora_smoke/smoke.yml --log-level info
+#
+# 或直接跑同目录的 run_smoke.sh。
+nodes:
+  - id: leader_teleop
+    path: ../../../nodes/leader_teleop.py
+    env:
+      # 相对路径按 dataflow 所在目录解析（dora 会把节点 cwd 重定位到这里）。
+      LEADER_FOLLOWER_CONFIG: smoke.yaml
+    inputs:
+      motor_state: fake_plant/motor_state
+      motor_health: fake_plant/motor_health
+    outputs:
+      - jog
+      - control
+      - gripper
+
+  - id: fake_plant
+    path: fake_plant.py
+    inputs:
+      jog: leader_teleop/jog
+    outputs:
+      - motor_state
+      - motor_health

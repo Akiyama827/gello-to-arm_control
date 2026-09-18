@@ -1,0 +1,10 @@
+{"ts":"2026-09-18T06:56:37.885Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[teleop] 已 auto_align：当前大臂位形对齐当前小臂姿态，无跳变接管","target":null,"fields":null}
+{"ts":"2026-09-18T06:56:37.885Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[teleop] 启动：100 Hz，Ctrl-C 停止","target":null,"fields":null}
+{"ts":"2026-09-18T06:56:37.891Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[teleop] tick=1 实际≈0.0Hz 最大间隔=0.0ms 最近距离=n/a","target":null,"fields":null}
+{"ts":"2026-09-18T06:56:38.385Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[teleop] tick=51 实际≈102.0Hz 最大间隔=10.1ms 最近距离=n/a","target":null,"fields":null}
+{"ts":"2026-09-18T06:56:38.885Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[teleop] tick=101 实际≈101.0Hz 最大间隔=10.1ms 最近距离=n/a","target":null,"fields":null}
+{"ts":"2026-09-18T06:56:39.395Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[teleop] tick=152 实际≈100.7Hz 最大间隔=10.1ms 最近距离=n/a","target":null,"fields":null}
+{"ts":"2026-09-18T06:56:39.905Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[teleop] tick=203 实际≈100.5Hz 最大间隔=10.1ms 最近距离=n/a","target":null,"fields":null}
+{"ts":"2026-09-18T06:56:40.405Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[teleop] tick=253 实际≈100.4Hz 最大间隔=10.1ms 最近距离=n/a","target":null,"fields":null}
+{"ts":"2026-09-18T06:56:40.885Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[teleop] 到达 duration=3.0s，正常结束","target":null,"fields":null}
+{"ts":"2026-09-18T06:56:40.885Z","level":"stdout","node":"leader_teleop","stream":"stdout","msg":"[follower:dora] 已发送 control(cancel, arm=False)","target":null,"fields":null}
