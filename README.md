@@ -10,6 +10,9 @@ boundaries, and [Runbook](docs/RUNBOOK.md) for current commands. The
 [historical manuals](docs/history/README.md) preserve previous designs and bench
 records; they are not current operating instructions.
 
+> **小臂 → 大臂 主从遥操作**：怎么跑、怎么看可视化、常见问题，见
+> **[使用说明书 docs/leader-follower-usage.md](docs/leader-follower-usage.md)**。
+
 ## Layout
 
 | Path | Owner/responsibility |
