@@ -38,14 +38,19 @@
 
 ## 2. 环境准备（一次性）
 
-```fish
-cd /home/akiyama0827/project/arm_control
+```bash
+# 0) 克隆仓库到任意目录（示例目录名用 arm_control）
+git clone https://github.com/Akiyama827/git.git arm_control
+cd arm_control
 
-# 1) 虚拟环境（fish 用 activate.fish；bash/zsh 用 activate）
-source .venv/bin/activate.fish
+# 1) 虚拟环境（bash/zsh 用 activate；fish 用 activate.fish）
+python3 -m venv .venv
+source .venv/bin/activate
 
 # 2) 依赖：仿真 + 可视化 + 资产工具
 pip install -e '.[sim,viz,assets]'
+#    想锁版本复现：pip install -r requirements.txt
+#    （用 requirements.txt 时未安装本包，运行时记得带 PYTHONPATH=.）
 
 # 3) staging 真实 FR3 描述（约 27MB，落在 franka/，已被 gitignore）
 python tools/assets/fetch_fr3_description.py
@@ -53,16 +58,18 @@ python tools/assets/fetch_fr3_description.py
 #    python tools/assets/fetch_fr3_description.py --check
 ```
 
-> 目前 `franka/` 已经 staged 好，第 3 步可跳过。换机器或删了 `franka/` 才需要重跑。
-> 若只跑 MuJoCo 版和命令行示例，第 3 步不需要。
+> 第 3 步只有看**真实 FR3 外形**的两个查看器（`leader_follower_rerun.py`、
+> `leader_follower_interactive.py`）需要；命令行示例和胶囊版
+> `leader_follower_viewer.py` 都不需要。该步会联网 `git clone`
+> `franka_description`，离线机器请提前把 `franka/` 放到仓库根目录。
 
 ---
 
 ## 3. 五分钟上手
 
-```fish
-cd /home/akiyama0827/project/arm_control
-source .venv/bin/activate.fish
+```bash
+cd arm_control            # 换成你的克隆目录
+source .venv/bin/activate # fish: source .venv/bin/activate.fish
 ```
 
 **第 1 步 · 自检**（不碰硬件，应打印"全部通过"）

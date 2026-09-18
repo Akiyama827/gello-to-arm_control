@@ -61,8 +61,8 @@ Franka Hand）。
 
 - **官方 SDK**：编译 `unitree_actuator_sdk`（pybind 扩展）并把产物放到 `PYTHONPATH`。
   未完成时可先用 `leader.bus: serial_raw`（后备自实现帧）或 `fake` 跑通链路。
-- **Python 环境**：需 `numpy`、`pyarrow`、`dora-rs`（本仓库 `dependencies`）。本机验证用的解释器是
-  `/home/akiyama0827/miniconda3/envs/arm_control/bin/python`。
+- **Python 环境**：需 `numpy`、`pyarrow`、`dora-rs`（本仓库 `dependencies`）。建议用仓库根的
+  `.venv`（见使用说明书第 2 节），或任意满足 `pyproject.toml` 的 Python ≥3.10 解释器。
 - **RT 服务器**：FR3 需用 `-DWITH_FRANKA=ON` 编译，详见 `rt/README.md`。
 
 ---
