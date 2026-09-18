@@ -1,8 +1,10 @@
 # 小臂 → FR3 遥操作：交付文件清单与部署步骤
 
 本文档是 [leader-follower.md](leader-follower.md)（设计与原理）的**操作版**：一份
-照着做就能上线的清单。硬件约定见设计文档——小臂 = 8 个宇树 S288（7 臂关节 +
-1 夹爪，官方 `unitree_actuator_sdk`），大臂 = FR3（`fr3_joint1..7` + Franka Hand）。
+照着做就能上线的清单。日常怎么跑、怎么看可视化见
+[使用说明书](leader-follower-usage.md)。硬件约定见设计文档——小臂 = 8 个宇树 S288
+（7 臂关节 + 1 夹爪，官方 `unitree_actuator_sdk`），大臂 = FR3（`fr3_joint1..7` +
+Franka Hand）。
 
 ---
 
@@ -26,8 +28,13 @@
 | `examples/configs/leader_follower.yaml` | 全仿真示例配置（fake/fake） | 否 |
 | `examples/configs/leader_follower_real.example.yaml` | **真机配置模板**，复制后按现场标定 | **是** |
 | `examples/leader_follower_teleop.py` | 单机可运行示例（默认全仿真） | 否 |
+| `examples/leader_follower_viewer.py` | MuJoCo 3D 可视化（两条胶囊臂实时跟随，无需资产） | 否 |
+| `examples/leader_follower_rerun.py` | Rerun 可视化（真实 FR3 网格 + 小臂模型 + 时间序列曲线） | **是** |
+| `examples/leader_follower_interactive.py` | MuJoCo 交互可视化（鼠标拖拽小臂 -> 真实 FR3 跟随） | **是** |
+| `tools/assets/fetch_fr3_description.py` | 自动获取并 staging FR3 描述到 `franka/` | 否 |
 | `tools/bench/check_leader_follower.py` | 离线自检（无硬件） | 否 |
 | `docs/leader-follower.md` | 设计与原理 | 否 |
+| `docs/leader-follower-usage.md` | 使用说明书（怎么跑/看可视化/FAQ） | 否 |
 | `docs/leader-follower-deploy.md` | 本文档 | 否 |
 
 ### 1.2 部署侧需新增
@@ -219,7 +226,12 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 
 1. **离线自检**：`PYTHONPATH=. python -B tools/bench/check_leader_follower.py` 全绿。
 2. **单机仿真**：`PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10`，
-   观察 mapping 方向与周期。
+   观察 mapping 方向与周期。想直观看动作就开
+   `PYTHONPATH=. python -B examples/leader_follower_viewer.py --duration 20`（MuJoCo 3D
+   窗口，两条臂实时跟随；角标有跟踪误差/最近距离；`--collision-demo` 可看到逼近后停机）。
+   要看**真实 FR3 外形 + 关节/误差曲线**，先 staging 描述
+   （`pip install xacro trimesh pycollada && python tools/assets/fetch_fr3_description.py`），
+   再 `PYTHONPATH=. python -B examples/leader_follower_rerun.py --duration 20`（Rerun 单窗口）。
 3. **碰撞演示**：`... examples/leader_follower_teleop.py --collision-demo --duration 10`，
    确认逼近时安全停机。真机高保真两臂碰撞建议把 `MuJoCoCollisionWorld`（小臂作
    场景 actor）包成 `CallableCollisionGuard`，在 `node.py` 的

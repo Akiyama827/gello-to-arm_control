@@ -233,6 +233,7 @@ class FakeLeaderArm:
         amplitude: float = 0.4,
         period_s: float = 6.0,
         speed: float = 1.0,
+        center: Optional[Sequence[float]] = None,
     ) -> None:
         self._n_arm = int(n_arm_joints)
         self._gripper = bool(with_gripper)
@@ -240,6 +241,13 @@ class FakeLeaderArm:
         self._period = float(period_s)
         self._speed = float(speed)
         self._t0 = None
+        center_arr = None if center is None else np.asarray(center, dtype=float)
+        if center_arr is not None and center_arr.shape != (self._n_arm,):
+            raise ValueError(
+                f"center 长度应为 {self._n_arm}，得到 {center_arr.shape}"
+            )
+        self._center = center_arr
+        self._phase = np.arange(self._n_arm, dtype=float) * 0.7
 
     def num_dofs(self) -> int:
         return self._n_arm + (1 if self._gripper else 0)
@@ -250,12 +258,17 @@ class FakeLeaderArm:
         if self._t0 is None:
             self._t0 = time.monotonic()
         t = (time.monotonic() - self._t0) * self._speed
-        vals = [
-            self._amp * np.sin(2 * np.pi * t / self._period + i * 0.7)
-            for i in range(self._n_arm)
-        ]
+        omega = 2 * np.pi * t / self._period
+        if self._center is None:
+            vals = list(self._amp * np.sin(omega + self._phase))
+        else:
+            # 减去 t=0 的相位使初始姿态正好落在 center；系数 0.5 把偏差限制在 ±amp
+            vals = list(
+                self._center
+                + 0.5 * self._amp * (np.sin(omega + self._phase) - np.sin(self._phase))
+            )
         if self._gripper:
-            vals.append(0.5 + 0.5 * np.sin(2 * np.pi * t / self._period))
+            vals.append(0.5 + 0.5 * np.sin(omega))
         return np.asarray(vals, dtype=float)
 
     def get_observations(self) -> Dict[str, np.ndarray]:

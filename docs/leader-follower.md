@@ -12,6 +12,8 @@
 
 小臂 7 个臂关节与 FR3 的 7 个关节**天然一一对应**，关节空间直连即可。
 
+> 怎么跑、怎么看可视化、遇到问题怎么办：见 **[使用说明书](leader-follower-usage.md)**。
+
 ## 数据流
 
 ```
@@ -44,6 +46,13 @@ DryRunFollower / DoraJogFollower / RtFollower / FakeFollower （下发 FR3）
 | `nodes/leader_teleop.py` | 上述节点的 Dora 可执行薄壳 |
 | `dataflows/leader_teleop_franka.yml` | 真机 FR3 遥操作 Dora 图（本节点作为唯一运动源） |
 | `examples/leader_follower_teleop.py` | 可运行示例（默认全仿真） |
+| `examples/leader_follower_viewer.py` | MuJoCo 3D 可视化：两条 7-DOF 臂实时跟随（无需外部资产） |
+| `examples/leader_follower_rerun.py` | Rerun 可视化：真实 FR3 网格 + 小臂模型 + 关节/误差时间序列曲线 |
+| `examples/leader_follower_interactive.py` | MuJoCo 交互可视化：**鼠标拖拽小臂** -> 真实 FR3 跟随（含同场景几何碰撞守卫） |
+| `simulation/leader_arm_model.py` | 小臂模型（**等比缩小的 FR3 孪生**，网格+关节复用 FR3，供可视化共用） |
+| `simulation/mj_collision_guard.py` | `CollisionGuard`：同 MuJoCo 场景里两臂真实几何最近距离 |
+| `tools/assets/setup_fr3.py` | 把 FR3 描述 staging 到 `franka/` |
+| `tools/assets/fetch_fr3_description.py` | 自动 clone franka_description + xacro 生成 URDF + staging |
 | `examples/configs/leader_follower.yaml` | 示例配置 |
 | `tools/bench/check_leader_follower.py` | 离线自检 |
 
@@ -165,6 +174,85 @@ PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 # 带玩具碰撞守卫，演示两臂碰撞停机
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --collision-demo --duration 10
 ```
+
+### 3D 可视化（MuJoCo 窗口）
+
+`examples/leader_follower_viewer.py` 在**后台线程**跑真正的 `TeleopLoop`，主线程用
+MuJoCo 原生窗口把两条程序化 7-DOF capsule 臂实时驱动出来：左侧蓝=小臂(leader)，
+右侧橙=大臂(follower 实测)。窗口不需要 FR3/URDF/mesh 资产，`mujoco` 装上即可；
+角标显示 tick、跟踪误差与两臂最近距离，安全停机时变红并给出原因。核心遥操作代码
+零改动（用轻量代理记录关节状态）。
+
+```bash
+# 边跑边看（默认无限时，关闭窗口退出）
+PYTHONPATH=. python -B examples/leader_follower_viewer.py
+# 跑 20s 后停在末态，窗口留着让你观察
+PYTHONPATH=. python -B examples/leader_follower_viewer.py --duration 20
+# 用玩具碰撞守卫演示“两臂将碰 -> 停机”
+PYTHONPATH=. python -B examples/leader_follower_viewer.py --collision-demo
+# 无窗口自检（CI/无显示环境用）
+PYTHONPATH=. python -B examples/leader_follower_viewer.py --headless --duration 3
+```
+
+> 说明：Wayland 会话下 MuJoCo/GLFW 会打印 `libdecor` 与一次 `OpenGL error 0x502`
+> 的告警，属该显示环境的已知无害提示，窗口照常工作。若窗口起不来，可退到
+> `--headless` 自检，或换 X11 会话运行。
+
+### 真实 FR3 外形 + 时间序列曲线（Rerun 单窗口）
+
+`examples/leader_follower_rerun.py` 用 **Rerun** 在同一个窗口里同时给出：
+
+* **3D**：真实 FR3 视觉网格（跟随 `follower.measured`，手指跟夹爪），旁边是小臂
+  **等比缩小的 FR3 孪生**（`simulation/leader_arm_model.py`：宇树 S288 无公开网格，
+  直接复用真实 FR3 网格 + 同一套关节坐标系缩小，跟随 `leader`）。两条臂同构、
+  同号连杆同色、关节标 `J1..J7`。网格只上传一次，之后每帧只发世界变换。
+* **曲线**：每个关节的 `leader / follower 指令 / follower 实测 / 跟踪误差`，
+  外加夹爪位置与两臂最近距离。在 Rerun 里会自动聚成 Time series 视图。
+
+需要先把真实 FR3 描述 staging 到 `franka/`（该目录被 gitignore，网格较大）：
+
+```bash
+pip install -e '.[assets]'
+python tools/assets/fetch_fr3_description.py        # 自动 clone + 生成 URDF + 转网格
+```
+
+```bash
+# 开 Rerun 查看器（native 窗口，3D + Time series）
+PYTHONPATH=. python -B examples/leader_follower_rerun.py
+# 跑 20s 后停在末态
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --duration 20
+# 两臂分得更开（基座间距，米）
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --separation 1.5
+# 演示“两臂将碰 -> 停机”（停机会在录制里写一条 status/stop）
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --collision-demo
+# 只存录制、不弹窗（无显示环境/存档；用 `rerun <file>.rrd` 回放）
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd --duration 10
+```
+
+### 鼠标拖拽小臂（MuJoCo 交互式）
+
+`examples/leader_follower_interactive.py` 把"采集"换成 MuJoCo 窗口里的**鼠标拖拽**：
+真实 FR3 网格与小臂的 **FR3 孪生**放进同一个 `MjSpec`（`simulation/leader_arm_model.py`），
+拖动小臂连杆时 MuJoCo 施加扰动弹簧力、小臂关节在阻尼下运动；主线程每帧读出
+小臂 7 关节 + 夹爪，喂给**真正的 `TeleopLoop`**（`DragLeader` / `KinematicFollower`
+两个适配器），再写回 FR3 的 qpos。因此安全链路与真机一致，且碰撞守卫用
+`simulation/mj_collision_guard.py`：在同场景里用 `mj_geomDistance` 逐对算
+leader 几何与 FR3 几何的最近有符号距离。
+
+```bash
+PYTHONPATH=. python -B examples/leader_follower_interactive.py
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --separation 1.4
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --no-collision-guard
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --rerun   # 边拖边看曲线
+```
+
+拖拽：**默认已选中小臂末端**，按住 **Ctrl + 鼠标右键拖动 = 平移施力**（推荐）、
+**Ctrl + 鼠标左键拖动 = 旋转施力**；想拖别的连杆先**左键双击**选中那一节。
+直接左键拖是旋转视角。仿真里小臂是 FR3 孪生，关节映射按**直连**走（`sign=+1`），
+所以拖哪一节、大臂同号关节就同向跟动。
+
+两者怎么选：只要快速看关节动作、机器上没有 FR3 资产时用 MuJoCo 版；要看
+**真实外形**和**曲线**用 Rerun 版。
 
 真机 Dora 图（需部署配置：`leader.kind: s288` + `follower.kind: dora`）：
 
