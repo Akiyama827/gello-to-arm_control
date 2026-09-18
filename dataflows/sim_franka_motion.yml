@@ -1,0 +1,84 @@
+# Sim twin of real_franka_motion.yml — the FR3 through the MuJoCo plant.
+#
+# Identical to sim_motion.yml except for the pinned mode config: every node's
+# `env:` block names examples/profiles/motion_franka.yaml so a bare `dora run` gets
+# the FR3's gains. That pin is why this file has to exist at all — a per-node
+# `env:` entry OVERRIDES the launcher's environment, so pointing view.py at a
+# different mode config is not enough on its own. Getting this wrong is silent:
+# the DM gain table is keyed by Joint1..Joint6 and expands to ZERO gains for
+# fr3_* joints (the executor now refuses that outright).
+#
+#   python tools/assets/setup_fr3.py --check   # meshes must be staged
+#   ARM_CONTROL_CONFIG=configs/entries/sim_franka.yaml dora run dataflows/sim_franka_motion.yml
+#   (or: python tools/run.py sim franka motion)
+nodes:
+  - id: arm_console
+    path: ../nodes/arm_console.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      controller_arm: arm_controller/arm
+      controller_event: arm_controller/controller_event
+      plant_capabilities: plant_interface/model_revision
+    outputs:
+      - plan
+      - control
+      - jog
+      - gripper
+
+  # Drag-teach replay driver (file-triggered, inert otherwise): validates a
+  # real hand-guided recording against the MuJoCo twin before bench day.
+  #   echo float.csv > /tmp/arm_replay_go
+  - id: trajectory_replay
+    path: ../nodes/trajectory_replay.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+    outputs:
+      - plan
+      - control
+
+  - id: arm_controller
+    path: ../nodes/arm_controller.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
+      # mujoco_interface is the plant here: no safety bridge in the path, so
+      # no motor_health, so no armed edge to wait for. Opt-out only.
+      ARM_CONTROL_PLANT_HEALTH: "0"
+    inputs:
+      motor_state: plant_interface/motor_state
+      plan:     arm_console/plan
+      control:  arm_console/control
+      jog:      arm_console/jog
+      plant_capabilities: plant_interface/model_revision
+      # Aliased inputs: dora maps one producer per input, so a second
+      # motion source reaches the same handlers under its own names.
+      plan_replay:    trajectory_replay/plan
+      control_replay: trajectory_replay/control
+    outputs:
+      - motor_command     # the ONLY producer of this topic
+      - arm               # and of this one — the console presses, this owns
+      - controller_event  # ready / leg_result / fault
+
+  - id: plant_interface
+    path: ../nodes/mujoco_interface.py
+    inputs:
+      motor_command: arm_controller/motor_command
+      arm: arm_controller/arm
+      # Teleop gripper slider drives the scene's finger servos directly (the
+      # 6-motor sim config has no gripper motor slot). No-op if the scene has
+      # no gripper.
+      motor_command_gripper: arm_console/gripper
+    outputs:
+      - motor_state
+      - sim_qpos       # live twin qpos (unconsumed here)
+      - gripper_state  # finger positions/efforts (unconsumed here)
+      - topology_state # sent once with model_revision (unconsumed here)
+      - model_revision
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state

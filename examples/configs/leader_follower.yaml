@@ -1,0 +1,85 @@
+# 主从遥操作示例配置：小臂(leader) -> FR3(follower)。
+#
+# 硬件：
+#   * 小臂(leader) = 8 个宇树 S288 = 7 个臂关节 + 1 个夹爪，串口走官方
+#     unitree_actuator_sdk。
+#   * 大臂(follower) = FR3 = fr3_joint1..7 + Franka Hand。
+#     臂关节走 arm_controller 的 jog/control；夹爪走 franka_gripper 的 gripper
+#     topic（消息里是**单指位移，米**）。
+#
+# 小臂 7 关节 <-> FR3 7 关节天然对齐，关节空间直连即可。
+# 默认用 FakeLeader + FakeFollower 跑通整条"采集->换算->下发"链路，不需要硬件。
+
+leader:
+  kind: fake            # fake | s288 | gello
+  n_arm_joints: 7       # 7 臂关节 + 1 夹爪 = 8 个 S288
+  with_gripper: true
+  # --- 真机 s288 时取消注释并填你的总线/标定 ---
+  # kind: s288
+  # bus: unitree_sdk     # unitree_sdk(官方SDK,首选) | serial_raw(自实现帧) | fake
+  # port: /dev/ttyUSB0
+  # motor_type: S288     # 官方 SDK MotorType 里的枚举名
+  # motor_ids: [1, 2, 3, 4, 5, 6, 7, 8]
+  # gripper_index: 7     # 8 个里的最后一个是夹爪
+  # joint_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  # joint_signs:   [1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0]
+  # gripper_open_rad: 0.8
+  # gripper_close_rad: 0.0
+  # alpha: 0.99
+  # start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+follower:
+  kind: fake            # dry_run | fake | dora | rt
+  n_arm_joints: 7       # FR3：7 关节 + Franka Hand
+  # 仿真/空跑后端的初始位形：FR3 的一个合法 home（否则 auto_align 会从全零起步，
+  # 而 fr3_joint4 的零位本身越限，第一 tick 就会安全停机）。
+  initial: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+  initial_finger_m: 0.04
+  # --- 走 Dora（arm_control 原生通道；FR3 推荐）时 ---
+  # kind: dora
+  # auto_arm: true   # 节点 open() 发 control(arm=True)；保留操作台门则设 false
+  # --- 直连远程 RT 时（只驱动 7 臂关节，夹爪不经此通道）---
+  # kind: rt
+  # joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+
+mapping:
+  auto_align: true      # 启动时把 FR3 当前位形对齐到小臂当前姿态，避免跳变
+  alpha: 0.9            # 目标指数平滑
+  ramp_s: 0.0
+  # 小臂 7 个臂关节 -> FR3 7 个关节，顺序直连（src=0..6）。sign/offset/scale
+  # 需按两臂实际零位与转向标定；lower/upper 用 FR3 官方关节限位（上线前按 URDF 核对）。
+  joints:
+    - {src: 0, sign:  1.0, offset: 0.0, scale: 1.0, lower: -2.7437, upper:  2.7437, max_rate: 1.5}
+    - {src: 1, sign: -1.0, offset: 0.0, scale: 1.0, lower: -1.7831, upper:  1.7831, max_rate: 1.5}
+    - {src: 2, sign: -1.0, offset: 0.0, scale: 1.0, lower: -2.9007, upper:  2.9007, max_rate: 2.0}
+    - {src: 3, sign: -1.0, offset: 0.0, scale: 1.0, lower: -3.0421, upper: -0.1518, max_rate: 2.0}
+    - {src: 4, sign:  1.0, offset: 0.0, scale: 1.0, lower: -2.8064, upper:  2.8064, max_rate: 2.5}
+    - {src: 5, sign:  1.0, offset: 0.0, scale: 1.0, lower: -0.5445, upper:  4.5161, max_rate: 2.5}
+    - {src: 6, sign:  1.0, offset: 0.0, scale: 1.0, lower: -3.0159, upper:  3.0159, max_rate: 2.5}
+  gripper:
+    src: 7              # 小臂夹爪在 8 个 S288 的最后一位，1=张开 0=闭合
+    open_finger_m: 0.04 # FR3 Hand 单指行程（gripper_range_m: [0.0, 0.04]）
+    closed_finger_m: 0.0
+    max_rate_m_s: 0.1
+
+safety:
+  joint_lower: [-2.7437, -1.7831, -2.9007, -3.0421, -2.8064, -0.5445, -3.0159]
+  joint_upper: [ 2.7437,  1.7831,  2.9007, -0.1518,  2.8064,  4.5161,  3.0159]
+  limits:
+    joint_margin_rad: 0.05
+    max_step_rad: 0.30          # 单 tick 目标跳变 > 0.30 rad 视为异常，停机
+    max_target_vel_rad_s: 2.0
+    feedback_required: true     # 遥操作必须有大臂回读
+    feedback_timeout_s: 0.30
+    track_err_rad: 0.15         # 命令-实测误差持续超阈 -> 停机
+    track_err_hold_s: 0.30
+    track_vel_rad_s: 3.0
+    leader_timeout_s: 0.30
+    collision_stop_m: 0.010     # 两臂最近距离 <= 1cm -> 停机
+    collision_warn_m: 0.050     # <= 5cm -> 限速
+    collision_every_n: 1
+    collision_slow_scale: 0.25
+
+loop:
+  hz: 100
+  log_period_s: 1.0

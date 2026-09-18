@@ -1,0 +1,118 @@
+# TWO arms, one graph, zero forked code.
+#
+# This graph exists to make the two-arm claim checkable. Every node type below
+# appears twice and differs only by two environment variables:
+#
+#   ARM_CONTROL_CONFIG  which robot (and, through it, which console port and
+#                       which log file -- per-INSTANCE facts live with the
+#                       robot, not with the mode)
+#   ARM_ID              which instance, which is the Rerun entity root and the
+#                       banner on the console page
+#
+# Dora node ids namespace the topics, so `left_plant/motor_state` and
+# `right_plant/motor_state` cannot be confused; ARM_ID does the same job inside
+# the single Rerun recording the two visualizers share. Both consoles serve the
+# same page on different ports (7500 and 7510), and neither can command the
+# other's arm: each controller subscribes only to its own console.
+#
+#   python tools/assets/setup_fr3.py --source <franka_description checkout>
+#   ARM_CONTROL_CONFIG=examples/configs/sim_arm.yaml dora run dataflows/dual_arm_sim.yml
+#
+# (The per-node env below overrides that outer value; it is set only so a bare
+# `dora run` has something to resolve if a node is added without one.)
+nodes:
+  # ----------------------------------------------------------------- left ---
+  - id: left_console
+    path: ../nodes/arm_console.py
+    env:
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
+      ARM_ID: left
+    inputs:
+      motor_state: left_plant/motor_state
+      controller_arm: left_controller/arm
+      controller_event: left_controller/controller_event
+      plant_capabilities: left_plant/model_revision
+    outputs: [plan, control, jog, gripper]
+
+  - id: left_controller
+    path: ../nodes/arm_controller.py
+    env:
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
+      ARM_ID: left
+      ARM_CONTROL_PLANT_HEALTH: "0"   # bare mujoco plant, no safety bridge
+    inputs:
+      motor_state: left_plant/motor_state
+      plan:        left_console/plan
+      control:     left_console/control
+      jog:         left_console/jog
+      plant_capabilities: left_plant/model_revision
+      gripper:     left_console/gripper
+    outputs: [motor_command, arm, controller_event]
+
+  - id: left_plant
+    path: ../nodes/mujoco_interface.py
+    env:
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm.yaml
+      ARM_ID: left
+    inputs:
+      motor_command: left_controller/motor_command
+      arm: left_controller/arm
+    outputs: [motor_state, sim_qpos, gripper_state, topology_state, model_revision]
+
+  - id: left_viz
+    path: ../nodes/visualizer.py
+    env:
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm.yaml
+      ARM_ID: left           # -> entity paths under left/...
+    inputs:
+      motor_state: left_plant/motor_state
+
+  # ---------------------------------------------------------------- right ---
+  - id: right_console
+    path: ../nodes/arm_console.py
+    env:
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm_b.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
+      ARM_ID: right
+    inputs:
+      motor_state: right_plant/motor_state
+      controller_arm: right_controller/arm
+      controller_event: right_controller/controller_event
+      plant_capabilities: right_plant/model_revision
+    outputs: [plan, control, jog, gripper]
+
+  - id: right_controller
+    path: ../nodes/arm_controller.py
+    env:
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm_b.yaml
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
+      ARM_ID: right
+      ARM_CONTROL_PLANT_HEALTH: "0"
+    inputs:
+      motor_state: right_plant/motor_state
+      plan:        right_console/plan
+      control:     right_console/control
+      jog:         right_console/jog
+      plant_capabilities: right_plant/model_revision
+      gripper:     right_console/gripper
+    outputs: [motor_command, arm, controller_event]
+
+  - id: right_plant
+    path: ../nodes/mujoco_interface.py
+    env:
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm_b.yaml
+      ARM_ID: right
+    inputs:
+      motor_command: right_controller/motor_command
+      arm: right_controller/arm
+    outputs: [motor_state, sim_qpos, gripper_state, topology_state, model_revision]
+
+  - id: right_viz
+    path: ../nodes/visualizer.py
+    env:
+      ARM_CONTROL_CONFIG: examples/configs/sim_arm_b.yaml
+      ARM_ID: right          # same rerun_app_id, different entity root
+    inputs:
+      motor_state: right_plant/motor_state

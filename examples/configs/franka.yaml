@@ -1,0 +1,29 @@
+# Generic FR3 model profile for the standalone simulation example.
+# No deployed addresses, camera roles, workcell calibration, or task geometry.
+# Stage a stock franka_description under the selected ARM_CONTROL_ROOT first.
+arm:
+  joints: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+  gripper_joints: [fr3_finger_joint1, fr3_finger_joint2]
+  ee_frame: fr3_hand_tcp
+  urdf: franka/urdf/fr3.urdf
+  plant_gravity_comp: true
+  world_origin: [0.0, 0.0, 0.0]
+  world_rpy: [0.0, 0.0, 0.0]
+  kp: [1200, 1200, 1200, 1200, 800, 600, 400]
+  kd: [30, 30, 30, 30, 20, 15, 10]
+num_motors: 7
+motor_ids: [1, 2, 3, 4, 5, 6, 7]
+motor_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+render_joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+urdf_path: franka/urdf/fr3.urdf
+gripper_range_m: [0.0, 0.04]
+# The simulation node uses this to initialize finger opening.
+franka:
+  gripper:
+    open_width_m: 0.075
+hardware_update_rate_hz: 100
+viz_publish_rate_hz: 60
+rerun_fk_rate_hz: 30
+rerun_plot_window_s: 10.0
+viz_log_rates: false

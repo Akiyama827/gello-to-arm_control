@@ -18,8 +18,47 @@ Thumbs.db
 node_modules/
 dist/
 build/
-__pycache__/
-*.pyc
-.venv/
-venv/
 target/
+
+# Derived from Control/.gitignore. Only the rules that still have a producer in
+# THIS repo are kept; assembler/*.sdf, modules/*.sdf, isaac_assets/ and rl/*
+# went with the project.
+
+# Staged FR3 description (tools/assets/setup_fr3.py). Not vendored: it comes
+# from franka_description (Apache-2.0) or a local Isaac install, and the meshes
+# are large. Run the script to (re)create it.
+# LEADING SLASH IS LOAD-BEARING: unanchored `franka/` also matches
+# a deployment's configs/robots/franka/ directory, which is tracked config.
+/franka/
+
+# Planning cache (arm_control/planning/stack.py -> $ARM_CONTROL_ROOT/.cache/planning).
+.cache/
+
+# MuJoCo model cache + native log.
+.mj_cache/
+MUJOCO_LOG.TXT
+
+# Local runtime output.
+dataflows/out/
+Log/
+
+# Vendor DM CAN shared objects (dlopen'd by hardware/dm_backend.py). Untracked
+# AND unignored in Control today, which is how it went missing; name it here.
+dlls/
+
+rt/build*/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+
+# Local virtualenv for running the leader-follower teleop (see docs/leader-follower-deploy.md).
+/.venv/
+venv/
+
+# Agent scratch: plans, progress and status docs are regenerated per run and
+# are not committed. Durable decisions belong in docs/, verified history in
+# docs/history/.
+.planning/
+.superpowers/

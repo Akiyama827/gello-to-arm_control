@@ -1,0 +1,42 @@
+# Weightless/backdrivable float mode. Hardware identity stays in configs/real.
+# `plant.mode: float` enables motors on open and forwards impedance setpoints
+# directly (no arm-gate/grasp/deadman) — distinct from command mode, which also
+# runs listen_mode:false but comes up disarmed.
+plant:
+  mode: float
+  listen_mode: false
+
+# Float = gravity feedforward + velocity damping, holding at the measured pose.
+# kp defaults to 0 (pure backdrivable float); gravity ff carries the weight, kd
+# damps. Live-tune with `view.py real tune-float` (edits float_tuning.yaml).
+controller:
+  command_rate_hz: 100
+  settings_ramp_sec: 0.5
+  state_timeout_sec: 0.25
+  kp: 0.0             # 0 = pure gravity float; a per-joint dict is also accepted
+  gravity_scale: 1.0  # holding-torque fraction; raise (>1) if the arm sags
+  kd:
+    Joint1: 0.10
+    Joint2: 0.10
+    Joint3: 0.08
+    Joint4: 0.05
+    Joint5: 0.03
+    Joint6: 0.02
+    Gripper: 0.01
+  torque_limits:
+    Joint1: 8.0
+    Joint2: 8.0
+    Joint3: 8.0
+    Joint4: 3.0
+    Joint5: 2.0
+    Joint6: 1.5
+    Gripper: 0.2
+  limits:
+    kp_max: 80.0
+    kd_max: 3.0
+    gravity_scale_max: 1.5
+    torque_limit_max: 12.0
+
+tuner:
+  settings_path: configs/modes/float_tuning.yaml
+  poll_rate_hz: 2

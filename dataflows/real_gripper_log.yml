@@ -1,0 +1,24 @@
+# Real assembler gripper calibration log.
+#
+# Run with:
+#   python tools/run.py real gripper-log
+
+nodes:
+  - id: plant_interface
+    path: ../nodes/hardware_interface.py
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - model_revision
+      - can_bus_status
+
+  - id: motor_state_logger
+    path: ../nodes/motor_state_logger.py
+    inputs:
+      motor_state: plant_interface/motor_state
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      can_bus_status: plant_interface/can_bus_status

@@ -1,0 +1,68 @@
+# Sim twin of real_motion.yml: operator console -> planner -> arm_controller
+# -> MuJoCo sim plant. Desk-side end-to-end check of the motion stack with zero
+# hardware: same nodes, same mode config, mujoco_interface instead of the DM
+# bridge.
+#
+# ONE command owner. The console plans and never commands the plant;
+# arm_controller servos and never plans. A plan crosses gated and named, and
+# runs only when an `execute` names that same id -- so a plan superseded by a
+# re-plan can never run.
+#
+#   ARM_CONTROL_CONFIG=configs/entries/sim_assembler.yaml dora run dataflows/sim_motion.yml
+#   (or, from the deployment: python tools/run.py sim motion)
+nodes:
+  - id: arm_console
+    path: ../nodes/arm_console.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      controller_arm: arm_controller/arm
+      controller_event: arm_controller/controller_event
+      plant_capabilities: plant_interface/model_revision
+    outputs:
+      - plan       # gated, named
+      - control    # arm / execute / cancel / gains
+      - jog        # live setpoint while a direction is held
+      - gripper
+
+  - id: arm_controller
+    path: ../nodes/arm_controller.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
+      # No sim_bridge in this graph: mujoco_interface is the plant and has no
+      # arm gate, so it publishes no motor_health. Without this the controller
+      # waits forever for an armed edge that cannot come. Opt-out, and only
+      # ever set on a graph with no safety bridge in the path.
+      ARM_CONTROL_PLANT_HEALTH: "0"
+    inputs:
+      motor_state: plant_interface/motor_state
+      plan:        arm_console/plan
+      control:     arm_console/control
+      jog:         arm_console/jog
+      plant_capabilities: plant_interface/model_revision
+    outputs:
+      - motor_command     # the ONLY producer of this topic
+      - arm               # and of this one
+      - controller_event  # ready / leg_result / fault
+
+  - id: plant_interface
+    path: ../nodes/mujoco_interface.py
+    inputs:
+      motor_command: arm_controller/motor_command
+      arm: arm_controller/arm
+      # Console gripper slider drives the scene's finger servos directly (the
+      # 6-motor sim config has no gripper motor slot). No-op if the scene has
+      # no gripper.
+      motor_command_gripper: arm_console/gripper
+    outputs:
+      - motor_state
+      - sim_qpos       # live twin qpos (unconsumed here)
+      - gripper_state  # finger positions/efforts (unconsumed here)
+      - topology_state # sent once with model_revision (unconsumed here)
+      - model_revision
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state

@@ -1,0 +1,110 @@
+# MoveIt-lite motion mode: meshcat teleop -> self-collision-aware planner ->
+# trajectory executor -> command-mode bridge. Hardware identity stays in
+# configs/real. The bridge comes up DISARMED (operator arm gate + deadman +
+# fault reflex live); the executor streams a measured-pose hold until a
+# trajectory arrives, so arming never jumps.
+plant:
+  mode: command
+  listen_mode: false
+
+# Tracking servo (NOT float): kp/kd drive the arm along the trajectory and
+# reject friction/payload/model error; RNEA feedforward (gravity + Coriolis +
+# inertia) carries the modeled dynamics. kp/kd start at the bench-ramp anchor
+# (kp=20/kd=0.5) — climb on the bench.
+controller:
+  # Runtime guards belong in the deployment config's execution_policy block.
+  kp:
+    Joint1: 20.0
+    Joint2: 20.0
+    Joint3: 20.0
+    Joint4: 20.0
+    Joint5: 20.0
+    Joint6: 20.0
+    Gripper: 5.0           # hold-in-place only; the planner never moves the gripper
+  kd:
+    Joint1: 0.5
+    Joint2: 0.5
+    Joint3: 0.5
+    Joint4: 0.5
+    Joint5: 0.5
+    Joint6: 0.5
+    Gripper: 0.2
+  torque_limits:
+    Joint1: 8.0
+    Joint2: 8.0
+    Joint3: 8.0
+    Joint4: 3.0
+    Joint5: 2.0
+    Joint6: 1.5
+    Gripper: 0.2
+
+# OMPL RRT-Connect over joint space + MuJoCo self-collision oracle.
+planner:
+  # `joints` omitted on purpose: it defaults to `arm.joints` from the arm config,
+  # so this mode file carries no arm identity. (It used to hardcode the DM arm's
+  # Joint1..Joint6, which made the file unusable for any other arm.)
+  vel_limits: 0.5          # rad/s, scalar or per-joint dict — bench-conservative
+  acc_limits: 1.0          # rad/s^2
+  # Absorbs shallow convex-hull overlap at the rest pose (MuJoCo hulls the
+  # concave STLs for collision); hulls stay conservative elsewhere.
+  self_collision_padding_m: -0.002
+  solve_time_sec: 2.0
+  simplify_time_sec: 0.5
+  resolution_frac: 0.005   # validity-check resolution, fraction of joint-space extent
+
+# Jog envelope — the safety bounds on unplanned, held-button motion.
+#
+# A jog is the one motion here that no planner reviews and no operator approves
+# in advance, so every bound below is checked on EVERY step, not once. Modelled
+# on a materials-test machine's crosshead limits: you say how fast, and you also
+# say how far it may go before it stops itself.
+jog:
+  speed_m_s: 0.01          # 1 cm/s. Deliberately slow; raise it knowingly.
+  joint_speed_rad_s: 0.15
+  # Stroke limit, measured from where THIS press started (released and pressed
+  # again = a new origin). Without it a descent made of legal 1 mm steps is
+  # unbounded.
+  max_travel_m: 0.20
+  # The floor is the only environmental thing assumed: no table, no fixtures,
+  # no walls. z is the WORLD frame (the board plane on the real bench), and the
+  # clearance is how close the EE may get. `floor_z: null` disables the gate --
+  # a decision, not an oversight.
+  floor_z: 0.0
+  floor_clearance_m: 0.02
+  # Absolute box, if this cell has one. Absent = unbounded apart from the floor.
+  # workspace_min: [-0.6, -0.6, 0.0]
+  # workspace_max: [0.6, 0.6, 0.8]
+  joint_margin_rad: 0.05   # stop short of a hard stop, so a jog can back out
+  # Smallest singular value of the TRANSLATIONAL Jacobian. Near a singularity a
+  # 1 cm/s request answers with an unbounded joint rate; this is the gate a
+  # planned move never needs. Arm-specific: this arm measures ~0.049 fully
+  # extended and ~0.18 with the joints bent, so 0.02 stops well short of a
+  # genuine collapse without nagging in normal poses. A JOINT jog is exempt --
+  # it is how the operator backs out of one.
+  sigma_min: 0.02
+  # How long a setpoint stays live at the controller. The console re-sends
+  # while a button is held, so a closed tab, a wedged console and a cut network
+  # are all just "setpoints stopped arriving" -- and the arm holds.
+  timeout_s: 0.2
+
+# Gain presets the console offers as one-press buttons. `track` is the
+# controller.kp/kd above (the reviewed tracking law); `float` is gravity-only
+# compliance -- kp=0 means the executor's hold command ships RNEA gravity plus
+# payload and nothing else, which IS float, so no separate impedance node is
+# needed to get it. `soft` is the contact-phase law.
+#
+# Applying any of these CANCELS a running leg: the plan was reviewed at one
+# stiffness, and float applied mid-trajectory would drop the arm through the
+# rest of its path.
+gain_presets:
+  float:
+    kp: 0.0
+    kd: 0.6
+  soft:
+    kp: 6.0
+    kd: 0.4
+  track: {}          # empty = the controller.kp/kd above
+
+# The panel's address is NOT here: a port is a per-instance fact, so it
+# lives in the robot config as `console.http_port` (two arms sharing a
+# mode must not share a port). Mode-level teleop knobs still belong here.

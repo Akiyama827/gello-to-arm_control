@@ -1,0 +1,83 @@
+# MoveIt-lite motion graph: the operator console (3D page -> plan -> preview)
+# hands named, gated plans to arm_controller, which streams motor commands
+# through the command-mode DM bridge. Self-collision-aware planning runs in the
+# console (MuJoCo collision world + OMPL); the controller never plans.
+#
+# ONE command owner. The console has no motor_command and no plant handle: it
+# emits `plan` and `control`, and arm_controller is the single producer of both
+# `motor_command` and the bridge's `arm` topic. A plan runs only when an
+# `execute` names its exact id, so a plan superseded by a re-plan never runs.
+#
+# SAFETY — the graph comes up DISARMED. The console page carries the operator
+# gate (ARM/DISARM + armed badge, same page as planning); ARM travels as a
+# control update and the controller enables into a measured-pose hold. Motion
+# happens only on Execute, which is refused visibly while disarmed. The 0.1s
+# deadman + fault reflex are live the whole time.
+#
+#   ARM_CONTROL_CONFIG=configs/entries/real_assembler.yaml dora run dataflows/real_motion.yml
+#   (or: python tools/run.py real motion)
+nodes:
+  - id: arm_console
+    path: ../nodes/arm_console.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      # Lets the panel gate Execute while DISARMED (visible refusal instead
+      # of a silent bridge drop + executor abort 2 s later).
+      motor_health: plant_interface/motor_health
+      controller_event: arm_controller/controller_event
+    outputs:
+      - plan
+      - control
+      - jog
+      - gripper
+
+  - id: arm_controller
+    path: ../nodes/arm_controller.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      # The armed edge. Without it the controller never leaves its pre-arm
+      # wait, because a bridge publishes motor_state while DISARMED and only a
+      # state received AFTER this edge is provably post-enable.
+      motor_health: plant_interface/motor_health
+      plan:        arm_console/plan
+      control:     arm_console/control
+      jog:         arm_console/jog
+      gripper:     arm_console/gripper
+    outputs:
+      - motor_command     # the ONLY producer of this topic
+      - arm               # and of this one — the console presses, this owns
+      - controller_event  # ready / leg_result / fault
+
+  - id: plant_interface
+    path: ../nodes/hardware_interface.py
+    # Command mode: safety layer built, disarmed until the console gate fires.
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
+    inputs:
+      motor_command: arm_controller/motor_command
+      arm:           arm_controller/arm
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - motor_health
+      - can_bus_status
+      - model_revision
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state:    plant_interface/motor_state_viz
+      can_bus_status: plant_interface/can_bus_status
+
+  # Tracking log for gain tuning: measured pos/vel/torque + commanded q_des
+  # per motor_state tick -> CSV (motor_log_path, default
+  # /tmp/arm_control_motor_state.csv). Steady-state error = qdes - pos.
+  - id: motor_state_logger
+    path: ../nodes/motor_state_logger.py
+    inputs:
+      motor_state:   plant_interface/motor_state
+      motor_command: arm_controller/motor_command

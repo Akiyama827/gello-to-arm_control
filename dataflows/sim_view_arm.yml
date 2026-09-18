@@ -1,0 +1,12 @@
+nodes:
+  - id: plant_interface
+    path: ../nodes/mujoco_interface.py
+    outputs:
+      - motor_state
+      - sim_qpos       # live twin qpos (unconsumed here)
+      - model_revision
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state

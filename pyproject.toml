@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arm_control"
+version = "0.1.0"
+description = "Reusable robot control, planning, plant backends and Dora adapters"
+requires-python = ">=3.10"
+
+# HARD deps = imported at module top level by code any consumer hits.
+#   numpy    — every module
+#   pyarrow  — contracts/ (wire codecs; messages.py remains an API alias)
+#   pyyaml   — config.py, node_utils.py (top-level)
+#   dora-rs  — the repository ships Dora process adapters.
+dependencies = [
+    "numpy",
+    "pyarrow",
+    "pyyaml",
+    "dora-rs",
+]
+
+[project.optional-dependencies]
+# --- pip-installable extras -------------------------------------------------
+# simulation/ + planning/mujoco_collision.py import mujoco at MODULE top level,
+# so `pip install arm_control[sim]` is required before importing those.
+sim = ["mujoco"]
+# Shared joint-path retiming; imported only by planning processes.
+planning = ["toppra==0.6.10", "scipy"]
+# nodes/visualizer.py, planning/preview_rerun.py, simulation/rerun_scene.py.
+# visualizer is in every dataflow, so in practice this is not optional at
+# RUNTIME — it is an extra only because the library imports it lazily.
+viz = ["rerun-sdk"]
+# simulation/convex_decomp.py (coacd + trimesh, both lazy) and
+# tools/assets/setup_fr3.py (trimesh, lazy).
+mesh = ["trimesh", "coacd"]
+# Opt-in geometric refinement and native constrained spline timing.
+trajopt = ["toppra==0.6.10", "tesseract-robotics-nanobind==0.35.0.7", "scipy", "mujoco"]
+
+# Backend/toolchain dependencies not managed by these extras:
+#   pinocchio / hpp-fcl — dynamics, FK/IK, geometry and preview.
+#   ompl — optional planning bindings.
+#   pylibfranka — direct Franka backend bindings, provisioned with libfranka.
+#   dmcan — vendor USB2FDCAN SDK and its shared library when that transport is selected.
+# See docs/RUNBOOK.md; installing extras does not provision vendor toolchains.
+# Perception implementation and camera dependencies belong to consumers.
+
+[project.scripts]
+# Dora launches the repository's small node wrappers by path.
+
+[tool.setuptools.packages.find]
+# Only arm_control/ is installed. nodes/, tools/, examples/ and dataflows/
+# remain repository files; reusable implementations are package modules.
+include = ["arm_control*"]
+
+[tool.setuptools.package-data]
+arm_control = ["ui/static/*", "ui/static/vendor/*"]
+
+# ruff needs no config: repo follows ruff defaults, whose line-length is
+# already 88. `ruff check .` from the repo root is the whole lint story.

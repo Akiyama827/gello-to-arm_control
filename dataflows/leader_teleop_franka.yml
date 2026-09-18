@@ -1,0 +1,95 @@
+# REAL FR3 teleoperation — the leader arm (8x Unitree S288: 7 joints + 1
+# gripper, official unitree_actuator_sdk over serial) drives the FR3 through
+# the same RT bridge as real_franka_motion.yml.
+#
+# One node is the SOLE motion source. `leader_teleop` produces the exact
+# jog/control/gripper contract `arm_console` produces, so arm_controller and
+# franka_gripper wire to it unchanged. It also consumes the feedback topics
+# (motor_state / motor_health / controller_event / gripper_state) and feeds
+# them through its safety layer — tracking error, stale feedback, latched
+# fault, disarm — and stops the arm on any of them.
+#
+# SAFETY MODEL — differs from real_franka_motion.yml on purpose. There is no
+# on-page ARM/DISARM gate here: the teleop node sends control(arm=True) when
+# it opens (follower.auto_arm) and control(cancel, arm=False) when it exits or
+# safety-stops, and the RT server keeps its normal deadman, so losing the node
+# parks the arm. STOPPING THIS NODE IS THE DISARM. To keep the console's
+# ARM/DISARM gate instead, run real_franka_motion.yml and set
+# follower.auto_arm:false in the teleop config.
+#
+# REQUIREMENT — this graph needs a deployment config with
+#   leader:   {kind: s288, bus: unitree_sdk, port: ..., motor_ids: [...]}
+#   follower: {kind: dora, auto_arm: true}
+# exported as LEADER_FOLLOWER_CONFIG (a bare run would fall back to the
+# fake/fake example and the node refuses to start).
+#
+#   LEADER_FOLLOWER_CONFIG=$PWD/configs/entries/leader_follower.yaml \
+#     ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
+#     dora run libs/arm_control/dataflows/leader_teleop_franka.yml
+nodes:
+  - id: leader_teleop
+    path: ../nodes/leader_teleop.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
+    inputs:
+      # Feedback for the safety layer; the jog channel itself does not read back.
+      motor_state: plant_interface/motor_state
+      motor_health: plant_interface/motor_health
+      controller_event: arm_controller/controller_event
+      gripper_state: franka_gripper/gripper_state
+    outputs:
+      - jog
+      - control
+      - gripper
+
+  # The Franka Hand — gripper-ONLY bridge, unchanged from real_franka_motion.yml.
+  # The teleop `gripper` message is a 2-finger motor_command whose position[0]
+  # is the single-finger travel in metres (width = 2*finger).
+  - id: franka_gripper
+    path: ../nodes/franka_gripper.py
+    inputs:
+      gripper: leader_teleop/gripper
+    outputs:
+      - gripper_state
+      - grasp_result
+
+  - id: arm_controller
+    path: ../nodes/arm_controller.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      motor_health: plant_interface/motor_health
+      control: leader_teleop/control
+      jog:     leader_teleop/jog
+    outputs:
+      - motor_command     # the ONLY producer of this topic
+      - arm
+      - controller_event  # ready / leg_result / fault
+
+  - id: plant_interface
+    path: ../nodes/rt_interface.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
+    inputs:
+      motor_command: arm_controller/motor_command
+      arm:           arm_controller/arm
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - motor_health
+      - model_revision
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      gripper_state: franka_gripper/gripper_state
+
+  # Tracking log: measured pos/vel/torque + commanded q_des per motor_state
+  # tick -> CSV. Tracking error = qdes - pos.
+  - id: motor_state_logger
+    path: ../nodes/motor_state_logger.py
+    inputs:
+      motor_state:   plant_interface/motor_state
+      motor_command: arm_controller/motor_command

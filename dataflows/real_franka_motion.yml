@@ -1,0 +1,118 @@
+# REAL FR3 motion through the RT machine — the first graph that moves this arm.
+#
+# The plant is nodes/rt_interface.py -> arm_rt_server on the RT box
+# (--backend franka): the PC streams the full servo word (q_des, qd_des,
+# tau_ff MINUS gravity, kp, kd) at 100 Hz; the 1 kHz torque loop, clamp,
+# slew, staleness->hold and fault latching all live server-side. Two motion
+# sources feed one executor:
+#   - arm_console: meshcat sliders -> OMPL plan (MuJoCo self-collision
+#     oracle) -> preview -> Execute button (point-to-point, planned)
+#   - trajectory_replay: drag-teach playback of an rt_handguide recording
+#     (echo <csv> > /tmp/arm_replay_go), joined from the current pose
+#
+# SAFETY — the graph comes up DISARMED. The console page carries the operator
+# gate (ARM/DISARM + armed badge on the same page as planning — one page,
+# and DISARM is one click during a live session; arm_controller is the single
+# producer of the bridge `arm` topic). The RT server must be up with the
+# franka backend and its NORMAL deadman (default --fault-ms 1000, NOT the
+# handguide's 3600000 — this graph is a commander, and losing it must park
+# the arm). The server holds on staleness and latches on faults. Legacy
+# start/tracking thresholds require an explicit deployment execution_policy;
+# this graph does not turn that policy on implicitly.
+#
+#   python tools/run.py real franka motion        # canonical launcher
+#   (raw dora run needs BOTH roots exported — dora rebases node cwd to this
+#   directory, so a bare relative ARM_CONTROL_CONFIG resolves against the
+#   arm_control checkout instead of the project deployment root:
+#   ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
+#     dora run libs/arm_control/dataflows/real_franka_motion.yml)
+nodes:
+  - id: arm_console
+    path: ../nodes/arm_console.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      # Armed badge + Execute gating + gate visibility on the panel.
+      motor_health: plant_interface/motor_health
+      controller_event: arm_controller/controller_event
+      # Live Hand width -> the measured ghost's fingers track reality.
+      gripper_state: franka_gripper/gripper_state
+      grasp_result: franka_gripper/grasp_result
+    outputs:
+      - plan
+      - control
+      - jog
+      - gripper
+      - grasp_request
+
+  # The Franka Hand — gripper-ONLY bridge (the RT machine owns the arm's FCI
+  # session; the Hand is its own TCP service and coexists). Teleop slider ->
+  # move()/grasp() on the existing worker; observations return at ~10 Hz.
+  - id: franka_gripper
+    path: ../nodes/franka_gripper.py
+    inputs:
+      gripper: arm_console/gripper
+      grasp_request: arm_console/grasp_request
+    outputs:
+      - gripper_state
+      - grasp_result
+
+  - id: trajectory_replay
+    path: ../nodes/trajectory_replay.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      # Replay is a second motion-authority path (file trigger, no page in
+      # front of it): it refuses while DISARMED or fault-latched.
+      motor_health: plant_interface/motor_health
+    outputs:
+      - plan
+      - control
+
+  - id: arm_controller
+    path: ../nodes/arm_controller.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      motor_health: plant_interface/motor_health
+      plan:     arm_console/plan
+      control:  arm_console/control
+      jog:      arm_console/jog
+      # Aliased inputs: dora maps one producer per input, so a second
+      # motion source reaches the same handlers under its own names.
+      plan_replay:    trajectory_replay/plan
+      control_replay: trajectory_replay/control
+    outputs:
+      - motor_command     # the ONLY producer of this topic
+      - arm               # and of this one — the console presses, this owns
+      - controller_event  # ready / leg_result / fault
+
+  - id: plant_interface
+    path: ../nodes/rt_interface.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
+    inputs:
+      motor_command: arm_controller/motor_command
+      arm:           arm_controller/arm
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - motor_health
+      - model_revision
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      gripper_state: franka_gripper/gripper_state
+
+  # Tracking log: measured pos/vel/torque + commanded q_des per motor_state
+  # tick -> CSV. THE rung-3 artefact: tracking error = qdes - pos.
+  - id: motor_state_logger
+    path: ../nodes/motor_state_logger.py
+    inputs:
+      motor_state:   plant_interface/motor_state
+      motor_command: arm_controller/motor_command

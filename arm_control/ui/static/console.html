@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arm console</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/console.css">
+  <script type="importmap">
+  {"imports": {
+    "three": "/static/vendor/three.module.js",
+    "three/addons/": "/static/vendor/"
+  }}
+  </script>
+</head>
+<body class="arm-console">
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">Operator console</p>
+      <h1>Arm control</h1>
+    </div>
+    <div class="session">
+      <span id="ident">Waiting for configuration</span>
+      <span id="connection" class="status neutral">Connecting</span>
+    </div>
+  </header>
+
+  <main class="console-shell">
+    <section class="viewport" aria-label="Arm scene">
+      <div id="view"></div>
+      <div class="view-tools">
+        <strong>Target</strong>
+        <div class="mode-row">
+          <button id="mode-t" class="selected">Move</button>
+          <button id="mode-r">Rotate</button>
+        </div>
+      </div>
+      <div class="view-labels">
+        <span><i class="live-key"></i>live arm</span>
+        <span><i class="target-key"></i>your target</span>
+        <span><i class="plan-key"></i>planned motion</span>
+      </div>
+    </section>
+
+    <div class="gutter" data-side="right" role="separator" aria-orientation="vertical"></div>
+
+    <aside id="rail" class="rail">
+      <!-- Gate first: DISARM must be findable without reading anything. -->
+      <div id="gate" class="gate" hidden>
+        <div class="gate-head">
+          <span>Safety gate</span><span id="gatebadge" class="status neutral">—</span>
+        </div>
+        <div class="button-pair">
+          <button id="arm-btn" class="arm">ARM</button>
+          <button id="disarm-btn" class="danger">DISARM</button>
+        </div>
+      </div>
+
+      <div class="rail-section">
+        <div class="rail-head">Move</div>
+        <p>Plan → Preview → ARM → Execute. Runs until complete or stopped.</p>
+        <p class="pose-convention">Robot base frame · XYZ (mm), RPY (°)<br>Fixed axes: R = Rz(yaw) Ry(pitch) Rx(roll)</p>
+        <div class="pose-grid" id="pose-fields">
+          <span>Axis</span><span>Current</span><span>Desired</span>
+          <label for="pose-x">X (mm)</label><output id="current-x">—</output><input id="pose-x" aria-label="Desired X in millimetres" type="number" step="any" required>
+          <label for="pose-y">Y (mm)</label><output id="current-y">—</output><input id="pose-y" aria-label="Desired Y in millimetres" type="number" step="any" required>
+          <label for="pose-z">Z (mm)</label><output id="current-z">—</output><input id="pose-z" aria-label="Desired Z in millimetres" type="number" step="any" required>
+          <label for="pose-roll">Roll (°)</label><output id="current-roll">—</output><input id="pose-roll" aria-label="Desired roll in degrees" type="number" step="any" required>
+          <label for="pose-pitch">Pitch (°)</label><output id="current-pitch">—</output><input id="pose-pitch" aria-label="Desired pitch in degrees" type="number" step="any" required>
+          <label for="pose-yaw">Yaw (°)</label><output id="current-yaw">—</output><input id="pose-yaw" aria-label="Desired yaw in degrees" type="number" step="any" required>
+        </div>
+        <p id="current-status">Current pose unavailable</p>
+        <div class="button-pair">
+          <button id="copy-current" type="button" disabled>Copy current</button>
+          <button id="apply-pose" type="button">Apply target</button>
+        </div>
+        <div id="preset-row" class="button-pair" hidden>
+          <select id="preset-select" aria-label="Named pose preset"></select>
+          <button id="fill-preset" type="button">Fill from preset</button>
+        </div>
+        <p>Copy fills Desired only. Apply sets the target without moving.</p>
+        <p id="pose-status" aria-live="polite"></p>
+        <div id="buttons" class="command-stack"></div>
+      </div>
+
+      <div class="rail-section">
+        <div class="rail-head">Jog <small id="jog-note" class="jog-note"></small></div>
+        <p id="jog-speed"></p>
+        <label class="speed-field" for="jog-cart-speed">Cartesian speed (mm/s)<input id="jog-cart-speed" type="number" min="0" step="any" required></label>
+        <div id="jog-pad" class="jog-pad"></div>
+        <details id="jog-joints-wrap" hidden>
+          <summary>Joint jog — the way out of a singularity</summary>
+          <p id="jog-joint-speed"></p>
+          <label class="speed-field" for="jog-joint-input">Joint speed (°/s)<input id="jog-joint-input" type="number" min="0" step="any" required></label>
+          <div id="jog-joints" class="jog-pad"></div>
+        </details>
+        <button id="save-speeds" class="wide" type="button">Save speeds</button>
+        <p id="speed-status" aria-live="polite">Saved speeds apply on the next press.</p>
+      </div>
+
+      <details id="gains-wrap" class="rail-section" hidden>
+        <summary>Control law <output id="mode-selected" class="mode-badge">Unknown</output></summary>
+        <p id="mode-status" aria-live="polite"></p>
+        <p id="control-mode"></p>
+        <div id="gains" class="command-stack"></div>
+      </details>
+
+      <details id="grip-wrap" class="rail-section">
+        <summary>Gripper <output id="grip-readout"></output></summary>
+        <div id="grip"></div>
+        <div class="button-pair">
+          <button id="hand-grasp" disabled>Grasp</button>
+          <button id="hand-open" disabled>Open</button>
+        </div>
+        <div class="hand-fields">
+          <label>Force (N)<input id="hand-force" type="number" step="1" required></label>
+          <label>Grasp width (mm)<input id="hand-width" type="number" min="0" step="0.1" required></label>
+          <label>Payload<select id="hand-payload"><option value="">none</option></select></label>
+        </div>
+        <p id="hand-settings"></p>
+        <p id="hand-feedback" aria-live="polite">Hand feedback unavailable</p>
+        <p id="hand-status" aria-live="polite">Force grasp unavailable</p>
+      </details>
+
+      <details class="rail-section">
+        <summary>Telemetry</summary>
+        <dl class="telemetry-list">
+          <div><dt>Joints</dt><dd id="joint-summary">No samples</dd></div>
+          <div><dt>Plan</dt><dd id="plan-summary">None</dd></div>
+        </dl>
+        <pre id="log" aria-live="polite"></pre>
+      </details>
+
+      <details class="rail-section">
+        <summary>Joint sliders (debug)</summary>
+        <div id="debug"></div>
+      </details>
+
+      <button id="hold-disarm" class="danger wide" type="button">Stop and disarm</button>
+    </aside>
+  </main>
+
+  <script type="module" src="/static/console.js"></script>
+</body>
+</html>

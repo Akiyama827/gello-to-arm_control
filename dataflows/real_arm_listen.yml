@@ -1,0 +1,22 @@
+# Real assembler listen mode — monitor motor state and visualise without
+# sending commands to motors.
+#
+# Run with:
+#   ARM_CONTROL_CONFIG=configs/entries/real_assembler.yaml dora run dataflows/real_arm_listen.yml
+#
+# Motors: DM4340P (0x01), DM4340 ×2 (0x02–0x03), DM4310 ×3 (0x04–0x06)
+
+nodes:
+  - id: plant_interface
+    path: ../nodes/hardware_interface.py
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - model_revision
+      - can_bus_status
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      can_bus_status: plant_interface/can_bus_status

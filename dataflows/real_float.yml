@@ -1,0 +1,70 @@
+# Real assembler in FLOAT: gravity feedforward carries the weight, damping
+# stops it wandering, and the arm is backdrivable by hand.
+#
+# Float is a CONTROL LAW, not a node. It used to have its own command owner
+# (`nodes/impedance_controller.py`, 238 lines) computing gravity + damping in a
+# second place; `arm_controller`'s hold command already ships gravity + payload
+# at the measured pose, and float is that with kp = 0 -- which is exactly what
+# examples/profiles/float.yaml states. One command owner, one servo law, one place
+# a torque can come from.
+#
+# Unlike the old graph this comes up DISARMED, and the console is here to arm
+# it. That is a deliberate change: the float node enabled motors the moment it
+# opened, with no gate and no deadman, on an arm nobody had told to move yet.
+#
+#   python tools/run.py real float
+nodes:
+  - id: plant_interface
+    path: ../nodes/hardware_interface.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/float.yaml
+    inputs:
+      motor_command: arm_controller/motor_command
+    outputs:
+      - motor_state
+      - motor_state_viz
+      - model_revision
+      - can_bus_status
+
+  - id: arm_console
+    path: ../nodes/arm_console.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/float.yaml
+    inputs:
+      motor_state: plant_interface/motor_state
+      controller_arm: arm_controller/arm
+      controller_event: arm_controller/controller_event
+    outputs:
+      - plan
+      - control
+      - jog
+      - gripper
+
+  - id: arm_controller
+    path: ../nodes/arm_controller.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/float.yaml
+      # No safety bridge in this graph, so no motor_health edge to wait for.
+      ARM_CONTROL_PLANT_HEALTH: "0"
+    inputs:
+      motor_state: plant_interface/motor_state
+      plan:    arm_console/plan
+      control: arm_console/control
+      jog:     arm_console/jog
+    outputs:
+      - motor_command
+      - arm
+      - controller_event
+
+  - id: visualizer
+    path: ../nodes/visualizer.py
+    inputs:
+      motor_state: plant_interface/motor_state_viz
+      can_bus_status: plant_interface/can_bus_status
+
+  # CSV joint-state log (cfg motor_log_path) — scripts/calibrate_hand_eye.py
+  # reads the freshest row per pose while the arm floats (rung 9).
+  - id: motor_state_logger
+    path: ../nodes/motor_state_logger.py
+    inputs:
+      motor_state: plant_interface/motor_state
