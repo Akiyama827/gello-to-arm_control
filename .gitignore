@@ -31,6 +31,10 @@ __pycache__/
 *.egg-info/
 .ruff_cache/
 
+# Local virtualenv for running the leader-follower teleop (see docs/leader-follower-deploy.md).
+/.venv/
+venv/
+
 # Agent scratch: plans, progress and status docs are regenerated per run and
 # are not committed. Durable decisions belong in docs/, verified history in
 # docs/history/.
