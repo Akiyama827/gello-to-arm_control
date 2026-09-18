@@ -1,0 +1,31 @@
+# 小臂 -> 大臂 主从遥操作：仿真 + 3D 可视化 + 资产 staging 的可复现版本快照。
+# 对应 extras：.[sim,viz,assets]，在 Python 3.12 / Linux 上验证通过。
+#
+# 用法（干净机器）：
+#   python3 -m venv .venv && source .venv/bin/activate   # fish: activate.fish
+#   pip install -r requirements.txt                      # 锁版本装依赖
+#   pip install -e .                                     # 安装本包；不装则运行时带 PYTHONPATH=.
+#   python tools/assets/fetch_fr3_description.py         # 拉真实 FR3 网格（联网）
+#
+# 说明：
+# - 这里只钉住「仿真 + 可视化」链路。真机所需的厂商工具链
+#   （unitree_actuator_sdk / pylibfranka / dmcan）不是 pip 包，见
+#   docs/leader-follower-deploy.md。
+# - 传递依赖大多交给 pip 解析；下面显式钉住的是跨平台差异较大、
+#   且 MuJoCo 查看器强依赖的两个（glfw / PyOpenGL）。
+# - 想完全冻结当前环境，可另行 `pip freeze > requirements.lock`。
+
+# --- 直接依赖（sim / viz / assets）---
+numpy==2.5.3
+pyarrow==25.0.1
+PyYAML==6.0.3
+dora-rs==1.0.1
+mujoco==3.13.0
+rerun-sdk==0.38.1
+xacro==2.1.1
+trimesh==5.1.0
+pycollada==0.9.3
+
+# --- 关键传递依赖（MuJoCo 原生窗口，Linux）---
+glfw==2.10.2
+PyOpenGL==3.1.10
