@@ -390,7 +390,7 @@ def main(argv=None) -> int:
     staged = build_mujoco_model(FR3_URDF, cache_dir=cache, keep_visual=True)
     spec, refs = build_combined_spec(
         str(staged),
-        leader_position=(-args.separation, 0.0, 0.30),
+        leader_position=(-args.separation, 0.0, 0.0),
         leader_scale=args.leader_scale,
     )
     model = spec.compile()

@@ -147,7 +147,7 @@ def add_leader_arm(
     spec: mujoco.MjSpec,
     fr3_spec: mujoco.MjSpec,
     *,
-    position: Sequence[float] = (-1.0, 0.0, 0.30),
+    position: Sequence[float] = (-1.0, 0.0, 0.0),
     quat: Optional[Sequence[float]] = None,
     scale: float = 1.0,
     prefix: str = "leader",
@@ -227,7 +227,7 @@ def force_identity_arm_mapping(cfg) -> None:
 def build_combined_spec(
     fr3_model_path: str,
     *,
-    leader_position: Sequence[float] = (-1.0, 0.0, 0.30),
+    leader_position: Sequence[float] = (-1.0, 0.0, 0.0),
     leader_quat: Optional[Sequence[float]] = None,
     leader_scale: float = 1.0,
     leader_prefix: str = "leader",
