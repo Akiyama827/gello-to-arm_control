@@ -34,6 +34,9 @@ viz = ["rerun-sdk"]
 # simulation/convex_decomp.py (coacd + trimesh, both lazy) and
 # tools/assets/setup_fr3.py (trimesh, lazy).
 mesh = ["trimesh", "coacd"]
+# tools/assets/fetch_fr3_description.py: xacro-generate the FR3 URDF, read the
+# .dae visuals via pycollada, convert them with trimesh.
+assets = ["xacro", "trimesh", "pycollada"]
 # Opt-in geometric refinement and native constrained spline timing.
 trajopt = ["toppra==0.6.10", "tesseract-robotics-nanobind==0.35.0.7", "scipy", "mujoco"]
 

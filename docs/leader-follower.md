@@ -45,6 +45,9 @@ DryRunFollower / DoraJogFollower / RtFollower / FakeFollower （下发 FR3）
 | `dataflows/leader_teleop_franka.yml` | 真机 FR3 遥操作 Dora 图（本节点作为唯一运动源） |
 | `examples/leader_follower_teleop.py` | 可运行示例（默认全仿真） |
 | `examples/leader_follower_viewer.py` | MuJoCo 3D 可视化：两条 7-DOF 臂实时跟随（无需外部资产） |
+| `examples/leader_follower_rerun.py` | Rerun 可视化：真实 FR3 网格 + 关节/误差时间序列曲线 |
+| `tools/assets/setup_fr3.py` | 把 FR3 描述 staging 到 `franka/` |
+| `tools/assets/fetch_fr3_description.py` | 自动 clone franka_description + xacro 生成 URDF + staging |
 | `examples/configs/leader_follower.yaml` | 示例配置 |
 | `tools/bench/check_leader_follower.py` | 离线自检 |
 
@@ -189,6 +192,36 @@ PYTHONPATH=. python -B examples/leader_follower_viewer.py --headless --duration 
 > 说明：Wayland 会话下 MuJoCo/GLFW 会打印 `libdecor` 与一次 `OpenGL error 0x502`
 > 的告警，属该显示环境的已知无害提示，窗口照常工作。若窗口起不来，可退到
 > `--headless` 自检，或换 X11 会话运行。
+
+### 真实 FR3 外形 + 时间序列曲线（Rerun 单窗口）
+
+`examples/leader_follower_rerun.py` 用 **Rerun** 在同一个窗口里同时给出：
+
+* **3D**：真实 FR3 视觉网格（跟随 `follower.measured`，手指跟夹爪），小臂仍用
+  骨架线框（宇树 S288 无公开网格）。网格只上传一次，之后每帧只发世界变换。
+* **曲线**：每个关节的 `leader / follower 指令 / follower 实测 / 跟踪误差`，
+  外加夹爪位置与两臂最近距离。在 Rerun 里会自动聚成 Time series 视图。
+
+需要先把真实 FR3 描述 staging 到 `franka/`（该目录被 gitignore，网格较大）：
+
+```bash
+pip install -e '.[assets]'
+python tools/assets/fetch_fr3_description.py        # 自动 clone + 生成 URDF + 转网格
+```
+
+```bash
+# 开 Rerun 查看器（native 窗口，3D + Time series）
+PYTHONPATH=. python -B examples/leader_follower_rerun.py
+# 跑 20s 后停在末态
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --duration 20
+# 演示“两臂将碰 -> 停机”（停机会在录制里写一条 status/stop）
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --collision-demo
+# 只存录制、不弹窗（无显示环境/存档；用 `rerun <file>.rrd` 回放）
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd --duration 10
+```
+
+两者怎么选：只要快速看关节动作、机器上没有 FR3 资产时用 MuJoCo 版；要看
+**真实外形**和**曲线**用 Rerun 版。
 
 真机 Dora 图（需部署配置：`leader.kind: s288` + `follower.kind: dora`）：
 
