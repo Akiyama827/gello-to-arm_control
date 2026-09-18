@@ -3,7 +3,8 @@
 
 与另外两个查看器的区别：这个窗口是**可输入**的。
 
-* 左：程序化的小臂模型（S288 近似外形，capsule 连杆 + 夹爪），可用鼠标拖拽；
+* 左：小臂模型（**等比缩小的 FR3 孪生**，与右侧同构，关节一一对应、同号同色），
+  可用鼠标拖拽；
 * 右：staged 的**真实 FR3 网格**，按 ``Retargeter`` 实时跟动。
 
 拖拽走 MuJoCo 自带的扰动（perturbation）：按住被拖的连杆拖动会给它一个弹簧力，
@@ -13,8 +14,10 @@
 安全停机并冻结大臂。
 
 窗口操作（MuJoCo 原生）：
-* 按住 **Ctrl + 鼠标左键拖动连杆** = 施加拖拽力（推荐，最能体现"拖小臂"）；
-* 鼠标左键拖动 = 旋转视角；右键 = 平移；滚轮 = 缩放；
+* 默认已经选中小臂末端；按住 **Ctrl + 鼠标右键拖动** = 平移施力（推荐，最能体现
+  "拖小臂"），**Ctrl + 鼠标左键拖动** = 绕选中点旋转施力；
+* 想拖别的连杆：先 **鼠标左键双击** 选中那一节，再按上面的方式拖动；
+* 鼠标左键拖动 = 旋转视角；右键 = 平移视角；滚轮 = 缩放；
 * 界面内空格 = 暂停/继续物理；Esc/q = 退出（也可直接关窗口）。
 
 前置：先 staging 真实 FR3 描述：``python tools/assets/fetch_fr3_description.py``。
@@ -58,6 +61,7 @@ from arm_control.leader_follower.config import (  # noqa: E402
 from arm_control.simulation.leader_arm_model import (  # noqa: E402
     GRIP_TRAVEL_M,
     build_combined_spec,
+    force_identity_arm_mapping,
     leader_state_from_qpos,
 )
 from arm_control.simulation.mj_collision_guard import (  # noqa: E402
@@ -86,6 +90,44 @@ def _adr(model: mujoco.MjModel, joint_name: str) -> int:
 def _dof_adr(model: mujoco.MjModel, joint_name: str) -> int:
     jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
     return int(model.jnt_dofadr[jid])
+
+
+def _leader_gripper_joints(model: mujoco.MjModel, refs) -> list[str]:
+    """小臂上所有夹爪指关节名（Franka Hand 是双指）。"""
+    out: list[str] = []
+    for jid in range(model.njnt):
+        name = model.joint(jid).name or ""
+        if name.startswith(refs.prefix + "_") and "finger" in name:
+            out.append(name)
+    return out
+
+
+def _leader_tip_body_id(model: mujoco.MjModel, refs) -> int:
+    """默认拖拽目标：小臂末节连杆；找不到就退化为最深的小臂 body。
+
+    MuJoCo 的扰动机制要求先"选中"一个 body（``perturb.select > 0``）才会施力，
+    默认替用户选中末端，于是不必先双击即可直接 Ctrl+拖动。
+    """
+    for candidate in (
+        f"{refs.prefix}_fr3_link7",
+        f"{refs.prefix}_l7",
+        f"{refs.prefix}_finger",
+    ):
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, candidate)
+        if bid > 0:
+            return int(bid)
+    best, best_depth = -1, -1
+    for bid in range(model.nbody):
+        name = model.body(bid).name or ""
+        if not name.startswith(refs.prefix + "_"):
+            continue
+        depth, cur = 0, bid
+        while model.body_parentid[cur] > 0:
+            cur = int(model.body_parentid[cur])
+            depth += 1
+        if depth > best_depth:
+            best, best_depth = bid, depth
+    return int(best)
 
 
 # --------------------------------------------------------------------------- #
@@ -201,7 +243,7 @@ def _make_guard(args, model, refs, cfg):
         follower_arm_qpos_adr=[_adr(model, n) for n in ARM_JOINTS],
         leader_arm_qpos_adr=[_adr(model, n) for n in refs.arm_joint_names],
         leader_grip_qpos_adr=(_adr(model, refs.gripper_name) if refs.gripper_name else None),
-        leader_geom_ids=select_geoms_by_name(model, refs.prefix),
+        leader_geom_ids=select_geoms_by_name(model, refs.prefix, group=0),
         follower_geom_ids=select_geoms_by_name(model, "fr3", group=0),
         distmax_m=max(0.3, float(cfg.safety.limits.collision_warn_m) * 5.0),
     )
@@ -248,8 +290,17 @@ def run_interactive(loop, kin, drag_leader, refs, model, data, args, monitor, lo
             handle.cam.azimuth = 90.0
             handle.cam.elevation = -18.0
 
+            # 默认选中小臂末端：MuJoCo 要先选中 body 才施力，省去"先双击"这一步
+            tip_body = _leader_tip_body_id(model, refs)
+            if tip_body > 0:
+                handle.perturb.select = int(tip_body)
+                handle.perturb.localpos[:] = 0.0
+
             while handle.is_running():
                 with handle.lock():
+                    if tip_body > 0 and handle.perturb.select <= 0:
+                        # 双击空白会清掉选择，这里兜底重新选上
+                        handle.perturb.select = int(tip_body)
                     # 1) 大臂先对齐到 loop 最近一次下发
                     fq, fg = kin.current()
                     _write_follower(data.qpos, fr3_arm_adr, fr3_finger_adr, fq, fg)
@@ -278,10 +329,11 @@ def run_interactive(loop, kin, drag_leader, refs, model, data, args, monitor, lo
                         line2 = "小臂仍可拖动；重新运行本脚本可恢复"
                     else:
                         d_txt = f"{distance * 1000:.0f}mm" if np.isfinite(distance) else "n/a"
-                        line1 = "RUNNING   蓝=小臂(可拖)  橙=真实 FR3"
+                        line1 = "RUNNING   左=小臂(可拖)  右=真实 FR3  同号同色=对应关节"
                         line2 = (
                             f"tick={loop.stats.ticks}  两臂最近={d_txt}  "
-                            f"拖拽=Ctrl+左键拖连杆  夹爪={fg * 1000:.0f}mm"
+                            f"拖拽=Ctrl+右键(平移)/Ctrl+左键(旋转)，已选中末端  "
+                            f"夹爪={fg * 1000:.0f}mm"
                         )
                     handle.set_texts(text(line1, line2))
                 except Exception:
@@ -333,7 +385,7 @@ def main(argv=None) -> int:
     if args.hz:
         cfg.loop.hz = args.hz
 
-    # --- 合并模型：真实 FR3 + 程序化小臂 ---
+    # --- 合并模型：真实 FR3 + 等比缩小的 FR3 孪生小臂 ---
     cache = Path(tempfile.gettempdir()) / "arm_control_fr3_mjcache"
     staged = build_mujoco_model(FR3_URDF, cache_dir=cache, keep_visual=True)
     spec, refs = build_combined_spec(
@@ -347,18 +399,26 @@ def main(argv=None) -> int:
     initial = np.asarray(cfg.follower.initial, dtype=float)
     if initial.shape != (cfg.follower.n_arm_joints,):
         initial = np.asarray(FR3_HOME, dtype=float)[: cfg.follower.n_arm_joints]
+    # follower 与 leader（FR3 孪生）从同一个合法 home 起步：auto_align 之后映射
+    # 退化为直连，两条臂保持"同形"（只差一个缩放），关节对应关系最直观。
     for adr, value in zip((_adr(model, n) for n in ARM_JOINTS), initial):
         data.qpos[adr] = float(value)
     for adr in (_adr(model, n) for n in FINGER_JOINTS):
         data.qpos[adr] = float(cfg.follower.initial_finger_m)
-    if refs.gripper_name:
-        data.qpos[_adr(model, refs.gripper_name)] = GRIP_TRAVEL_M  # 初始张开
+    for adr, value in zip((_adr(model, n) for n in refs.arm_joint_names), initial):
+        data.qpos[adr] = float(value)
+    for name in _leader_gripper_joints(model, refs):
+        data.qpos[_adr(model, name)] = GRIP_TRAVEL_M  # 初始张开
     mujoco.mj_forward(model, data)
 
     # --- 装配 TeleopLoop（与真机同一条安全链路）---
     drag_leader = DragLeader(cfg.leader.n_arm_joints, cfg.leader.with_gripper, grip_open=1.0)
+    # 小臂初始状态 = FR3 home + 夹爪张开，保证 auto_align 时 offset ≈ 0
+    drag_leader.set_state(np.concatenate([initial, [1.0]]))
     kin = KinematicFollower(cfg.follower.n_arm_joints, initial, cfg.follower.initial_finger_m)
     guard = _make_guard(args, model, refs, cfg)
+    # 小臂是 FR3 孪生：关节映射改为直连，大臂才会和小臂同形跟动
+    force_identity_arm_mapping(cfg)
     retargeter = build_retargeter(cfg.mapping)
     monitor = build_monitor(cfg.safety, cfg.mapping.joints, collision_guard=guard)
     loop = TeleopLoop(
@@ -377,7 +437,7 @@ def main(argv=None) -> int:
         _start_rerun(args)
 
     print(
-        f"[interactive] 窗口打开：小臂(左) Ctrl+左键拖拽，FR3(右) 实时跟随；"
+        f"[interactive] 窗口打开：左=小臂(FR3 孪生，Ctrl+右键拖动)，右=真实 FR3；"
         f"间距={args.separation:.2f}m  "
         f"碰撞守卫={'关' if args.no_collision_guard else '开'}",
         flush=True,

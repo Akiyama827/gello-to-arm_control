@@ -16,7 +16,7 @@
 | 可视化 | `examples/leader_follower_viewer.py` | MuJoCo 窗口：两条胶囊臂（无需资产） |
 | 可视化 | `examples/leader_follower_rerun.py` | Rerun 单窗口：真实 FR3 网格 + 小臂模型 + 曲线 |
 | 可视化 | `examples/leader_follower_interactive.py` | MuJoCo 窗口：**鼠标拖拽小臂**，真实 FR3 跟随 |
-| 模型 | `arm_control/simulation/leader_arm_model.py` | 程序化小臂模型（S288 近似外形） |
+| 模型 | `arm_control/simulation/leader_arm_model.py` | 小臂模型（**等比缩小的 FR3 孪生**，网格+关节复用 FR3） |
 | 安全 | `arm_control/simulation/mj_collision_guard.py` | 同场景真实几何的两臂碰撞守卫 |
 | 配置 | `examples/configs/leader_follower.yaml` | 仿真配置（fake/fake） |
 | 配置 | `examples/configs/leader_follower_real.example.yaml` | 真机配置模板 |
@@ -106,8 +106,10 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py
 
 - **3D 视图**
   - 右侧 = **真实 FR3**（视觉网格），跟随大臂实测关节角，手指跟夹爪开合。
-  - 左侧 = **小臂模型**（蓝色；宇树 S288 无公开网格，用 capsule 连杆 + 夹爪近似，
-    不是官方外形），跟随 leader 关节角，夹爪开合。
+  - 左侧 = **小臂模型**（**等比缩小的 FR3 孪生**；宇树 S288 无公开网格，直接复用
+    真实 FR3 网格 + 同一套关节坐标系缩小而成）。
+  - 两条臂**同构**：`leader_fr3_joint_i ↔ fr3_joint_i` 一一对应，**同号连杆同色**
+    （J1..J7 七彩、夹爪灰），每个关节位置标 `J1..J7`，对应关系一眼可对。
 - **Time series 视图**（Rerun 自动聚合）：每个关节的
   `plots/leader/qN`、`plots/follower_cmd/qN`（指令）、`plots/follower_meas/qN`（实测）、
   `plots/track_err/qN`（跟踪误差），以及 `plots/gripper_m`、`plots/collision_distance_m`。
@@ -148,11 +150,17 @@ PYTHONPATH=. python -B examples/leader_follower_interactive.py
 
 窗口里：
 
-- 左 = **小臂模型**（蓝色，capsule 近似外形），**可用鼠标拖拽**；
-- 右 = **真实 FR3 网格**，按 `Retargeter` 实时跟动。
+- 左 = **小臂模型**（**等比缩小的 FR3 孪生**，与右侧同构、同号连杆同色、标 `J1..J7`），
+  **可用鼠标拖拽**；
+- 右 = **真实 FR3 网格**，按 `Retargeter` 实时跟动。仿真里小臂是 FR3 孪生，所以
+  关节映射按**直连**（`sign=+1`）走，拖哪一节、大臂同号关节就同向跟动。
 
-拖拽方式：按住 **Ctrl + 鼠标左键拖动连杆/末端**（MuJoCo 原生扰动 = 施加弹簧力，
-小臂关节在阻尼下运动）。其它：左键=旋转视角、右键=平移、滚轮=缩放。
+拖拽方式（MuJoCo 原生扰动 = 施加弹簧力，小臂关节在阻尼下运动）：
+
+- **默认已经选中小臂末端**，直接按住 **Ctrl + 鼠标右键拖动 = 平移施力**（推荐），
+  **Ctrl + 鼠标左键拖动 = 绕选中点旋转施力**；
+- 想拖别的连杆：先 **鼠标左键双击** 选中那一节，再按上面的方式拖动；
+- 左键拖动 = 旋转视角，右键 = 平移视角，滚轮 = 缩放。
 
 拖出来的小臂关节角会喂给**真正的 `TeleopLoop`**（与真机同一条安全链路：`auto_align`、
 关节限位/跳变、跟踪误差、leader 超时、以及用**同场景真实几何**算的两臂最近距离碰撞
@@ -165,9 +173,10 @@ PYTHONPATH=. python -B examples/leader_follower_interactive.py --no-collision-gu
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --rerun             # 边拖边看曲线
 ```
 
-> 小臂外形是**近似**的：宇树 S288 没有公开网格/URDF，这里用 capsule 连杆 + 夹爪
-> 拼出可辨识、可拖拽的模型；真实零位/转向仍以 `S288LeaderArm` 的
-> `joint_offsets / joint_signs` 标定为准。
+> 小臂外形是**视觉替身**：宇树 S288 没有公开网格/URDF，这里直接把真实 FR3 网格
+> 等比缩小后作为小臂，好处是关节一一对应、颜色也对得上；它**不代表 S288 的真实
+> 外观**。真机小臂的零位/转向仍以 `S288LeaderArm` 的 `joint_offsets / joint_signs`
+> 标定为准（仿真里的"直连"映射只针对这个 FR3 孪生，真机标定配置不受影响）。
 
 ### 4.4 存盘 / 回放（无显示环境或存档）
 
@@ -246,8 +255,8 @@ ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
 
 **Q：Rerun 里只看到小臂线框、没有大臂 FR3？**
 已在 `feat/leader-follower-teleop` 修复（网格改为 `static` 记录）；小臂也已从线框
-换成 capsule 模型。先 `git pull` 到最新，再重跑。若仍无，检查
-`franka/urdf/fr3.urdf` 是否存在。
+换成**等比缩小的 FR3 孪生**（网格 + 关节坐标系复用真实 FR3）。先 `git pull` 到最新，
+再重跑。若仍无，检查 `franka/urdf/fr3.urdf` 是否存在。
 
 **Q：两臂离得太近 / 想分得更开？**
 三个可视化都支持 `--separation <米>`（两臂基座间距），例如
@@ -306,7 +315,7 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd 
 PYTHONPATH=. python -B examples/leader_follower_viewer.py
 PYTHONPATH=. python -B examples/leader_follower_viewer.py --headless --duration 3
 
-# 可视化：鼠标拖拽小臂 -> 真实 FR3 跟随（Ctrl+左键拖连杆）
+# 可视化：鼠标拖拽小臂 -> 真实 FR3 跟随（默认选中末端，Ctrl+右键平移）
 PYTHONPATH=. python -B examples/leader_follower_interactive.py
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --separation 1.4 --rerun
 

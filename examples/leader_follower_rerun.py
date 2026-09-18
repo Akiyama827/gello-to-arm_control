@@ -5,12 +5,13 @@
 
 * ``examples/leader_follower_viewer.py``       MuJoCo 窗口、两条胶囊示意臂；
 * ``examples/leader_follower_interactive.py``  MuJoCo 窗口、可**鼠标拖拽**小臂；
-* 本文件：Rerun 单窗口，用 **staged 的真实 FR3 网格** + **程序化小臂模型**
-  （S288 无公开网格，capsule 近似）一起画，并在同一录制里画曲线。
+* 本文件：Rerun 单窗口，用 **staged 的真实 FR3 网格** + **等比缩小的 FR3 孪生**
+  一起画，并在同一录制里画曲线。
 
-3D：
+3D（两条臂同构：``leader_fr3_joint_i`` 与 ``fr3_joint_i`` 一一对应，同号连杆同色，
+关节位置标 ``J1..J7``）：
 * 右侧 = 真实 FR3（视觉网格，跟随 ``follower.measured``；手指跟夹爪）；
-* 左侧 = 小臂模型（capsule 连杆 + 夹爪，跟随 ``leader``）。
+* 左侧 = 小臂（缩小的 FR3，跟随 ``leader``）。
 曲线：每个关节的 leader / follower 指令 / follower 实测 / 跟踪误差，
 以及夹爪、两臂最近距离。
 
@@ -57,9 +58,12 @@ from arm_control.leader_follower.config import (  # noqa: E402
     build_pipeline,
     config_from_yaml,
 )
+from arm_control.leader_follower.leader import FakeLeaderArm  # noqa: E402
 from arm_control.simulation.leader_arm_model import (  # noqa: E402
     GRIP_TRAVEL_M,
+    JOINT_COLORS,
     build_combined_spec,
+    force_identity_arm_mapping,
     joint_qpos_addresses,
 )
 from arm_control.simulation.mujoco_model import build_mujoco_model  # noqa: E402
@@ -69,7 +73,8 @@ ARM_JOINTS = [f"fr3_joint{i}" for i in range(1, 8)]
 FINGER_JOINTS = ["fr3_finger_joint1", "fr3_finger_joint2"]
 FINGER_MAX_M = 0.04
 APP_ID = "arm_control_leader_follower"
-_LEADER_COLOR = [80, 160, 255]
+# follower 的合法 home；仿真里小臂也绕它摆动，使两臂同形
+FR3_HOME = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
 
 
 # --------------------------------------------------------------------------- #
@@ -269,14 +274,13 @@ def main(argv=None) -> int:
     else:
         print("[rerun] 已初始化，但未自动拉起查看器（--no-spawn）", flush=True)
 
-    # --- 合并模型：真实 FR3 网格 + 程序化小臂 ---
+    # --- 合并模型：真实 FR3 网格 + 等比缩小的 FR3 孪生小臂 ---
     cache = Path(tempfile.gettempdir()) / "arm_control_fr3_mjcache"
     staged = build_mujoco_model(FR3_URDF, cache_dir=cache, keep_visual=True)
     spec, refs = build_combined_spec(
         str(staged),
         leader_position=(-args.separation, 0.0, 0.30),
         leader_scale=args.leader_scale,
-        leader_rgba=[c / 255.0 for c in _LEADER_COLOR] + [1.0],
     )
     model = spec.compile()
     data = mujoco.MjData(model)
@@ -284,7 +288,12 @@ def main(argv=None) -> int:
     qadr = joint_qpos_addresses(model, ARM_JOINTS + FINGER_JOINTS)
     leader_adr = joint_qpos_addresses(model, refs.joint_names)
     leader_arm_adr = [leader_adr[n] for n in refs.arm_joint_names]
-    leader_grip_adr = leader_adr.get(refs.gripper_name) if refs.gripper_name else None
+    leader_finger_adr = [
+        int(model.jnt_qposadr[jid])
+        for jid in range(model.njnt)
+        if (model.joint(jid).name or "").startswith(refs.prefix + "_")
+        and "finger" in (model.joint(jid).name or "")
+    ]
 
     follower_mirror = _VisualMirror(model, data, prefix="follower", geom_prefix="fr3")
     leader_mirror = _VisualMirror(model, data, prefix="leader", geom_prefix=refs.prefix)
@@ -305,7 +314,20 @@ def main(argv=None) -> int:
         spec_mod.loader.exec_module(mod)
         guard = mod.make_demo_collision_guard(cfg.follower.n_arm_joints)
 
+    # 小臂是 FR3 孪生：关节映射改为直连，大臂才会和小臂同形跟动
+    force_identity_arm_mapping(cfg)
     leader, retargeter, follower, monitor = build_pipeline(cfg, collision_guard=guard)
+    # 让假小臂绕 FR3 home 摆动（初值正好落在 home），两条臂保持同形
+    initial = np.asarray(cfg.follower.initial, dtype=float)
+    if initial.shape != (cfg.follower.n_arm_joints,):
+        initial = np.asarray(FR3_HOME, dtype=float)[: cfg.follower.n_arm_joints]
+    leader = FakeLeaderArm(
+        n_arm_joints=cfg.leader.n_arm_joints,
+        with_gripper=cfg.leader.with_gripper,
+        amplitude=cfg.leader.fake_amplitude,
+        period_s=cfg.leader.fake_period_s,
+        center=initial,
+    )
     loop = TeleopLoop(
         leader=leader,
         retargeter=retargeter,
@@ -330,11 +352,27 @@ def main(argv=None) -> int:
             data.qpos[qadr[name]] = grip
         for i, adr in enumerate(leader_arm_adr):
             data.qpos[adr] = float(st.leader[i])
-        if leader_grip_adr is not None:
-            data.qpos[leader_grip_adr] = float(np.clip(st.leader_grip, 0.0, 1.0)) * GRIP_TRAVEL_M
+        leader_grip_m = float(np.clip(st.leader_grip, 0.0, 1.0)) * GRIP_TRAVEL_M
+        for adr in leader_finger_adr:
+            data.qpos[adr] = leader_grip_m
         mujoco.mj_forward(model, data)
         follower_mirror.update()
         leader_mirror.update()
+
+        # 关节位置标 J1..J7（两臂同号同色）
+        for arm_joints, view in ((ARM_JOINTS, "follower"), (refs.arm_joint_names, "leader")):
+            positions = np.empty((len(arm_joints), 3))
+            colors = []
+            labels = []
+            for i, name in enumerate(arm_joints):
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                positions[i] = data.xanchor[jid]
+                colors.append(JOINT_COLORS[i][:3])
+                labels.append(f"J{i + 1}")
+            rr.log(
+                f"labels/{view}",
+                rr.Points3D(positions, colors=colors, labels=labels, radii=0.008),
+            )
 
         for i in range(st.leader.size):
             rr.log(f"plots/leader/q{i + 1}", rr.Scalars(float(st.leader[i])))
@@ -372,6 +410,12 @@ def main(argv=None) -> int:
         + (f"（{st.reason}）" if st.stopped else ""),
         flush=True,
     )
+    # 主动 flush / 断开：MuJoCo 在解释器退出时可能段错误，析构会被跳过，
+    # 否则 .rrd 可能只落盘了一部分（例如小臂网格丢失）。
+    try:
+        rr.disconnect()
+    except Exception:
+        pass
     return 0
 
 
