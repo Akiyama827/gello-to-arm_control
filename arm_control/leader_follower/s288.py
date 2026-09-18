@@ -37,22 +37,33 @@ S288 规格（来源：Unitree 官网 DigitalServo 页面 / YS-342026-S288 数�
 反馈里同时给了"转子角度"和"输出端角度"，优先用**输出端角度**，避免自己除 r
 引入的累积误差；若固件未上报输出端角度，则退回 `q_rotor / r`。
 
-关于协议正确性的诚实说明
+串口通信走宇树官方 SDK
 --------------------------------------------------------------------------
-宇树官方 `unitree_actuator_sdk` 只覆盖 GO-M8010-6 / A1 / B1，**不含 S288/J288**。
-下面 `S288Codec` 的帧布局按宇树公开 MIT 协议的通用形式实现（0xFE 0xEE 头、
-mode、id、5 个 float32、CRC16-CCITT），但 S288 属于较新的数字舵机系列：
+真实硬件默认用官方 `unitree_actuator_sdk`（编译后的 pybind 扩展）通信：
 
-    ★ 上线前必须用 Unitree Motor Assistant 或逻辑分析仪核对帧长/字段顺序/CRC。
-    ★ 所有可能不同的地方都提到了 S288Codec 的参数上，校正时只改这里。
-    ★ 无法确认时用 FakeS288Bus 开发整条映射链路，不要盲发真实硬件。
+    from unitree_actuator_sdk import SerialPort, MotorCmd, MotorData
+    serial = SerialPort('/dev/ttyUSB0')
+    cmd, data = MotorCmd(), MotorData()
+    cmd.motorType = data.motorType = MotorType.<型号>
+    cmd.mode = queryMotorMode(...); cmd.id = ...; cmd.q/dq/kp/kd/tau = ...
+    serial.sendRecv(cmd, data)   # data.q/dq/temp/merror 为反馈
+
+SDK 的 `q/dq/tau/kp/kd` 全是**转子侧**量，而本模块对外统一用**输出端**语义；
+`UnitreeSdkS288Bus` 在边界用 `S288Spec` 做换算（这是"电机参数不同"的核心）。
+
+`SerialS288Bus`（自实现的 0xFE 0xEE MIT 帧 + CRC16-CCITT）保留作离线/无 SDK
+时的后备，并用于自检。
+
+    ★ 若官方 SDK 的 `MotorType` 里没有 S288 名称，`UnitreeSdkS288Bus` 会列出
+      可选项并在构造时报错，避免悄无声息地发错协议。
 
 对外主接口
 --------------------------------------------------------------------------
     S288Spec                     规格与单位换算
-    S288Codec                    MIT 命令/反馈帧编解码（CRC16-CCITT）
+    S288Codec                    MIT 命令/反馈帧编解码（CRC16-CCITT，后备）
     S288Bus(Protocol)            总线抽象：read / write / close
-    SerialS288Bus                 真实串口实现（懒加载 pyserial）
+    UnitreeSdkS288Bus            官方 unitree_actuator_sdk 串口实现（首选）
+    SerialS288Bus                 自实现帧的串口实现（后备）
     FakeS288Bus                   仿真实现，无需硬件
     S288JointChain               多电机链：读输出端关节角/速度，写输出端位置
 """
@@ -449,6 +460,148 @@ class SerialS288Bus:
                 pass
             self._serial.close()
             self._serial = None
+
+
+# --------------------------------------------------------------------------- #
+# 官方 SDK 串口实现（首选）
+# --------------------------------------------------------------------------- #
+class UnitreeSdkS288Bus:
+    """宇树官方 `unitree_actuator_sdk` 的串口总线。
+
+    对外仍是输出端语义的 `S288Command`/`S288State`，边界处按 `S288Spec`
+    在转子端与输出端之间换算——SDK 的 `q/dq/tau/kp/kd` 都是转子侧量。
+
+    参数
+    ----
+    motor_type: SDK `MotorType` 里的枚举名。S288 若不在官方枚举里，构造时会
+        列出全部可选项并报错；把 `motor_type` 设成实际可用的名称即可。
+    port:       串口设备，如 `/dev/ttyUSB0`（S288 为半双工 TTL 多点总线）。
+
+    依赖：编译好的 `unitree_actuator_sdk`（pybind 扩展）在 PYTHONPATH 上。
+    """
+
+    def __init__(
+        self,
+        motor_ids: Sequence[int],
+        port: str,
+        spec: S288Spec | None = None,
+        motor_type: str = "S288",
+    ) -> None:
+        self.spec = spec or S288Spec()
+        self._ids = [int(i) for i in motor_ids]
+        self._port = port
+        self._motor_type_name = motor_type
+        self._sdk = _import_unitree_actuator_sdk()
+        self._motor_type = self._resolve_motor_type(motor_type)
+        self._mode = self._sdk.queryMotorMode(
+            self._motor_type, self._sdk.MotorMode.FOC
+        )
+        self._serial = self._open_serial(port)
+        self._lock = threading.Lock()
+        self._last_states: dict[int, S288State] = {}
+        self._last_target: dict[int, float] = {i: 0.0 for i in self._ids}
+
+    # -- 初始化辅助 ---------------------------------------------------------
+    def _resolve_motor_type(self, name: str):
+        mt = getattr(self._sdk.MotorType, name, None)
+        if mt is None:
+            options = [n for n in dir(self._sdk.MotorType) if not n.startswith("_")]
+            raise RuntimeError(
+                f"官方 SDK 的 MotorType 里没有 {name!r}；可用：{options}。"
+                "若是较新的 S288/J288，请按实际枚举名设置 motor_type。"
+            )
+        return mt
+
+    def _open_serial(self, port: str):
+        # 不同版本的 pybind 签名可能是 (port) 或 (port, baudrate)。
+        try:
+            return self._sdk.SerialPort(port, self.spec.baudrate)
+        except TypeError:
+            return self._sdk.SerialPort(port)
+
+    # -- 单次收发 -----------------------------------------------------------
+    def _exchange(self, motor_id: int, command: S288Command | None) -> None:
+        sdk = self._sdk
+        cmd = sdk.MotorCmd()
+        data = sdk.MotorData()
+        cmd.motorType = data.motorType = self._motor_type
+        cmd.mode = self._mode
+        cmd.id = int(motor_id)
+
+        if command is None:
+            q_out = self._last_target.get(motor_id, 0.0)
+            dq_out = tau_out = kp_out = kd_out = 0.0
+        else:
+            q_out, dq_out, tau_out, kp_out, kd_out = (
+                command.q_out, command.dq_out, command.tau_out,
+                command.kp_out, command.kd_out,
+            )
+        spec = self.spec
+        cmd.q = float(spec.output_to_rotor_angle(q_out))
+        cmd.dq = float(spec.output_to_rotor_velocity(dq_out))
+        cmd.kp = float(spec.output_to_rotor_kp(kp_out))
+        cmd.kd = float(spec.output_to_rotor_kd(kd_out))
+        cmd.tau = float(spec.output_to_rotor_torque(tau_out))
+
+        self._serial.sendRecv(cmd, data)
+
+        q_r, dq_r, tau_r = float(data.q), float(data.dq), float(data.tau)
+        temp = float(getattr(data, "temp", float("nan")))
+        err = int(getattr(data, "merror", 0))
+        self._last_states[motor_id] = S288State(
+            motor_id=motor_id,
+            q_rotor=q_r,
+            dq_rotor=dq_r,
+            tau_rotor=tau_r,
+            q_out=float(spec.rotor_to_output_angle(q_r)),
+            dq_out=float(spec.rotor_to_output_velocity(dq_r)),
+            tau_out=float(spec.rotor_to_output_torque(tau_r)),
+            temperature_c=temp,
+            error=err,
+            has_output_angle=False,
+        )
+        self._last_target[motor_id] = float(q_out)
+
+    # -- S288Bus 接口 -------------------------------------------------------
+    def write_commands(self, commands: dict[int, S288Command]) -> None:
+        with self._lock:
+            for mid in self._ids:
+                self._exchange(mid, commands.get(mid))
+
+    def read_states(self) -> dict[int, S288State]:
+        with self._lock:
+            for mid in self._ids:
+                if mid not in self._last_states:
+                    self._exchange(mid, None)
+            return dict(self._last_states)
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                for mid in self._ids:  # 零刚度零阻尼，撤销主动控制
+                    self._exchange(mid, S288Command())
+            except Exception:
+                pass
+        close = getattr(self._serial, "close", None)
+        if callable(close):
+            close()
+
+
+def _import_unitree_actuator_sdk():
+    """懒加载官方 SDK，缺失时给出可操作的报错。"""
+    try:
+        import unitree_actuator_sdk as sdk  # type: ignore
+    except ImportError as exc:  # pragma: no cover - 取决于部署环境
+        raise RuntimeError(
+            "UnitreeSdkS288Bus 需要官方 unitree_actuator_sdk。请编译该 SDK 并把 "
+            "生成的扩展（如 lib/unitree_actuator_sdk*.so）加入 PYTHONPATH，"
+            "或改用 bus=serial_raw / fake。"
+        ) from exc
+    required = ("SerialPort", "MotorCmd", "MotorData", "MotorType", "MotorMode", "queryMotorMode")
+    missing = [name for name in required if not hasattr(sdk, name)]
+    if missing:
+        raise RuntimeError(f"unitree_actuator_sdk 缺少接口：{missing}")
+    return sdk
 
 
 # --------------------------------------------------------------------------- #

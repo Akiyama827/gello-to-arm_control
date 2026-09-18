@@ -14,7 +14,10 @@
 --------------------------------------------------------------------------
 - leader 状态向量：前若干位是臂关节（rad），最后一位（若有）是夹爪，
   归一化到 [0,1]，**1 = 张开，0 = 闭合**（见 leader.S288LeaderArm）。
-- 输出：`(arm_target_rad, gripper_width_m)`；夹爪宽度用米，张开 > 闭合。
+- 输出：`(arm_target_rad, gripper_finger_m)`；夹爪用**单指位移（米）**，
+  这与 arm_control 的约定一致：DM 臂经 `joint_mimics` 把单指位移换算成夹爪电机角，
+  FR3 的 Franka Hand 也把 `gripper` 消息里的 `position[i]` 当作单指位移
+  （`franka_adapter` 内部 `width = 2 * finger`）。张开 > 闭合。
 - 所有限位/变化率都在这里强制，绝不依赖上层。
 """
 from __future__ import annotations
@@ -47,18 +50,18 @@ class JointMapping:
 
 @dataclass(frozen=True)
 class GripperMapping:
-    """夹爪：leader 的 [0,1] -> 大臂手指宽度（米）。"""
+    """夹爪：leader 的 [0,1] -> 大臂**单指位移（米）**。"""
 
     src_index: int = -1
-    open_width_m: float = 0.075     # leader 张开(1) 对应的大臂宽度
-    closed_width_m: float = 0.0     # leader 闭合(0) 对应的大臂宽度
-    max_rate_m_s: float = np.inf    # 宽度变化率上限
+    open_finger_m: float = 0.04     # leader 张开(1) 对应的单指位移（FR3 Hand 行程 0~0.04）
+    closed_finger_m: float = 0.0    # leader 闭合(0) 对应的单指位移
+    max_rate_m_s: float = np.inf    # 单指位移变化率上限
 
     def apply(self, leader_state: np.ndarray) -> float:
         g = float(np.clip(leader_state[self.src_index], 0.0, 1.0))  # 1=张开
-        w = self.closed_width_m + g * (self.open_width_m - self.closed_width_m)
-        return float(np.clip(w, min(self.open_width_m, self.closed_width_m),
-                             max(self.open_width_m, self.closed_width_m)))
+        w = self.closed_finger_m + g * (self.open_finger_m - self.closed_finger_m)
+        return float(np.clip(w, min(self.open_finger_m, self.closed_finger_m),
+                             max(self.open_finger_m, self.closed_finger_m)))
 
 
 @dataclass
@@ -108,9 +111,9 @@ class Retargeter:
         )
 
     # -- 初始化：用大臂当前位形做软启动起点 --------------------------------
-    def reset(self, follower_arm_state: Sequence[float], follower_gripper_width: float) -> None:
+    def reset(self, follower_arm_state: Sequence[float], follower_gripper_finger_m: float) -> None:
         self._start_arm = np.asarray(follower_arm_state, dtype=float).copy()
-        self._start_grip = float(follower_gripper_width)
+        self._start_grip = float(follower_gripper_finger_m)
         self._prev_arm = self._start_arm.copy()
         self._prev_grip = self._start_grip
         self._ramp_elapsed = 0.0

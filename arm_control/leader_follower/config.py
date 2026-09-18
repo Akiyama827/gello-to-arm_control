@@ -29,6 +29,7 @@ from .s288 import (
     S288JointChain,
     S288Spec,
     SerialS288Bus,
+    UnitreeSdkS288Bus,
 )
 
 
@@ -38,9 +39,11 @@ from .s288 import (
 @dataclass
 class LeaderConfig:
     kind: str = "fake"                 # s288 | gello | fake
-    n_arm_joints: int = 6
+    n_arm_joints: int = 7              # 默认按 8 个 S288 = 7 臂关节 + 1 夹爪
     with_gripper: bool = True
     # s288
+    bus: str = "unitree_sdk"           # unitree_sdk | serial_raw | fake
+    motor_type: str = "S288"           # 官方 SDK MotorType 枚举名
     port: str = "/dev/ttyUSB0"
     motor_ids: Sequence[int] = ()
     gripper_index: Optional[int] = None
@@ -50,7 +53,7 @@ class LeaderConfig:
     gripper_close_rad: float = 0.0
     alpha: float = 0.99
     start_joints: Sequence[float] = ()
-    use_fake_bus: bool = False         # s288 无硬件时用仿真总线
+    use_fake_bus: bool = False         # 兼容旧字段：等价于 bus=fake
     # fake
     fake_amplitude: float = 0.4
     fake_period_s: float = 6.0
@@ -59,7 +62,10 @@ class LeaderConfig:
 @dataclass
 class FollowerConfig:
     kind: str = "dry_run"              # dry_run | fake | dora | rt
-    n_arm_joints: int = 6
+    n_arm_joints: int = 7              # FR3：7 关节 + Franka Hand
+    # 仿真/空跑后端的初始位形（让 auto_align 从一个合法位形起步）
+    initial: Sequence[float] = ()
+    initial_finger_m: float = 0.0
     # rt
     joint_names: Sequence[str] = ()
     host: str = "127.0.0.1"
@@ -105,6 +111,12 @@ class LeaderFollowerConfig:
 # --------------------------------------------------------------------------- #
 # 解析
 # --------------------------------------------------------------------------- #
+FR3_JOINTS: tuple[str, ...] = (
+    "fr3_joint1", "fr3_joint2", "fr3_joint3", "fr3_joint4",
+    "fr3_joint5", "fr3_joint6", "fr3_joint7",
+)
+
+
 def _joint_mapping(raw: dict, default_src: int) -> JointMapping:
     return JointMapping(
         src_index=int(raw.get("src", default_src)),
@@ -150,8 +162,12 @@ def config_from_dict(raw: dict) -> LeaderFollowerConfig:
     if grip_raw is not None:
         gripper = GripperMapping(
             src_index=int(grip_raw.get("src", -1)),
-            open_width_m=float(grip_raw.get("open_width_m", 0.075)),
-            closed_width_m=float(grip_raw.get("closed_width_m", 0.0)),
+            open_finger_m=float(
+                grip_raw.get("open_finger_m", grip_raw.get("open_width_m", 0.04))
+            ),
+            closed_finger_m=float(
+                grip_raw.get("closed_finger_m", grip_raw.get("closed_width_m", 0.0))
+            ),
             max_rate_m_s=float(grip_raw.get("max_rate_m_s", np.inf)),
         )
     mapping = MappingConfig(
@@ -210,12 +226,29 @@ def build_leader(cfg: LeaderConfig):
         ids = list(cfg.motor_ids)
         if not ids:
             raise ValueError("leader.motor_ids 不能为空（s288）")
-        bus = (
-            FakeS288Bus(ids)
-            if cfg.use_fake_bus
-            else SerialS288Bus(ids, port=cfg.port)
-        )
-        chain = S288JointChain(motor_ids=ids, bus=bus, spec=S288Spec(), codec=S288Codec())
+        # 8 个 S288 时总 dof 应与配置一致，早报错好过把关节顺序搞错。
+        expected = cfg.n_arm_joints + (1 if cfg.with_gripper else 0)
+        if len(ids) != expected:
+            raise ValueError(
+                f"leader.motor_ids 有 {len(ids)} 个，与 n_arm_joints={cfg.n_arm_joints}"
+                f" + 夹爪={cfg.with_gripper}（应为 {expected}）不一致"
+            )
+        spec = S288Spec()
+        bus_kind = "fake" if cfg.use_fake_bus else cfg.bus
+        if bus_kind == "fake":
+            bus = FakeS288Bus(ids, spec=spec)
+        elif bus_kind == "serial_raw":
+            bus = SerialS288Bus(ids, port=cfg.port, spec=spec, codec=S288Codec())
+        elif bus_kind == "unitree_sdk":
+            # 官方 unitree_actuator_sdk：串口通信，转子侧 q 在总线内换算。
+            bus = UnitreeSdkS288Bus(
+                ids, port=cfg.port, spec=spec, motor_type=cfg.motor_type
+            )
+        else:
+            raise ValueError(
+                f"未知 leader.bus={bus_kind!r}（unitree_sdk | serial_raw | fake）"
+            )
+        chain = S288JointChain(motor_ids=ids, bus=bus, spec=spec, codec=S288Codec())
         return leader_mod.S288LeaderArm(
             chain=chain,
             joint_offsets=cfg.joint_offsets,
@@ -235,15 +268,25 @@ def build_leader(cfg: LeaderConfig):
 
 
 def build_follower(cfg: FollowerConfig):
+    initial = list(cfg.initial) or None
     if cfg.kind == "dry_run":
-        return follower_mod.DryRunFollower(num_arm_joints=cfg.n_arm_joints)
+        return follower_mod.DryRunFollower(
+            num_arm_joints=cfg.n_arm_joints,
+            initial_q=initial,
+            initial_finger_m=cfg.initial_finger_m,
+        )
     if cfg.kind == "fake":
-        return follower_mod.FakeFollower(num_arm_joints=cfg.n_arm_joints)
+        return follower_mod.FakeFollower(
+            num_arm_joints=cfg.n_arm_joints,
+            initial_q=initial,
+            initial_finger_m=cfg.initial_finger_m,
+        )
     if cfg.kind == "dora":
         return follower_mod.DoraJogFollower(num_arm_joints=cfg.n_arm_joints)
     if cfg.kind == "rt":
+        names = list(cfg.joint_names) or list(FR3_JOINTS[: cfg.n_arm_joints])
         return follower_mod.RtFollower(
-            joint_names=cfg.joint_names,
+            joint_names=names,
             host=cfg.host,
             udp_port=cfg.udp_port,
             tcp_port=cfg.tcp_port,

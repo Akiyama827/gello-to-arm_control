@@ -5,12 +5,14 @@ arm_control 里所有运动都走 Dora（`plan` / `jog` / `control` / `gripper`�
 0.2s 不过期即停，天然安全）+ `gripper`。另提供：
 
     DryRunFollower   不接硬件，只记录/打印（默认，用来先验证映射）
-    DoraJogFollower  通过 Dora 节点把 jog + gripper 发给 arm_controller
-    RtFollower       绕开 Dora，直连远程 RT 服务器（RtBackend.apply_command）
+    DoraJogFollower  通过 Dora 节点把 jog + gripper 发给 arm_controller /
+                     franka_gripper（FR3 就是这个接法）
+    RtFollower       绕开 Dora，直连远程 RT 服务器（RtBackend.apply_command）；
+                     只驱动 FR3 的 7 个臂关节，夹爪不走这条通道
     FakeFollower     仿真大臂，用于回路自检
 
-统一接口：`send(arm_q_rad, gripper_width_m)`；`read_state()` 返回大臂当前
-(arm_q, gripper_width)，供启动 auto_align 使用。
+统一接口：`send(arm_q_rad, gripper_finger_m)`；`read_state()` 返回大臂当前
+(arm_q, gripper_finger_m)，供启动 auto_align 使用。
 """
 from __future__ import annotations
 
@@ -30,7 +32,7 @@ class FollowerArm(Protocol):
     def read_state(self) -> tuple[np.ndarray, float]:
         ...
 
-    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+    def send(self, arm_q: Sequence[float], gripper_finger_m: float) -> None:
         ...
 
     def safe_stop(self) -> None:
@@ -48,9 +50,11 @@ class DryRunFollower:
 
     def __init__(
         self,
-        num_arm_joints: int = 6,
+        num_arm_joints: int = 7,
         log_period_s: float = 1.0,
         verbose: bool = True,
+        initial_q: Optional[Sequence[float]] = None,
+        initial_finger_m: float = 0.0,
     ) -> None:
         self.num_arm_joints = int(num_arm_joints)
         self._log_period_s = float(log_period_s)
@@ -58,19 +62,25 @@ class DryRunFollower:
         self._last_log = 0.0
         self._last_cmd: Optional[tuple[np.ndarray, float]] = None
         self._sent = 0
+        self._q0 = (
+            np.zeros(self.num_arm_joints)
+            if initial_q is None
+            else np.asarray(initial_q, dtype=float)
+        )
+        self._grip0 = float(initial_finger_m)
 
     def open(self) -> None:
         if self._verbose:
             print("[follower:dry-run] 已就绪（不驱动任何硬件）")
 
     def read_state(self) -> tuple[np.ndarray, float]:
-        return np.zeros(self.num_arm_joints), 0.0
+        return self._q0.copy(), self._grip0
 
-    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+    def send(self, arm_q: Sequence[float], gripper_finger_m: float) -> None:
         q = np.asarray(arm_q, dtype=float)
         if q.shape != (self.num_arm_joints,):
             raise ValueError(f"大臂目标长度应为 {self.num_arm_joints}，得到 {q.shape}")
-        self._last_cmd = (q, float(gripper_width_m))
+        self._last_cmd = (q, float(gripper_finger_m))
         self._sent += 1
         now = time.monotonic()
         if self._verbose and now - self._last_log >= self._log_period_s:
@@ -78,7 +88,7 @@ class DryRunFollower:
             qs = ", ".join(f"{v:+.3f}" for v in q)
             print(
                 f"[follower:dry-run] #{self._sent:6d}  q=[{qs}]  "
-                f"gripper={gripper_width_m * 1000:.1f}mm"
+                f"gripper={gripper_finger_m * 1000:.1f}mm"
             )
 
     def safe_stop(self) -> None:
@@ -96,15 +106,22 @@ class FakeFollower:
 
     def __init__(
         self,
-        num_arm_joints: int = 6,
-        gripper_open_m: float = 0.075,
+        num_arm_joints: int = 7,
+        gripper_open_finger_m: float = 0.04,
         time_constant_s: float = 0.08,
+        initial_q: Optional[Sequence[float]] = None,
+        initial_finger_m: float = 0.0,
     ) -> None:
         self.num_arm_joints = int(num_arm_joints)
-        self._q = np.zeros(self.num_arm_joints)
-        self._q_cmd = np.zeros(self.num_arm_joints)
-        self._grip = 0.0
-        self._grip_cmd = 0.0
+        self.gripper_open_finger_m = float(gripper_open_finger_m)
+        self._q = (
+            np.zeros(self.num_arm_joints)
+            if initial_q is None
+            else np.asarray(initial_q, dtype=float).copy()
+        )
+        self._q_cmd = self._q.copy()
+        self._grip = float(initial_finger_m)
+        self._grip_cmd = float(initial_finger_m)
         self._tau = max(float(time_constant_s), 1e-3)
         self._last_t = time.monotonic()
 
@@ -123,13 +140,13 @@ class FakeFollower:
         self._step()
         return self._q.copy(), float(self._grip)
 
-    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+    def send(self, arm_q: Sequence[float], gripper_finger_m: float) -> None:
         self._step()
         q = np.asarray(arm_q, dtype=float)
         if q.shape != (self.num_arm_joints,):
             raise ValueError(f"大臂目标长度应为 {self.num_arm_joints}，得到 {q.shape}")
         self._q_cmd = q
-        self._grip_cmd = float(gripper_width_m)
+        self._grip_cmd = float(gripper_finger_m)
 
     def safe_stop(self) -> None:
         self._q_cmd = self._q.copy()
@@ -150,7 +167,7 @@ class DoraJogFollower:
     时大臂会保持而不是失控。默认在 `open()` 时发 `control(arm=True)` 使能。
     """
 
-    num_arm_joints: int = 6
+    num_arm_joints: int = 7
     kp: Optional[Sequence[float]] = None
     kd: Optional[Sequence[float]] = None
     reason: str = "leader-follower"
@@ -182,7 +199,7 @@ class DoraJogFollower:
         # 由 loop 决定是否 auto_align。
         return np.zeros(self.num_arm_joints), 0.0
 
-    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+    def send(self, arm_q: Sequence[float], gripper_finger_m: float) -> None:
         from arm_control.messages import pack_jog, pack_motor_command
 
         node = self._ensure_node()
@@ -190,12 +207,14 @@ class DoraJogFollower:
         if q.shape != (self.num_arm_joints,):
             raise ValueError(f"大臂目标长度应为 {self.num_arm_joints}，得到 {q.shape}")
         node.send_output("jog", pack_jog(q=q, reason=self.reason))
-        # 夹爪走 gripper topic：arm_controller.on_gripper 取 position[0]（米）。
+        # 夹爪走 gripper topic，格式为 2 指 motor_command：`franka_gripper` 取
+        # position[0] 作为**单指位移（米）**并令 width = 2*finger；DM 臂则由
+        # joint_mimics 把单指位移换算成夹爪电机角。两指槽填同一个值。
         zeros = np.zeros(2)
         node.send_output(
             "gripper",
             pack_motor_command(
-                [float(gripper_width_m), float(gripper_width_m)],
+                [float(gripper_finger_m), float(gripper_finger_m)],
                 zeros,
                 zeros,
                 zeros,
@@ -237,12 +256,19 @@ class DoraJogFollower:
 # --------------------------------------------------------------------------- #
 @dataclass
 class RtFollower:
-    """直连远程 RT 服务器（`RtBackend`），100Hz 流式发 MIT 词。
+    """直连远程 RT 服务器（`RtBackend`），100Hz 流式发伺服词。
 
-    `joint_names` 必须与部署 `arm.joints` 完全一致（含夹爪电机槽则把
-    `gripper_slot=True`）。RT 服务器自带 staleness->hold、fault latch、力矩
-    限幅，因此这里只需持续发帧；停发超过 hold_ms 会 HOLD、超过 fault_ms 会
-    LATCH（需 DISARM->ARM 恢复）。
+    **FR3 注意**：这条通道只驱动 7 个臂关节（`gripper_slot=False`），
+    Franka Hand 是独立设备、不走 RT（走 `franka_gripper` 节点）。也就是说
+    用 RT 后端遥操作时夹爪不动；要连夹爪一起遥操作请用 `DoraJogFollower`。
+
+    对 DM 臂这类"夹爪和臂在同一总线"的机械臂，可把 `gripper_slot=True`，
+    把夹爪作为最后一个电机槽一起下发（此时 `gripper_finger_m` 需已换算成该
+    槽的电机语义）。
+
+    `joint_names` 必须与部署 `arm.joints` 完全一致。RT 服务器自带
+    staleness->hold、fault latch、力矩限幅，因此这里只需持续发帧；停发超过
+    hold_ms 会 HOLD、超过 fault_ms 会 LATCH（需 DISARM->ARM 恢复）。
     """
 
     joint_names: Sequence[str]
@@ -257,6 +283,10 @@ class RtFollower:
     num_arm_joints: int = field(init=False)
 
     _backend: object = field(default=None, init=False, repr=False)
+
+    # FR3 的关节刚度/阻尼（examples/profiles/motion_franka.yaml）。
+    _FR3_KP = (1200.0, 1200.0, 1200.0, 1200.0, 800.0, 600.0, 400.0)
+    _FR3_KD = (30.0, 30.0, 30.0, 30.0, 20.0, 15.0, 10.0)
 
     def __post_init__(self) -> None:
         self.joint_names = list(self.joint_names)
@@ -275,15 +305,16 @@ class RtFollower:
 
     def _gains(self) -> tuple[np.ndarray, np.ndarray]:
         n = len(self.joint_names)
+        is_fr3 = n == 7 and not self.gripper_slot
         kp = (
             np.asarray(self.kp, dtype=float)
             if self.kp is not None
-            else np.full(n, 20.0)
+            else (np.asarray(self._FR3_KP) if is_fr3 else np.full(n, 20.0))
         )
         kd = (
             np.asarray(self.kd, dtype=float)
             if self.kd is not None
-            else np.full(n, 0.5)
+            else (np.asarray(self._FR3_KD) if is_fr3 else np.full(n, 0.5))
         )
         return kp, kd
 
@@ -295,12 +326,12 @@ class RtFollower:
         grip = float(st[self.num_arm_joints]) if self.gripper_slot else 0.0
         return arm, grip
 
-    def send(self, arm_q: Sequence[float], gripper_width_m: float) -> None:
+    def send(self, arm_q: Sequence[float], gripper_finger_m: float) -> None:
         assert self._backend is not None, "RtFollower.open() 未调用"
         kp, kd = self._gains()
         q = np.asarray(arm_q, dtype=float)
         if self.gripper_slot:
-            q = np.concatenate([q, [float(gripper_width_m)]])
+            q = np.concatenate([q, [float(gripper_finger_m)]])
         command = {
             "position": q,
             "velocity": np.zeros(len(q)),

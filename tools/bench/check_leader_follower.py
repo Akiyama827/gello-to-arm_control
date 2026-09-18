@@ -55,12 +55,101 @@ def check_s288_units_and_codec() -> None:
     print("s288: 单位换算 / CRC / 帧编解码 OK")
 
 
+def check_s288_leader_8motors() -> None:
+    from arm_control.leader_follower.config import build_leader, config_from_dict
+
+    cfg = config_from_dict(
+        {
+            "leader": {
+                "kind": "s288", "n_arm_joints": 7, "with_gripper": True,
+                "bus": "fake", "motor_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+                "gripper_index": 7, "gripper_open_rad": 0.8, "gripper_close_rad": 0.0,
+                "joint_signs": [1, -1, -1, -1, 1, 1, 1, 1], "alpha": 1.0,
+            },
+            "follower": {"kind": "fake", "n_arm_joints": 6},
+            "mapping": {
+                "joints": [{"src": i} for i in range(6)],
+                "gripper": {"src": 7},
+            },
+        }
+    )
+    leader = build_leader(cfg.leader)
+    assert leader.num_dofs() == 8
+    leader.chain.command_positions([0.1] * 7 + [0.4])
+    time.sleep(0.3)
+    state = leader.get_joint_state()
+    assert state.shape == (8,), state
+    assert abs(state[7] - 0.5) < 0.02, state  # 夹爪 0.4/0.8 -> 0.5
+
+    # 电机数与布局不符要早报错
+    bad = config_from_dict(
+        {
+            "leader": {
+                "kind": "s288", "n_arm_joints": 6, "with_gripper": True,
+                "bus": "fake", "motor_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+            },
+            "follower": {"kind": "fake", "n_arm_joints": 6},
+            "mapping": {"joints": [{"src": i} for i in range(6)]},
+        }
+    )
+    try:
+        build_leader(bad.leader)
+        raise AssertionError("电机数与 n_arm_joints 不符时应报错")
+    except ValueError:
+        pass
+    print("s288: 8 电机(7 臂 + 夹爪)装配 / 夹爪归一化 / 布局校验 OK")
+
+
+def check_dora_follower_messages() -> None:
+    """校验 DoraJogFollower 产出 jog/control/gripper 的格式（FR3 主路径）。"""
+    from arm_control.leader_follower.follower import DoraJogFollower
+    from arm_control.messages import (
+        pack_control_update,
+        unpack_control_update,
+        unpack_jog,
+        unpack_motor_command,
+    )
+
+    class FakeNode:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, object]] = []
+
+        def send_output(self, name, value=None) -> None:
+            self.sent.append((name, value))
+
+    assert unpack_control_update(pack_control_update(arm=True)) == {"arm": True}
+
+    node = FakeNode()
+    follower = DoraJogFollower(num_arm_joints=7, node=node)
+    follower.open()  # 发 control(arm=True) 使能
+    follower.send([0.1] * 7, 0.03)  # 夹爪 3cm 单指
+    follower.safe_stop()
+    follower.close()
+
+    topics = [name for name, _ in node.sent]
+    assert topics[0] == "control", topics
+    assert "jog" in topics and "gripper" in topics, topics
+
+    jog = next(v for n, v in node.sent if n == "jog")
+    assert np.allclose(unpack_jog(jog)["q"], [0.1] * 7)
+    assert unpack_jog(jog)["reason"] == "leader-follower"
+
+    gripper = next(v for n, v in node.sent if n == "gripper")
+    pos = unpack_motor_command(gripper, 2)["position"]
+    assert np.allclose(pos, [0.03, 0.03]), pos  # 单指位移，两指同值
+
+    controls = [unpack_control_update(v) for n, v in node.sent if n == "control"]
+    assert {"arm": True} in controls, controls
+    assert any(c.get("cancel") for c in controls), controls
+    print("dora: jog/control/gripper 消息格式（FR3，单指米）OK")
+
+
 def check_mapping() -> None:
     joints = [
         JointMapping(src_index=0, sign=1.0, scale=0.5, lower=-1.0, upper=1.0, max_rate=1.0),
         JointMapping(src_index=1, sign=-1.0, scale=1.0, lower=-2.0, upper=2.0),
     ]
-    grip = GripperMapping(src_index=2, open_width_m=0.08, closed_width_m=0.0)
+    grip = GripperMapping(src_index=2, open_finger_m=0.08, closed_finger_m=0.0)
     rt = Retargeter(joints=joints, gripper=grip, alpha=1.0)
     rt.auto_align(np.array([0.4, -0.3, 1.0]), np.array([0.1, -0.2]))
     rt.reset(np.array([0.1, -0.2]), 0.0)
@@ -160,20 +249,20 @@ def check_fake_loop() -> None:
 
     cfg = config_from_dict(
         {
-            "leader": {"kind": "fake", "n_arm_joints": 6, "with_gripper": True},
-            "follower": {"kind": "fake", "n_arm_joints": 6},
+            "leader": {"kind": "fake", "n_arm_joints": 7, "with_gripper": True},
+            "follower": {"kind": "fake", "n_arm_joints": 7},
             "mapping": {
                 "auto_align": True,
                 "alpha": 1.0,
                 "joints": [
                     {"src": i, "scale": 0.6, "lower": -2.9, "upper": 2.9, "max_rate": 5.0}
-                    for i in range(6)
+                    for i in range(7)
                 ],
-                "gripper": {"src": -1, "open_width_m": 0.08, "closed_width_m": 0.0},
+                "gripper": {"src": -1, "open_finger_m": 0.04, "closed_finger_m": 0.0},
             },
             "safety": {
-                "joint_lower": [-2.9] * 6,
-                "joint_upper": [2.9] * 6,
+                "joint_lower": [-2.9] * 7,
+                "joint_upper": [2.9] * 7,
                 "limits": {"track_err_rad": 0.5, "track_err_hold_s": 0.5},
             },
             "loop": {"hz": 200.0},
@@ -239,6 +328,8 @@ def check_safety_stop_propagates() -> None:
 
 if __name__ == "__main__":
     check_s288_units_and_codec()
+    check_s288_leader_8motors()
+    check_dora_follower_messages()
     check_mapping()
     check_safety_gates()
     check_collision()
