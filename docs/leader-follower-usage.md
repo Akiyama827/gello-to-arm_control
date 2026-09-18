@@ -14,7 +14,7 @@
 | 核心 | `arm_control/leader_follower/*.py` | 采集→换算→下发→安全的主从逻辑 |
 | 示例 | `examples/leader_follower_teleop.py` | 命令行跑一遍（默认全仿真） |
 | 可视化 | `examples/leader_follower_viewer.py` | MuJoCo 窗口：两条胶囊臂（无需资产） |
-| 可视化 | `examples/leader_follower_rerun.py` | Rerun 单窗口：真实 FR3 网格 + 小臂模型 + 曲线 |
+| 可视化 | `examples/leader_follower_rerun.py` | Rerun 单窗口：真实 FR3 网格 + FR3 孪生小臂 + 曲线 |
 | 可视化 | `examples/leader_follower_interactive.py` | MuJoCo 窗口：**鼠标拖拽小臂**，真实 FR3 跟随 |
 | 模型 | `arm_control/simulation/leader_arm_model.py` | 小臂模型（**等比缩小的 FR3 孪生**，网格+关节复用 FR3） |
 | 安全 | `arm_control/simulation/mj_collision_guard.py` | 同场景真实几何的两臂碰撞守卫 |
@@ -30,7 +30,7 @@
 | --- | --- | --- |
 | 快速确认逻辑没坏 | `leader_follower_teleop.py` | 否 |
 | 看动作，机器上没 FR3 资产 | `leader_follower_viewer.py`（MuJoCo） | 否 |
-| 看**真实 FR3 外形 + 小臂模型 + 曲线** | `leader_follower_rerun.py`（Rerun） | **是** |
+| 看**真实 FR3 外形 + FR3 孪生小臂 + 曲线** | `leader_follower_rerun.py`（Rerun） | **是** |
 | **用鼠标拖小臂**、看真实 FR3 实时跟随 | `leader_follower_interactive.py`（MuJoCo） | **是** |
 | 接真机 | `dora run dataflows/leader_teleop_franka.yml` | 是 |
 
@@ -82,7 +82,7 @@ PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 **第 3 步 · 看可视化**（三选一）
 
 ```fish
-# A. 真实 FR3 + 小臂模型 + 曲线（Rerun 窗口）
+# A. 真实 FR3 + FR3 孪生小臂 + 曲线（Rerun 窗口）
 PYTHONPATH=. python -B examples/leader_follower_rerun.py
 
 # B. 胶囊示意臂（MuJoCo 窗口，无需 FR3 资产）
@@ -96,7 +96,7 @@ PYTHONPATH=. python -B examples/leader_follower_interactive.py
 
 ## 4. 可视化怎么用
 
-### 4.1 Rerun：真实 FR3 外形 + 小臂模型 + 时间序列曲线
+### 4.1 Rerun：真实 FR3 外形 + FR3 孪生小臂 + 时间序列曲线
 
 ```fish
 PYTHONPATH=. python -B examples/leader_follower_rerun.py
@@ -117,13 +117,17 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py
 操作：3D 里**左键拖=旋转、右键拖=平移、滚轮=缩放**；底部时间轴可**暂停/拖动回放**；
 左侧实体树可点选高亮。停止：终端 `Ctrl-C`；Rerun 窗口单独关即可。
 
+两条臂的**底座都落在世界原点所在的同一水平面（z=0）**上，只是小臂等比缩小了
+（默认 `--leader-scale 0.75`），所以能直接比姿态。
+
 常用参数：
 
 ```fish
-PYTHONPATH=. python -B examples/leader_follower_rerun.py --duration 20      # 跑 20s
-PYTHONPATH=. python -B examples/leader_follower_rerun.py --separation 1.5   # 两臂分得更开
-PYTHONPATH=. python -B examples/leader_follower_rerun.py --collision-demo   # 演示碰撞停机
-PYTHONPATH=. python -B examples/leader_follower_rerun.py --no-spawn         # 初始化但不弹窗
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --duration 20       # 跑 20s
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --separation 1.5    # 两臂分得更开
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --leader-scale 0.6  # 小臂缩得更小
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --collision-demo    # 演示碰撞停机
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --no-spawn          # 初始化但不弹窗
 ```
 
 ### 4.2 MuJoCo：胶囊示意臂（最快，无需资产）
@@ -168,6 +172,7 @@ PYTHONPATH=. python -B examples/leader_follower_interactive.py
 
 ```fish
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --separation 1.4   # 分得更开
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --leader-scale 0.6 # 小臂缩得更小
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --duration 60      # 60s 后停止下发
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --no-collision-guard
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --rerun             # 边拖边看曲线
@@ -186,6 +191,26 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd 
 # 回放
 .venv/bin/rerun /tmp/teleop.rrd
 ```
+
+### 4.5 小臂模型（FR3 孪生）怎么来的
+
+宇树 S288 没有公开的网格/URDF。为了让"小臂和大臂的关节对应关系"一眼可见，本仓库
+**不再用 capsule 拼近似外形**，而是直接复用真实 FR3 的描述做一条**等比缩小的 FR3**：
+
+- 同一个 `MjSpec`（`arm_control/simulation/leader_arm_model.py`）里，用
+  `mujoco.MjSpec.attach` 把 FR3 整体复制一份并缩放（`--leader-scale`），网格自动
+  加 `leader_` 前缀，挂到大臂基座左侧 `(-separation, 0, 0)` 处；
+- 于是 `leader_fr3_joint_i ↔ fr3_joint_i` **一一对应**，夹爪用 Franka Hand 双指；
+- `color_arm_links()` 按连杆编号给**两条臂同号连杆上同一颜色**（J1..J7 七彩、夹爪灰），
+  Rerun 里再在每个关节位置标 `J1..J7`；
+- 两臂底座都在 **z=0**，只是缩放比不同。
+
+> 因为小臂是 FR3 孪生，仿真的关节映射会调用 `force_identity_arm_mapping()` 改成
+> **直连**（`sign=+1`、`scale=1`），这样拖小臂时大臂是"同形跟动"而不是"镜像"。
+> 这**只影响仿真查看器**；真机 S288 的 `sign/offset` 标定仍在 YAML 里，不受影响。
+
+想改配色/缩放：颜色在 `leader_arm_model.py` 的 `JOINT_COLORS`；缩放用
+`--leader-scale`（Rerun 默认 0.75、交互式默认 0.8）。
 
 ---
 
@@ -263,8 +288,22 @@ ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
 `--separation 1.5`（Rerun）或 `--separation 2.2`（MuJoCo 胶囊版）。
 
 **Q：交互式窗口里拖不动小臂？**
-要按住 **Ctrl** 再拖（MuJoCo 的扰动键）；直接左键拖是旋转视角。拖动时请点住
-小臂的连杆/末端，不要点地面或大臂。
+脚本**默认已经选中小臂末端**，直接按住 **Ctrl + 右键拖动 = 平移施力**（推荐），
+**Ctrl + 左键拖动 = 旋转施力**。想拖别的连杆：先**鼠标左键双击**选中那一节，
+再按上面的方式拖。直接左键拖是旋转视角，不会拖小臂。
+
+**Q：小臂为什么长得和大臂一样，不像宇树 S288？**
+因为 S288 没有公开网格。为让关节对应关系直观，小臂直接用**等比缩小的 FR3**
+作视觉替身（见 4.5 节）；它**不代表 S288 的真实外观**，真机标定仍按 YAML 里的
+`sign/offset` 走。
+
+**Q：两臂底座不在同一水平面 / 想调小臂大小？**
+两臂底座都已固定在 **z=0** 同一水平面。小臂大小用 `--leader-scale`（Rerun 默认
+0.75、交互式默认 0.8）；间距用 `--separation`。
+
+**Q：`.rrd` 里小臂网格缺失 / 只落了一部分？**
+已在 `feat/leader-follower-teleop` 修复：脚本结束会主动 `rr.disconnect()` 落盘
+（MuJoCo 退出时的段错误会跳过析构、丢缓冲）。`git pull` 到最新再重跑。
 
 **Q：交互式窗口里大臂突然不动了、显示 `[安全停机]`？**
 这是安全门生效（例如把小臂拖到让大臂目标越限，或两臂最近距离 ≤ 1cm）。
@@ -306,7 +345,7 @@ PYTHONPATH=. python -B tools/bench/check_leader_follower.py
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --collision-demo --duration 10
 
-# 可视化：真实 FR3 + 小臂模型 + 曲线
+# 可视化：真实 FR3 + FR3 孪生小臂 + 曲线
 PYTHONPATH=. python -B examples/leader_follower_rerun.py
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd --duration 10
 .venv/bin/rerun /tmp/teleop.rrd
