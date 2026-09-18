@@ -40,7 +40,7 @@
 
 ```bash
 # 0) 克隆仓库到任意目录（示例目录名用 arm_control）
-git clone https://github.com/Akiyama827/git.git arm_control
+git clone https://github.com/Akiyama827/gello-to-arm_control.git arm_control
 cd arm_control
 
 # 1) 虚拟环境（bash/zsh 用 activate；fish 用 activate.fish）

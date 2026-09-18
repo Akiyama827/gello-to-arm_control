@@ -16,7 +16,7 @@ records; they are not current operating instructions.
 ## Quickstart（新机器：仿真 + 3D 可视化）
 
 ```bash
-git clone https://github.com/Akiyama827/git.git arm_control   # 换成你的仓库地址
+git clone https://github.com/Akiyama827/gello-to-arm_control.git arm_control   # 换成你的仓库地址
 cd arm_control
 python3 -m venv .venv && source .venv/bin/activate            # fish: source .venv/bin/activate.fish
 pip install -e '.[sim,viz,assets]'                            # 想锁版本：pip install -r requirements.txt
