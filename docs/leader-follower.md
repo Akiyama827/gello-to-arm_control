@@ -44,6 +44,7 @@ DryRunFollower / DoraJogFollower / RtFollower / FakeFollower （下发 FR3）
 | `nodes/leader_teleop.py` | 上述节点的 Dora 可执行薄壳 |
 | `dataflows/leader_teleop_franka.yml` | 真机 FR3 遥操作 Dora 图（本节点作为唯一运动源） |
 | `examples/leader_follower_teleop.py` | 可运行示例（默认全仿真） |
+| `examples/leader_follower_viewer.py` | MuJoCo 3D 可视化：两条 7-DOF 臂实时跟随（无需外部资产） |
 | `examples/configs/leader_follower.yaml` | 示例配置 |
 | `tools/bench/check_leader_follower.py` | 离线自检 |
 
@@ -165,6 +166,29 @@ PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 # 带玩具碰撞守卫，演示两臂碰撞停机
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --collision-demo --duration 10
 ```
+
+### 3D 可视化（MuJoCo 窗口）
+
+`examples/leader_follower_viewer.py` 在**后台线程**跑真正的 `TeleopLoop`，主线程用
+MuJoCo 原生窗口把两条程序化 7-DOF capsule 臂实时驱动出来：左侧蓝=小臂(leader)，
+右侧橙=大臂(follower 实测)。窗口不需要 FR3/URDF/mesh 资产，`mujoco` 装上即可；
+角标显示 tick、跟踪误差与两臂最近距离，安全停机时变红并给出原因。核心遥操作代码
+零改动（用轻量代理记录关节状态）。
+
+```bash
+# 边跑边看（默认无限时，关闭窗口退出）
+PYTHONPATH=. python -B examples/leader_follower_viewer.py
+# 跑 20s 后停在末态，窗口留着让你观察
+PYTHONPATH=. python -B examples/leader_follower_viewer.py --duration 20
+# 用玩具碰撞守卫演示“两臂将碰 -> 停机”
+PYTHONPATH=. python -B examples/leader_follower_viewer.py --collision-demo
+# 无窗口自检（CI/无显示环境用）
+PYTHONPATH=. python -B examples/leader_follower_viewer.py --headless --duration 3
+```
+
+> 说明：Wayland 会话下 MuJoCo/GLFW 会打印 `libdecor` 与一次 `OpenGL error 0x502`
+> 的告警，属该显示环境的已知无害提示，窗口照常工作。若窗口起不来，可退到
+> `--headless` 自检，或换 X11 会话运行。
 
 真机 Dora 图（需部署配置：`leader.kind: s288` + `follower.kind: dora`）：
 

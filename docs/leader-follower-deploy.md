@@ -26,6 +26,7 @@
 | `examples/configs/leader_follower.yaml` | 全仿真示例配置（fake/fake） | 否 |
 | `examples/configs/leader_follower_real.example.yaml` | **真机配置模板**，复制后按现场标定 | **是** |
 | `examples/leader_follower_teleop.py` | 单机可运行示例（默认全仿真） | 否 |
+| `examples/leader_follower_viewer.py` | MuJoCo 3D 可视化（两条胶囊臂实时跟随，无需资产） | 否 |
 | `tools/bench/check_leader_follower.py` | 离线自检（无硬件） | 否 |
 | `docs/leader-follower.md` | 设计与原理 | 否 |
 | `docs/leader-follower-deploy.md` | 本文档 | 否 |
@@ -219,7 +220,9 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 
 1. **离线自检**：`PYTHONPATH=. python -B tools/bench/check_leader_follower.py` 全绿。
 2. **单机仿真**：`PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10`，
-   观察 mapping 方向与周期。
+   观察 mapping 方向与周期。想直观看动作就开
+   `PYTHONPATH=. python -B examples/leader_follower_viewer.py --duration 20`（MuJoCo 3D
+   窗口，两条臂实时跟随；角标有跟踪误差/最近距离；`--collision-demo` 可看到逼近后停机）。
 3. **碰撞演示**：`... examples/leader_follower_teleop.py --collision-demo --duration 10`，
    确认逼近时安全停机。真机高保真两臂碰撞建议把 `MuJoCoCollisionWorld`（小臂作
    场景 actor）包成 `CallableCollisionGuard`，在 `node.py` 的
