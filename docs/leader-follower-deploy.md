@@ -29,7 +29,8 @@ Franka Hand）。
 | `examples/configs/leader_follower_real.example.yaml` | **真机配置模板**，复制后按现场标定 | **是** |
 | `examples/leader_follower_teleop.py` | 单机可运行示例（默认全仿真） | 否 |
 | `examples/leader_follower_viewer.py` | MuJoCo 3D 可视化（两条胶囊臂实时跟随，无需资产） | 否 |
-| `examples/leader_follower_rerun.py` | Rerun 可视化（真实 FR3 网格 + 时间序列曲线） | 否 |
+| `examples/leader_follower_rerun.py` | Rerun 可视化（真实 FR3 网格 + 小臂模型 + 时间序列曲线） | **是** |
+| `examples/leader_follower_interactive.py` | MuJoCo 交互可视化（鼠标拖拽小臂 -> 真实 FR3 跟随） | **是** |
 | `tools/assets/fetch_fr3_description.py` | 自动获取并 staging FR3 描述到 `franka/` | 否 |
 | `tools/bench/check_leader_follower.py` | 离线自检（无硬件） | 否 |
 | `docs/leader-follower.md` | 设计与原理 | 否 |

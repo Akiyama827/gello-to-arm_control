@@ -10,6 +10,7 @@ qpos 并 sync。核心代码零改动——用轻量代理包住 leader/follower
 
     python -B examples/leader_follower_viewer.py                  # 边跑边看
     python -B examples/leader_follower_viewer.py --duration 20    # 20s 后停
+    python -B examples/leader_follower_viewer.py --separation 2.2  # 两臂分得更开
     python -B examples/leader_follower_viewer.py --collision-demo # 演示碰撞停机
     python -B examples/leader_follower_viewer.py --headless --duration 3  # 无窗口自检
 
@@ -81,7 +82,10 @@ def _arm_xml(prefix: str, scale: float, pos: str, quat: str, rgba: str) -> str:
     return "\n".join(out)
 
 
-def build_model_xml() -> str:
+def build_model_xml(separation: float = 1.8) -> str:
+    """``separation`` = 两条臂基座之间的总距离（米），各放在中线的两侧。"""
+    lead_x = -separation / 2.0
+    foll_x = separation / 2.0
     return f"""<mujoco model="leader_follower_teleop">
   <compiler angle="radian"/>
   <option gravity="0 0 0"/>
@@ -91,11 +95,11 @@ def build_model_xml() -> str:
   </visual>
   <worldbody>
     <light pos="0 0 3" dir="0 0 -1" directional="true"/>
-    <geom name="floor" type="plane" size="3 3 0.1" rgba="0.22 0.24 0.28 1"/>
-    <geom name="midline" type="box" size="0.004 0.6 0.001" pos="0 0 0.001"
+    <geom name="floor" type="plane" size="4 4 0.1" rgba="0.22 0.24 0.28 1"/>
+    <geom name="midline" type="box" size="0.004 0.9 0.001" pos="0 0 0.001"
           rgba="0.5 0.5 0.55 0.6"/>
-    {_arm_xml("lead", 0.55, "-0.62 0 0.30", "1 0 0 0", "0.20 0.62 1.0 1.0")}
-    {_arm_xml("foll", 1.00, "0.62 0 0.30", "0 0 0 1", "1.00 0.55 0.10 1.0")}
+    {_arm_xml("lead", 0.55, f"{lead_x:.3f} 0 0.30", "1 0 0 0", "0.20 0.62 1.0 1.0")}
+    {_arm_xml("foll", 1.00, f"{foll_x:.3f} 0 0.30", "0 0 0 1", "1.00 0.55 0.10 1.0")}
   </worldbody>
 </mujoco>
 """
@@ -181,7 +185,8 @@ def run_headless(loop: TeleopLoop, rec: _Record, duration_s: float) -> None:
 # --------------------------------------------------------------------------- #
 # MuJoCo 窗口
 # --------------------------------------------------------------------------- #
-def run_viewer(loop: TeleopLoop, rec: _Record, monitor, duration_s, hold_s: float = 0.0) -> int:
+def run_viewer(loop: TeleopLoop, rec: _Record, monitor, duration_s, hold_s: float = 0.0,
+               separation: float = 1.8) -> int:
     try:
         import mujoco
         import mujoco.viewer
@@ -190,7 +195,7 @@ def run_viewer(loop: TeleopLoop, rec: _Record, monitor, duration_s, hold_s: floa
         print("[viewer] 可改用 --headless 自检，或安装 mujoco/修复显示环境。", file=sys.stderr)
         return 2
 
-    model = mujoco.MjModel.from_xml_string(build_model_xml())
+    model = mujoco.MjModel.from_xml_string(build_model_xml(separation))
     data = mujoco.MjData(model)
 
     joint_adr: dict[str, int] = {}
@@ -260,6 +265,7 @@ def main(argv=None) -> int:
     parser.add_argument("--headless", action="store_true", help="不开窗口，仅自检并打印")
     parser.add_argument("--hold", type=float, default=0.0,
                         help="遥操作结束后窗口再保留几秒（0=一直保留到手动关闭）")
+    parser.add_argument("--separation", type=float, default=1.8, help="两臂基座间距（米）")
     parser.add_argument("--collision-demo", action="store_true", help="用玩具球体守卫演示碰撞停机")
     parser.add_argument("--hz", type=float, default=None, help="覆盖 loop.hz")
     args = parser.parse_args(argv)
@@ -301,7 +307,8 @@ def main(argv=None) -> int:
         return 0
 
     print("[viewer] 打开 MuJoCo 窗口；关闭窗口或 Ctrl-C 结束。", flush=True)
-    return run_viewer(loop, rec, monitor, args.duration, hold_s=args.hold)
+    return run_viewer(loop, rec, monitor, args.duration, hold_s=args.hold,
+                      separation=args.separation)
 
 
 if __name__ == "__main__":

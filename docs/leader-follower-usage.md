@@ -14,20 +14,24 @@
 | 核心 | `arm_control/leader_follower/*.py` | 采集→换算→下发→安全的主从逻辑 |
 | 示例 | `examples/leader_follower_teleop.py` | 命令行跑一遍（默认全仿真） |
 | 可视化 | `examples/leader_follower_viewer.py` | MuJoCo 窗口：两条胶囊臂（无需资产） |
-| 可视化 | `examples/leader_follower_rerun.py` | Rerun 单窗口：真实 FR3 网格 + 曲线 |
+| 可视化 | `examples/leader_follower_rerun.py` | Rerun 单窗口：真实 FR3 网格 + 小臂模型 + 曲线 |
+| 可视化 | `examples/leader_follower_interactive.py` | MuJoCo 窗口：**鼠标拖拽小臂**，真实 FR3 跟随 |
+| 模型 | `arm_control/simulation/leader_arm_model.py` | 程序化小臂模型（S288 近似外形） |
+| 安全 | `arm_control/simulation/mj_collision_guard.py` | 同场景真实几何的两臂碰撞守卫 |
 | 配置 | `examples/configs/leader_follower.yaml` | 仿真配置（fake/fake） |
 | 配置 | `examples/configs/leader_follower_real.example.yaml` | 真机配置模板 |
 | 自检 | `tools/bench/check_leader_follower.py` | 无硬件离线自检 |
 | 资产 | `tools/assets/fetch_fr3_description.py` | 获取并 staging FR3 描述到 `franka/` |
 | 真机 | `dataflows/leader_teleop_franka.yml` | 真机 Dora 图 |
 
-三种运行形态，按需选：
+四种运行形态，按需选：
 
 | 我想…… | 用哪个 | 需要 FR3 资产？ |
 | --- | --- | --- |
 | 快速确认逻辑没坏 | `leader_follower_teleop.py` | 否 |
 | 看动作，机器上没 FR3 资产 | `leader_follower_viewer.py`（MuJoCo） | 否 |
-| 看**真实 FR3 外形 + 曲线** | `leader_follower_rerun.py`（Rerun） | **是** |
+| 看**真实 FR3 外形 + 小臂模型 + 曲线** | `leader_follower_rerun.py`（Rerun） | **是** |
+| **用鼠标拖小臂**、看真实 FR3 实时跟随 | `leader_follower_interactive.py`（MuJoCo） | **是** |
 | 接真机 | `dora run dataflows/leader_teleop_franka.yml` | 是 |
 
 ---
@@ -75,21 +79,24 @@ PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 
 看到 `[teleop] tick=... 实际≈100Hz ...` 就对了。
 
-**第 3 步 · 看可视化**（二选一）
+**第 3 步 · 看可视化**（三选一）
 
 ```fish
-# A. 真实 FR3 + 曲线（Rerun 窗口）
+# A. 真实 FR3 + 小臂模型 + 曲线（Rerun 窗口）
 PYTHONPATH=. python -B examples/leader_follower_rerun.py
 
 # B. 胶囊示意臂（MuJoCo 窗口，无需 FR3 资产）
 PYTHONPATH=. python -B examples/leader_follower_viewer.py
+
+# C. 鼠标拖拽小臂、真实 FR3 实时跟随（MuJoCo 窗口，需 FR3 资产）
+PYTHONPATH=. python -B examples/leader_follower_interactive.py
 ```
 
 ---
 
 ## 4. 可视化怎么用
 
-### 4.1 Rerun：真实 FR3 外形 + 时间序列曲线
+### 4.1 Rerun：真实 FR3 外形 + 小臂模型 + 时间序列曲线
 
 ```fish
 PYTHONPATH=. python -B examples/leader_follower_rerun.py
@@ -99,7 +106,8 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py
 
 - **3D 视图**
   - 右侧 = **真实 FR3**（视觉网格），跟随大臂实测关节角，手指跟夹爪开合。
-  - 左侧 = **小臂**骨架线框（蓝色；宇树 S288 无公开网格，用 7 段线表示）。
+  - 左侧 = **小臂模型**（蓝色；宇树 S288 无公开网格，用 capsule 连杆 + 夹爪近似，
+    不是官方外形），跟随 leader 关节角，夹爪开合。
 - **Time series 视图**（Rerun 自动聚合）：每个关节的
   `plots/leader/qN`、`plots/follower_cmd/qN`（指令）、`plots/follower_meas/qN`（实测）、
   `plots/track_err/qN`（跟踪误差），以及 `plots/gripper_m`、`plots/collision_distance_m`。
@@ -111,6 +119,7 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py
 
 ```fish
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --duration 20      # 跑 20s
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --separation 1.5   # 两臂分得更开
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --collision-demo   # 演示碰撞停机
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --no-spawn         # 初始化但不弹窗
 ```
@@ -126,11 +135,41 @@ PYTHONPATH=. python -B examples/leader_follower_viewer.py
 
 ```fish
 PYTHONPATH=. python -B examples/leader_follower_viewer.py --duration 20
+PYTHONPATH=. python -B examples/leader_follower_viewer.py --separation 2.2       # 两臂分得更开
 PYTHONPATH=. python -B examples/leader_follower_viewer.py --collision-demo
 PYTHONPATH=. python -B examples/leader_follower_viewer.py --headless --duration 3   # 无窗口自检
 ```
 
-### 4.3 存盘 / 回放（无显示环境或存档）
+### 4.3 MuJoCo：鼠标拖拽小臂，真实 FR3 实时跟随（交互式）
+
+```fish
+PYTHONPATH=. python -B examples/leader_follower_interactive.py
+```
+
+窗口里：
+
+- 左 = **小臂模型**（蓝色，capsule 近似外形），**可用鼠标拖拽**；
+- 右 = **真实 FR3 网格**，按 `Retargeter` 实时跟动。
+
+拖拽方式：按住 **Ctrl + 鼠标左键拖动连杆/末端**（MuJoCo 原生扰动 = 施加弹簧力，
+小臂关节在阻尼下运动）。其它：左键=旋转视角、右键=平移、滚轮=缩放。
+
+拖出来的小臂关节角会喂给**真正的 `TeleopLoop`**（与真机同一条安全链路：`auto_align`、
+关节限位/跳变、跟踪误差、leader 超时、以及用**同场景真实几何**算的两臂最近距离碰撞
+守卫）。所以越限 / 两臂将碰都会**安全停机并冻结大臂**，左上角显示 `[安全停机]`。
+
+```fish
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --separation 1.4   # 分得更开
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --duration 60      # 60s 后停止下发
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --no-collision-guard
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --rerun             # 边拖边看曲线
+```
+
+> 小臂外形是**近似**的：宇树 S288 没有公开网格/URDF，这里用 capsule 连杆 + 夹爪
+> 拼出可辨识、可拖拽的模型；真实零位/转向仍以 `S288LeaderArm` 的
+> `joint_offsets / joint_signs` 标定为准。
+
+### 4.4 存盘 / 回放（无显示环境或存档）
 
 ```fish
 # Rerun 版存成 .rrd（不弹窗）
@@ -180,6 +219,11 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd 
 演示：加 `--collision-demo` 会装一个玩具球体守卫（两臂各 6 球、沿 y 分开），
 跑到逼近时你会看到它自动停机并打印原因。
 
+交互式查看器 `leader_follower_interactive.py` 默认用更保真的
+`MjGeomDistanceGuard`：在两臂所在的同一个 MuJoCo 模型里，用 `mj_geomDistance`
+逐对算 leader 几何与 FR3 几何的最近有符号距离，直接作为上面这道碰撞门。
+想关掉可用 `--no-collision-guard`。
+
 ---
 
 ## 7. 真机运行（简述）
@@ -201,8 +245,21 @@ ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
 ## 8. 常见问题（FAQ）
 
 **Q：Rerun 里只看到小臂线框、没有大臂 FR3？**
-已在 `feat/leader-follower-teleop` 修复（网格改为 `static` 记录）。
-先 `git pull` 到最新，再重跑。若仍无，检查 `franka/urdf/fr3.urdf` 是否存在。
+已在 `feat/leader-follower-teleop` 修复（网格改为 `static` 记录）；小臂也已从线框
+换成 capsule 模型。先 `git pull` 到最新，再重跑。若仍无，检查
+`franka/urdf/fr3.urdf` 是否存在。
+
+**Q：两臂离得太近 / 想分得更开？**
+三个可视化都支持 `--separation <米>`（两臂基座间距），例如
+`--separation 1.5`（Rerun）或 `--separation 2.2`（MuJoCo 胶囊版）。
+
+**Q：交互式窗口里拖不动小臂？**
+要按住 **Ctrl** 再拖（MuJoCo 的扰动键）；直接左键拖是旋转视角。拖动时请点住
+小臂的连杆/末端，不要点地面或大臂。
+
+**Q：交互式窗口里大臂突然不动了、显示 `[安全停机]`？**
+这是安全门生效（例如把小臂拖到让大臂目标越限，或两臂最近距离 ≤ 1cm）。
+重新运行脚本即可恢复；这是预期行为，不是崩溃。
 
 **Q：脚本说找不到 viewer / 不弹窗？**
 几乎都是没激活 venv（`rerun` 不在 PATH）。`source .venv/bin/activate.fish` 后再跑；
@@ -240,7 +297,7 @@ PYTHONPATH=. python -B tools/bench/check_leader_follower.py
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --collision-demo --duration 10
 
-# 可视化：真实 FR3 + 曲线
+# 可视化：真实 FR3 + 小臂模型 + 曲线
 PYTHONPATH=. python -B examples/leader_follower_rerun.py
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd --duration 10
 .venv/bin/rerun /tmp/teleop.rrd
@@ -248,6 +305,10 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd 
 # 可视化：胶囊示意臂
 PYTHONPATH=. python -B examples/leader_follower_viewer.py
 PYTHONPATH=. python -B examples/leader_follower_viewer.py --headless --duration 3
+
+# 可视化：鼠标拖拽小臂 -> 真实 FR3 跟随（Ctrl+左键拖连杆）
+PYTHONPATH=. python -B examples/leader_follower_interactive.py
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --separation 1.4 --rerun
 
 # FR3 资产
 python tools/assets/fetch_fr3_description.py

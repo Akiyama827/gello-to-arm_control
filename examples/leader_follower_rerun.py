@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""真实 FR3 外形 + 时间序列曲线，单窗口（Rerun）。
+"""真实 FR3 外形 + 小臂模型 + 时间序列曲线，单窗口（Rerun）。
 
-与 ``examples/leader_follower_viewer.py``（MuJoCo 窗口、胶囊示意臂）互补：
-这里用 **staged 的真实 FR3 网格**渲染大臂，并在同一 Rerun 录制里画曲线：
+与另外两个查看器互补：
 
-* 3D：右侧 = 真实 FR3（视觉网格，跟随 ``follower.measured``；手指跟夹爪）；
-       左侧 = 小臂(leader)骨架线框（S288 无公开网格，用 7 段线示意）。
-* 曲线：每个关节的 leader / follower 指令 / follower 实测 / 跟踪误差，
-        以及夹爪、两臂最近距离。
+* ``examples/leader_follower_viewer.py``       MuJoCo 窗口、两条胶囊示意臂；
+* ``examples/leader_follower_interactive.py``  MuJoCo 窗口、可**鼠标拖拽**小臂；
+* 本文件：Rerun 单窗口，用 **staged 的真实 FR3 网格** + **程序化小臂模型**
+  （S288 无公开网格，capsule 近似）一起画，并在同一录制里画曲线。
+
+3D：
+* 右侧 = 真实 FR3（视觉网格，跟随 ``follower.measured``；手指跟夹爪）；
+* 左侧 = 小臂模型（capsule 连杆 + 夹爪，跟随 ``leader``）。
+曲线：每个关节的 leader / follower 指令 / follower 实测 / 跟踪误差，
+以及夹爪、两臂最近距离。
 
 前置：先 staging 真实 FR3 描述（脚本会自动 clone franka_description + 用
 xacro 生成 URDF + 把网格转成 .stl）：
@@ -20,6 +25,7 @@ xacro 生成 URDF + 把网格转成 .stl）：
     source .venv/bin/activate.fish
     PYTHONPATH=. python -B examples/leader_follower_rerun.py                 # 开 Rerun 窗口
     PYTHONPATH=. python -B examples/leader_follower_rerun.py --duration 20   # 跑 20s
+    PYTHONPATH=. python -B examples/leader_follower_rerun.py --separation 1.4
     PYTHONPATH=. python -B examples/leader_follower_rerun.py --collision-demo
     PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/opencode/teleop.rrd  # 存盘，无窗口
 
@@ -51,6 +57,11 @@ from arm_control.leader_follower.config import (  # noqa: E402
     build_pipeline,
     config_from_yaml,
 )
+from arm_control.simulation.leader_arm_model import (  # noqa: E402
+    GRIP_TRAVEL_M,
+    build_combined_spec,
+    joint_qpos_addresses,
+)
 from arm_control.simulation.mujoco_model import build_mujoco_model  # noqa: E402
 
 FR3_URDF = ROOT / "franka" / "urdf" / "fr3.urdf"
@@ -58,69 +69,32 @@ ARM_JOINTS = [f"fr3_joint{i}" for i in range(1, 8)]
 FINGER_JOINTS = ["fr3_finger_joint1", "fr3_finger_joint2"]
 FINGER_MAX_M = 0.04
 APP_ID = "arm_control_leader_follower"
-
-# 小臂骨架：与 MuJoCo 版同一套连杆约定（基座 yaw + 平面 pitch + 前臂/腕 roll）。
-_LINKS = [
-    ("0 0 1", 0.10),
-    ("0 1 0", 0.30),
-    ("0 1 0", 0.27),
-    ("1 0 0", 0.11),
-    ("0 1 0", 0.10),
-    ("1 0 0", 0.08),
-    ("0 1 0", 0.07),
-]
-_LEADER_SCALE = 0.6
-_LEADER_BASE = (-0.65, 0.0, 0.25)
 _LEADER_COLOR = [80, 160, 255]
 
 
 # --------------------------------------------------------------------------- #
-# 小臂正运动学（骨架线框）
-# --------------------------------------------------------------------------- #
-def _axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:
-    axis = np.asarray(axis, dtype=float)
-    axis = axis / np.linalg.norm(axis)
-    x, y, z = axis
-    K = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
-    R = np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)
-    T = np.eye(4)
-    T[:3, :3] = R
-    return T
-
-
-def leader_fk(q: np.ndarray, scale: float, base) -> np.ndarray:
-    """返回 7 段骨的 8 个端点（世界坐标）。"""
-    T = np.eye(4)
-    T[:3, 3] = np.asarray(base, dtype=float)
-    pts = [T[:3, 3].copy()]
-    for i, (axis, length) in enumerate(_LINKS):
-        T = T @ _axis_angle(np.array([float(a) for a in axis.split()]), float(q[i]))
-        tip = T @ np.array([length * scale, 0.0, 0.0, 1.0])
-        pts.append(tip[:3].copy())
-        T = T.copy()
-        T[:3, 3] = tip[:3]
-    return np.asarray(pts)
-
-
-# --------------------------------------------------------------------------- #
-# 只渲染视觉网格（group==1）的镜像器：资产上传一次，每帧只发 Transform3D
+# 只渲染视觉几何（group==1）的镜像器：资产上传一次，每帧只发 Transform3D
 # --------------------------------------------------------------------------- #
 class _VisualMirror:
-    def __init__(self, model, data, prefix: str) -> None:
+    def __init__(self, model, data, prefix: str, geom_prefix: str) -> None:
         self._m = model
         self._d = data
         self._prefix = prefix.rstrip("/")
         self._geoms: list[tuple[int, str]] = []
         for i in range(model.ngeom):
-            if model.geom_group[i] != 1:  # 0=碰撞 1=视觉 3=视觉的碰撞孪生
+            if model.geom_group[i] != 1:  # 0=碰撞 1=视觉
+                continue
+            name = model.geom(i).name or f"geom{i}"
+            if not name.startswith(geom_prefix):
                 continue
             kind = int(model.geom_type[i])
             if kind not in (
                 int(mujoco.mjtGeom.mjGEOM_MESH),
                 int(mujoco.mjtGeom.mjGEOM_BOX),
+                int(mujoco.mjtGeom.mjGEOM_CAPSULE),
+                int(mujoco.mjtGeom.mjGEOM_CYLINDER),
             ):
                 continue
-            name = model.geom(i).name or f"geom{i}"
             body = model.body(model.geom_bodyid[i]).name or "world"
             entity = f"{self._prefix}/{body}/{name}"
             self._log_asset(i, entity)
@@ -133,25 +107,52 @@ class _VisualMirror:
         return [int(round(c * 255)) for c in rgba]
 
     def _log_asset(self, i: int, entity: str) -> None:
+        m = self._m
         color = self._color(i)
-        if int(self._m.geom_type[i]) == int(mujoco.mjtGeom.mjGEOM_MESH):
-            did = self._m.geom_dataid[i]
-            v0, nv = self._m.mesh_vertadr[did], self._m.mesh_vertnum[did]
-            f0, nf = self._m.mesh_faceadr[did], self._m.mesh_facenum[did]
+        kind = int(m.geom_type[i])
+        size = m.geom_size[i]
+        if kind == int(mujoco.mjtGeom.mjGEOM_MESH):
+            did = m.geom_dataid[i]
+            v0, nv = m.mesh_vertadr[did], m.mesh_vertnum[did]
+            f0, nf = m.mesh_faceadr[did], m.mesh_facenum[did]
             rr.log(
                 entity,
                 rr.Mesh3D(
-                    vertex_positions=self._m.mesh_vert[v0 : v0 + nv],
-                    triangle_indices=self._m.mesh_face[f0 : f0 + nf],
+                    vertex_positions=m.mesh_vert[v0 : v0 + nv],
+                    triangle_indices=m.mesh_face[f0 : f0 + nf],
                     albedo_factor=color,
                 ),
                 static=True,  # 几何是 timeless：否则会落在 log_time 时间轴，切到 tick 就不显示
             )
-        else:
+        elif kind == int(mujoco.mjtGeom.mjGEOM_BOX):
             rr.log(
                 entity,
-                rr.Boxes3D(
-                    half_sizes=[self._m.geom_size[i]], colors=[color], fill_mode="solid"
+                rr.Boxes3D(half_sizes=[size], colors=[color], fill_mode="solid"),
+                static=True,
+            )
+        elif kind == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+            # Rerun 胶囊从 (0,0,0) 沿 +z 到 (0,0,length)（端帽球心）；MuJoCo 的
+            # capsule 以 geom 中心为原点、半长 size[1]。故 length=2*size[1]，
+            # 并沿 -z 平移 size[1] 把它对回中心。
+            rr.log(
+                entity,
+                rr.Capsules3D(
+                    lengths=[2.0 * float(size[1])],
+                    radii=[float(size[0])],
+                    translations=[[0.0, 0.0, -float(size[1])]],
+                    colors=[color],
+                    fill_mode="solid",
+                ),
+                static=True,
+            )
+        else:  # CYLINDER：Rerun 以中心为原点，length 即全长
+            rr.log(
+                entity,
+                rr.Cylinders3D(
+                    lengths=[2.0 * float(size[1])],
+                    radii=[float(size[0])],
+                    colors=[color],
+                    fill_mode="solid",
                 ),
                 static=True,
             )
@@ -173,6 +174,7 @@ class _VisualMirror:
 class _State:
     def __init__(self, n: int) -> None:
         self.leader = np.zeros(n)
+        self.leader_grip = 1.0  # 1=张开
         self.target = np.zeros(n)
         self.measured = np.zeros(n)
         self.gripper = 0.0
@@ -188,6 +190,8 @@ def _instrument(leader, follower, loop, st: _State) -> None:
     def get_joint_state():
         q = np.asarray(orig_get(), dtype=float)
         st.leader = q[: st.leader.size]
+        if q.size > st.leader.size:
+            st.leader_grip = float(np.clip(q[st.leader.size], 0.0, 1.0))
         return q
 
     leader.get_joint_state = get_joint_state  # type: ignore[method-assign]
@@ -229,9 +233,11 @@ def _instrument(leader, follower, loop, st: _State) -> None:
 
 # --------------------------------------------------------------------------- #
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="真实 FR3 + 时间序列（Rerun）")
+    parser = argparse.ArgumentParser(description="真实 FR3 + 小臂模型 + 时间序列（Rerun）")
     parser.add_argument("--config", default=str(ROOT / "examples/configs/leader_follower.yaml"))
     parser.add_argument("--duration", type=float, default=None, help="遥操作运行时长（秒）")
+    parser.add_argument("--separation", type=float, default=1.15, help="两臂基座间距（米）")
+    parser.add_argument("--leader-scale", type=float, default=0.75, help="小臂模型缩放")
     parser.add_argument("--collision-demo", action="store_true", help="用玩具球体守卫演示碰撞停机")
     parser.add_argument("--save", default=None, help="把录制存成 .rrd（不弹窗，适合无显示/存档）")
     parser.add_argument("--no-spawn", action="store_true", help="初始化 Rerun 但不自动拉起查看器")
@@ -263,16 +269,25 @@ def main(argv=None) -> int:
     else:
         print("[rerun] 已初始化，但未自动拉起查看器（--no-spawn）", flush=True)
 
-    # --- 真实 FR3 模型 + 视觉镜像 ---
+    # --- 合并模型：真实 FR3 网格 + 程序化小臂 ---
     cache = Path(tempfile.gettempdir()) / "arm_control_fr3_mjcache"
     staged = build_mujoco_model(FR3_URDF, cache_dir=cache, keep_visual=True)
-    model = mujoco.MjModel.from_xml_path(str(staged))
+    spec, refs = build_combined_spec(
+        str(staged),
+        leader_position=(-args.separation, 0.0, 0.30),
+        leader_scale=args.leader_scale,
+        leader_rgba=[c / 255.0 for c in _LEADER_COLOR] + [1.0],
+    )
+    model = spec.compile()
     data = mujoco.MjData(model)
-    qadr = {
-        name: int(model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)])
-        for name in (*ARM_JOINTS, *FINGER_JOINTS)
-    }
-    mirror = _VisualMirror(model, data, prefix="follower")
+
+    qadr = joint_qpos_addresses(model, ARM_JOINTS + FINGER_JOINTS)
+    leader_adr = joint_qpos_addresses(model, refs.joint_names)
+    leader_arm_adr = [leader_adr[n] for n in refs.arm_joint_names]
+    leader_grip_adr = leader_adr.get(refs.gripper_name) if refs.gripper_name else None
+
+    follower_mirror = _VisualMirror(model, data, prefix="follower", geom_prefix="fr3")
+    leader_mirror = _VisualMirror(model, data, prefix="leader", geom_prefix=refs.prefix)
 
     # 坐标约定放在根实体上（两只臂都在根下），静态、任何时间轴都生效
     rr.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
@@ -282,12 +297,12 @@ def main(argv=None) -> int:
     if args.collision_demo:
         import importlib.util
 
-        spec = importlib.util.spec_from_file_location(
+        spec_mod = importlib.util.spec_from_file_location(
             "leader_follower_teleop", str(ROOT / "examples" / "leader_follower_teleop.py")
         )
-        mod = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(mod)
+        mod = importlib.util.module_from_spec(spec_mod)
+        assert spec_mod.loader is not None
+        spec_mod.loader.exec_module(mod)
         guard = mod.make_demo_collision_guard(cfg.follower.n_arm_joints)
 
     leader, retargeter, follower, monitor = build_pipeline(cfg, collision_guard=guard)
@@ -313,12 +328,13 @@ def main(argv=None) -> int:
         grip = float(np.clip(st.gripper, 0.0, FINGER_MAX_M))
         for name in FINGER_JOINTS:
             data.qpos[qadr[name]] = grip
+        for i, adr in enumerate(leader_arm_adr):
+            data.qpos[adr] = float(st.leader[i])
+        if leader_grip_adr is not None:
+            data.qpos[leader_grip_adr] = float(np.clip(st.leader_grip, 0.0, 1.0)) * GRIP_TRAVEL_M
         mujoco.mj_forward(model, data)
-        mirror.update()
-
-        pts = leader_fk(st.leader, _LEADER_SCALE, _LEADER_BASE)
-        rr.log("leader/skeleton", rr.LineStrips3D([pts], colors=[_LEADER_COLOR], radii=0.022))
-        rr.log("leader/joints", rr.Points3D(pts, radii=0.032, colors=[_LEADER_COLOR]))
+        follower_mirror.update()
+        leader_mirror.update()
 
         for i in range(st.leader.size):
             rr.log(f"plots/leader/q{i + 1}", rr.Scalars(float(st.leader[i])))
@@ -343,7 +359,7 @@ def main(argv=None) -> int:
 
     print(
         f"[rerun] 启动：{cfg.loop.hz:.0f}Hz  duration={args.duration or '∞'}  "
-        f"（Ctrl-C 结束；关查看器不影响循环）",
+        f"间距={args.separation:.2f}m（Ctrl-C 结束；关查看器不影响循环）",
         flush=True,
     )
     try:
