@@ -72,8 +72,9 @@ def main(argv=None) -> int:
     parser.add_argument("--separation", type=float, default=1.15, help="两臂基座间距（米）")
     parser.add_argument("--leader-scale", type=float, default=None,
                         help=f"小臂缩放（默认 gello {GELLO_LEADER_SCALE}，twin 0.8）")
-    parser.add_argument("--appearance", choices=("gello", "twin"), default="gello",
-                        help="gello=真实零件外观；twin=缩小 FR3 孪生")
+    parser.add_argument("--appearance", choices=("gello", "twin"), default="twin",
+                        help="twin=缩小 FR3 孪生（默认，连贯）；"
+                             "gello=GELLO 零件外观（装配位姿为反求近似，待官方 CAD 精确对齐）")
     parser.add_argument("--save", default=None, help="离屏渲染到 PNG（无显示环境）")
     args = parser.parse_args(argv)
 

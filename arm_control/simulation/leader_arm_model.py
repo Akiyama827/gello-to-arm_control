@@ -7,10 +7,15 @@
     小臂 leader_fr3_joint_i  <->  大臂 fr3_joint_i     （i = 1..7，一一对应）
     小臂 leader_fr3_finger_* <->  大臂 fr3_finger_*    （Franka Hand 两指）
 
-**外观** —— 默认把骨架的 FR3 视觉网格换成 **Franka 官方 GELLO 的真实 3D 打印件**
-（``gello_leader/franka_fr3/*.STL``，见 :func:`apply_gello_appearance` 与
-:data:`GELLO_LINK_PARTS`）。这样小臂看起来就是那台真实 leader，而不是"缩小版 FR3"。
-``--leader-appearance twin`` 可切回直接复用 FR3 网格的孪生外观。
+**外观** —— 默认直接用骨架自己的 FR3 视觉网格（"缩小 FR3 孪生"，连贯保真）。
+另提供 **Franka 官方 GELLO 的真实 3D 打印件**外观：`--leader-appearance gello` /
+``gello_parts=True`` 时把各连杆视觉网格换成 ``gello_leader/franka_fr3/*.STL``
+（见 :func:`apply_gello_appearance` 与 :data:`GELLO_LINK_PARTS`）。
+
+.. warning::
+   GELLO 零件外观是**反求近似装配**：上游只发布零件级 STL，没有装配体/CAD，
+   :data:`GELLO_LINK_PARTS` 的位姿是自动估的，法兰 roll 与具体摆放不保证正确，
+   待拿到官方 CAD 后替换为精确位姿。
 
 两条臂同构，任一转关节时"哪一节在动"一眼可对；再配合 :func:`color_arm_links`
 把每对对应连杆涂成同一颜色，对应关系更直观（J1..J7 七彩，夹爪灰）。
@@ -19,9 +24,9 @@
 ----
 * 小臂外观只是**视觉/仿真替身**；真实 S288 的零位/转向标定仍走 ``S288LeaderArm``
   的 ``joint_offsets / joint_signs``，与渲染无关。
-* GELLO 零件的相对位姿是"按零件孔轴 + 包围盒自动摆出来的**近似**装配"——公共渠道
-  只有零件级 STL，没有装配体；**绕各关节轴的法兰 roll 需人工微调**（改
-  :data:`GELLO_LINK_PARTS`）。
+* GELLO 零件外观默认**不启用**（用孪生）；启用时其相对位姿是"按零件孔轴 + 包围盒自动
+  摆出来的**近似**装配"——公共渠道只有零件级 STL，没有装配体；**绕各关节轴的法兰 roll
+  需人工微调或替换为官方 CAD**（改 :data:`GELLO_LINK_PARTS`）。
 * 因为小臂骨架与大臂同构，仿真里的关节映射应改为**直连**（``sign=+1``、``scale=1``），
   见 :func:`force_identity_arm_mapping`；否则大臂会和小臂"镜像"而不是"同形"。
 * 夹爪沿用 Franka Hand 双指，读取时取一指并按行程 ``GRIP_TRAVEL_M`` 归一化，
