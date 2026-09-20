@@ -49,8 +49,8 @@ DryRunFollower / DoraJogFollower / RtFollower / FakeFollower （下发 FR3）
 | `examples/leader_follower_viewer.py` | MuJoCo 3D 可视化：两条 7-DOF 臂实时跟随（无需外部资产） |
 | `examples/leader_follower_rerun.py` | Rerun 可视化：真实 FR3 网格 + 小臂模型 + 关节/误差时间序列曲线 |
 | `examples/leader_follower_interactive.py` | MuJoCo 交互可视化：**鼠标拖拽小臂** -> 真实 FR3 跟随（含同场景几何碰撞守卫） |
-| `examples/gello_leader_preview.py` | 小臂外观查看/调参（GELLO 真实零件，支持离屏出图） |
-| `simulation/leader_arm_model.py` | 小臂模型（骨架=缩小 FR3；外观=**Franka 官方 GELLO 真实零件**） |
+| `examples/gello_leader_preview.py` | 小臂外观查看/调参（默认孪生，`--appearance gello` 看 GELLO 零件，支持离屏出图） |
+| `simulation/leader_arm_model.py` | 小臂模型（骨架=缩小 FR3；外观默认=孪生，可选 **Franka 官方 GELLO 零件**） |
 | `simulation/mj_collision_guard.py` | `CollisionGuard`：同 MuJoCo 场景里两臂真实几何最近距离 |
 | `tools/assets/setup_fr3.py` | 把 FR3 描述 staging 到 `franka/` |
 | `tools/assets/fetch_fr3_description.py` | 自动 clone franka_description + xacro 生成 URDF + staging |
@@ -204,10 +204,10 @@ PYTHONPATH=. python -B examples/leader_follower_viewer.py --headless --duration 
 `examples/leader_follower_rerun.py` 用 **Rerun** 在同一个窗口里同时给出：
 
 * **3D**：真实 FR3 视觉网格（跟随 `follower.measured`，手指跟夹爪），旁边是小臂
-  **Franka 官方 GELLO 真实零件**外观（`simulation/leader_arm_model.py`：骨架是等比
-  缩小的 FR3，视觉网格换成 `gello_leader/franka_fr3/*.STL`，跟随 `leader`）。两条臂
-  同构、同号连杆同色、关节标 `J1..J7`。网格只上传一次，之后每帧只发世界变换。
-  （`--leader-appearance twin` 可切回旧的"缩小 FR3 孪生"外观。）
+  外观（`simulation/leader_arm_model.py`：骨架是等比缩小的 FR3，跟随 `leader`）。
+  默认用**缩小 FR3 孪生**外观；`--leader-appearance gello` 可换成 **Franka 官方 GELLO
+  真实零件**（`gello_leader/franka_fr3/*.STL`，装配位姿为反求近似，待官方 CAD）。
+  两条臂同构、同号连杆同色、关节标 `J1..J7`。网格只上传一次，之后每帧只发世界变换。
 * **曲线**：每个关节的 `leader / follower 指令 / follower 实测 / 跟踪误差`，
   外加夹爪位置与两臂最近距离。在 Rerun 里会自动聚成 Time series 视图。
 
@@ -235,7 +235,7 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd 
 ### 鼠标拖拽小臂（MuJoCo 交互式）
 
 `examples/leader_follower_interactive.py` 把"采集"换成 MuJoCo 窗口里的**鼠标拖拽**：
-真实 FR3 网格与小臂的 **GELLO 零件外观**（骨架是缩小的 FR3）放进同一个 `MjSpec`
+真实 FR3 网格与小臂外观（骨架是缩小的 FR3；默认孪生，`--leader-appearance gello` 为零件）放进同一个 `MjSpec`
 （`simulation/leader_arm_model.py`），
 拖动小臂连杆时 MuJoCo 施加扰动弹簧力、小臂关节在阻尼下运动；主线程每帧读出
 小臂 7 关节 + 夹爪，喂给**真正的 `TeleopLoop`**（`DragLeader` / `KinematicFollower`

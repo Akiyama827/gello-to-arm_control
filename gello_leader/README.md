@@ -18,8 +18,8 @@ Franka 官方 GELLO 3D 打印件 STL，用于本仓库可视化里的小臂外�
 需要按实物微调**。用下面这个窗口边看边调：
 
 ```bash
-PYTHONPATH=. python -B examples/gello_leader_preview.py
-PYTHONPATH=. python -B examples/gello_leader_preview.py --save /tmp/gello.png   # 无显示环境
+PYTHONPATH=. python -B examples/gello_leader_preview.py --appearance gello
+PYTHONPATH=. python -B examples/gello_leader_preview.py --appearance gello --save /tmp/gello.png  # 无显示环境
 ```
 
 ## 已随仓库分发的零件

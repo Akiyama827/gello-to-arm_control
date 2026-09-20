@@ -371,8 +371,9 @@ def main(argv=None) -> int:
     parser.add_argument("--separation", type=float, default=1.15, help="两臂基座间距（米）")
     parser.add_argument("--leader-scale", type=float, default=None,
                         help=f"小臂模型缩放（默认：gello 外观 {GELLO_LEADER_SCALE}，孪生 0.8）")
-    parser.add_argument("--leader-appearance", choices=("gello", "twin"), default="gello",
-                        help="小臂外观：gello=Franka 官方 GELLO 真实零件；twin=缩小 FR3 孪生")
+    parser.add_argument("--leader-appearance", choices=("gello", "twin"), default="twin",
+                        help="小臂外观：twin=缩小 FR3 孪生（默认，连贯）；"
+                             "gello=Franka 官方 GELLO 零件（装配位姿为反求近似，待官方 CAD 精确对齐）")
     parser.add_argument("--duration", type=float, default=None, help="遥操作运行时长（秒）")
     parser.add_argument("--no-collision-guard", action="store_true", help="关闭碰撞守卫")
     parser.add_argument("--hz", type=float, default=None, help="覆盖 loop.hz")
@@ -394,7 +395,7 @@ def main(argv=None) -> int:
     if args.hz:
         cfg.loop.hz = args.hz
 
-    # --- 合并模型：真实 FR3 + 缩小的小臂（默认用 Franka 官方 GELLO 真实零件外观） ---
+    # --- 合并模型：真实 FR3 + 缩小的小臂（默认孪生外观；--leader-appearance gello 切零件外观） ---
     cache = Path(tempfile.gettempdir()) / "arm_control_fr3_mjcache"
     staged = build_mujoco_model(FR3_URDF, cache_dir=cache, keep_visual=True)
     use_gello = args.leader_appearance == "gello"
