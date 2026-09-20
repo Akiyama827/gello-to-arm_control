@@ -14,9 +14,11 @@
 | 核心 | `arm_control/leader_follower/*.py` | 采集→换算→下发→安全的主从逻辑 |
 | 示例 | `examples/leader_follower_teleop.py` | 命令行跑一遍（默认全仿真） |
 | 可视化 | `examples/leader_follower_viewer.py` | MuJoCo 窗口：两条胶囊臂（无需资产） |
-| 可视化 | `examples/leader_follower_rerun.py` | Rerun 单窗口：真实 FR3 网格 + FR3 孪生小臂 + 曲线 |
+| 可视化 | `examples/leader_follower_rerun.py` | Rerun 单窗口：真实 FR3 网格 + GELLO 零件小臂 + 曲线 |
 | 可视化 | `examples/leader_follower_interactive.py` | MuJoCo 窗口：**鼠标拖拽小臂**，真实 FR3 跟随 |
-| 模型 | `arm_control/simulation/leader_arm_model.py` | 小臂模型（**等比缩小的 FR3 孪生**，网格+关节复用 FR3） |
+| 可视化 | `examples/gello_leader_preview.py` | 只看/调小臂外观（GELLO 真实零件，支持离屏出图） |
+| 模型 | `arm_control/simulation/leader_arm_model.py` | 小臂模型（骨架=缩小 FR3，外观=**Franka 官方 GELLO 真实零件**） |
+| 资产 | `gello_leader/franka_fr3/` | GELLO 小臂的 3D 打印件 STL（随仓库分发） |
 | 安全 | `arm_control/simulation/mj_collision_guard.py` | 同场景真实几何的两臂碰撞守卫 |
 | 配置 | `examples/configs/leader_follower.yaml` | 仿真配置（fake/fake） |
 | 配置 | `examples/configs/leader_follower_real.example.yaml` | 真机配置模板 |
@@ -30,7 +32,7 @@
 | --- | --- | --- |
 | 快速确认逻辑没坏 | `leader_follower_teleop.py` | 否 |
 | 看动作，机器上没 FR3 资产 | `leader_follower_viewer.py`（MuJoCo） | 否 |
-| 看**真实 FR3 外形 + FR3 孪生小臂 + 曲线** | `leader_follower_rerun.py`（Rerun） | **是** |
+| 看**真实 FR3 外形 + GELLO 零件小臂 + 曲线** | `leader_follower_rerun.py`（Rerun） | **是** |
 | **用鼠标拖小臂**、看真实 FR3 实时跟随 | `leader_follower_interactive.py`（MuJoCo） | **是** |
 | 接真机 | `dora run dataflows/leader_teleop_franka.yml` | 是 |
 
@@ -88,7 +90,7 @@ PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 **第 3 步 · 看可视化**（三选一）
 
 ```fish
-# A. 真实 FR3 + FR3 孪生小臂 + 曲线（Rerun 窗口）
+# A. 真实 FR3 + GELLO 零件小臂 + 曲线（Rerun 窗口）
 PYTHONPATH=. python -B examples/leader_follower_rerun.py
 
 # B. 胶囊示意臂（MuJoCo 窗口，无需 FR3 资产）
@@ -102,7 +104,7 @@ PYTHONPATH=. python -B examples/leader_follower_interactive.py
 
 ## 4. 可视化怎么用
 
-### 4.1 Rerun：真实 FR3 外形 + FR3 孪生小臂 + 时间序列曲线
+### 4.1 Rerun：真实 FR3 外形 + GELLO 零件小臂 + 时间序列曲线
 
 ```fish
 PYTHONPATH=. python -B examples/leader_follower_rerun.py
@@ -112,8 +114,8 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py
 
 - **3D 视图**
   - 右侧 = **真实 FR3**（视觉网格），跟随大臂实测关节角，手指跟夹爪开合。
-  - 左侧 = **小臂模型**（**等比缩小的 FR3 孪生**；宇树 S288 无公开网格，直接复用
-    真实 FR3 网格 + 同一套关节坐标系缩小而成）。
+  - 左侧 = **小臂模型**（**Franka 官方 GELLO 真实零件**：3D 打印件 STL 挂在缩小的
+    FR3 骨架上；宇树 S288 无公开网格）。
   - 两条臂**同构**：`leader_fr3_joint_i ↔ fr3_joint_i` 一一对应，**同号连杆同色**
     （J1..J7 七彩、夹爪灰），每个关节位置标 `J1..J7`，对应关系一眼可对。
 - **Time series 视图**（Rerun 自动聚合）：每个关节的
@@ -124,14 +126,15 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py
 左侧实体树可点选高亮。停止：终端 `Ctrl-C`；Rerun 窗口单独关即可。
 
 两条臂的**底座都落在世界原点所在的同一水平面（z=0）**上，只是小臂等比缩小了
-（默认 `--leader-scale 0.75`），所以能直接比姿态。
+（GELLO 零件外观默认 `--leader-scale 0.4`），所以能直接比姿态。
 
 常用参数：
 
 ```fish
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --duration 20       # 跑 20s
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --separation 1.5    # 两臂分得更开
-PYTHONPATH=. python -B examples/leader_follower_rerun.py --leader-scale 0.6  # 小臂缩得更小
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --leader-scale 0.5  # 小臂缩放
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --leader-appearance twin  # 旧孪生外观
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --collision-demo    # 演示碰撞停机
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --no-spawn          # 初始化但不弹窗
 ```
@@ -160,9 +163,9 @@ PYTHONPATH=. python -B examples/leader_follower_interactive.py
 
 窗口里：
 
-- 左 = **小臂模型**（**等比缩小的 FR3 孪生**，与右侧同构、同号连杆同色、标 `J1..J7`），
-  **可用鼠标拖拽**；
-- 右 = **真实 FR3 网格**，按 `Retargeter` 实时跟动。仿真里小臂是 FR3 孪生，所以
+- 左 = **小臂模型**（默认 **Franka 官方 GELLO 真实零件**外观；骨架是缩小的 FR3，
+  与右侧同构、同号连杆同色、标 `J1..J7`），**可用鼠标拖拽**；
+- 右 = **真实 FR3 网格**，按 `Retargeter` 实时跟动。仿真里小臂骨架是 FR3，所以
   关节映射按**直连**（`sign=+1`）走，拖哪一节、大臂同号关节就同向跟动。
 
 拖拽方式（MuJoCo 原生扰动 = 施加弹簧力，小臂关节在阻尼下运动）：
@@ -178,16 +181,18 @@ PYTHONPATH=. python -B examples/leader_follower_interactive.py
 
 ```fish
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --separation 1.4   # 分得更开
-PYTHONPATH=. python -B examples/leader_follower_interactive.py --leader-scale 0.6 # 小臂缩得更小
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --leader-scale 0.5 # 小臂缩放
+PYTHONPATH=. python -B examples/leader_follower_interactive.py --leader-appearance twin  # 旧孪生外观
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --duration 60      # 60s 后停止下发
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --no-collision-guard
 PYTHONPATH=. python -B examples/leader_follower_interactive.py --rerun             # 边拖边看曲线
 ```
 
-> 小臂外形是**视觉替身**：宇树 S288 没有公开网格/URDF，这里直接把真实 FR3 网格
-> 等比缩小后作为小臂，好处是关节一一对应、颜色也对得上；它**不代表 S288 的真实
-> 外观**。真机小臂的零位/转向仍以 `S288LeaderArm` 的 `joint_offsets / joint_signs`
-> 标定为准（仿真里的"直连"映射只针对这个 FR3 孪生，真机标定配置不受影响）。
+> 小臂外形是**视觉替身**：宇树 S288 没有公开网格/URDF。默认挂 Franka 官方 GELLO 的
+> 真实零件（也按同样思路等比缩小）；它**代表的是 GELLO 这台 leader 的外观**，不代表
+> 裸 S288 的外观。零件相对位姿是近似装配，法兰对齐可在 `leader_arm_model.py` 里微调
+> （见 4.5）。真机小臂的零位/转向仍以 `S288LeaderArm` 的 `joint_offsets / joint_signs`
+> 标定为准（仿真里的"直连"映射只针对这个 FR3 骨架，真机标定配置不受影响）。
 
 ### 4.4 存盘 / 回放（无显示环境或存档）
 
@@ -198,25 +203,43 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd 
 .venv/bin/rerun /tmp/teleop.rrd
 ```
 
-### 4.5 小臂模型（FR3 孪生）怎么来的
+### 4.5 小臂外观：Franka 官方 GELLO 真实零件
 
-宇树 S288 没有公开的网格/URDF。为了让"小臂和大臂的关节对应关系"一眼可见，本仓库
-**不再用 capsule 拼近似外形**，而是直接复用真实 FR3 的描述做一条**等比缩小的 FR3**：
+宇树 S288 没有公开的网格/URDF。为了让"小臂和大臂的关节对应关系"一眼可见，同时尽量
+接近真机，本仓库的小臂这样构成：
 
-- 同一个 `MjSpec`（`arm_control/simulation/leader_arm_model.py`）里，用
-  `mujoco.MjSpec.attach` 把 FR3 整体复制一份并缩放（`--leader-scale`），网格自动
-  加 `leader_` 前缀，挂到大臂基座左侧 `(-separation, 0, 0)` 处；
-- 于是 `leader_fr3_joint_i ↔ fr3_joint_i` **一一对应**，夹爪用 Franka Hand 双指；
-- `color_arm_links()` 按连杆编号给**两条臂同号连杆上同一颜色**（J1..J7 七彩、夹爪灰），
-  Rerun 里再在每个关节位置标 `J1..J7`；
+- **运动链（骨架）**：复用真实 FR3 的描述，用 `mujoco.MjSpec.attach` 整体复制一份并
+  等比缩小（`--leader-scale`），挂到大臂基座左侧 `(-separation, 0, 0)`。于是
+  `leader_fr3_joint_i ↔ fr3_joint_i` **一一对应**；
+- **外观**：默认把骨架的 FR3 网格**换成 Franka 官方 GELLO 的 3D 打印件**
+  （`gello_leader/franka_fr3/*.STL`，随仓库分发）。零件挂在各 `leader_fr3_linkN`
+  上，名字里带 `linkN`，所以 `color_arm_links()` 会把它们和大臂同号连杆涂成**同一颜色**
+  （J1..J7 七彩、夹爪灰），Rerun 里再在每个关节位置标 `J1..J7`；
 - 两臂底座都在 **z=0**，只是缩放比不同。
 
-> 因为小臂是 FR3 孪生，仿真的关节映射会调用 `force_identity_arm_mapping()` 改成
+`--leader-appearance twin` 可以切回"直接复用 FR3 网格的缩小孪生"外观。
+
+> `GELLO_LINK_PARTS` 里的相对位姿是"按零件孔轴 + 包围盒**自动摆出来的近似装配**"。
+> 公共渠道只放出了**零件级 STL**（各自局部坐标、单位 mm），没有装配体/URDF/STEP，
+> 所以**绕各关节轴的法兰 roll 需要按实物微调**。改 `arm_control/simulation/leader_arm_model.py`
+> 里的 `GELLO_LINK_PARTS` / `GELLO_BASE_PARTS`（每项是 `位置(m) + rpy(rad)`），
+> 用 `examples/gello_leader_preview.py` 边看边调即可，不必动其它代码：
+
+```bash
+# 弹出 MuJoCo 窗口，只看/调小臂外观
+PYTHONPATH=. python -B examples/gello_leader_preview.py
+# 无显示环境：离屏渲染四视角
+PYTHONPATH=. python -B examples/gello_leader_preview.py --save /tmp/gello.png
+# 看旧的"缩小 FR3 孪生"外观
+PYTHONPATH=. python -B examples/gello_leader_preview.py --appearance twin
+```
+
+> 因为小臂骨架就是 FR3，仿真的关节映射会调用 `force_identity_arm_mapping()` 改成
 > **直连**（`sign=+1`、`scale=1`），这样拖小臂时大臂是"同形跟动"而不是"镜像"。
 > 这**只影响仿真查看器**；真机 S288 的 `sign/offset` 标定仍在 YAML 里，不受影响。
 
-想改配色/缩放：颜色在 `leader_arm_model.py` 的 `JOINT_COLORS`；缩放用
-`--leader-scale`（Rerun 默认 0.75、交互式默认 0.8）。
+想改配色：颜色在 `leader_arm_model.py` 的 `JOINT_COLORS`；缩放用 `--leader-scale`
+（GELLO 零件是实尺，配合 `GELLO_LEADER_SCALE` 使用最自然；孪生外观默认为 0.75/0.8）。
 
 ---
 
@@ -299,13 +322,21 @@ ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
 再按上面的方式拖。直接左键拖是旋转视角，不会拖小臂。
 
 **Q：小臂为什么长得和大臂一样，不像宇树 S288？**
-因为 S288 没有公开网格。为让关节对应关系直观，小臂直接用**等比缩小的 FR3**
-作视觉替身（见 4.5 节）；它**不代表 S288 的真实外观**，真机标定仍按 YAML 里的
-`sign/offset` 走。
+因为 S288 没有公开网格。这里用 **Franka 官方 GELLO 的真实零件**当小臂外观
+（骨架是缩小的 FR3，见 4.5 节）。它**代表的是 GELLO 这台 leader 的外观**，不代表裸
+S288；真机标定仍按 YAML 里的 `sign/offset` 走。想看旧的"缩小 FR3 孪生"：
+`--leader-appearance twin`。
+
+**Q：GELLO 零件之间的相对位置 / 法兰角度不对，怎么调？**
+公共渠道只有**零件级 STL**，没有装配体，所以 `arm_control/simulation/leader_arm_model.py`
+里的 `GELLO_LINK_PARTS` / `GELLO_BASE_PARTS` 是近似装配——尤其绕各关节轴的法兰 roll
+要按实物微调。改那两张表（每项 = `位置(m) + rpy(rad)`），用
+`PYTHONPATH=. python -B examples/gello_leader_preview.py` 边看边调即可。
 
 **Q：两臂底座不在同一水平面 / 想调小臂大小？**
-两臂底座都已固定在 **z=0** 同一水平面。小臂大小用 `--leader-scale`（Rerun 默认
-0.75、交互式默认 0.8）；间距用 `--separation`。
+两臂底座都已固定在 **z=0** 同一水平面。小臂大小用 `--leader-scale`
+（GELLO 零件外观默认 0.4；孪生外观 Rerun 默认 0.75、交互式默认 0.8）；间距用
+`--separation`。
 
 **Q：`.rrd` 里小臂网格缺失 / 只落了一部分？**
 已在 `feat/leader-follower-teleop` 修复：脚本结束会主动 `rr.disconnect()` 落盘
@@ -351,10 +382,15 @@ PYTHONPATH=. python -B tools/bench/check_leader_follower.py
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --collision-demo --duration 10
 
-# 可视化：真实 FR3 + FR3 孪生小臂 + 曲线
+# 可视化：真实 FR3 + GELLO 零件小臂 + 曲线
 PYTHONPATH=. python -B examples/leader_follower_rerun.py
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --save /tmp/teleop.rrd --duration 10
 .venv/bin/rerun /tmp/teleop.rrd
+
+# 小臂外观查看 / 调 GELLO 零件装配
+PYTHONPATH=. python -B examples/gello_leader_preview.py
+PYTHONPATH=. python -B examples/gello_leader_preview.py --save /tmp/gello.png
+PYTHONPATH=. python -B examples/gello_leader_preview.py --appearance twin
 
 # 可视化：胶囊示意臂
 PYTHONPATH=. python -B examples/leader_follower_viewer.py
