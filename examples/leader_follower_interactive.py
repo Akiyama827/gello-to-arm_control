@@ -59,6 +59,7 @@ from arm_control.leader_follower.config import (  # noqa: E402
     config_from_yaml,
 )
 from arm_control.simulation.leader_arm_model import (  # noqa: E402
+    GELLO_LEADER_SCALE,
     GRIP_TRAVEL_M,
     build_combined_spec,
     force_identity_arm_mapping,
@@ -243,7 +244,12 @@ def _make_guard(args, model, refs, cfg):
         follower_arm_qpos_adr=[_adr(model, n) for n in ARM_JOINTS],
         leader_arm_qpos_adr=[_adr(model, n) for n in refs.arm_joint_names],
         leader_grip_qpos_adr=(_adr(model, refs.gripper_name) if refs.gripper_name else None),
-        leader_geom_ids=select_geoms_by_name(model, refs.prefix, group=0),
+        leader_geom_ids=select_geoms_by_name(
+            model,
+            refs.prefix,
+            # gello 外观下小臂几何在 group 1（FR3 网格已被替换）；孪生外观在 group 0。
+            group=(1 if args.leader_appearance == "gello" else 0),
+        ),
         follower_geom_ids=select_geoms_by_name(model, "fr3", group=0),
         distmax_m=max(0.3, float(cfg.safety.limits.collision_warn_m) * 5.0),
     )
@@ -363,7 +369,10 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="交互式拖拽小臂 -> 真实 FR3 跟随（MuJoCo）")
     parser.add_argument("--config", default=str(ROOT / "examples/configs/leader_follower.yaml"))
     parser.add_argument("--separation", type=float, default=1.15, help="两臂基座间距（米）")
-    parser.add_argument("--leader-scale", type=float, default=0.8, help="小臂模型缩放")
+    parser.add_argument("--leader-scale", type=float, default=None,
+                        help=f"小臂模型缩放（默认：gello 外观 {GELLO_LEADER_SCALE}，孪生 0.8）")
+    parser.add_argument("--leader-appearance", choices=("gello", "twin"), default="gello",
+                        help="小臂外观：gello=Franka 官方 GELLO 真实零件；twin=缩小 FR3 孪生")
     parser.add_argument("--duration", type=float, default=None, help="遥操作运行时长（秒）")
     parser.add_argument("--no-collision-guard", action="store_true", help="关闭碰撞守卫")
     parser.add_argument("--hz", type=float, default=None, help="覆盖 loop.hz")
@@ -385,13 +394,18 @@ def main(argv=None) -> int:
     if args.hz:
         cfg.loop.hz = args.hz
 
-    # --- 合并模型：真实 FR3 + 等比缩小的 FR3 孪生小臂 ---
+    # --- 合并模型：真实 FR3 + 缩小的小臂（默认用 Franka 官方 GELLO 真实零件外观） ---
     cache = Path(tempfile.gettempdir()) / "arm_control_fr3_mjcache"
     staged = build_mujoco_model(FR3_URDF, cache_dir=cache, keep_visual=True)
+    use_gello = args.leader_appearance == "gello"
+    leader_scale = args.leader_scale
+    if leader_scale is None:
+        leader_scale = GELLO_LEADER_SCALE if use_gello else 0.8
     spec, refs = build_combined_spec(
         str(staged),
         leader_position=(-args.separation, 0.0, 0.0),
-        leader_scale=args.leader_scale,
+        leader_scale=leader_scale,
+        leader_gello_parts=use_gello,
     )
     model = spec.compile()
     data = mujoco.MjData(model)

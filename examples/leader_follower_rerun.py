@@ -60,6 +60,7 @@ from arm_control.leader_follower.config import (  # noqa: E402
 )
 from arm_control.leader_follower.leader import FakeLeaderArm  # noqa: E402
 from arm_control.simulation.leader_arm_model import (  # noqa: E402
+    GELLO_LEADER_SCALE,
     GRIP_TRAVEL_M,
     JOINT_COLORS,
     build_combined_spec,
@@ -242,7 +243,10 @@ def main(argv=None) -> int:
     parser.add_argument("--config", default=str(ROOT / "examples/configs/leader_follower.yaml"))
     parser.add_argument("--duration", type=float, default=None, help="遥操作运行时长（秒）")
     parser.add_argument("--separation", type=float, default=1.15, help="两臂基座间距（米）")
-    parser.add_argument("--leader-scale", type=float, default=0.75, help="小臂模型缩放")
+    parser.add_argument("--leader-scale", type=float, default=None,
+                        help=f"小臂模型缩放（默认：gello 外观 {GELLO_LEADER_SCALE}，孪生 0.75）")
+    parser.add_argument("--leader-appearance", choices=("gello", "twin"), default="gello",
+                        help="小臂外观：gello=Franka 官方 GELLO 真实零件；twin=缩小 FR3 孪生")
     parser.add_argument("--collision-demo", action="store_true", help="用玩具球体守卫演示碰撞停机")
     parser.add_argument("--save", default=None, help="把录制存成 .rrd（不弹窗，适合无显示/存档）")
     parser.add_argument("--no-spawn", action="store_true", help="初始化 Rerun 但不自动拉起查看器")
@@ -274,13 +278,18 @@ def main(argv=None) -> int:
     else:
         print("[rerun] 已初始化，但未自动拉起查看器（--no-spawn）", flush=True)
 
-    # --- 合并模型：真实 FR3 网格 + 等比缩小的 FR3 孪生小臂 ---
+    # --- 合并模型：真实 FR3 网格 + 缩小的小臂（默认用 GELLO 真实零件外观） ---
     cache = Path(tempfile.gettempdir()) / "arm_control_fr3_mjcache"
     staged = build_mujoco_model(FR3_URDF, cache_dir=cache, keep_visual=True)
+    use_gello = args.leader_appearance == "gello"
+    leader_scale = args.leader_scale
+    if leader_scale is None:
+        leader_scale = GELLO_LEADER_SCALE if use_gello else 0.75
     spec, refs = build_combined_spec(
         str(staged),
         leader_position=(-args.separation, 0.0, 0.0),
-        leader_scale=args.leader_scale,
+        leader_scale=leader_scale,
+        leader_gello_parts=use_gello,
     )
     model = spec.compile()
     data = mujoco.MjData(model)
