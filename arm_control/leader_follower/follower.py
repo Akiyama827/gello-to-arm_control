@@ -9,7 +9,8 @@ arm_control 里所有运动都走 Dora（`plan` / `jog` / `control` / `gripper`�
                      franka_gripper（FR3 就是这个接法）
     RtFollower       绕开 Dora，直连远程 RT 服务器（RtBackend.apply_command）；
                      只驱动 FR3 的 7 个臂关节，夹爪不走这条通道
-    FakeFollower     仿真大臂，用于回路自检
+    FakeFollower     仿真大臂（一阶滞后），用于回路自检
+    PassThroughFollower 理想伺服（无滞后），把仿真 FR3 当理想被控对象
 
 统一接口：`send(arm_q_rad, gripper_finger_m)`；`read_state()` 返回大臂当前
 (arm_q, gripper_finger_m)，供启动 auto_align 使用。
@@ -153,6 +154,55 @@ class FakeFollower:
 
     def close(self) -> None:
         self.safe_stop()
+
+
+# --------------------------------------------------------------------------- #
+# 理想伺服（仿真 / 硬件在环）
+# --------------------------------------------------------------------------- #
+class PassThroughFollower:
+    """理想伺服：``read_state()`` 直接返回最近一次下发的目标。
+
+    没有一阶滞后，所以"命令 vs 实测"的跟踪误差恒为 0。把仿真里的 FR3 当**理想被控
+    对象**来验证"采集 -> 换算 -> 安全"链路时用它，免得 `FakeFollower` 的滞后（τ≈0.08s）
+    在快速划动时把跟踪误差门（默认 0.15 rad）误触成安全停机。``safe_stop`` 后冻结，
+    不再接受新目标（与真机 jog 过期即停的语义一致）。
+    """
+
+    def __init__(
+        self,
+        num_arm_joints: int = 7,
+        initial_q: Optional[Sequence[float]] = None,
+        initial_finger_m: float = 0.0,
+    ) -> None:
+        self.num_arm_joints = int(num_arm_joints)
+        self._q = (
+            np.zeros(self.num_arm_joints)
+            if initial_q is None
+            else np.asarray(initial_q, dtype=float).copy()
+        )
+        self._grip = float(initial_finger_m)
+        self._stopped = False
+
+    def open(self) -> None:
+        self._stopped = False
+
+    def read_state(self) -> tuple[np.ndarray, float]:
+        return self._q.copy(), float(self._grip)
+
+    def send(self, arm_q: Sequence[float], gripper_finger_m: float) -> None:
+        if self._stopped:
+            return
+        q = np.asarray(arm_q, dtype=float)
+        if q.shape != (self.num_arm_joints,):
+            raise ValueError(f"大臂目标长度应为 {self.num_arm_joints}，得到 {q.shape}")
+        self._q = q.copy()
+        self._grip = float(gripper_finger_m)
+
+    def safe_stop(self) -> None:
+        self._stopped = True
+
+    def close(self) -> None:
+        self._stopped = True
 
 
 # --------------------------------------------------------------------------- #

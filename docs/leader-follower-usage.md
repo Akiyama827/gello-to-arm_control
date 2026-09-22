@@ -137,8 +137,23 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py --separation 1.5    # �
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --leader-scale 0.5  # 小臂缩放
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --leader-appearance gello  # 换成 GELLO 官方零件外观（装配为反求近似）
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --collision-demo    # 演示碰撞停机
+PYTHONPATH=. python -B examples/leader_follower_rerun.py --no-collision-guard # 关闭两臂几何守卫
 PYTHONPATH=. python -B examples/leader_follower_rerun.py --no-spawn          # 初始化但不弹窗
 ```
+
+**真 S288 → 仿真 FR3**（插上硬件，让真小臂带动 Rerun 里真实的 FR3，不碰真机）：
+
+```fish
+pip install pyserial
+PYTHONPATH=. python -B examples/leader_follower_rerun.py \
+    --config examples/configs/leader_follower_s288_sim.yaml --leader-source config
+```
+
+- `--leader-source config` 表示小臂**按 YAML 装配**（`leader.kind: s288`, `bus: serial`），
+  而不是内置假小臂；先把 `port`/`motor_ids`/`joint_signs` 按现场标定好。
+- 无硬件时把 YAML 里 `bus` 改成 `fake`，同样能用 `--leader-source config` 跑通整条链路。
+- 该配置的 follower 是 `passthrough`（理想伺服），并把**两臂几何最近距离守卫**接上；
+  一旦两臂将碰或大臂没按预期跟动，安全层会停机。
 
 ### 4.2 MuJoCo：胶囊示意臂（最快，无需资产）
 

@@ -68,6 +68,10 @@ from arm_control.simulation.leader_arm_model import (  # noqa: E402
     joint_qpos_addresses,
 )
 from arm_control.simulation.mujoco_model import build_mujoco_model  # noqa: E402
+from arm_control.simulation.mj_collision_guard import (  # noqa: E402
+    MjGeomDistanceGuard,
+    select_geoms_by_name,
+)
 
 FR3_URDF = ROOT / "franka" / "urdf" / "fr3.urdf"
 ARM_JOINTS = [f"fr3_joint{i}" for i in range(1, 8)]
@@ -249,6 +253,11 @@ def main(argv=None) -> int:
                         help="小臂外观：twin=缩小 FR3 孪生（默认，连贯）；"
                              "gello=Franka 官方 GELLO 零件（装配位姿为反求近似，待官方 CAD 精确对齐）")
     parser.add_argument("--collision-demo", action="store_true", help="用玩具球体守卫演示碰撞停机")
+    parser.add_argument("--leader-source", choices=("fake", "config"), default="fake",
+                        help="小臂来源：fake=内置假小臂（默认，纯软件）；"
+                             "config=按 YAML 装配真小臂（如 S288，需 bus: serial + 硬件）")
+    parser.add_argument("--no-collision-guard", action="store_true",
+                        help="关闭两臂几何最近距离守卫（默认开启）")
     parser.add_argument("--save", default=None, help="把录制存成 .rrd（不弹窗，适合无显示/存档）")
     parser.add_argument("--no-spawn", action="store_true", help="初始化 Rerun 但不自动拉起查看器")
     parser.add_argument("--hz", type=float, default=None, help="覆盖 loop.hz")
@@ -323,21 +332,48 @@ def main(argv=None) -> int:
         assert spec_mod.loader is not None
         spec_mod.loader.exec_module(mod)
         guard = mod.make_demo_collision_guard(cfg.follower.n_arm_joints)
+    elif not args.no_collision_guard:
+        # 同场景两臂几何最近距离；按外观选 group（gello 零件在 group1，孪生在 group0）
+        guard = MjGeomDistanceGuard(
+            model,
+            follower_arm_qpos_adr=[qadr[n] for n in ARM_JOINTS],
+            leader_arm_qpos_adr=[leader_adr[n] for n in refs.arm_joint_names],
+            leader_grip_qpos_adr=(
+                leader_adr[refs.gripper_name] if refs.gripper_name else None
+            ),
+            leader_geom_ids=select_geoms_by_name(
+                model, refs.prefix, group=(1 if use_gello else 0)
+            ),
+            follower_geom_ids=select_geoms_by_name(model, "fr3", group=0),
+            distmax_m=max(0.3, float(cfg.safety.limits.collision_warn_m) * 5.0),
+        )
+        print(
+            "[rerun] 碰撞守卫：同场景两臂几何最近距离（--no-collision-guard 可关）",
+            flush=True,
+        )
 
-    # 小臂是 FR3 孪生：关节映射改为直连，大臂才会和小臂同形跟动
-    force_identity_arm_mapping(cfg)
+    use_config_leader = args.leader_source == "config"
+    if not use_config_leader:
+        # 小臂是 FR3 孪生：关节映射改为直连，大臂才会和小臂同形跟动
+        force_identity_arm_mapping(cfg)
     leader, retargeter, follower, monitor = build_pipeline(cfg, collision_guard=guard)
-    # 让假小臂绕 FR3 home 摆动（初值正好落在 home），两条臂保持同形
-    initial = np.asarray(cfg.follower.initial, dtype=float)
-    if initial.shape != (cfg.follower.n_arm_joints,):
-        initial = np.asarray(FR3_HOME, dtype=float)[: cfg.follower.n_arm_joints]
-    leader = FakeLeaderArm(
-        n_arm_joints=cfg.leader.n_arm_joints,
-        with_gripper=cfg.leader.with_gripper,
-        amplitude=cfg.leader.fake_amplitude,
-        period_s=cfg.leader.fake_period_s,
-        center=initial,
-    )
+    if not use_config_leader:
+        # 让假小臂绕 FR3 home 摆动（初值正好落在 home），两条臂保持同形
+        initial = np.asarray(cfg.follower.initial, dtype=float)
+        if initial.shape != (cfg.follower.n_arm_joints,):
+            initial = np.asarray(FR3_HOME, dtype=float)[: cfg.follower.n_arm_joints]
+        leader = FakeLeaderArm(
+            n_arm_joints=cfg.leader.n_arm_joints,
+            with_gripper=cfg.leader.with_gripper,
+            amplitude=cfg.leader.fake_amplitude,
+            period_s=cfg.leader.fake_period_s,
+            center=initial,
+        )
+    else:
+        print(
+            f"[rerun] 小臂来源：配置（kind={cfg.leader.kind}, bus={cfg.leader.bus}）",
+            flush=True,
+        )
     loop = TeleopLoop(
         leader=leader,
         retargeter=retargeter,

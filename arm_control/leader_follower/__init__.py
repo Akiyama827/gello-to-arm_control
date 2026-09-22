@@ -6,7 +6,7 @@
         FakeLeaderArm                 RtFollower / FakeFollower
 
 核心模块：
-    s288       宇树 S288 规格、MIT 协议编解码、总线、关节读取
+    s288       宇树 S288 规格、官方 digital_servo 协议编解码（CRC32）、总线、关节读取
     leader     小臂抽象与 S288 / gello / fake 实现
     mapping    关节空间换算（sign/offset/scale/限位/夹爪归一化/align）
     follower   大臂三种下发后端

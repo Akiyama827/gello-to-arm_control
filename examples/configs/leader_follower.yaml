@@ -2,7 +2,7 @@
 #
 # 硬件：
 #   * 小臂(leader) = 8 个宇树 S288 = 7 个臂关节 + 1 个夹爪，串口走官方
-#     unitree_actuator_sdk。
+#     digital_servo 协议（20B/26B + CRC32，pyserial 直连）。
 #   * 大臂(follower) = FR3 = fr3_joint1..7 + Franka Hand。
 #     臂关节走 arm_controller 的 jog/control；夹爪走 franka_gripper 的 gripper
 #     topic（消息里是**单指位移，米**）。
@@ -16,7 +16,7 @@ leader:
   with_gripper: true
   # --- 真机 s288 时取消注释并填你的总线/标定 ---
   # kind: s288
-  # bus: unitree_sdk     # unitree_sdk(官方SDK,首选) | serial_raw(自实现帧) | fake
+  # bus: serial          # serial(官方 digital_servo 协议,首选) | fake
   # port: /dev/ttyUSB0
   # motor_type: S288     # 官方 SDK MotorType 里的枚举名
   # motor_ids: [1, 2, 3, 4, 5, 6, 7, 8]

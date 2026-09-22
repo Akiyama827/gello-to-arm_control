@@ -9,8 +9,8 @@
 #
 # 说明：
 # - 这里只钉住「仿真 + 可视化」链路。真机所需的厂商工具链
-#   （unitree_actuator_sdk / pylibfranka / dmcan）不是 pip 包，见
-#   docs/leader-follower-deploy.md。
+#   （pyserial / pylibfranka / dmcan）不是全部为 pip 包，见
+#   docs/leader-follower-deploy.md。S288 走官方 digital_servo 协议，只需 pyserial。
 # - 传递依赖大多交给 pip 解析；下面显式钉住的是跨平台差异较大、
 #   且 MuJoCo 查看器强依赖的两个（glfw / PyOpenGL）。
 # - 想完全冻结当前环境，可另行 `pip freeze > requirements.lock`。
