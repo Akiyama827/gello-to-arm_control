@@ -667,27 +667,35 @@ class S288JointChain:
     def n(self) -> int:
         return len(self.motor_ids)
 
-    def read_positions(self) -> np.ndarray:
-        states = self.bus.read_states()
-        out = np.empty(self.n, dtype=float)
-        for i, mid in enumerate(self.motor_ids):
-            st = states.get(mid)
-            if st is None:
-                raise RuntimeError(f"S288 id={mid} 缺少状态反馈")
-            out[i] = st.q_out
-        return out
+    def read_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """一次轮询取回 ``(输出端角度, 输出端速度, 输出端单圈绝对角 ExPos)``。
 
-    def read_positions_and_velocities(self) -> tuple[np.ndarray, np.ndarray]:
+        ExPos 不可用时对应元素为 ``nan``。三种读取方法都走这里，保证每 tick 只
+        轮询总线一次。
+        """
         states = self.bus.read_states()
         pos = np.empty(self.n, dtype=float)
         vel = np.empty(self.n, dtype=float)
+        ex = np.full(self.n, dtype=float, fill_value=float("nan"))
         for i, mid in enumerate(self.motor_ids):
             st = states.get(mid)
             if st is None:
                 raise RuntimeError(f"S288 id={mid} 缺少状态反馈")
             pos[i] = st.q_out
             vel[i] = st.dq_out
+            ex[i] = st.ex_pos_rad
+        return pos, vel, ex
+
+    def read_positions(self) -> np.ndarray:
+        return self.read_arrays()[0]
+
+    def read_positions_and_velocities(self) -> tuple[np.ndarray, np.ndarray]:
+        pos, vel, _ = self.read_arrays()
         return pos, vel
+
+    def read_positions_and_ex_positions(self) -> tuple[np.ndarray, np.ndarray]:
+        pos, _, ex = self.read_arrays()
+        return pos, ex
 
     def command_positions(
         self,

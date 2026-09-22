@@ -38,6 +38,10 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 缩
   `PYTHONPATH=. python -B examples/leader_follower_rerun.py --config examples/configs/leader_follower_s288_sim.yaml --leader-source config`
   （先 `pip install pyserial`）。S288 走官方 `digital_servo` 协议（20B/26B + CRC32），
   已由 `leader_follower/s288.py` 逐字节实现，**不需要** `unitree_actuator_sdk`。
+- **标定真 S288 小臂**（读数 / 找零 / 定方向 / 标夹爪，可写回 YAML）：
+  `PYTHONPATH=. python -B examples/s288_calibrate.py --config examples/configs/leader_follower_s288_sim.yaml read`
+  子命令 `read|zero|signs|gripper`；无硬件加 `--bus fake` 演练，`--apply` 写回配置。
+  用 `zero --from-ex` 可借**绝对单圈编码器 ExPos** 做上电即绝对零位（`use_ex_pos: true`）。
 - 接**真机**还需厂商工具链（`pyserial` 读 S288 / `pylibfranka` / `dmcan`）与 C++ 实时核心，
   见 [部署文档 docs/leader-follower-deploy.md](docs/leader-follower-deploy.md)。
 

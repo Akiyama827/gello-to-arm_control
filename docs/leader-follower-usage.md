@@ -272,6 +272,8 @@ PYTHONPATH=. python -B examples/gello_leader_preview.py --appearance gello
 | --- | --- | --- |
 | `leader` | `kind` | `fake` / `s288`（真机） / `gello` |
 | `leader` | `n_arm_joints` | 臂关节数（7；加夹爪共 8 个 S288） |
+| `leader` | `joint_offsets` / `joint_signs` | 小臂零位与方向（用 `s288_calibrate.py` 标） |
+| `leader` | `use_ex_pos` | `true`=用绝对单圈 ExPos 作角度源（上电即绝对角，行程需 <π） |
 | `follower` | `kind` | `dry_run` / `fake`（仿真） / `dora`（真机） / `rt` |
 | `follower` | `initial` | FR3 合法初始位形（`fr3_joint4` 零位越限，必须给合法值） |
 | `mapping` | `auto_align` | 启动时把大臂对齐到小臂当前姿态，无跳变接管 |
@@ -323,6 +325,26 @@ ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
 
 - `dora run` 必须在**已激活 venv** 的 shell 里跑（否则节点用系统 python）。
 - 首次接真机建议 `follower.auto_arm: false`，只观察回读与 `auto_align`，确认无跳变后再 ARM。
+
+### 7.1 小臂标定（接上真 S288 后）
+
+用 `examples/s288_calibrate.py` 一键标定，直接读写 YAML（自动备份 `.bak`）：
+
+```bash
+CFG=<你的真机配置>
+# 看实时读数（验证接线 / 电机 ID / ExPos）
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG read --watch
+# 找零 / 定方向 / 标夹爪（--apply 写回 YAML）
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG zero --apply
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG signs --apply
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG gripper --apply
+```
+
+`read` 会同时打印 `q_out`（多圈）、`ExPos`（绝对单圈）与二者一致性：
+`wrap-mis ≈ 0` 说明多圈可信；明显非 0 则多圈计数可能不可信，可改用
+`zero --from-ex --apply`（用 ExPos 做绝对零位，同时置 `use_ex_pos: true`）。
+无硬件时加 `--bus fake` 可演练。详见
+[部署文档第 5 节](leader-follower-deploy.md#5-标定上线前必做)。
 
 ---
 
@@ -398,6 +420,13 @@ source .venv/bin/activate.fish
 
 # 自检
 PYTHONPATH=. python -B tools/bench/check_leader_follower.py
+
+# S288 小臂标定（真机；--bus fake 可无硬件演练）
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG read --watch
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG zero --apply
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG zero --from-ex --apply
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG signs --apply
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG gripper --apply
 
 # 纯仿真
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10

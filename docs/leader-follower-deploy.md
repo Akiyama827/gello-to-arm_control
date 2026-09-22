@@ -31,6 +31,7 @@ Franka Hand）。
 | `examples/leader_follower_viewer.py` | MuJoCo 3D 可视化（两条胶囊臂实时跟随，无需资产） | 否 |
 | `examples/leader_follower_rerun.py` | Rerun 可视化（真实 FR3 网格 + 小臂模型 + 时间序列曲线） | **是** |
 | `examples/leader_follower_interactive.py` | MuJoCo 交互可视化（鼠标拖拽小臂 -> 真实 FR3 跟随） | **是** |
+| `examples/s288_calibrate.py` | **S288 小臂标定 CLI**（读数 / 找零 / 定方向 / 标夹爪，可写回 YAML） | **是**（标定用） |
 | `tools/assets/fetch_fr3_description.py` | 自动获取并 staging FR3 描述到 `franka/` | 否 |
 | `tools/bench/check_leader_follower.py` | 离线自检（无硬件） | 否 |
 | `docs/leader-follower.md` | 设计与原理 | 否 |
@@ -112,20 +113,53 @@ cp examples/configs/leader_follower_real.example.yaml \
 
 目标：小臂静止时大臂也静止，小臂动 1 rad 大臂方向/幅度符合预期，夹爪开合对应。
 
+推荐用附带的小工具 `examples/s288_calibrate.py` 一键标定（它直接读 S288 原始量并
+可写回 YAML，自动备份 `.bak`）。四个子命令：
+
+```bash
+# 0) 先看实时读数：验证接线 / 电机 ID / ExPos，Ctrl-C 退出
+PYTHONPATH=. python -B examples/s288_calibrate.py \
+  --config <你的真机配置> read --watch
+
+# 1) 找零：把机械臂摆到"全部关节零位"，记录 joint_offsets
+PYTHONPATH=. python -B examples/s288_calibrate.py \
+  --config <你的真机配置> zero --apply
+#    或：用绝对单圈编码器 ExPos 作零位（上电即绝对角，不依赖多圈计数）
+#    ... zero --from-ex --apply     # 会同时把 use_ex_pos 置 true
+
+# 2) 定方向：逐关节朝"关节角增大的方向"移动，自动判定 ±1
+PYTHONPATH=. python -B examples/s288_calibrate.py \
+  --config <你的真机配置> signs --apply
+
+# 3) 标夹爪：分别把夹爪"完全张开 / 完全闭合"，记录两个角
+PYTHONPATH=. python -B examples/s288_calibrate.py \
+  --config <你的真机配置> gripper --apply
+```
+
+无硬件时可加 `--bus fake` 演练（`read` / `zero` / `--apply` 都能跑，只是读数恒 0）。
+
+手工标定 / 原理：
+
 1. **关节符号 `joint_signs`**：单个小臂关节缓慢正向转一点，看对应 FR3 关节是否
    同向。反向就把它置 `-1.0`。默认已给一组常见值，仍需实机确认。
 2. **零位偏移 `joint_offsets`**：把两臂摆到机械上一致的姿态，读小臂角 `θ_s`、FR3
    角 `θ_f`，则 `offset = θ_f - sign·scale·θ_s`。`auto_align: true` 会吸收启动
    时刻的偏差，但 `offset` 决定**运动中**的一致性，仍要标。
+   注意：本工具的 `zero` 记录的是**小臂自身**的零位（使 `joint=0`），与上面的
+   `mapping.offset`（小臂→FR3 的换算偏移）是两回事。
 3. **夹爪 `gripper_open_rad`/`gripper_close_rad`**：小臂夹爪全开/全闭时的 S288
    输出端角度（rad）。映射会把 `[close, open]` 线性归一到 `[0, 1]`，再变成 FR3
    单指位移 `[0, 0.04] m`。
 4. **FR3 限位**：`mapping.joints[*].lower/upper` 与 `safety.joint_lower/upper`
    必须和实际 URDF 一致（尤其 `fr3_joint4` 约为 `[-3.0421, -0.1518]`，零位越限）。
-5. **SDK 枚举 / 波特率**：`motor_type` 与总线参数按实机核对。
+5. **ExPos 绝对零位**：`use_ex_pos: true` 时，小臂用**输出端绝对单圈编码器**
+   （反馈帧里的 `ExPos`，0..2π）作角度源，上电即为绝对角、不依赖多圈计数。
+   代价是只能分辨一圈：要求该关节**机械行程落在 (-π, π]**，且零点不要正好压在
+   编码器 0/2π 边界上。行程更大的关节请保持 `use_ex_pos: false`（用多圈 `q_out`），
+   并在配置里给 `start_joints` 以消除上电多圈歧义。
 
 标定顺序建议：先 `leader.bus: fake` + `follower.kind: dry_run` 验证 mapping
-方向，再 `bus: s288` + `follower.kind: dora` 真机。
+方向，再 `bus: serial` + `follower.kind: dora` 真机。
 
 ---
 
@@ -266,7 +300,8 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 - [ ] `check_leader_follower.py` 全绿
 - [ ] `pyserial` 已装，`bus: serial`（官方 digital_servo 协议）已生效
 - [ ] 串口端口与 `dialout` 权限确认
-- [ ] `joint_signs` / `joint_offsets` 实机标定
+- [ ] `s288_calibrate.py read` 能看到 8 个电机且无 CRC/反馈错误
+- [ ] `joint_signs` / `joint_offsets` 实机标定（`s288_calibrate.py signs/zero --apply`）
 - [ ] `gripper_open_rad` / `gripper_close_rad` 标定，夹爪开合方向正确
 - [ ] FR3 限位按 URDF 核对（`mapping.joints` 与 `safety.joint_lower/upper` 一致）
 - [ ] `auto_arm` 策略确定（自使能 / 操作台门）

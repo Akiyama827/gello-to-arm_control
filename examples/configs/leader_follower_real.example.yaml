@@ -14,12 +14,14 @@ leader:
   with_gripper: true
   bus: serial              # serial(官方 digital_servo 协议,首选) | fake
   port: /dev/ttyUSB0
-  motor_type: S288         # 官方 SDK MotorType 枚举名；无此名构造时会列出可选项
+  motor_type: S288         # 已废弃：官方 SDK 无 S288；保留仅为兼容旧配置，不再使用
   motor_ids: [1, 2, 3, 4, 5, 6, 7, 8]
   gripper_index: 7         # 第 8 个是夹爪
   # --- 以下按现场标定填写（见 docs/leader-follower-deploy.md 第 4 节）---
-  joint_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-  joint_signs:   [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  # 用 examples/s288_calibrate.py 一键测：read / zero / signs / gripper。
+  joint_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  joint_signs:   [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  use_ex_pos: false        # true=用绝对单圈 ExPos 作角度源（上电即绝对角，行程需 <π）
   gripper_open_rad: 0.8    # 小臂夹爪完全张开时的电机角（输出端 rad）
   gripper_close_rad: 0.0   # 完全闭合时的电机角
   alpha: 0.99              # 小臂读数指数平滑
