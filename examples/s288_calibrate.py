@@ -401,8 +401,8 @@ def _add_common(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
                         help="把结果写回 YAML（自动备份 .bak）")
     parser.add_argument("--yes", action="store_true", default=default(False),
                         help="跳过交互提示（自动化用）")
-    parser.add_argument("--interval", type=float, default=default(0.4),
-                        help="动作间隔/采样间隔（秒）")
+    parser.add_argument("--interval", type=float, default=default(0.1),
+                        help="动作间隔/采样间隔（秒）；read --watch 即刷新周期")
     parser.add_argument("--min-delta", type=float, default=default(1e-3),
                         help="判定运动的最小 Δraw（rad）")
 
