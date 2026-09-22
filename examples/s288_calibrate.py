@@ -87,14 +87,18 @@ def _load(args):
 
 
 def _read_raw_ex(leader):
-    """按当前 use_ex_pos 语义返回 ``(角度源, ExPos)``。"""
+    """按当前角度源语义返回 ``(角度源, ExPos)``。
+
+    源选择与 ``S288LeaderArm`` 一致：``use_ex_pos`` 全局生效，
+    ``gripper_use_ex_pos`` 只把夹爪那一个关节换成 ExPos。
+    """
     raw, ex = leader.chain.read_positions_and_ex_positions()
     raw = np.asarray(raw, dtype=float)
     ex = np.asarray(ex, dtype=float)
-    if leader.use_ex_pos:
+    if leader.use_ex_pos or getattr(leader, "gripper_use_ex_pos", False):
         src = raw.copy()
-        finite = np.isfinite(ex)
-        src[finite] = ex[finite]
+        use = leader.ex_pos_mask() & np.isfinite(ex)
+        src[use] = ex[use]
         return src, ex
     return raw, ex
 
@@ -177,6 +181,7 @@ def cmd_read(args) -> int:
     )
     print(
         f"[标定] bus={bus_name}  ids={ids}  use_ex_pos={cfg.leader.use_ex_pos}  "
+        f"gripper_use_ex_pos={getattr(cfg.leader, 'gripper_use_ex_pos', False)}  "
         f"gripper_index={cfg.leader.gripper_index}",
         flush=True,
     )
@@ -196,12 +201,9 @@ def cmd_read(args) -> int:
                 [states[mid].ex_pos_rad if mid in states else np.nan for mid in ids],
                 dtype=float,
             )
-            if cfg.leader.use_ex_pos:
-                finite = np.isfinite(ex)
-                src = raw.copy()
-                src[finite] = ex[finite]
-            else:
-                src = raw
+            use_mask = leader.ex_pos_mask() & np.isfinite(ex)
+            src = raw.copy()
+            src[use_mask] = ex[use_mask]
             if args.watch:
                 sys.stdout.write("\033[H\033[J")
             print(f"\nt={time.strftime('%H:%M:%S')}  {header}")
