@@ -300,7 +300,45 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 | 小臂动、大臂不动 | `jog` 未接线 / 目标被限幅掉 / DISARMED | 看 `arm_controller` 日志的 IGNORING 与 armed 状态 |
 | 方向相反 | `joint_signs` 标定错 | 按第 5 节重标 |
 | 夹爪不动 | `gripper` 未接 `franka_gripper` / 单指米超 `[0,0.04]` | 查图接线与 `open_finger_m` |
-| 夹爪电机反馈冻结 / `err` 非 0 且重上电不消失 | 该电机编码器/驱动硬件故障（`read --watch` 或 `gripper` 采样中角度全程不变） | 先查接线与机械耦合；确属电机故障时可**临时停用夹爪**：注释掉配置里的 `mapping.gripper`（`leader.with_gripper` 保持 true 即可），7 个臂关节照常遥操作、夹爪指令恒 0；换电机后再恢复 |
+| 单个电机反馈冻结 / `err` 非 0 且重上电不消失 | 看是哪一路反馈坏：`q_out`（转子多圈）冻结、但 `ExPos`（输出端绝对单圈）仍随手动扳动变化 → 多为**转子多圈计数坏**；两路都不动才是电机彻底坏 | 用单电机探针 `examples/s288_gripper_probe.py` 分辨；若只是 `q_out` 坏，见 §9.1，把该关节（夹爪）角度源切到 ExPos |
+
+### 9.1 单个 S288 反馈冻结：区分"哪一路编码器坏了"
+
+S288 的反馈帧里同时有**两路**位置：
+
+* `q_out`：转子侧**多圈**位置（关节角默认用它）；
+* `ExPos`：输出端**绝对单圈**编码器（0..2π）。
+
+若某台电机在 `read --watch` 里 `q_out` 纹丝不动、但 `ExPos` 会随手动扳动变化，
+说明**输出端绝对编码器是好的，坏的是转子多圈计数**（常伴随 `err=0x100`）。
+这类电机通常**不能再主动驱动**（FOC 依赖转子位置），但**仍然可以读**。
+
+诊断脚本（不改配置，只读+小幅命令）：
+
+```bash
+PYTHONPATH=. python -B examples/s288_gripper_probe.py \
+    --config <你的真机配置> --id 8
+```
+
+* 阶段 1「自由反驱」：零刚度，手动全行程来回扳动，看两路反馈的范围；
+* 阶段 2「主动驱动」：发小幅慢速位置正弦，看能否跟随。
+
+**救援办法——把该关节的角度源切到 ExPos**。以夹爪（第 8 个 S288）为例：
+
+```yaml
+leader:
+  gripper_use_ex_pos: true   # 仅夹爪用输出端绝对单圈 ExPos，臂关节仍用 q_out
+```
+
+再重标夹爪（此时读到的是 ExPos 语义，`_gripper_calibrated` 会自动用同一套源）：
+
+```bash
+PYTHONPATH=. python -B examples/s288_calibrate.py \
+    --config <你的真机配置> gripper --apply
+```
+
+注意 ExPos 只能分辨一圈：该关节机械行程需落在 (-π, π]，且零点别正好压在
+0/2π 边界上（`_calibrated_positions` 会折到 (-π, π] 处理跨界）。
 
 ---
 

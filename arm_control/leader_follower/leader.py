@@ -75,6 +75,9 @@ class S288LeaderArm:
     alpha: float = 0.99
     start_joints: Optional[Sequence[float]] = None
     use_ex_pos: bool = False
+    # 仅夹爪这一个关节改用绝对单圈 ExPos 作角度源（该电机的转子多圈 q_out 故障时）。
+    # q_out 坏但输出端绝对编码器仍可用时，用它把夹爪救回来；臂关节照旧用 q_out。
+    gripper_use_ex_pos: bool = False
 
     _last_pos: Optional[np.ndarray] = field(default=None, init=False, repr=False)
     _joint_offsets: np.ndarray = field(default=None, init=False, repr=False)  # type: ignore[assignment]
@@ -101,21 +104,39 @@ class S288LeaderArm:
             self._align_offsets_to_start()
 
     # -- 标定 ---------------------------------------------------------------
+    def _ex_pos_mask(self) -> np.ndarray:
+        """哪些关节用**绝对单圈 ExPos**作角度源（其余用多圈 q_out）。"""
+        mask = np.zeros(int(self.chain.n), dtype=bool)
+        if self.use_ex_pos:
+            mask[:] = True
+        if self.gripper_use_ex_pos and self.gripper_index is not None:
+            mask[self.gripper_index] = True
+        return mask
+
+    def ex_pos_mask(self) -> np.ndarray:
+        """公开版：供标定 CLI 复用同一套源选择逻辑。"""
+        return self._ex_pos_mask()
+
     def _use_ex_angle(self, raw: np.ndarray, ex: np.ndarray) -> np.ndarray:
-        """把角度源换成**绝对单圈编码器 ExPos**（0..2π；nan 的关节保留 q_out）。
+        """把角度源换成**绝对单圈编码器 ExPos**（0..2π；nan/未选中的关节保留 q_out）。
 
         ExPos 是输出端单圈绝对值，跨上电仍是绝对角，因此用它做角度源就不依赖多圈
         计数。代价：可分辨范围只有一圈，配合 ``_calibrated_positions`` 折到 (-π, π]，
-        因此关节机械行程需落在 (-π, π] 且零点不正对编码器 0/2π 边界。
+        因此该关节机械行程需落在 (-π, π] 且零点不正对编码器 0/2π 边界。默认只对
+        ``use_ex_pos`` 的关节生效；``gripper_use_ex_pos`` 时仅夹爪这一个关节生效。
         """
         out = np.asarray(raw, dtype=float).copy()
         ex = np.asarray(ex, dtype=float)
-        finite = np.isfinite(ex)
-        out[finite] = ex[finite]
+        use = self._ex_pos_mask() & np.isfinite(ex)
+        out[use] = ex[use]
         return out
 
+    def read_source_positions(self) -> np.ndarray:
+        """当前角度源（按 use_ex_pos / gripper_use_ex_pos 选 q_out 或 ExPos），未标定。"""
+        return self._read_raw_positions()
+
     def _read_raw_positions(self) -> np.ndarray:
-        if not self.use_ex_pos:
+        if not (self.use_ex_pos or self.gripper_use_ex_pos):
             return np.asarray(self.chain.read_positions(), dtype=float)
         raw, ex = self.chain.read_positions_and_ex_positions()
         return self._use_ex_angle(raw, ex)
@@ -138,9 +159,11 @@ class S288LeaderArm:
 
     def _calibrated_positions(self, raw: np.ndarray) -> np.ndarray:
         pos = (np.asarray(raw, dtype=float) - self._joint_offsets) * self._joint_signs
-        if self.use_ex_pos:
+        mask = self._ex_pos_mask()
+        if mask.any():
             # ExPos 只有一圈：折到 (-π, π]，让跨 0/2π 边界时连续
-            pos = (pos + np.pi) % (2 * np.pi) - np.pi
+            pos = pos.copy()
+            pos[mask] = (pos[mask] + np.pi) % (2 * np.pi) - np.pi
         return pos
 
     # -- 读取 ---------------------------------------------------------------
@@ -166,7 +189,7 @@ class S288LeaderArm:
 
     def get_positions_and_velocities(self) -> tuple[np.ndarray, np.ndarray]:
         raw_pos, raw_vel, ex = self.chain.read_arrays()
-        if self.use_ex_pos:
+        if self.use_ex_pos or self.gripper_use_ex_pos:
             raw_pos = self._use_ex_angle(raw_pos, ex)
         pos = self._calibrated_positions(raw_pos)
         vel = np.asarray(raw_vel, dtype=float) * self._joint_signs

@@ -42,18 +42,24 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 缩
   `PYTHONPATH=. python -B examples/s288_calibrate.py --config examples/configs/leader_follower_s288_sim.yaml read`
   子命令 `read|zero|signs|gripper`；无硬件加 `--bus fake` 演练，`--apply` 写回配置。
   用 `zero --from-ex` 可借**绝对单圈编码器 ExPos** 做上电即绝对零位（`use_ex_pos: true`）。
+  单关节（如夹爪）也可单独切 ExPos：配置里 `leader.gripper_use_ex_pos: true`。
+- **直接驱动 FR3（不经小臂/映射）自检**：`PYTHONPATH=. python -B examples/franka_direct_demo.py`
+  （7 关节摆动 + 夹爪 0↔40mm 自动演示，用来验证"程序能不能命令 FR3"）。
+- **S288 单电机探针**（零刚度反驱 + 小幅主动驱动，排查"反馈冻结"）：
+  `PYTHONPATH=. python -B examples/s288_gripper_probe.py --config <真机配置> --id 8`。
 - 接**真机**还需厂商工具链（`pyserial` 读 S288 / `pylibfranka` / `dmcan`）与 C++ 实时核心，
   见 [部署文档 docs/leader-follower-deploy.md](docs/leader-follower-deploy.md)。
 
 ### 已知问题（当前真机现场）
 
-- **S288 夹爪电机（第 8 个，ID 8）硬件故障**：反馈冻结（全行程扳动时 `q_out` / `ExPos`
-  在数秒采样里几乎不变）且 `err=256` 重新上电后仍存在，判定为电机/编码器硬件问题，
-  非操作或软件问题。为不阻塞其余关节，**已临时停用夹爪映射**：注释掉配置里的
-  `mapping.gripper`（`leader.with_gripper` 保持 `true` 即可），
-  **7 个臂关节照常主从遥操作**，夹爪指令恒为 `0`（闭合）。
-  详见[部署文档第 9 节故障排查](docs/leader-follower-deploy.md)；换/修好电机后
-  取消注释即可恢复夹爪遥操作（新电机可能需重新 `zero` / `gripper` 标定）。
+- **S288 夹爪电机（第 8 个，ID 8）转子多圈反馈故障**：`q_out` 冻结（手动扳动时不变）
+  且 `err=256`（`0x100`）重上电不消，但**输出端的绝对单圈编码器 `ExPos` 仍正常**
+  （随扳机变化）。结论是**转子多圈计数坏**，不是扳机没接、也不是程序问题。
+  该电机因此**不能再主动驱动**（FOC 依赖转子位置），但**仍可读**。
+  - **已用 ExPos 规避**：配置里 `leader.gripper_use_ex_pos: true`，只把**夹爪**这一个
+    关节的角度源切到 `ExPos`（臂关节仍用 `q_out`），并重标了夹爪 → 夹爪遥操作恢复正常。
+  - 诊断脚本：`examples/s288_gripper_probe.py`（零刚度反驱 + 小幅主动驱动）。
+  - 详见[部署文档 §9.1](docs/leader-follower-deploy.md)；彻底修复需换/修该电机。
 
 ## Layout
 

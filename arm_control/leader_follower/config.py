@@ -54,6 +54,7 @@ class LeaderConfig:
     alpha: float = 0.99
     start_joints: Sequence[float] = ()
     use_ex_pos: bool = False           # 用绝对单圈编码器 ExPos 校正当前圈内的角
+    gripper_use_ex_pos: bool = False   # 仅夹爪关节用 ExPos（该电机多圈 q_out 故障时）
     use_fake_bus: bool = False         # 兼容旧字段：等价于 bus=fake
     # fake
     fake_amplitude: float = 0.4
@@ -266,6 +267,7 @@ def build_leader(cfg: LeaderConfig):
             alpha=cfg.alpha,
             start_joints=cfg.start_joints or None,
             use_ex_pos=cfg.use_ex_pos,
+            gripper_use_ex_pos=cfg.gripper_use_ex_pos,
         )
     if cfg.kind == "gello":
         raise ValueError(
