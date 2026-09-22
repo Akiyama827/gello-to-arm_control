@@ -138,6 +138,21 @@ vol     = vol_raw / 2                      （V）
 - 换算成对实现：`S288Spec.output_pos_to_raw` / `raw_to_output_pos`、
   `output_kp_to_raw` / `raw_to_output_kp` 等（共 5 组）。
 
+### 5.1 用 ExPos 做绝对零位（`leader.use_ex_pos`）
+
+`q_out` 由转子多圈计数推得：只要计数在掉电后仍保留，它就是绝对角；若计数丢失，
+它只能确定"当前圈内"的角。`ExPos` 是输出端**单圈绝对**编码器，掉电重上电仍是绝对
+角，但只有一圈信息。
+
+- 默认 `use_ex_pos: false`：角度源用多圈 `q_out`，配合 `start_joints` 消除上电多圈
+  歧义。
+- `use_ex_pos: true`：角度源改为 `ExPos`（0..2π），上电即绝对角、不依赖多圈计数。
+  代价是只能分辨一圈，故要求该关节**机械行程落在 (-π, π]**，且零点不正对编码器
+  0/2π 边界。实现见 `S288LeaderArm._use_ex_angle` / `_calibrated_positions`。
+
+标定用 `examples/s288_calibrate.py`：`read` 会打印 `wrap(q_out) − ExPos` 的一致性
+（≈0 表示多圈可信），`zero --from-ex --apply` 记录 ExPos 绝对零位并置 `use_ex_pos`。
+
 ## 6. 与 `unitree_actuator_sdk` 的关系
 
 | | `unitree_actuator_sdk` | 本仓库 `SerialS288Bus` |

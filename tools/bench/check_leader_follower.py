@@ -118,6 +118,37 @@ def check_s288_leader_8motors() -> None:
     print("s288: 8 电机(7 臂 + 夹爪)装配 / 夹爪归一化 / 布局校验 OK")
 
 
+def check_s288_ex_pos() -> None:
+    """ExPos 绝对单圈模式：read_arrays 三元组 + 圈内回绕后仍还原角度。"""
+    from arm_control.leader_follower.config import build_leader, config_from_dict
+
+    cfg = config_from_dict(
+        {
+            "leader": {
+                "kind": "s288", "n_arm_joints": 7, "with_gripper": True,
+                "bus": "fake", "motor_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+                "gripper_index": 7, "gripper_open_rad": 1.0, "gripper_close_rad": 0.0,
+                "joint_offsets": [0.1] * 8, "joint_signs": [1.0] * 8,
+                "alpha": 1.0, "use_ex_pos": True,
+            },
+        }
+    )
+    leader = build_leader(cfg.leader)
+    pos, vel, ex = leader.chain.read_arrays()
+    assert pos.shape == (8,) and vel.shape == (8,) and ex.shape == (8,)
+    assert np.all(np.isfinite(ex)), ex
+
+    def wrapped_expected(target: float) -> float:
+        return (target - 0.1 + np.pi) % (2 * np.pi) - np.pi
+
+    for target in (0.5, 3.0, -3.0):
+        leader.chain.command_positions([target] * 7 + [1.0])
+        time.sleep(0.35)
+        st = leader.get_joint_state()
+        assert abs(st[0] - wrapped_expected(target)) < 0.05, (target, st[0])
+    print("s288: ExPos 绝对单圈 / read_arrays / 圈内回绕 OK")
+
+
 def check_dora_follower_messages() -> None:
     """校验 DoraJogFollower 产出 jog/control/gripper 的格式（FR3 主路径）。"""
     from arm_control.leader_follower.follower import DoraJogFollower
@@ -456,6 +487,7 @@ def check_safety_stop_propagates() -> None:
 if __name__ == "__main__":
     check_s288_units_and_codec()
     check_s288_leader_8motors()
+    check_s288_ex_pos()
     check_dora_follower_messages()
     check_dora_feedback()
     check_mapping()

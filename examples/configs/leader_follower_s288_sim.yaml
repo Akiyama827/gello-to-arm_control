@@ -24,6 +24,8 @@ leader:
   # --- 以下按现场标定填写（见 docs/leader-follower-deploy.md 第 4 节）---
   joint_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   joint_signs:   [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  use_ex_pos: false        # true=用绝对单圈 ExPos 作角度源（上电即绝对角，行程需 <π；
+                           #        用 s288_calibrate.py zero --from-ex 记录零位）
   gripper_open_rad: 0.8    # 小臂夹爪完全张开时的电机角（输出端 rad）
   gripper_close_rad: 0.0   # 完全闭合时的电机角
   alpha: 0.99              # 小臂读数指数平滑
