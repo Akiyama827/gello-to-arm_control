@@ -551,15 +551,29 @@ class SerialS288Bus:
     def _open(self) -> None:
         import serial
 
-        self._serial = serial.Serial(
+        kwargs = dict(
             port=self._port,
-            baudrate=self.spec.baudrate,
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
             timeout=self._response_timeout_s,
             write_timeout=self._response_timeout_s,
         )
+        baud = int(self.spec.baudrate)
+        try:
+            self._serial = serial.Serial(baudrate=baud, **kwargs)
+        except Exception as first_exc:
+            # 某些 USB-CDC 适配器（如 Artery AT32）不接受直接以 6 Mbps 打开
+            # （termios 返回 EINVAL，但 CDC 本身忽略波特率）。退化为先用一个
+            # 标准波特率打开，再用 TCSETS2 强制自定义波特率。
+            try:
+                self._serial = serial.Serial(baudrate=115200, **kwargs)
+            except Exception:
+                raise first_exc
+            setter = getattr(self._serial, "_set_special_baudrate", None)
+            if setter is None:
+                raise first_exc
+            setter(baud)
         self._serial.reset_input_buffer()
 
     def _read_response(self) -> Optional[bytes]:

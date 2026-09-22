@@ -176,3 +176,5 @@ vol     = vol_raw / 2                      （V）
 | `timeout` 持续增长 | 接线/电压/波特率问题 | 同上；确认电机供电（J288 25.2V / S288 12.6V） |
 | 电机不回 | `mode` 没设为 1 | 用混合闭环模式（`mode=1`） |
 | 电机发烫/顶死 | `timeout=0` 且命令持续 | 用 `timeout=1` 让主机停发后自动卸力（本实现默认开启） |
+| `open()` 直接报 `(22, 'Invalid argument')` | 某些 USB-CDC 适配器（如 Artery AT32）不接受直接以 6 Mbps 打开 | **无需手动处理**：`SerialS288Bus._open` 会自动改为先以 115200 打开、再用 `TCSETS2` 强制切到 6 Mbps；CDC 本身忽略波特率，故不影响通信 |
+| 设备名不是 `/dev/ttyUSB0` 而是 `/dev/ttyACM0` | 适配器是 USB-CDC 类而非 ftdi/cp210x | 配置里 `port` 改成 `ls /dev/serial/by-id/` 下的稳定路径即可 |
