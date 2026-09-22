@@ -113,8 +113,13 @@ def _apply_yaml(path, updates: dict[str, str]) -> None:
     path = Path(path)
     text = path.read_text(encoding="utf-8")
     for key, value in updates.items():
-        pat = re.compile(rf"^(\s*){re.escape(key)}:\s*.*$", re.M)
-        text, n = pat.subn(lambda m: f"{m.group(1)}{key}: {value}", text)
+        pat = re.compile(rf"^(\s*){re.escape(key)}:([^#\n]*)(#[^\n]*)?$", re.M)
+
+        def _repl(m):
+            comment = f"  {m.group(3)}" if m.group(3) else ""
+            return f"{m.group(1)}{key}: {value}{comment}"
+
+        text, n = pat.subn(_repl, text)
         if n == 0:
             # 键不存在：插到 leader 段里的锚点之后（默认 joint_signs，其次 start_joints）
             text = _insert_after_anchor(text, key, value)
