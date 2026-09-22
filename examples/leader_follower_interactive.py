@@ -142,6 +142,22 @@ def _leader_tip_body_id(model: mujoco.MjModel, refs) -> int:
     return int(best)
 
 
+def _hide_follower_geoms(model: mujoco.MjModel) -> int:
+    """把大臂（FR3 follower）的视觉几何设为不可见。
+
+    合并模型里 follower 的 body 名以 ``fr3`` 开头，leader 的是 ``leader_*``。
+    只改 alpha（视觉），不动几何本身——安全守卫仍可查询。
+    """
+    hidden = 0
+    for gid in range(model.ngeom):
+        bid = int(model.geom_bodyid[gid])
+        name = model.body(bid).name or ""
+        if name.startswith("fr3"):
+            model.geom_rgba[gid, 3] = 0.0
+            hidden += 1
+    return hidden
+
+
 # --------------------------------------------------------------------------- #
 # 把"被拖拽的小臂"接成 leader，把"被写 qpos 的 FR3"接成 follower
 # --------------------------------------------------------------------------- #
@@ -345,9 +361,20 @@ def run_interactive(
     )
     thread.start()
 
-    def text(msg: str, sub: str = "") -> list:
-        return [(mujoco.mjtFontScale.mjFONTSCALE_150,
-                 mujoco.mjtGridPos.mjGRID_TOPLEFT, msg, sub)]
+    def _text(lines) -> list:
+        """lines: 可迭代的 (grid_pos, msg, sub)。"""
+        return [
+            (mujoco.mjtFontScale.mjFONTSCALE_130, pos, msg, sub)
+            for pos, msg, sub in lines
+        ]
+
+    def _joints_line() -> str:
+        """小臂各关节的实时角度（rad，含夹爪归一化值）。"""
+        n = len(leader_arm_adr)
+        parts = [f"J{i + 1}={ls[i]:+.3f}" for i in range(n)]
+        if ls.size > n:
+            parts.append(f"grip={ls[n]:+.3f}")
+        return "  ".join(parts)
 
     try:
         with mujoco.viewer.launch_passive(model, data) as handle:
@@ -422,21 +449,31 @@ def run_interactive(
                         )
                     else:
                         d_txt = f"{distance * 1000:.0f}mm" if np.isfinite(distance) else "n/a"
+                        right_txt = "" if args.hide_follower else "  右=真实 FR3"
                         if use_config_leader:
-                            line1 = "RUNNING   左=真机小臂(实时)  右=真实 FR3  同号同色=对应关节"
+                            line1 = (
+                                f"RUNNING  左=真机小臂(实时){right_txt}  "
+                                f"同号同色=对应关节"
+                            )
                             line2 = (
                                 f"tick={loop.stats.ticks}  两臂最近={d_txt}  "
                                 f"鼠标=左键旋转/右键平移  "
-                                f"夹爪={fg * 1000:.0f}mm"
+                                f"夹爪指令={fg * 1000:.0f}mm"
                             )
                         else:
-                            line1 = "RUNNING   左=小臂(可拖)  右=真实 FR3  同号同色=对应关节"
+                            line1 = (
+                                f"RUNNING  左=小臂(可拖){right_txt}  "
+                                f"同号同色=对应关节"
+                            )
                             line2 = (
                                 f"tick={loop.stats.ticks}  两臂最近={d_txt}  "
                                 f"拖拽=Ctrl+右键(平移)/Ctrl+左键(旋转)，已选中末端  "
-                                f"夹爪={fg * 1000:.0f}mm"
+                                f"夹爪指令={fg * 1000:.0f}mm"
                             )
-                    handle.set_texts(text(line1, line2))
+                    handle.set_texts(_text([
+                        (mujoco.mjtGridPos.mjGRID_TOPLEFT, line1, _joints_line()),
+                        (mujoco.mjtGridPos.mjGRID_BOTTOMLEFT, line2, ""),
+                    ]))
                 except Exception:
                     pass
                 handle.sync()
@@ -474,6 +511,8 @@ def main(argv=None) -> int:
     parser.add_argument("--leader-source", choices=("drag", "config"), default="drag",
                         help="小臂来源：drag=鼠标拖拽虚拟小臂（默认）；"
                              "config=读配置里的真机小臂（S288），此时鼠标只用于转视角")
+    parser.add_argument("--hide-follower", action="store_true",
+                        help="隐藏大臂（FR3 follower），只看小臂")
     parser.add_argument("--hz", type=float, default=None, help="覆盖 loop.hz")
     parser.add_argument("--rerun", action="store_true", help="同时把曲线记到 Rerun（实时）")
     parser.add_argument("--rerun-save", default=None, help="把 Rerun 录制存成 .rrd（不弹窗）")
@@ -507,6 +546,9 @@ def main(argv=None) -> int:
         leader_gello_parts=use_gello,
     )
     model = spec.compile()
+    if args.hide_follower:
+        n_hidden = _hide_follower_geoms(model)
+        print(f"[interactive] 已隐藏大臂（{n_hidden} 个几何）", flush=True)
     data = mujoco.MjData(model)
 
     initial = np.asarray(cfg.follower.initial, dtype=float)
