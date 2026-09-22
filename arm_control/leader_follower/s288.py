@@ -528,6 +528,8 @@ class SerialS288Bus:
         codec: S288Codec | None = None,
         response_timeout_s: float = 0.005,
         inter_frame_s: float = 0.0002,
+        write_timeout_s: float = 0.05,
+        write_retries: int = 4,
     ) -> None:
         try:
             import serial  # noqa: F401  (懒加载，避免无硬件时 import 失败)
@@ -541,6 +543,11 @@ class SerialS288Bus:
         self._port = port
         self._response_timeout_s = float(response_timeout_s)
         self._inter_frame_s = float(inter_frame_s)
+        # 写超时故意比读超时宽松：100 Hz 循环与 GUI 渲染并发时，tty 输出缓冲
+        # 偶尔会短暂排空不及时，5ms 太短会误判为写失败。写 20B 正常情况下
+        # 只需几十 µs，放宽只是给"忙时"留余量，不影响正常速度。
+        self._write_timeout_s = float(write_timeout_s)
+        self._write_retries = max(1, int(write_retries))
         self._serial = None
         self._last_states: dict[int, S288State] = {}
         # 记住每台最后一次命令，读状态时原样重发（对应 timeout=1 的"持续发帧"语义）
@@ -557,7 +564,7 @@ class SerialS288Bus:
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
             timeout=self._response_timeout_s,
-            write_timeout=self._response_timeout_s,
+            write_timeout=self._write_timeout_s,
         )
         baud = int(self.spec.baudrate)
         try:
@@ -603,10 +610,30 @@ class SerialS288Bus:
 
     def _exchange_one(self, motor_id: int, command: S288Command) -> None:
         assert self._serial is not None
+        import serial
+
         frame = self.codec.pack_command(motor_id, command, self.spec)
-        self._serial.reset_input_buffer()
-        self._serial.write(frame)
-        self._serial.flush()
+        last_exc: Optional[Exception] = None
+        for attempt in range(self._write_retries):
+            try:
+                self._serial.reset_input_buffer()
+                self._serial.write(frame)
+                self._serial.flush()
+                last_exc = None
+                break
+            except serial.SerialException as exc:  # 含 SerialTimeoutException
+                last_exc = exc
+                # 写了一半 / 输出缓冲未排空：清掉缓冲，稍等再整帧重发
+                # （设备按 0xFE 0xEE 帧头重新同步，重发整帧安全）。
+                try:
+                    self._serial.reset_output_buffer()
+                except Exception:  # noqa: BLE001
+                    pass
+                if attempt + 1 >= self._write_retries:
+                    break
+                time.sleep(0.005 * (attempt + 1))
+        if last_exc is not None:
+            raise last_exc
         payload = self._read_response()
         if payload is None:
             raise TimeoutError(f"S288 id={motor_id} 无有效反馈（超时/CRC/帧头不符）")
