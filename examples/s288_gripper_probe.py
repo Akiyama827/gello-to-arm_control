@@ -145,9 +145,10 @@ def main(argv=None) -> int:
         )
         print("[probe] 电机应带动扳机小幅慢速摆动；若被卡住会顶住（时间短、力小）。", flush=True)
         t0 = time.time()
-        err_sum = 0.0
-        err_n = 0
-        act_lo = act_hi = None
+        span_cmd = 2 * args.amp
+        q_lo = q_hi = None
+        ex_lo = ex_hi = None
+        tick = 0
         while time.time() - t0 < args.drive_s:
             t = time.time() - t0
             q_des = center + args.amp * np.sin(2 * np.pi * t / args.period)
@@ -155,39 +156,43 @@ def main(argv=None) -> int:
                 {mid: S288Command(q_out=float(q_des), kp_out=args.kp, kd_out=args.kd)}
             )
             st = _state_of(bus, mid)
-            err = q_des - st.q_out
-            err_sum += abs(err)
-            err_n += 1
-            act_lo = st.q_out if act_lo is None else min(act_lo, st.q_out)
-            act_hi = st.q_out if act_hi is None else max(act_hi, st.q_out)
-            if err_n % 10 == 0:
+            q_lo = st.q_out if q_lo is None else min(q_lo, st.q_out)
+            q_hi = st.q_out if q_hi is None else max(q_hi, st.q_out)
+            if np.isfinite(st.ex_pos_rad):
+                ex_lo = st.ex_pos_rad if ex_lo is None else min(ex_lo, st.ex_pos_rad)
+                ex_hi = st.ex_pos_rad if ex_hi is None else max(ex_hi, st.ex_pos_rad)
+            tick += 1
+            if tick % 10 == 0:
                 print(
-                    f"    t={t:4.1f}s  目标={q_des:+.4f}  实测={st.q_out:+.4f}  "
-                    f"误差={err:+.4f}  err=0x{st.error:X}",
+                    f"    t={t:4.1f}s  目标={q_des:+.4f}  q_out={st.q_out:+.4f}  "
+                    f"ExPos={st.ex_pos_rad:+.4f}  err=0x{st.error:X}",
                     flush=True,
                 )
             time.sleep(0.02)
-        act_span = (act_hi - act_lo) if act_lo is not None else 0.0
-        mean_err = err_sum / max(err_n, 1)
+        q_span = (q_hi - q_lo) if q_lo is not None else 0.0
+        ex_span = (ex_hi - ex_lo) if ex_lo is not None else float("nan")
         print(
-            f"[probe] 阶段2结果：实测范围 [{act_lo:+.4f}, {act_hi:+.4f}]"
-            f"（span={act_span:.4f} rad），平均|误差|={mean_err:.4f} rad",
+            f"[probe] 阶段2结果：q_out span={q_span:.4f} rad；ExPos span={ex_span:.4f} rad"
+            f"（命令 span≈{span_cmd:.3f} rad）",
             flush=True,
         )
-        if act_span > 0.5 * args.amp * 2 * 0.5 and mean_err < 0.1:
+        # 用 ExPos 判定：q_out 可能正是坏掉的那一路，不能拿它判断电机能不能转。
+        follows = np.isfinite(ex_span) and ex_span > 0.4 * span_cmd
+        if follows:
             print(
-                "[probe]  -> 电机跟随命令：电机 + 编码器 + 协议均正常。"
-                "若阶段1不动，问题在反驱/耦合/固件抱闸，而非输出硬件。",
+                "[probe]  -> 电机在主动转（ExPos 跟随命令）：驱动/FOC 正常，"
+                "坏的只是转子多圈 q_out 反馈。",
                 flush=True,
             )
-        elif act_span < 0.05:
+        elif q_span < 0.05 and (not np.isfinite(ex_span) or ex_span < 0.05):
             print(
-                "[probe]  -> 电机不跟随命令：电机/编码器/驱动侧有问题（或此 ID 没接电机）。",
+                "[probe]  -> 电机不跟随（q_out 与 ExPos 都不动）：电机/驱动侧有问题，"
+                "或此 ID 没接电机。",
                 flush=True,
             )
         else:
             print(
-                "[probe]  -> 跟随不理想：可能有机械阻力/限位/固件告警，结合 err 判断。",
+                "[probe]  -> 部分跟随/受阻：可能有机械阻力/限位/固件告警，结合 err 判断。",
                 flush=True,
             )
     finally:
