@@ -36,24 +36,29 @@ follower:
   # 接真 FR3 时改成 kind: dora（auto_arm: true）。
   kind: passthrough        # dry_run | fake | passthrough | dora | rt
   n_arm_joints: 7          # FR3：7 关节 + Franka Hand
-  # 仿真的初始 home；fr3_joint4 零位越限，必须给合法值，否则第一 tick 就停机。
-  initial: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+  # 与大臂"零位→位形"对应的初始位形。FR3 其余关节零位≈伸直；J4 零位是伸直、
+  # 而小臂 J4 标定零位是弯约 90°；J6=+90° 时末端接近轴朝下、J7=+45° 对齐夹爪开合朝向。
+  # 均须落在合法限位内，否则第一 tick 就停机。
+  initial: [0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.7854]
   initial_finger_m: 0.04
 
 mapping:
-  auto_align: true         # 启动时把仿真 FR3 当前位形对齐到小臂当前姿态，避免跳变
+  # 关掉 auto_align：用 mapping 的**绝对**对应（小臂零位 -> 上面 initial 位形）。
+  # 开 auto_align 会把大臂锚到 initial、只跟小臂增量，绝对值被吸收，姿态会对不上。
+  auto_align: false
   alpha: 0.9               # 目标指数平滑
   ramp_s: 0.0
-  # 小臂 7 关节 -> FR3 7 关节，顺序直连（src=0..6）。sign/offset 需按两臂现场标定；
-  # lower/upper 用 FR3 官方关节限位（上线前按 URDF 核对）。
+  # 小臂 7 关节 -> FR3 7 关节，顺序直连（src=0..6）。下面的 sign/offset 是
+  # 本次样机的标定参考值（J2/J3 已按实测翻正、J4 补 -90°、J6 补 +90°、J7 补 +45°）；
+  # 换一台小臂需按现场标定重新核对。lower/upper 用 FR3 官方关节限位。
   joints:
     - {src: 0, sign:  1.0, offset: 0.0, scale: 1.0, lower: -2.7437, upper:  2.7437, max_rate: 1.5}
-    - {src: 1, sign: -1.0, offset: 0.0, scale: 1.0, lower: -1.7831, upper:  1.7831, max_rate: 1.5}
-    - {src: 2, sign: -1.0, offset: 0.0, scale: 1.0, lower: -2.9007, upper:  2.9007, max_rate: 2.0}
-    - {src: 3, sign: -1.0, offset: 0.0, scale: 1.0, lower: -3.0421, upper: -0.1518, max_rate: 2.0}
+    - {src: 1, sign:  1.0, offset: 0.0, scale: 1.0, lower: -1.7831, upper:  1.7831, max_rate: 1.5}
+    - {src: 2, sign:  1.0, offset: 0.0, scale: 1.0, lower: -2.9007, upper:  2.9007, max_rate: 2.0}
+    - {src: 3, sign: -1.0, offset: -1.5708, scale: 1.0, lower: -3.0421, upper: -0.1518, max_rate: 2.0}
     - {src: 4, sign:  1.0, offset: 0.0, scale: 1.0, lower: -2.8064, upper:  2.8064, max_rate: 2.5}
-    - {src: 5, sign:  1.0, offset: 0.0, scale: 1.0, lower: -0.5445, upper:  4.5161, max_rate: 2.5}
-    - {src: 6, sign:  1.0, offset: 0.0, scale: 1.0, lower: -3.0159, upper:  3.0159, max_rate: 2.5}
+    - {src: 5, sign:  1.0, offset: 1.5708, scale: 1.0, lower: -0.5445, upper:  4.5161, max_rate: 2.5}
+    - {src: 6, sign:  1.0, offset: 0.7854, scale: 1.0, lower: -3.0159, upper:  3.0159, max_rate: 2.5}
   gripper:
     src: 7                 # 小臂夹爪在 8 个 S288 的最后一位，1=张开 0=闭合
     open_finger_m: 0.04    # FR3 Hand 单指行程（gripper_range_m: [0.0, 0.04]）

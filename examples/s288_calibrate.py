@@ -10,7 +10,7 @@
   read     打印每个电机的角度/速度/温度/电压/错误；``--watch`` 持续刷新
   zero     把当前姿态记为各关节零位 -> 输出 joint_offsets
   signs    交互式确定每个臂关节的正方向 -> 输出 joint_signs
-  gripper  记录夹爪完全张开/闭合的角度 -> 输出 gripper_open_rad/gripper_close_rad
+  gripper  全行程扫描几秒，取最小/最大角 -> 输出 gripper_open_rad/gripper_close_rad
 
 示例
 ----
@@ -19,6 +19,10 @@
 
   # 把当前姿态记为零位，并写回配置（自动备份 .bak）
   PYTHONPATH=. python -B examples/s288_calibrate.py zero --apply
+
+  # 逐关节找零：一次只摆一个关节、回车记录，其余关节不动（推荐）
+  PYTHONPATH=. python -B examples/s288_calibrate.py zero --per-joint --apply
+  #   只重标某几个：--per-joint --only 1,4,7
 
   # 用绝对单圈编码器 ExPos 当角度源（上电即绝对角，不依赖多圈计数）
   PYTHONPATH=. python -B examples/s288_calibrate.py zero --from-ex --apply
@@ -109,8 +113,13 @@ def _apply_yaml(path, updates: dict[str, str]) -> None:
     path = Path(path)
     text = path.read_text(encoding="utf-8")
     for key, value in updates.items():
-        pat = re.compile(rf"^(\s*){re.escape(key)}:\s*.*$", re.M)
-        text, n = pat.subn(lambda m: f"{m.group(1)}{key}: {value}", text)
+        pat = re.compile(rf"^(\s*){re.escape(key)}:([^#\n]*)(#[^\n]*)?$", re.M)
+
+        def _repl(m):
+            comment = f"  {m.group(3)}" if m.group(3) else ""
+            return f"{m.group(1)}{key}: {value}{comment}"
+
+        text, n = pat.subn(_repl, text)
         if n == 0:
             # 键不存在：插到 leader 段里的锚点之后（默认 joint_signs，其次 start_joints）
             text = _insert_after_anchor(text, key, value)
@@ -227,35 +236,67 @@ def cmd_read(args) -> int:
 # --------------------------------------------------------------------------- #
 # zero
 # --------------------------------------------------------------------------- #
+def _parse_only(spec, n: int) -> list[int]:
+    """把 ``--only 1,3,5`` 解析成 0 基下标；空表示全部。"""
+    if not spec:
+        return list(range(n))
+    out: list[int] = []
+    for tok in spec.replace(" ", "").split(","):
+        if not tok:
+            continue
+        j = int(tok)
+        if not (1 <= j <= n):
+            raise SystemExit(f"[标定] --only {j} 超出范围 1..{n}")
+        out.append(j - 1)
+    return out
+
+
 def cmd_zero(args) -> int:
     cfg, leader = _load(args)
     ids = list(leader.chain.motor_ids)
     n = len(ids)
+    prev_offsets, _ = _offsets_signs(cfg, n)
+    selected = _parse_only(args.only, n)
+    offsets = prev_offsets.copy()  # 未选中的关节保留原零位
+    used_ex = False
     try:
-        _prompt(args, "把机械臂摆到**全部关节的零位**")
-        raw, ex = _read_raw_ex(leader)
-        if args.from_ex:
-            use_ex = np.isfinite(ex)
-            if not np.any(use_ex):
-                print("[标定] 反馈里没有 ExPos，无法用 --from-ex", file=sys.stderr, flush=True)
-                return 2
-            offsets = np.where(use_ex, ex, raw)
+        if args.per_joint:
             print(
-                "[标定] 已记录 ExPos 绝对零位（use_ex_pos: true）。"
-                f"缺 ExPos 的 {int((~use_ex).sum())} 个关节退回 q_out。",
+                f"[标定] 逐关节找零：共 {len(selected)} 个关节，逐个摆到位后回车"
+                "（未选中的保留原零位）。",
                 flush=True,
             )
-            updates = {
-                "joint_offsets": _fmt_list(offsets),
-                "use_ex_pos": "true",
-            }
+            for i in selected:
+                tag = "夹爪" if i == cfg.leader.gripper_index else f"J{i + 1}"
+                _prompt(args, f"把 {tag}（motor {ids[i]}）摆到零位")
+                raw, ex = _read_raw_ex(leader)
+                if args.from_ex and np.isfinite(ex[i]):
+                    offsets[i] = ex[i]
+                    used_ex = True
+                    src = "ExPos"
+                else:
+                    offsets[i] = raw[i]
+                    src = "q_out"
+                print(f"  {tag}: offset = {offsets[i]:+.5f}  ({src})", flush=True)
         else:
-            offsets = raw
-            print("[标定] 已记录多圈 q_out 零位（use_ex_pos: false）。", flush=True)
-            updates = {
-                "joint_offsets": _fmt_list(offsets),
-                "use_ex_pos": "false",
-            }
+            _prompt(args, "把机械臂摆到**全部关节的零位**")
+            raw, ex = _read_raw_ex(leader)
+            if args.from_ex and not np.any(np.isfinite(ex)):
+                print("[标定] 反馈里没有 ExPos，无法用 --from-ex", file=sys.stderr, flush=True)
+                return 2
+            for i in selected:
+                if args.from_ex and np.isfinite(ex[i]):
+                    offsets[i] = ex[i]
+                    used_ex = True
+                else:
+                    offsets[i] = raw[i]
+        use_ex = bool(args.from_ex and used_ex)
+        mode = "ExPos 绝对零位" if use_ex else "多圈 q_out 零位"
+        print(f"[标定] 已记录{mode}（use_ex_pos: {str(use_ex).lower()}）。", flush=True)
+        updates = {
+            "joint_offsets": _fmt_list(offsets),
+            "use_ex_pos": "true" if use_ex else "false",
+        }
         _emit(updates, args)
         return 0
     finally:
@@ -320,16 +361,35 @@ def cmd_gripper(args) -> int:
     ids = list(leader.chain.motor_ids)
     n = len(ids)
     gi = cfg.leader.gripper_index if cfg.leader.gripper_index is not None else n - 1
-    print(f"[标定] 夹爪是第 {gi} 个（motor {ids[gi]}），1=张开 0=闭合。", flush=True)
+    window = float(getattr(args, "window", 6.0) or 6.0)
+    print(
+        f"[标定] 夹爪是第 {gi} 个（motor {ids[gi]}），1=张开 0=闭合。"
+        f"接下来 {window:.1f}s 内请把扳机/夹爪**全行程来回扳动**。",
+        flush=True,
+    )
     try:
-        _prompt(args, "把夹爪**完全张开**")
-        open_rad = _gripper_calibrated(leader, cfg, n)
-        _prompt(args, "把夹爪**完全闭合**")
-        close_rad = _gripper_calibrated(leader, cfg, n)
-        if open_rad <= close_rad:
+        _prompt(args, "准备好后回车，随即开始全行程扳动（张开<->闭合）")
+        print(f"[标定] 采样中（{window:.1f}s）… 请持续全行程扳动", flush=True)
+        lo, hi = np.inf, -np.inf
+        t0 = time.time()
+        while time.time() - t0 < window:
+            v = _gripper_calibrated(leader, cfg, n)
+            if np.isfinite(v):
+                lo = min(lo, float(v))
+                hi = max(hi, float(v))
+            time.sleep(0.02)
+        if not np.isfinite(lo):
+            raise SystemExit("[标定] 采样失败：没有得到有效读数")
+        open_rad, close_rad = hi, lo
+        span = hi - lo
+        print(
+            f"[标定] 全行程 joint 范围 [{lo:.4f}, {hi:.4f}]，行程 {span:.4f} rad",
+            flush=True,
+        )
+        if span <= float(args.min_delta):
             print(
-                f"[标定] 警告：张开角 {open_rad:.4f} <= 闭合角 {close_rad:.4f}，"
-                "请检查 joint_signs 或夹爪接线方向。",
+                f"[标定] 警告：行程 {span:.4f} <= min_delta={args.min_delta}，"
+                "夹爪几乎没动（先查接线/耦合/电机反馈）",
                 flush=True,
             )
         print(f"[标定] 张开={open_rad:.4f} rad  闭合={close_rad:.4f} rad", flush=True)
@@ -360,8 +420,8 @@ def _add_common(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
                         help="把结果写回 YAML（自动备份 .bak）")
     parser.add_argument("--yes", action="store_true", default=default(False),
                         help="跳过交互提示（自动化用）")
-    parser.add_argument("--interval", type=float, default=default(0.4),
-                        help="动作间隔/采样间隔（秒）")
+    parser.add_argument("--interval", type=float, default=default(0.1),
+                        help="动作间隔/采样间隔（秒）；read --watch 即刷新周期")
     parser.add_argument("--min-delta", type=float, default=default(1e-3),
                         help="判定运动的最小 Δraw（rad）")
 
@@ -384,12 +444,18 @@ def main(argv=None) -> int:
     p_zero = sub.add_parser("zero", parents=[common], help="记录零位 -> joint_offsets")
     p_zero.add_argument("--from-ex", action="store_true",
                         help="用绝对单圈 ExPos 作零位（同时置 use_ex_pos: true）")
+    p_zero.add_argument("--per-joint", action="store_true",
+                        help="逐个关节找零：一个摆好回车，其余关节不动（推荐）")
+    p_zero.add_argument("--only", default=None,
+                        help="只标这些关节（1 基、逗号分隔，如 1,3,5）")
     p_zero.set_defaults(func=cmd_zero)
 
     p_signs = sub.add_parser("signs", parents=[common], help="交互式确定关节正方向 -> joint_signs")
     p_signs.set_defaults(func=cmd_signs)
 
-    p_grip = sub.add_parser("gripper", parents=[common], help="记录夹爪张开/闭合角")
+    p_grip = sub.add_parser("gripper", parents=[common], help="记录夹爪张开/闭合角（全行程扫描）")
+    p_grip.add_argument("--window", type=float, default=6.0,
+                        help="采样时长（秒）：此间全行程来回扳动，取最小/最大")
     p_grip.set_defaults(func=cmd_gripper)
 
     args = parser.parse_args(argv)

@@ -258,7 +258,9 @@ def build_leader(cfg: LeaderConfig):
             chain=chain,
             joint_offsets=cfg.joint_offsets,
             joint_signs=cfg.joint_signs,
-            gripper_index=cfg.gripper_index,
+            # with_gripper=false 时链上只有臂关节，必须忽略 gripper_index，
+            # 否则 get_joint_state 会越界索引。
+            gripper_index=(cfg.gripper_index if cfg.with_gripper else None),
             gripper_open_rad=cfg.gripper_open_rad,
             gripper_close_rad=cfg.gripper_close_rad,
             alpha=cfg.alpha,

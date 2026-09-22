@@ -124,6 +124,9 @@ PYTHONPATH=. python -B examples/s288_calibrate.py \
 # 1) 找零：把机械臂摆到"全部关节零位"，记录 joint_offsets
 PYTHONPATH=. python -B examples/s288_calibrate.py \
   --config <你的真机配置> zero --apply
+#    推荐：逐个关节找零（一次只摆一个，其余不动；未选中的保留原零位）
+#    ... zero --per-joint --apply
+#    只重标某几个：... zero --per-joint --only 1,4,7 --apply
 #    或：用绝对单圈编码器 ExPos 作零位（上电即绝对角，不依赖多圈计数）
 #    ... zero --from-ex --apply     # 会同时把 use_ex_pos 置 true
 
@@ -131,10 +134,15 @@ PYTHONPATH=. python -B examples/s288_calibrate.py \
 PYTHONPATH=. python -B examples/s288_calibrate.py \
   --config <你的真机配置> signs --apply
 
-# 3) 标夹爪：分别把夹爪"完全张开 / 完全闭合"，记录两个角
+# 3) 标夹爪：回车后连续采样数秒，此间把扳机/夹爪全行程来回扳动
 PYTHONPATH=. python -B examples/s288_calibrate.py \
   --config <你的真机配置> gripper --apply
 ```
+
+> `gripper` 子命令回车后会**连续采样 6 秒**（`--window` 可调），取全行程的
+> **最小/最大**角作为闭合/张开（张开 > 闭合）。这样不依赖单次瞬时读数，能避开
+> "松手回弹"造成的误标。若采样行程 ≈ 0（比如 < `--min-delta`），说明夹爪读数
+> 在整段时间里没有变化，多半是**接线/耦合/电机反馈**问题，先排障再标。
 
 无硬件时可加 `--bus fake` 演练（`read` / `zero` / `--apply` 都能跑，只是读数恒 0）。
 
@@ -292,6 +300,7 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 | 小臂动、大臂不动 | `jog` 未接线 / 目标被限幅掉 / DISARMED | 看 `arm_controller` 日志的 IGNORING 与 armed 状态 |
 | 方向相反 | `joint_signs` 标定错 | 按第 5 节重标 |
 | 夹爪不动 | `gripper` 未接 `franka_gripper` / 单指米超 `[0,0.04]` | 查图接线与 `open_finger_m` |
+| 夹爪电机反馈冻结 / `err` 非 0 且重上电不消失 | 该电机编码器/驱动硬件故障（`read --watch` 或 `gripper` 采样中角度全程不变） | 先查接线与机械耦合；确属电机故障时可**临时停用夹爪**：注释掉配置里的 `mapping.gripper`（`leader.with_gripper` 保持 true 即可），7 个臂关节照常遥操作、夹爪指令恒 0；换电机后再恢复 |
 
 ---
 
