@@ -29,6 +29,16 @@
     PYTHONPATH=. python -B examples/leader_follower_interactive.py --duration 60
     PYTHONPATH=. python -B examples/leader_follower_interactive.py --no-collision-guard
     PYTHONPATH=. python -B examples/leader_follower_interactive.py --rerun   # 边拖边看曲线
+
+真机驱动模式（``--leader-source config``）：
+    用配置里的**真机 S288 小臂**驱动左臂模型，鼠标只用于转视角/缩放；
+    适合边掰真臂边在原生窗口里看孪生，**用来标 ``joint_signs``**：
+
+        python -B examples/leader_follower_interactive.py \\
+            --config examples/configs/leader_follower_s288.local.yaml \\
+            --leader-source config
+
+    此时渲染线程不读串口，真机读数由 100 Hz 的 ``TeleopLoop`` 线程采样后转存。
 """
 from __future__ import annotations
 
@@ -54,6 +64,7 @@ from arm_control.leader_follower import (  # noqa: E402
     TeleopLoop,
 )
 from arm_control.leader_follower.config import (  # noqa: E402
+    build_leader,
     build_monitor,
     build_retargeter,
     config_from_yaml,
@@ -165,6 +176,42 @@ class DragLeader:
         pass
 
 
+class _LeaderTap:
+    """缓存真机 leader 最近一次 ``get_joint_state`` 的结果。
+
+    TeleopLoop 在 100 Hz 线程里读真机；渲染线程不能再去读同一个串口，故用这个
+    轻量缓存把"最近一次读数"转发给渲染线程。
+    """
+
+    def __init__(self, n_arm: int, with_gripper: bool) -> None:
+        n = int(n_arm) + (1 if with_gripper else 0)
+        self._state = np.zeros(n, dtype=float)
+        if with_gripper:
+            self._state[-1] = 1.0  # 1=张开
+        self._lock = threading.Lock()
+
+    def record(self, state: np.ndarray) -> None:
+        s = np.asarray(state, dtype=float).ravel()
+        with self._lock:
+            self._state[: min(s.size, self._state.size)] = s[: self._state.size]
+
+    def state(self) -> np.ndarray:
+        with self._lock:
+            return self._state.copy()
+
+
+def _instrument_leader(leader, tap: "_LeaderTap") -> None:
+    """包一层 ``get_joint_state``，把每次真机读数转存到 ``tap``。"""
+    orig_get = leader.get_joint_state
+
+    def get_joint_state():
+        q = np.asarray(orig_get(), dtype=float)
+        tap.record(q)
+        return q
+
+    leader.get_joint_state = get_joint_state  # type: ignore[method-assign]
+
+
 class KinematicFollower:
     """实现 ``FollowerArm``：只记录目标，viewer 线程把它写进 FR3 的 qpos。
 
@@ -263,7 +310,20 @@ def _write_follower(qpos, fr3_arm_adr, fr3_finger_adr, arm_q, finger_m) -> None:
         qpos[adr] = fm
 
 
-def run_interactive(loop, kin, drag_leader, refs, model, data, args, monitor, logger) -> int:
+def run_interactive(
+    loop,
+    kin,
+    drag_leader,
+    refs,
+    model,
+    data,
+    args,
+    monitor,
+    logger,
+    *,
+    tap=None,
+    use_config_leader: bool = False,
+) -> int:
     try:
         import mujoco.viewer  # noqa: F401  # 子模块不会随 import mujoco 自动加载
     except Exception as exc:  # 依赖/显示不可用
@@ -296,35 +356,58 @@ def run_interactive(loop, kin, drag_leader, refs, model, data, args, monitor, lo
             handle.cam.azimuth = 90.0
             handle.cam.elevation = -18.0
 
-            # 默认选中小臂末端：MuJoCo 要先选中 body 才施力，省去"先双击"这一步
-            tip_body = _leader_tip_body_id(model, refs)
+            # 只有鼠标拖拽模式才需要"选中末端"以施力；真机模式鼠标只用于转视角
+            tip_body = 0 if use_config_leader else _leader_tip_body_id(model, refs)
             if tip_body > 0:
+                # 默认选中小臂末端：MuJoCo 要先选中 body 才施力，省去"先双击"这一步
                 handle.perturb.select = int(tip_body)
                 handle.perturb.localpos[:] = 0.0
 
+            n_leader_arm = len(leader_arm_adr)
+            ls = np.zeros(n_leader_arm + (1 if grip_adr is not None else 0))
+            fq, fg = kin.current()
+
             while handle.is_running():
                 with handle.lock():
-                    if tip_body > 0 and handle.perturb.select <= 0:
-                        # 双击空白会清掉选择，这里兜底重新选上
-                        handle.perturb.select = int(tip_body)
-                    # 1) 大臂先对齐到 loop 最近一次下发
-                    fq, fg = kin.current()
-                    _write_follower(data.qpos, fr3_arm_adr, fr3_finger_adr, fq, fg)
-                    for adr in fr3_dof_adr:
-                        data.qvel[adr] = 0.0
-                    # 2) 施加鼠标拖拽力，让小臂动力学走几步
-                    for _ in range(substeps):
-                        mujoco.mjv_applyPerturbForce(model, data, handle.perturb)
-                        mujoco.mj_step(model, data)
-                    # 3) 读回被拖出来的小臂状态，交给 TeleopLoop
-                    ls = leader_state_from_qpos(data.qpos, leader_arm_adr, grip_adr)
-                    drag_leader.set_state(ls)
-                    # 4) 再写一次大臂，覆盖 step 期间的任何漂移
-                    fq, fg = kin.current()
-                    _write_follower(data.qpos, fr3_arm_adr, fr3_finger_adr, fq, fg)
-                    for adr in fr3_dof_adr:
-                        data.qvel[adr] = 0.0
-                    mujoco.mj_forward(model, data)
+                    if use_config_leader and tap is not None:
+                        # 1) 小臂 = 真机最近一次读数（由 loop 线程 100Hz 采样）
+                        ls = tap.state()
+                        for i, adr in enumerate(leader_arm_adr):
+                            data.qpos[adr] = float(ls[i])
+                        if grip_adr is not None and ls.size > n_leader_arm:
+                            data.qpos[grip_adr] = (
+                                float(np.clip(ls[n_leader_arm], 0.0, 1.0)) * GRIP_TRAVEL_M
+                            )
+                        for adr in leader_arm_adr:
+                            data.qvel[adr] = 0.0
+                        # 2) 大臂对齐到 loop 最近一次下发
+                        fq, fg = kin.current()
+                        _write_follower(data.qpos, fr3_arm_adr, fr3_finger_adr, fq, fg)
+                        for adr in fr3_dof_adr:
+                            data.qvel[adr] = 0.0
+                        mujoco.mj_forward(model, data)
+                    else:
+                        if tip_body > 0 and handle.perturb.select <= 0:
+                            # 双击空白会清掉选择，这里兜底重新选上
+                            handle.perturb.select = int(tip_body)
+                        # 1) 大臂先对齐到 loop 最近一次下发
+                        fq, fg = kin.current()
+                        _write_follower(data.qpos, fr3_arm_adr, fr3_finger_adr, fq, fg)
+                        for adr in fr3_dof_adr:
+                            data.qvel[adr] = 0.0
+                        # 2) 施加鼠标拖拽力，让小臂动力学走几步
+                        for _ in range(substeps):
+                            mujoco.mjv_applyPerturbForce(model, data, handle.perturb)
+                            mujoco.mj_step(model, data)
+                        # 3) 读回被拖出来的小臂状态，交给 TeleopLoop
+                        ls = leader_state_from_qpos(data.qpos, leader_arm_adr, grip_adr)
+                        drag_leader.set_state(ls)
+                        # 4) 再写一次大臂，覆盖 step 期间的任何漂移
+                        fq, fg = kin.current()
+                        _write_follower(data.qpos, fr3_arm_adr, fr3_finger_adr, fq, fg)
+                        for adr in fr3_dof_adr:
+                            data.qvel[adr] = 0.0
+                        mujoco.mj_forward(model, data)
 
                 distance = monitor.last_collision_distance
                 logger.frame(loop.stats.ticks, ls, fq, fg, distance)
@@ -332,15 +415,27 @@ def run_interactive(loop, kin, drag_leader, refs, model, data, args, monitor, lo
                 try:
                     if loop.stats.safety_stops > 0:
                         line1 = f"[安全停机] tick={loop.stats.ticks}  大臂已冻结"
-                        line2 = "小臂仍可拖动；重新运行本脚本可恢复"
+                        line2 = (
+                            "真机小臂仍在跟随；重新运行本脚本可恢复"
+                            if use_config_leader
+                            else "小臂仍可拖动；重新运行本脚本可恢复"
+                        )
                     else:
                         d_txt = f"{distance * 1000:.0f}mm" if np.isfinite(distance) else "n/a"
-                        line1 = "RUNNING   左=小臂(可拖)  右=真实 FR3  同号同色=对应关节"
-                        line2 = (
-                            f"tick={loop.stats.ticks}  两臂最近={d_txt}  "
-                            f"拖拽=Ctrl+右键(平移)/Ctrl+左键(旋转)，已选中末端  "
-                            f"夹爪={fg * 1000:.0f}mm"
-                        )
+                        if use_config_leader:
+                            line1 = "RUNNING   左=真机小臂(实时)  右=真实 FR3  同号同色=对应关节"
+                            line2 = (
+                                f"tick={loop.stats.ticks}  两臂最近={d_txt}  "
+                                f"鼠标=左键旋转/右键平移  "
+                                f"夹爪={fg * 1000:.0f}mm"
+                            )
+                        else:
+                            line1 = "RUNNING   左=小臂(可拖)  右=真实 FR3  同号同色=对应关节"
+                            line2 = (
+                                f"tick={loop.stats.ticks}  两臂最近={d_txt}  "
+                                f"拖拽=Ctrl+右键(平移)/Ctrl+左键(旋转)，已选中末端  "
+                                f"夹爪={fg * 1000:.0f}mm"
+                            )
                     handle.set_texts(text(line1, line2))
                 except Exception:
                     pass
@@ -376,6 +471,9 @@ def main(argv=None) -> int:
                              "gello=Franka 官方 GELLO 零件（装配位姿为反求近似，待官方 CAD 精确对齐）")
     parser.add_argument("--duration", type=float, default=None, help="遥操作运行时长（秒）")
     parser.add_argument("--no-collision-guard", action="store_true", help="关闭碰撞守卫")
+    parser.add_argument("--leader-source", choices=("drag", "config"), default="drag",
+                        help="小臂来源：drag=鼠标拖拽虚拟小臂（默认）；"
+                             "config=读配置里的真机小臂（S288），此时鼠标只用于转视角")
     parser.add_argument("--hz", type=float, default=None, help="覆盖 loop.hz")
     parser.add_argument("--rerun", action="store_true", help="同时把曲线记到 Rerun（实时）")
     parser.add_argument("--rerun-save", default=None, help="把 Rerun 录制存成 .rrd（不弹窗）")
@@ -427,17 +525,31 @@ def main(argv=None) -> int:
     mujoco.mj_forward(model, data)
 
     # --- 装配 TeleopLoop（与真机同一条安全链路）---
+    use_config_leader = args.leader_source == "config"
     drag_leader = DragLeader(cfg.leader.n_arm_joints, cfg.leader.with_gripper, grip_open=1.0)
     # 小臂初始状态 = FR3 home + 夹爪张开，保证 auto_align 时 offset ≈ 0
     drag_leader.set_state(np.concatenate([initial, [1.0]]))
+    tap = None
+    if use_config_leader:
+        # 真机小臂：复用与其它示例同一条 build_leader（串口在 build_leader 里打开）
+        leader = build_leader(cfg.leader)
+        tap = _LeaderTap(cfg.leader.n_arm_joints, cfg.leader.with_gripper)
+        _instrument_leader(leader, tap)
+        print(
+            f"[interactive] 小臂来源：真机（kind={cfg.leader.kind}, bus={cfg.leader.bus}）",
+            flush=True,
+        )
+    else:
+        leader = drag_leader
     kin = KinematicFollower(cfg.follower.n_arm_joints, initial, cfg.follower.initial_finger_m)
     guard = _make_guard(args, model, refs, cfg)
-    # 小臂是 FR3 孪生：关节映射改为直连，大臂才会和小臂同形跟动
-    force_identity_arm_mapping(cfg)
+    if not use_config_leader:
+        # 小臂是 FR3 孪生：关节映射改为直连，大臂才会和小臂同形跟动
+        force_identity_arm_mapping(cfg)
     retargeter = build_retargeter(cfg.mapping)
     monitor = build_monitor(cfg.safety, cfg.mapping.joints, collision_guard=guard)
     loop = TeleopLoop(
-        leader=drag_leader,
+        leader=leader,
         retargeter=retargeter,
         follower=kin,
         monitor=monitor,
@@ -451,13 +563,37 @@ def main(argv=None) -> int:
     if args.rerun or args.rerun_save:
         _start_rerun(args)
 
-    print(
-        f"[interactive] 窗口打开：左=小臂(FR3 孪生，Ctrl+右键拖动)，右=真实 FR3；"
-        f"间距={args.separation:.2f}m  "
-        f"碰撞守卫={'关' if args.no_collision_guard else '开'}",
-        flush=True,
-    )
-    return run_interactive(loop, kin, drag_leader, refs, model, data, args, monitor, logger)
+    if use_config_leader:
+        print(
+            f"[interactive] 窗口打开：左=真机小臂(实时)，右=真实 FR3；"
+            f"间距={args.separation:.2f}m  "
+            f"碰撞守卫={'关' if args.no_collision_guard else '开'}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[interactive] 窗口打开：左=小臂(FR3 孪生，Ctrl+右键拖动)，右=真实 FR3；"
+            f"间距={args.separation:.2f}m  "
+            f"碰撞守卫={'关' if args.no_collision_guard else '开'}",
+            flush=True,
+        )
+    try:
+        return run_interactive(
+            loop,
+            kin,
+            drag_leader,
+            refs,
+            model,
+            data,
+            args,
+            monitor,
+            logger,
+            tap=tap,
+            use_config_leader=use_config_leader,
+        )
+    finally:
+        if use_config_leader:
+            leader.close()
 
 
 if __name__ == "__main__":
