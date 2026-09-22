@@ -124,6 +124,9 @@ PYTHONPATH=. python -B examples/s288_calibrate.py \
 # 1) 找零：把机械臂摆到"全部关节零位"，记录 joint_offsets
 PYTHONPATH=. python -B examples/s288_calibrate.py \
   --config <你的真机配置> zero --apply
+#    推荐：逐个关节找零（一次只摆一个，其余不动；未选中的保留原零位）
+#    ... zero --per-joint --apply
+#    只重标某几个：... zero --per-joint --only 1,4,7 --apply
 #    或：用绝对单圈编码器 ExPos 作零位（上电即绝对角，不依赖多圈计数）
 #    ... zero --from-ex --apply     # 会同时把 use_ex_pos 置 true
 

@@ -336,6 +336,7 @@ CFG=<你的真机配置>
 PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG read --watch
 # 找零 / 定方向 / 标夹爪（--apply 写回 YAML）
 PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG zero --apply
+PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG zero --per-joint --apply
 PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG signs --apply
 PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG gripper --apply
 ```

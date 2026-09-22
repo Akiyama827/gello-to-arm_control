@@ -20,6 +20,10 @@
   # 把当前姿态记为零位，并写回配置（自动备份 .bak）
   PYTHONPATH=. python -B examples/s288_calibrate.py zero --apply
 
+  # 逐关节找零：一次只摆一个关节、回车记录，其余关节不动（推荐）
+  PYTHONPATH=. python -B examples/s288_calibrate.py zero --per-joint --apply
+  #   只重标某几个：--per-joint --only 1,4,7
+
   # 用绝对单圈编码器 ExPos 当角度源（上电即绝对角，不依赖多圈计数）
   PYTHONPATH=. python -B examples/s288_calibrate.py zero --from-ex --apply
 
@@ -227,35 +231,67 @@ def cmd_read(args) -> int:
 # --------------------------------------------------------------------------- #
 # zero
 # --------------------------------------------------------------------------- #
+def _parse_only(spec, n: int) -> list[int]:
+    """把 ``--only 1,3,5`` 解析成 0 基下标；空表示全部。"""
+    if not spec:
+        return list(range(n))
+    out: list[int] = []
+    for tok in spec.replace(" ", "").split(","):
+        if not tok:
+            continue
+        j = int(tok)
+        if not (1 <= j <= n):
+            raise SystemExit(f"[标定] --only {j} 超出范围 1..{n}")
+        out.append(j - 1)
+    return out
+
+
 def cmd_zero(args) -> int:
     cfg, leader = _load(args)
     ids = list(leader.chain.motor_ids)
     n = len(ids)
+    prev_offsets, _ = _offsets_signs(cfg, n)
+    selected = _parse_only(args.only, n)
+    offsets = prev_offsets.copy()  # 未选中的关节保留原零位
+    used_ex = False
     try:
-        _prompt(args, "把机械臂摆到**全部关节的零位**")
-        raw, ex = _read_raw_ex(leader)
-        if args.from_ex:
-            use_ex = np.isfinite(ex)
-            if not np.any(use_ex):
-                print("[标定] 反馈里没有 ExPos，无法用 --from-ex", file=sys.stderr, flush=True)
-                return 2
-            offsets = np.where(use_ex, ex, raw)
+        if args.per_joint:
             print(
-                "[标定] 已记录 ExPos 绝对零位（use_ex_pos: true）。"
-                f"缺 ExPos 的 {int((~use_ex).sum())} 个关节退回 q_out。",
+                f"[标定] 逐关节找零：共 {len(selected)} 个关节，逐个摆到位后回车"
+                "（未选中的保留原零位）。",
                 flush=True,
             )
-            updates = {
-                "joint_offsets": _fmt_list(offsets),
-                "use_ex_pos": "true",
-            }
+            for i in selected:
+                tag = "夹爪" if i == cfg.leader.gripper_index else f"J{i + 1}"
+                _prompt(args, f"把 {tag}（motor {ids[i]}）摆到零位")
+                raw, ex = _read_raw_ex(leader)
+                if args.from_ex and np.isfinite(ex[i]):
+                    offsets[i] = ex[i]
+                    used_ex = True
+                    src = "ExPos"
+                else:
+                    offsets[i] = raw[i]
+                    src = "q_out"
+                print(f"  {tag}: offset = {offsets[i]:+.5f}  ({src})", flush=True)
         else:
-            offsets = raw
-            print("[标定] 已记录多圈 q_out 零位（use_ex_pos: false）。", flush=True)
-            updates = {
-                "joint_offsets": _fmt_list(offsets),
-                "use_ex_pos": "false",
-            }
+            _prompt(args, "把机械臂摆到**全部关节的零位**")
+            raw, ex = _read_raw_ex(leader)
+            if args.from_ex and not np.any(np.isfinite(ex)):
+                print("[标定] 反馈里没有 ExPos，无法用 --from-ex", file=sys.stderr, flush=True)
+                return 2
+            for i in selected:
+                if args.from_ex and np.isfinite(ex[i]):
+                    offsets[i] = ex[i]
+                    used_ex = True
+                else:
+                    offsets[i] = raw[i]
+        use_ex = bool(args.from_ex and used_ex)
+        mode = "ExPos 绝对零位" if use_ex else "多圈 q_out 零位"
+        print(f"[标定] 已记录{mode}（use_ex_pos: {str(use_ex).lower()}）。", flush=True)
+        updates = {
+            "joint_offsets": _fmt_list(offsets),
+            "use_ex_pos": "true" if use_ex else "false",
+        }
         _emit(updates, args)
         return 0
     finally:
@@ -384,6 +420,10 @@ def main(argv=None) -> int:
     p_zero = sub.add_parser("zero", parents=[common], help="记录零位 -> joint_offsets")
     p_zero.add_argument("--from-ex", action="store_true",
                         help="用绝对单圈 ExPos 作零位（同时置 use_ex_pos: true）")
+    p_zero.add_argument("--per-joint", action="store_true",
+                        help="逐个关节找零：一个摆好回车，其余关节不动（推荐）")
+    p_zero.add_argument("--only", default=None,
+                        help="只标这些关节（1 基、逗号分隔，如 1,3,5）")
     p_zero.set_defaults(func=cmd_zero)
 
     p_signs = sub.add_parser("signs", parents=[common], help="交互式确定关节正方向 -> joint_signs")
