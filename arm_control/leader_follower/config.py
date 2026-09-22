@@ -42,8 +42,8 @@ class LeaderConfig:
     n_arm_joints: int = 7              # 默认按 8 个 S288 = 7 臂关节 + 1 夹爪
     with_gripper: bool = True
     # s288
-    bus: str = "unitree_sdk"           # unitree_sdk | serial_raw | fake
-    motor_type: str = "S288"           # 官方 SDK MotorType 枚举名
+    bus: str = "serial"                # serial(官方 digital_servo 协议,首选) | fake
+    motor_type: str = "S288"           # 已废弃：官方 SDK 无 S288，保留以兼容旧 YAML
     port: str = "/dev/ttyUSB0"
     motor_ids: Sequence[int] = ()
     gripper_index: Optional[int] = None
@@ -61,7 +61,7 @@ class LeaderConfig:
 
 @dataclass
 class FollowerConfig:
-    kind: str = "dry_run"              # dry_run | fake | dora | rt
+    kind: str = "dry_run"              # dry_run | fake | passthrough | dora | rt
     n_arm_joints: int = 7              # FR3：7 关节 + Franka Hand
     # 仿真/空跑后端的初始位形（让 auto_align 从一个合法位形起步）
     initial: Sequence[float] = ()
@@ -240,16 +240,17 @@ def build_leader(cfg: LeaderConfig):
         bus_kind = "fake" if cfg.use_fake_bus else cfg.bus
         if bus_kind == "fake":
             bus = FakeS288Bus(ids, spec=spec)
-        elif bus_kind == "serial_raw":
+        elif bus_kind in ("serial", "serial_raw"):
+            # 官方 digital_servo 协议（20B/26B + CRC32），pyserial 直接收发。
             bus = SerialS288Bus(ids, port=cfg.port, spec=spec, codec=S288Codec())
         elif bus_kind == "unitree_sdk":
-            # 官方 unitree_actuator_sdk：串口通信，转子侧 q 在总线内换算。
+            # 官方 unitree_actuator_sdk 没有 S288/J288，构造即给出可操作报错。
             bus = UnitreeSdkS288Bus(
                 ids, port=cfg.port, spec=spec, motor_type=cfg.motor_type
             )
         else:
             raise ValueError(
-                f"未知 leader.bus={bus_kind!r}（unitree_sdk | serial_raw | fake）"
+                f"未知 leader.bus={bus_kind!r}（serial | fake；serial_raw 为别名）"
             )
         chain = S288JointChain(motor_ids=ids, bus=bus, spec=spec, codec=S288Codec())
         return leader_mod.S288LeaderArm(
@@ -280,6 +281,12 @@ def build_follower(cfg: FollowerConfig):
         )
     if cfg.kind == "fake":
         return follower_mod.FakeFollower(
+            num_arm_joints=cfg.n_arm_joints,
+            initial_q=initial,
+            initial_finger_m=cfg.initial_finger_m,
+        )
+    if cfg.kind == "passthrough":
+        return follower_mod.PassThroughFollower(
             num_arm_joints=cfg.n_arm_joints,
             initial_q=initial,
             initial_finger_m=cfg.initial_finger_m,

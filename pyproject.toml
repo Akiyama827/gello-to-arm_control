@@ -39,6 +39,10 @@ mesh = ["trimesh", "coacd"]
 assets = ["xacro", "trimesh", "pycollada"]
 # Opt-in geometric refinement and native constrained spline timing.
 trajopt = ["toppra==0.6.10", "tesseract-robotics-nanobind==0.35.0.7", "scipy", "mujoco"]
+# Real S288/J288 leader arm over serial. The protocol is the official
+# digital_servo one (20B/26B + CRC32), implemented in leader_follower/s288.py;
+# only pyserial is needed to talk to the bus (half-duplex TTL, 6 Mbps).
+hardware = ["pyserial"]
 
 # Backend/toolchain dependencies not managed by these extras:
 #   pinocchio / hpp-fcl — dynamics, FK/IK, geometry and preview.

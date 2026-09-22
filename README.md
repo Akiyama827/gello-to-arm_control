@@ -34,7 +34,11 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 缩
   `PYTHONPATH=. python -B examples/gello_leader_preview.py`。
 - 交互拖拽版：`PYTHONPATH=. python -B examples/leader_follower_interactive.py`。
 - 胶囊示意臂（无需任何 FR3 资产）：`PYTHONPATH=. python -B examples/leader_follower_viewer.py`。
-- 接**真机**还需厂商工具链（`unitree_actuator_sdk` / `pylibfranka` / `dmcan`）与 C++ 实时核心，
+- **真 S288 → 仿真 FR3**（插上硬件就能看真小臂带动 Rerun 里的真 FR3）：
+  `PYTHONPATH=. python -B examples/leader_follower_rerun.py --config examples/configs/leader_follower_s288_sim.yaml --leader-source config`
+  （先 `pip install pyserial`）。S288 走官方 `digital_servo` 协议（20B/26B + CRC32），
+  已由 `leader_follower/s288.py` 逐字节实现，**不需要** `unitree_actuator_sdk`。
+- 接**真机**还需厂商工具链（`pyserial` 读 S288 / `pylibfranka` / `dmcan`）与 C++ 实时核心，
   见 [部署文档 docs/leader-follower-deploy.md](docs/leader-follower-deploy.md)。
 
 ## Layout

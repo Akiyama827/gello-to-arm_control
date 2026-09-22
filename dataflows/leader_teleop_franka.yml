@@ -1,6 +1,6 @@
 # REAL FR3 teleoperation — the leader arm (8x Unitree S288: 7 joints + 1
-# gripper, official unitree_actuator_sdk over serial) drives the FR3 through
-# the same RT bridge as real_franka_motion.yml.
+# gripper, official digital_servo protocol over serial via pyserial) drives the
+# FR3 through the same RT bridge as real_franka_motion.yml.
 #
 # One node is the SOLE motion source. `leader_teleop` produces the exact
 # jog/control/gripper contract `arm_console` produces, so arm_controller and
@@ -18,7 +18,7 @@
 # follower.auto_arm:false in the teleop config.
 #
 # REQUIREMENT — this graph needs a deployment config with
-#   leader:   {kind: s288, bus: unitree_sdk, port: ..., motor_ids: [...]}
+#   leader:   {kind: s288, bus: serial, port: ..., motor_ids: [...]}
 #   follower: {kind: dora, auto_arm: true}
 # exported as LEADER_FOLLOWER_CONFIG (a bare run would fall back to the
 # fake/fake example and the node refuses to start).

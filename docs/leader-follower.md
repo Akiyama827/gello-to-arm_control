@@ -6,7 +6,7 @@
 硬件构成：
 
 - **小臂（leader）**：**8 个宇树 S288** = 7 个臂关节 + 1 个夹爪；串口通信走
-  **官方 `unitree_actuator_sdk`**。
+  **官方 `digital_servo` 协议**（20B/26B + CRC32，pyserial 直连）。
 - **大臂（follower）**：**FR3** = `fr3_joint1..7` + Franka Hand。臂关节走
   `arm_controller` 的 `jog`/`control`，夹爪走 `franka_gripper` 的 `gripper`。
 
@@ -34,7 +34,7 @@ DryRunFollower / DoraJogFollower / RtFollower / FakeFollower （下发 FR3）
 
 | 文件 | 作用 |
 |---|---|
-| `arm_control/leader_follower/s288.py` | S288 规格、各单位换算；官方 SDK 总线 `UnitreeSdkS288Bus`；自实现帧总线 `SerialS288Bus`（后备）；仿真总线 |
+| `arm_control/leader_follower/s288.py` | S288 规格、定点换算、官方 `digital_servo` 协议编解码（CRC32）、`SerialS288Bus`（pyserial 直连）、仿真总线 |
 | `leader.py` | 小臂接口 + S288 / gello 适配 / fake 三种实现 |
 | `mapping.py` | 关节空间换算（sign/offset/scale/限位/夹爪/auto_align） |
 | `follower.py` | 大臂四种下发后端 |
@@ -57,31 +57,33 @@ DryRunFollower / DoraJogFollower / RtFollower / FakeFollower （下发 FR3）
 | `examples/configs/leader_follower.yaml` | 示例配置 |
 | `tools/bench/check_leader_follower.py` | 离线自检 |
 
-## 串口通信：官方 unitree_actuator_sdk
+## 串口通信：官方 digital_servo 协议
 
-真实硬件默认 `leader.bus: unitree_sdk`，即用官方 SDK 的 `SerialPort` +
-`MotorCmd`/`MotorData` + `serial.sendRecv(cmd, data)`：
+S288/J288 的官方通信协议**不在** `unitree_actuator_sdk` 里（该 SDK 的 `MotorType`
+只有 A1 / B1 / GO-M8010-6）。宇树为 J288/S288 单独开源了协议与参考实现：
 
-```python
-from unitree_actuator_sdk import SerialPort, MotorCmd, MotorData
-serial = SerialPort('/dev/ttyUSB0')
-cmd, data = MotorCmd(), MotorData()
-cmd.motorType = data.motorType = MotorType.<型号>
-cmd.mode = queryMotorMode(MotorType.<型号>, MotorMode.FOC)
-cmd.id = 0
-cmd.q, cmd.dq, cmd.kp, cmd.kd, cmd.tau = ...
-serial.sendRecv(cmd, data)      # data.q/dq/tau/temp/merror 为反馈
-```
+- <https://github.com/unitreerobotics/digital_servo>（`specs/protocol.md`、
+  `python/servo_demo.py`、`stm32/`）
 
-**关键点**：SDK 的 `q/dq/tau/kp/kd` 全是**转子侧**量，而本模块对外统一用**输出端**
-语义；`UnitreeSdkS288Bus` 在边界用 `S288Spec` 换算（`q_out=q_rotor/r`、
-`tau_out=tau_rotor*r`、`kp_rotor=kp_out/r²`、`kd_rotor=kd_out/r²`）。这是"电机参数
-不同"要处理的核心。
+> 协议细节（帧表 / CRC32 / 换算式 / 参考向量 / 排障）已整理成
+> **[s288-protocol.md](s288-protocol.md)**，可离线查阅。
 
-`bus` 三选一：`unitree_sdk`（首选，需编译好的扩展在 `PYTHONPATH`）/
-`serial_raw`（自实现 0xFE 0xEE MIT 帧 + CRC16-CCITT，无 SDK 时用）/
-`fake`（纯软件）。若官方 SDK 的 `MotorType` 里没有 `S288` 名称，
-`UnitreeSdkS288Bus` 会**列出全部可选项并在构造时报错**，避免悄无声息地发错协议。
+本仓库的 `SerialS288Bus` 按该协议**逐字节实现**，只依赖 pyserial：
+
+- 物理层：半双工 **TTL 单线**多点，8N1，固定 **6,000,000 bps**；需要 USB-TTL
+  **收发一体**适配器，不能把 TX/RX 分别接到总线上。ID 0~14（15 = 广播，无回包）。
+- 控制包 20B：`0xFE 0xEE` + mode 字节（`id[3:0] | mode[6:4] | timeout[7]`）+
+  保留字节 + 12B 定点 `tor/spd/pos/kp/kd` + **CRC32**。
+- 反馈包 26B：`0xFC 0xEE` + mode + 19B 反馈 + **CRC32**。
+- CRC32：多项式 `0x04C11DB7`、初值 `0xFFFFFFFF`，按 32 位小端字查表推进。
+- 换算是**定点**的（量的语义是转子侧 q/dq/tau/kp/kd）。`S288Spec` 提供成对方法
+  `output_pos_to_raw` / `raw_to_output_pos`、`output_kp_to_raw` / `raw_to_output_kp`
+  等；关节角用**多圈** `q_out`（由转子 pos 推得），另有单圈绝对角 `ExPos`
+  （13bit 输出编码器，0..2π）供上电找零/诊断。
+
+`bus` 取值：`serial`（首选，官方协议 + pyserial）| `fake`（纯软件）；`serial_raw`
+是 `serial` 的旧别名。旧的 `unitree_sdk` 值会**明确报错**并提示改用 `serial`——
+因为官方 SDK 根本无法驱动 S288。
 
 ## FR3 下发通道（Dora）
 

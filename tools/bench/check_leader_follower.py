@@ -26,7 +26,7 @@ from arm_control.leader_follower.s288 import (
     S288Codec,
     S288Command,
     S288Spec,
-    crc16_ccitt,
+    crc32_unitree,
 )
 
 
@@ -37,22 +37,40 @@ def check_s288_units_and_codec() -> None:
         assert abs(float(spec.rotor_to_output_angle(spec.output_to_rotor_angle(q))) - q) < 1e-9
     # kp 按 r^2 缩放
     assert abs(float(spec.output_to_rotor_kp(1.0)) - 1.0 / spec.gear_ratio**2) < 1e-15
-    # CRC 稳定性（XMODEM 对 "123456789" 的已知值 0x31C3）
-    assert crc16_ccitt(b"123456789") == 0x31C3
-    # 命令帧可被自身解出转子侧 q
+    # 定点换算往返闭合（官方 digital_servo 公式）
+    for q in (0.0, 0.5, -1.25, 2.0):
+        raw = int(round(float(spec.output_pos_to_raw(q))))
+        assert abs(float(spec.raw_to_output_pos(raw)) - q) < 1e-4, q
+    # CRC32 已知向量（由官方 digital_servo/python/servo_demo.py 算得）
+    assert crc32_unitree(b"\x00\x00\x00\x00") == 0xC704DD7B
+    assert crc32_unitree(bytes(range(16))) == 0x081B46CA
+    # 空闲命令帧（id=1, mode=1, timeout=1, 全零）与官方逐字节一致
     codec = S288Codec()
+    idle = codec.pack_command(1, S288Command(), spec)
+    assert idle.hex() == "feee91000000000000000000000000009ce9c752", idle.hex()
+    assert len(idle) == 20 and idle[0:2] == bytes((0xFE, 0xEE)) and idle[3] == 0
+    # 命令帧的 mode_byte：低 4 位 id、[6:4] mode=1、最高位 timeout=1
     cmd = S288Command(q_out=0.5, dq_out=0.1, tau_out=0.2, kp_out=25.0, kd_out=1.0)
     frame = codec.pack_command(3, cmd, spec)
-    assert frame[0:2] == bytes((0xFE, 0xEE)) and frame[3] == 3
-    # 伪造一条反馈帧并用 unpack 解析
-    import struct
-
-    q_r = float(spec.output_to_rotor_angle(0.5))
-    fb = bytes((0xFE, 0xEE, 0x01, 3)) + struct.pack("<fff", q_r, 0.0, 0.0)
-    fb = fb + bytes([25, 0]) + b"\x00" * 4
+    assert frame[0:2] == bytes((0xFE, 0xEE))
+    assert (frame[2] & 0x0F) == 3 and ((frame[2] >> 4) & 0x07) == 1 and (frame[2] >> 7) == 1
+    # 伪造一条合法反馈帧并用 unpack 解析
+    fb = codec.build_feedback_frame(
+        3, spec, q_out=0.5, dq_out=0.1, tau_out=0.2, ex_pos_rad=0.3
+    )
     st = codec.unpack_state(fb, spec)
     assert st.motor_id == 3 and abs(st.q_out - 0.5) < 1e-4, st
-    print("s288: 单位换算 / CRC / 帧编解码 OK")
+    # 速度原始值较粗（每 raw ≈ 0.0085 rad/s），容差放到 5e-3
+    assert abs(st.dq_out - 0.1) < 5e-3 and abs(st.tau_out - 0.2) < 1e-3, st
+    # 篡改一个字节 -> CRC 校验必须失败
+    bad = bytearray(fb)
+    bad[10] ^= 0xFF
+    try:
+        codec.unpack_state(bytes(bad), spec)
+        raise AssertionError("篡改后的反馈帧应因 CRC 失败而报错")
+    except ValueError:
+        pass
+    print("s288: 单位换算 / CRC32 / 官方帧编解码 OK")
 
 
 def check_s288_leader_8motors() -> None:

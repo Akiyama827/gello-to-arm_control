@@ -3,7 +3,7 @@
 本文档是 [leader-follower.md](leader-follower.md)（设计与原理）的**操作版**：一份
 照着做就能上线的清单。日常怎么跑、怎么看可视化见
 [使用说明书](leader-follower-usage.md)。硬件约定见设计文档——小臂 = 8 个宇树 S288
-（7 臂关节 + 1 夹爪，官方 `unitree_actuator_sdk`），大臂 = FR3（`fr3_joint1..7` +
+（7 臂关节 + 1 夹爪，走官方 `digital_servo` 协议），大臂 = FR3（`fr3_joint1..7` +
 Franka Hand）。
 
 ---
@@ -14,7 +14,7 @@ Franka Hand）。
 
 | 文件 | 作用 | 上线需改 |
 |---|---|---|
-| `arm_control/leader_follower/s288.py` | S288 规格换算；`UnitreeSdkS288Bus`（官方 SDK）/`SerialS288Bus`（后备）/`FakeS288Bus`；关节链读取 | 否（`motor_type` 走配置） |
+| `arm_control/leader_follower/s288.py` | S288 规格与定点换算；官方 `digital_servo` 协议编解码（CRC32）、`SerialS288Bus`（pyserial 直连）、`FakeS288Bus`；关节链读取 | 否 |
 | `arm_control/leader_follower/leader.py` | 小臂抽象：`S288LeaderArm` / `GelloLeaderAdapter` / `FakeLeaderArm` | 否 |
 | `arm_control/leader_follower/mapping.py` | 关节/夹爪换算、平滑、限幅、`auto_align` | 否（参数走配置） |
 | `arm_control/leader_follower/follower.py` | 下发后端：`DryRunFollower`/`FakeFollower`/`DoraJogFollower`/`RtFollower` | 否 |
@@ -59,8 +59,9 @@ Franka Hand）。
 
 ### 2.2 软件
 
-- **官方 SDK**：编译 `unitree_actuator_sdk`（pybind 扩展）并把产物放到 `PYTHONPATH`。
-  未完成时可先用 `leader.bus: serial_raw`（后备自实现帧）或 `fake` 跑通链路。
+- **pyserial**：S288 走官方 `digital_servo` 协议（20B/26B + CRC32），由本仓库的
+  `SerialS288Bus` 逐字节实现，只需 `pip install pyserial`。**不需要** `unitree_actuator_sdk`
+  ——它根本不支持 S288/J288。无硬件时可先用 `leader.bus: fake` 跑通链路。
 - **Python 环境**：需 `numpy`、`pyarrow`、`dora-rs`（本仓库 `dependencies`）。建议用仓库根的
   `.venv`（见使用说明书第 2 节），或任意满足 `pyproject.toml` 的 Python ≥3.10 解释器。
 - **RT 服务器**：FR3 需用 `-DWITH_FRANKA=ON` 编译，详见 `rt/README.md`。
@@ -73,18 +74,15 @@ Franka Hand）。
 # 1) 串口能看到
 ls -l /dev/ttyUSB0
 
-# 2) 官方 SDK 是否在 PYTHONPATH（无 S288 枚举会在此报错并列出可选项）
-python - <<'PY'
-from unitree_actuator_sdk import MotorType
-print([n for n in dir(MotorType) if not n.startswith('_')])
-PY
+# 2) pyserial 是否装好
+python -c "import serial; print(serial.__version__)"
 
 # 3) 离线自检全绿（不接硬件）
 PYTHONPATH=. python -B tools/bench/check_leader_follower.py
 ```
 
-若第 2 步没有 `S288`：把配置里的 `leader.motor_type` 改成实际枚举名；若官方确实
-不支持 S288，改用 `leader.bus: serial_raw`，或先用 `fake` 验证其余链路。
+第 2 步失败就 `pip install pyserial`。若接的是旧配置里的 `bus: unitree_sdk`，会明确
+报错提示改用 `bus: serial`。
 
 ---
 
@@ -97,7 +95,7 @@ cp examples/configs/leader_follower_real.example.yaml \
    $DEPLOY_ROOT/configs/entries/leader_follower.yaml
 ```
 
-需要按现场标定的字段（见下一节）：`port`、`motor_ids`、`motor_type`、
+需要按现场标定的字段（见下一节）：`port`、`motor_ids`、
 `joint_offsets`/`joint_signs`、`gripper_open_rad`/`gripper_close_rad`，以及
 `mapping.joints[*].lower/upper`（FR3 官方限位，按实际 URDF 核对）、`auto_arm`。
 
@@ -251,7 +249,8 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 | 节点报「找不到配置文件」 | 未设 `LEADER_FOLLOWER_CONFIG` | 指向真机配置（见 6.2） |
 | 节点报「follower.kind 不是 dora」 | 用了 fake/fake 示例 | 改配置或换 `LEADER_FOLLOWER_CONFIG` |
 | 启动超时未收到 `motor_state` | `plant_interface` 未起 / RT 服务器没连上 / 图接线错 | 先看 RT 服务器日志，再确认 Dora 图里 `plant_interface` 节点起来了 |
-| 构造时报 MotorType 无 `S288` | 官方枚举名不同或未编 S288 | 改 `motor_type` 或 `bus: serial_raw` |
+| 报错「unitree_actuator_sdk 不支持 S288」 | 配置里是旧的 `bus: unitree_sdk` | 改成 `bus: serial`（官方 digital_servo 协议） |
+| 反馈超时/CRC 失败 | 波特率非 6M / TX-RX 接反 / 未共地 / 适配器不是半双工一体 | 核对 6 Mbps、TTL 单线接法、共地；换收发一体适配器 |
 | 打开串口失败 | 端口错 / 权限不足 | 查 `ls -l /dev/ttyUSB0`、加入 `dialout` |
 | 一启动就安全停机（越限） | `fr3_joint4` 零位越限 / 初始位形非法 | 确保 `auto_align: true` 且 FR3 处于合法位形；核对限位 |
 | 一启动就安全停机（跟踪误差） | 大臂没使能 / 增益 0 / `jog` 未接上 | 检查 `arm_controller` 的 `jog` 输入与 ARM 状态 |
@@ -265,7 +264,7 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 ## 10. 上线核对清单
 
 - [ ] `check_leader_follower.py` 全绿
-- [ ] 官方 SDK/`MotorType` 已核对，或已切 `serial_raw`
+- [ ] `pyserial` 已装，`bus: serial`（官方 digital_servo 协议）已生效
 - [ ] 串口端口与 `dialout` 权限确认
 - [ ] `joint_signs` / `joint_offsets` 实机标定
 - [ ] `gripper_open_rad` / `gripper_close_rad` 标定，夹爪开合方向正确

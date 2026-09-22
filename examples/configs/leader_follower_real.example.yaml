@@ -12,7 +12,7 @@ leader:
   kind: s288
   n_arm_joints: 7          # 7 臂关节 + 1 夹爪 = 8 个 S288
   with_gripper: true
-  bus: unitree_sdk         # unitree_sdk(官方SDK,首选) | serial_raw(后备) | fake
+  bus: serial              # serial(官方 digital_servo 协议,首选) | fake
   port: /dev/ttyUSB0
   motor_type: S288         # 官方 SDK MotorType 枚举名；无此名构造时会列出可选项
   motor_ids: [1, 2, 3, 4, 5, 6, 7, 8]
