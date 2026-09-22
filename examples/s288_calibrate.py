@@ -10,7 +10,7 @@
   read     打印每个电机的角度/速度/温度/电压/错误；``--watch`` 持续刷新
   zero     把当前姿态记为各关节零位 -> 输出 joint_offsets
   signs    交互式确定每个臂关节的正方向 -> 输出 joint_signs
-  gripper  记录夹爪完全张开/闭合的角度 -> 输出 gripper_open_rad/gripper_close_rad
+  gripper  全行程扫描几秒，取最小/最大角 -> 输出 gripper_open_rad/gripper_close_rad
 
 示例
 ----
@@ -361,16 +361,35 @@ def cmd_gripper(args) -> int:
     ids = list(leader.chain.motor_ids)
     n = len(ids)
     gi = cfg.leader.gripper_index if cfg.leader.gripper_index is not None else n - 1
-    print(f"[标定] 夹爪是第 {gi} 个（motor {ids[gi]}），1=张开 0=闭合。", flush=True)
+    window = float(getattr(args, "window", 6.0) or 6.0)
+    print(
+        f"[标定] 夹爪是第 {gi} 个（motor {ids[gi]}），1=张开 0=闭合。"
+        f"接下来 {window:.1f}s 内请把扳机/夹爪**全行程来回扳动**。",
+        flush=True,
+    )
     try:
-        _prompt(args, "把夹爪**完全张开**")
-        open_rad = _gripper_calibrated(leader, cfg, n)
-        _prompt(args, "把夹爪**完全闭合**")
-        close_rad = _gripper_calibrated(leader, cfg, n)
-        if open_rad <= close_rad:
+        _prompt(args, "准备好后回车，随即开始全行程扳动（张开<->闭合）")
+        print(f"[标定] 采样中（{window:.1f}s）… 请持续全行程扳动", flush=True)
+        lo, hi = np.inf, -np.inf
+        t0 = time.time()
+        while time.time() - t0 < window:
+            v = _gripper_calibrated(leader, cfg, n)
+            if np.isfinite(v):
+                lo = min(lo, float(v))
+                hi = max(hi, float(v))
+            time.sleep(0.02)
+        if not np.isfinite(lo):
+            raise SystemExit("[标定] 采样失败：没有得到有效读数")
+        open_rad, close_rad = hi, lo
+        span = hi - lo
+        print(
+            f"[标定] 全行程 joint 范围 [{lo:.4f}, {hi:.4f}]，行程 {span:.4f} rad",
+            flush=True,
+        )
+        if span <= float(args.min_delta):
             print(
-                f"[标定] 警告：张开角 {open_rad:.4f} <= 闭合角 {close_rad:.4f}，"
-                "请检查 joint_signs 或夹爪接线方向。",
+                f"[标定] 警告：行程 {span:.4f} <= min_delta={args.min_delta}，"
+                "夹爪几乎没动（先查接线/耦合/电机反馈）",
                 flush=True,
             )
         print(f"[标定] 张开={open_rad:.4f} rad  闭合={close_rad:.4f} rad", flush=True)
@@ -434,7 +453,9 @@ def main(argv=None) -> int:
     p_signs = sub.add_parser("signs", parents=[common], help="交互式确定关节正方向 -> joint_signs")
     p_signs.set_defaults(func=cmd_signs)
 
-    p_grip = sub.add_parser("gripper", parents=[common], help="记录夹爪张开/闭合角")
+    p_grip = sub.add_parser("gripper", parents=[common], help="记录夹爪张开/闭合角（全行程扫描）")
+    p_grip.add_argument("--window", type=float, default=6.0,
+                        help="采样时长（秒）：此间全行程来回扳动，取最小/最大")
     p_grip.set_defaults(func=cmd_gripper)
 
     args = parser.parse_args(argv)

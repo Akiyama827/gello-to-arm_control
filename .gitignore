@@ -37,6 +37,7 @@ venv/
 
 # Machine-local configs (现场标定后的端口/零位/方向，勿提交；模板见 *.example.yaml / *_sim.yaml).
 *.local.yaml
+*.local.yaml.*
 
 # Agent scratch: plans, progress and status docs are regenerated per run and
 # are not committed. Durable decisions belong in docs/, verified history in
