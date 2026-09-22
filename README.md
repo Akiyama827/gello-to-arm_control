@@ -45,6 +45,16 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 缩
 - 接**真机**还需厂商工具链（`pyserial` 读 S288 / `pylibfranka` / `dmcan`）与 C++ 实时核心，
   见 [部署文档 docs/leader-follower-deploy.md](docs/leader-follower-deploy.md)。
 
+### 已知问题（当前真机现场）
+
+- **S288 夹爪电机（第 8 个，ID 8）硬件故障**：反馈冻结（全行程扳动时 `q_out` / `ExPos`
+  在数秒采样里几乎不变）且 `err=256` 重新上电后仍存在，判定为电机/编码器硬件问题，
+  非操作或软件问题。为不阻塞其余关节，**已临时停用夹爪映射**：注释掉配置里的
+  `mapping.gripper`（`leader.with_gripper` 保持 `true` 即可），
+  **7 个臂关节照常主从遥操作**，夹爪指令恒为 `0`（闭合）。
+  详见[部署文档第 9 节故障排查](docs/leader-follower-deploy.md)；换/修好电机后
+  取消注释即可恢复夹爪遥操作（新电机可能需重新 `zero` / `gripper` 标定）。
+
 ## Layout
 
 | Path | Owner/responsibility |
