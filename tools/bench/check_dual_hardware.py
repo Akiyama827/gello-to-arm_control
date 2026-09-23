@@ -25,6 +25,7 @@ import numpy as np
 from arm_control.config import gripper_joints
 from arm_control.multi_arm.config import load_pair_config
 from arm_control.multi_arm import diagnostics
+from arm_control.multi_arm import hardware
 from arm_control.multi_arm.cooperative import pose_error, virtual_capture_reason
 from arm_control.multi_arm.hardware import RemoteHardware
 from arm_control.plants.remote_rt.client import RtBackend, RtConfig
@@ -180,6 +181,50 @@ def check_virtual(app, action, wait, refinement):
     goal = app.snapshot()["shared_object"]["values"].copy()
     goal[2] += 10
     goal[5] += 2
+    action("plan", object_target=goal)
+    state = wait(lambda s: s["status"] in {"preview", "failed"}, timeout=60)
+    assert state["status"] == "preview", state["error"]
+    idle_pair = state["preview_id"]
+    action("stage", pair_id=idle_pair, reviewed=True)
+    wait(lambda s: s["pair"]["lifecycle"] == "ready")
+    align, invalidate = hardware.align_feedback, app._invalidate
+    injected, cancelled = [], []
+    holds = {a: c.last_command.q_des.copy() for a, c in app.runtime.controllers.items()}
+
+    def gap_once(links, histories, **kwargs):
+        if not injected:
+            injected.append(True)
+            a, b = links
+            left, right = histories[a][-1], histories[b][-1]
+            target = min(left[0].t_mono_ns, right[0].t_mono_ns)
+            histories = {
+                a: [(replace(left[0], t_mono_ns=target), left[1])],
+                b: [(replace(right[0], t_mono_ns=target - 20_000_000,
+                             state_seq=right[0].state_seq - 3), right[1]),
+                    (replace(right[0], t_mono_ns=target + 525_493), right[1])],
+            }
+        return align(links, histories, **kwargs)
+
+    def observe_cancel(reason):
+        if "feedback interrupted" in reason:
+            assert not app.runtime.feedback_ready and not app.runtime.fresh
+            assert all(not h.state().ready for h in app.runtime.handles.values())
+            cancelled.append(True)
+        invalidate(reason)
+
+    with patch.object(hardware, "align_feedback", gap_once), patch.object(app, "_invalidate", observe_cancel):
+        state = wait(lambda s: s["status"] in {"cancelled", "faulted"})
+        assert state["status"] == "cancelled", state["error"]
+    assert injected and cancelled and app.fault_trace is None
+    assert state["pair"]["lifecycle"] == "cancelled" and state["preview_id"] is None
+    assert all(a["released_at"] is None for a in state["pair"]["members"])
+    wait(lambda s: app.runtime.feedback_ready and app.runtime.fresh)
+    with app._lock:
+        for a, c in app.runtime.controllers.items():
+            assert c.armed and not c._running and c._plan is None
+            np.testing.assert_array_equal(c.last_command.q_des, holds[a])
+    refused("execute", pair_id=idle_pair)
+    print("Idle 20.525493 ms feedback gap cancels staged pair, preserves hold, requires new plan: PASS", flush=True)
     action("plan", object_target=goal)
     first_executor = next(iter(app.runtime.controllers.values())).executor
     step = first_executor.step

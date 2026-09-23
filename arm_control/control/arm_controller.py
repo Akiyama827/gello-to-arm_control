@@ -690,7 +690,19 @@ class ArmController:
         does not dip, but a leg aborted mid-motion has a moving command, so
         ``_anchored_hold`` falls through to a static hold at the MEASURED
         pose -- which is where the arm actually is when the button is pressed.
+        A staged, unreleased joint plan has not moved the arm: cancelling only
+        that plan preserves the existing hold anchor, subject to normal relatch
+        and observation guards.
         """
+        keep_anchor = (
+            self._plan is not None and self._pending_traj is not None and not self._running
+            and not self._jog.active and self._pose_hold is None
+            and self._cartesian_now is None
+            and not self.frozen and not self.stopped
+            and self.last_command is not None and not np.any(self.last_command.qd_des)
+            and np.isfinite(self.last_state.velocity).all()
+            and np.max(np.abs(self.last_state.velocity)) < .01
+        )
         if self.execution_policy is not None:
             self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
         if self._pose_hold is not None:
@@ -705,7 +717,8 @@ class ArmController:
         self._running = False
         self.executor.clear_trajectory()
         self._jog.clear()
-        self._hold_anchor = None
+        if not keep_anchor:
+            self._hold_anchor = None
         print(f"[arm_controller] cancelled: {reason}"
               f"{' (cleared frozen hold)' if was_frozen else ''}", flush=True)
 

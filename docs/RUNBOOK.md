@@ -233,9 +233,13 @@ preview identity and passed unchanged to the planning worker. Translate/rotate
 the plate and use the usual preview/stage/execute
 workflow. In shared mode, the displayed pose and closure check use joint
 positions interpolated to one RT publication timestamp, with fresh bracketing
-samples from the same host and authority epoch. No extrapolation is allowed:
-receipt age above 50 ms, publication skew or interpolation gaps above 20 ms,
-or invalid feedback stops the pair. Controllers retain raw measured feedback.
+samples from the same host and authority epoch. No extrapolation is allowed.
+Receipt age above 50 ms, invalid feedback, or a spacing gap above 20 ms during
+motion stops the pair. A settled joint hold can wait up to 50 ms from the last
+aligned observation's receipt for a spacing gap to recover. It retains its hold
+target, cancels pending plans and blocks execution until fresh alignment returns.
+Then **Plan → review → Stage → Execute** again; the cancelled plan cannot resume.
+A prolonged gap still stops both arms. Controllers retain raw measured feedback.
 The object pose is inferred from the first TCP, with agreement checked against
 the second; it is not an object sensor measurement. Divergence
 above 3 mm / 2° faults the console and disarms both arms. Hand commands stay
@@ -244,8 +248,9 @@ plate at its current pose and invalidates previews; it needs no physical support
 The next approach uses the nominal edge poses again. Capture handles a virtual
 attachment only; it is not a correction for robot tracking or calibration.
 Ordinary joint-goal completion retains the planned endpoint with zero desired
-velocity. Timeout, cancellation and task-specific completion retain their
-measured-pose hold behavior.
+velocity. Cancelling an unreleased joint plan while stationary preserves that
+hold. Active-motion cancellation, timeout and task-specific completion hold at
+the measured pose.
 
 A shared-object runtime fault prints the measured disagreement and requests
 both arms to stop. Hardware runtime faults save the last 500 PC ticks under

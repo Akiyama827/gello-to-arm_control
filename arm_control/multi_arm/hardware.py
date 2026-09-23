@@ -23,7 +23,7 @@ from arm_control.messages import (
 from arm_control.model_bundle import pose_provenance
 from arm_control.multi_arm.interface import LocalArmHandle, QueueControllerNode
 from arm_control.multi_arm.synchronization import SharedReferenceClock
-from arm_control.multi_arm.feedback import align_feedback
+from arm_control.multi_arm.feedback import FeedbackGap, align_feedback
 from arm_control.multi_arm.cooperative import (
     CooperativeKinematics, RigidGrasps, pose_error, virtual_capture_reason,
 )
@@ -58,7 +58,8 @@ class _HardwareHandle(LocalArmHandle):
         state = super().state()
         health = self.runtime.links[self.arm_id].motor_health()
         return replace(state, armed=bool(health["armed"]),
-                       ready=state.ready and not self.runtime._pending[self.arm_id],
+                       ready=(state.ready and self.runtime.feedback_ready
+                              and not self.runtime._pending[self.arm_id]),
                        fault_reason=health.get("latched_fault") or self.runtime._faults.get(self.arm_id))
 
 
@@ -91,6 +92,7 @@ class RemoteHardware:
         self._hand_results = {}
         self._observations, self._observed_health = {}, {}
         self._closure_positions, self._feedback_alignment = None, None
+        self._aligned_at = self._holding_since = None
         self._closed = False
         self._connect_started = False
         self.period = 0.01
@@ -193,7 +195,7 @@ class RemoteHardware:
 
     @property
     def fresh(self):
-        return len(self.hands) == 2 and all(
+        return self.feedback_ready and len(self.hands) == 2 and all(
             self.links[a].motor_health()["state_fresh"]
             and not self.links[a].motor_health()["any_fault"]
             and not self._faults.get(a)
@@ -202,21 +204,51 @@ class RemoteHardware:
             for a in self.controllers
         )
 
+    @property
+    def feedback_ready(self):
+        return self.mode != "shared" or not (self._feedback_alignment or {}).get("error")
+
     def joint_state(self):
         return {
             key: np.concatenate([getattr(c.last_state, key) for c in self.controllers.values()])
             for key in ("position", "velocity")
         }
 
-    def _align_feedback(self, histories=None):
+    def _align_feedback(self, histories=None, *, allow_wait=False):
         if histories is None:
             histories = {a: link.recent_states() for a, link in self.links.items()}
+        now = time.monotonic()
         try:
-            positions, report = align_feedback(self.links, histories, now=time.monotonic())
+            positions, report = align_feedback(self.links, histories, now=now)
         except ValueError as exc:
-            self._feedback_alignment = dict(error=str(exc))
+            self._feedback_alignment = dict(error=str(exc), **getattr(exc, "details", {}))
+            # Only a settled joint hold can wait briefly for a new bracket.
+            # No trajectory clock is paused/resumed; pending plans lose admission.
+            # Invalid data, unknown authority, active motion and prolonged loss
+            # still reach the console's stop-both path immediately.
+            if (isinstance(exc, FeedbackGap) and allow_wait
+                    and self._aligned_at is not None and now - self._aligned_at <= .05):
+                return
             raise
         self._closure_positions, self._feedback_alignment = positions, report
+        # Re-evaluating unchanged packets must not renew the recovery budget.
+        self._aligned_at = min(history[-1][1] for history in histories.values())
+
+    def _update_holding(self, now):
+        holding = all(
+            c.armed and c.bridge_armed and c.ready_sent and c._health_ok
+            and not c.stopped and not c.frozen
+            and c._last_state_at is not None and not c._running
+            and not c._jog.active and c.mode_law == "joint"
+            and c.last_command is not None and not np.any(c.last_command.qd_des)
+            and np.max(np.abs(c.last_state.velocity)) < .01
+            for c in self.controllers.values()
+        )
+        if not holding:
+            self._holding_since = None
+        elif self._holding_since is None:
+            self._holding_since = now
+        return self._holding_since is not None and now - self._holding_since >= .25
 
     def closure_joint_state(self):
         """Shared closure uses common-time estimates; control uses raw states."""
@@ -370,6 +402,7 @@ class RemoteHardware:
                                       if c.executor.has_trajectory and self._reference_time is not None else None),
             )
         return dict(pc_monotonic=now, reference_time_pc=self._reference_time, arms=arms,
+                    feedback_ready=self.feedback_ready,
                     feedback_alignment=self._feedback_alignment if self.mode == "shared" else None)
 
     def step(self):
@@ -404,8 +437,9 @@ class RemoteHardware:
                 # A rejected non-finite sample deliberately clears this stamp.
                 if c._last_state_at is not None:
                     c._last_state_at = received
+        holding = self._update_holding(time.monotonic())
         if self.mode == "shared":
-            self._align_feedback(histories)
+            self._align_feedback(histories, allow_wait=holding)
         # Receive both arms before doing dynamics work; sample both trajectories
         # at the same PC time, then dispatch the two resulting commands together.
         # This removes computation-order skew, not network/physical-cycle skew.

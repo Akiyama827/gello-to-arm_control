@@ -8,6 +8,14 @@ synchronization before this comparison is meaningful and are refused here.
 import numpy as np
 
 
+class FeedbackGap(ValueError):
+    """Fresh packets exist, but their spacing cannot support interpolation."""
+
+    def __init__(self, message, **details):
+        super().__init__(message)
+        self.details = details
+
+
 def align_feedback(links, histories, *, now, max_age_s=.05, max_interval_s=.02):
     """Return common-time positions and the raw brackets that produced them.
 
@@ -50,7 +58,12 @@ def align_feedback(links, histories, *, now, max_age_s=.05, max_interval_s=.02):
     stamps = [s.t_mono_ns for s in latest.values()]
     target = min(stamps)
     if (max(stamps) - target) * 1e-9 > max_interval_s:
-        raise ValueError("paired feedback publication skew exceeds 20 ms")
+        skew = (max(stamps) - target) * 1e-9
+        raise FeedbackGap(
+            f"paired feedback publication skew {skew * 1000:.3f} ms "
+            f"exceeds {max_interval_s * 1000:g} ms",
+            latest_skew_s=skew, limit_s=max_interval_s, target_t_mono_ns=target,
+        )
     positions, brackets = {}, {}
     for a, history in histories.items():
         current = latest[a]
@@ -72,7 +85,14 @@ def align_feedback(links, histories, *, now, max_age_s=.05, max_interval_s=.02):
             raise ValueError(f"{a}: paired feedback cannot bracket common time")
         interval = (after.t_mono_ns - before.t_mono_ns) * 1e-9
         if interval > max_interval_s:
-            raise ValueError(f"{a}: paired feedback interpolation gap exceeds 20 ms")
+            raise FeedbackGap(
+                f"{a}: paired feedback interpolation gap {interval * 1000:.3f} ms "
+                f"exceeds {max_interval_s * 1000:g} ms",
+                arm_id=a, interval_s=interval, limit_s=max_interval_s,
+                target_t_mono_ns=target,
+                before_t_mono_ns=before.t_mono_ns, after_t_mono_ns=after.t_mono_ns,
+                before_seq=before.state_seq, after_seq=after.state_seq,
+            )
         alpha = (0. if interval == 0 else
                  (target - before.t_mono_ns) / (after.t_mono_ns - before.t_mono_ns))
         q0, q1 = position(a, before), position(a, after)

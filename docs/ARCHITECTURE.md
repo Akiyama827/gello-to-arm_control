@@ -151,6 +151,13 @@ isolation diagnostic.
 The relative-pose monitor uses fresh packets bracketing a common publication
 timestamp on one RT host. It refuses extrapolation, invalid/reordered packets,
 wrong authority, receipt age over 50 ms, or skew/interpolation gaps over 20 ms.
+Only an armed joint hold with measured speeds below 0.01 rad/s for 0.25 s may
+wait briefly for a spacing gap to recover. Readiness is withheld, pending plans
+are invalidated, and the existing hold target is retained. The wait ends no
+later than 50 ms after the older latest packet in the last valid alignment was
+received; re-reading unchanged packets cannot extend it. No closure estimate
+is accepted during that interval. Active motion, invalid feedback and expired
+recovery still stop both arms. Recovery requires a new plan, never auto-resume.
 This removes comparison error from asynchronous streams; it does not establish
 physical capture synchronization. Controllers still consume raw measurements.
 

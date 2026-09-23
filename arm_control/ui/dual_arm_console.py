@@ -517,6 +517,17 @@ class DualArmConsole:
                 deadline = time.monotonic() + self.runtime.period
                 with self._lock:
                     self.runtime.step()
+                    aligned = getattr(self.runtime, "feedback_ready", True)
+                    if not aligned and (
+                        self.coordinator.lifecycle.active or self.motion is not None
+                        or (self._future and self._future_revision == self.revision)
+                    ):
+                        self._invalidate("paired feedback interrupted while holding")
+                        self.status = "cancelled"
+                        self.error = (
+                            "Feedback interrupted while holding; plan cancelled. "
+                            "Wait for recovery, then re-plan."
+                        )
                     self.coordinator.pump()
                     speeds = self.runtime.joint_state()["velocity"]
                     if (
@@ -529,7 +540,7 @@ class DualArmConsole:
                         self._stationary_since = None
                     closure = (
                         self._object_errors()
-                        if self.runtime.mode == "shared" and not self.runtime.paused else None
+                        if aligned and self.runtime.mode == "shared" and not self.runtime.paused else None
                     )
                     if self.config.backend == "remote_rt":
                         sample = self.runtime.diagnostic_sample()

@@ -82,6 +82,20 @@ def main():
     c.on_control(pack_control_update(execute="p"))
     assert not c._running and c._plan is None, "Execute must recheck measured start"
 
+    for running, velocity in ((False, 0.), (True, 0.), (False, .02)):
+        c, clock = setup()
+        c.on_plan(plan())
+        if running:
+            c.on_control(pack_control_update(execute="p"))
+        c.on_motor_state(state(.002, velocity=velocity))
+        c.on_control(pack_control_update(cancel=True, cancel_plan_id="p"))
+        c.tick()
+        assert c._plan is None and c._pending_traj is None and not c._running
+        expected = .002 if running or velocity else 0.
+        assert np.allclose(commands(c)[-1]["position"], expected), (
+            "cancel must retain a staged hold, but reanchor an active motion"
+        )
+
     c, clock = setup()
     c.on_plan(plan())
     c.on_control(pack_control_update(execute="p"))
@@ -415,6 +429,12 @@ def check_completion_order():
     assert not c._running
     assert np.allclose(commands(c)[-1]["position"], 0), "successful joint goal must retain its endpoint"
     assert commands(c)[-1]["cartesian"] is None
+    c.on_motor_state(state(.0075))
+    c.on_control(pack_control_update(cancel=True))
+    c.tick()
+    assert np.allclose(commands(c)[-1]["position"], .0075), (
+        "ordinary Cancel after completion must still hold the measured pose"
+    )
     c, clock = setup(health=False)
     c.on_plan(plan(completion={"vel_tol": 100, "goal_q": [0]*7, "residual_max": 100}))
     c.on_control(pack_control_update(execute="p"))

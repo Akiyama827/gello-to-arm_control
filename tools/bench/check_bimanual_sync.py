@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -10,7 +11,8 @@ from check_bimanual_contract import Harness, measured
 from check_execution_policy import setup, commands
 from arm_control.multi_arm.synchronization import SharedReferenceClock, StartRecord
 from arm_control.multi_arm.types import PairLifecycle
-from arm_control.multi_arm.feedback import align_feedback
+from arm_control.multi_arm.feedback import FeedbackGap, align_feedback
+from arm_control.multi_arm.hardware import RemoteHardware
 from arm_control.plants.remote_rt.protocol import State, FLAG_ARMED, FLAG_FAULTED
 
 
@@ -18,6 +20,7 @@ def main():
     check_reference_phase()
     check_reference_safety()
     check_feedback_alignment()
+    check_idle_feedback_wait()
     h = Harness()
     h.coord.stage_pair(h.pair())
     for event in h.handles["fr3_1"].poll_events():
@@ -168,6 +171,21 @@ def check_feedback_alignment():
     raw = history()
     raw["a"] = [sample(9.98), sample(10.02)]
     refused(raw, "interpolation gap")
+    # Replay the exact timestamp/sequence spacing from the operator's fault.
+    raw = history()
+    stamps = {"a": [(2537345944240057, 17613370), (2537345968247231, 17613394)],
+              "b": [(2537345948579137, 14949686), (2537345969104630, 14949689)]}
+    for a, h in raw.items():
+        for (s, _), (stamp, seq) in zip(h, stamps[a]):
+            s.t_mono_ns, s.state_seq = stamp, seq
+    try:
+        align_feedback(links, raw, now=20.01)
+    except FeedbackGap as exc:
+        assert exc.details["arm_id"] == "b"
+        assert abs(exc.details["interval_s"] - .020525493) < 1e-12
+        assert exc.details["after_seq"] - exc.details["before_seq"] == 3
+    else:
+        raise AssertionError("operator's 20.525493 ms bracket was accepted")
     raw = history()
     raw["a"][-1][0].t_mono_ns += 30_000_000
     refused(raw, "publication skew")
@@ -200,6 +218,77 @@ def check_feedback_alignment():
     links["b"].config.host = "different-host"
     refused(history(), "one RT host clock")
     print("Common-time feedback removes timestamp skew, retains real offsets, refuses invalid/stale/unbracketed states: PASS")
+
+
+def check_idle_feedback_wait():
+    """An idle hold may wait; invalid data, moving and prolonged gaps must fail."""
+    runtime = RemoteHardware.__new__(RemoteHardware)
+    runtime.mode = "shared"
+    runtime.controllers = {a: setup()[0] for a in "ab"}
+    runtime._holding_since = runtime._aligned_at = None
+    runtime._closure_positions = runtime._feedback_alignment = None
+    runtime.links = {a: SimpleNamespace(
+        config=SimpleNamespace(host="same-host"),
+        motor_health=lambda: dict(session_id="7", arm_epoch=0),
+        motor_state=lambda *, state: dict(position=state.q, velocity=state.dq),
+    ) for a in "ab"}
+
+    def sample(stamp):
+        return State(n=1, state_seq=stamp, t_mono_ns=stamp * 1_000_000,
+                     session_id=7, flags=FLAG_ARMED, q=[0.], dq=[0.]), 20.
+
+    good = {"a": [sample(10), sample(20)], "b": [sample(5), sample(15)]}
+    gap = {"a": [sample(1), sample(25)], "b": [sample(5), sample(15)]}
+    assert not runtime._update_holding(19.74)
+    assert runtime._update_holding(20.)
+    with patch("arm_control.multi_arm.hardware.time", SimpleNamespace(monotonic=lambda: 20.)):
+        runtime._align_feedback(good)
+    held = runtime._closure_positions
+
+    def apply(raw, now, allowed, expected_error=None):
+        with patch("arm_control.multi_arm.hardware.time", SimpleNamespace(monotonic=lambda: now)):
+            try:
+                runtime._align_feedback(raw, allow_wait=allowed)
+            except ValueError as exc:
+                assert expected_error and expected_error in str(exc), exc
+            else:
+                assert expected_error is None, "unsafe feedback wait was accepted"
+
+    apply(gap, 20.01, True)
+    assert not runtime.feedback_ready and runtime._closure_positions is held
+    assert runtime._aligned_at == 20., "a gap must not reset its own deadline"
+    apply(gap, 20.04, True)
+    apply(gap, 20.051, True, "stale")
+    # Fresh packet receipt still cannot extend the 50 ms alignment deadline.
+    fresh_gap = {a: [(s, 20.04) for s, _ in h] for a, h in gap.items()}
+    apply(fresh_gap, 20.051, True, "interpolation gap")
+    apply(good, 20.02, True)
+    assert runtime.feedback_ready
+    apply(good, 20.04, True)
+    assert runtime._aligned_at == 20.
+    apply(fresh_gap, 20.051, True, "interpolation gap")
+    for flag, bad in (("_running", True), ("frozen", True), ("stopped", True),
+                      ("bridge_armed", False), ("_health_ok", False), ("_pose_hold", {})):
+        c = runtime.controllers["a"]
+        saved = getattr(c, flag)
+        setattr(c, flag, bad)
+        allowed = runtime._update_holding(20.03)
+        assert not allowed, flag
+        apply(gap, 20.03, allowed, "interpolation gap")
+        setattr(c, flag, saved)
+        assert not runtime._update_holding(20.03)
+        assert runtime._update_holding(20.30)
+    c._jog.set(np.zeros(7), 10.)
+    assert not runtime._update_holding(20.03)
+    c._jog.clear()
+    c.last_state.velocity[0] = .011
+    assert not runtime._update_holding(20.03)
+    good["a"][-1][0].dq[0] = np.nan
+    apply(good, 20.03, True, "invalid joints")
+    good["a"][-1][0].dq[0] = 0.
+    good["a"][-1][0].session_id = 99
+    apply(good, 20.03, True, "authority changed")
+    print("Idle feedback wait: bounded 50 ms, no extrapolation; motion/authority/invalid/stale guards retained: PASS")
 
 
 if __name__ == "__main__":
