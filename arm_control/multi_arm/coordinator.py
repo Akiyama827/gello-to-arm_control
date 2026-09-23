@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -94,6 +95,7 @@ class BimanualCoordinator:
         staging_timeout_s=2.0,
         state_timeout_s=1.0,
         admission: Callable | None = None,
+        release_context: Callable | None = None,
     ):
         self.arms = dict(arms)
         if len(self.arms) != 2:
@@ -112,6 +114,9 @@ class BimanualCoordinator:
         self.staging_timeout_s = float(staging_timeout_s)
         self.state_timeout_s = float(state_timeout_s)
         self.admission = admission
+        # In-process controllers can share a reference epoch. Transport-backed
+        # handles retain their existing barrier semantics without this hook.
+        self._release_context = release_context or nullcontext
         self._run: _PairRun | None = None
         self._last: dict[str, PairState] = {}
         self._consumed_pair_ids: set[str] = set()
@@ -220,17 +225,18 @@ class BimanualCoordinator:
             self._abort(PairLifecycle.REJECTED, str(exc))
             return
         run.lifecycle = PairLifecycle.EXECUTING
-        for a, p in run.plan.members().items():
-            try:
-                self.arms[a].execute(p.plan_id)
-                run.releases[a] = self._clock()
-                # In-process refusals must stop the release of the partner.
-                self._poll(a)
-                if run.lifecycle is not PairLifecycle.EXECUTING:
-                    break
-            except Exception as exc:
-                self._abort(PairLifecycle.FAULTED, f"{a}: release failed: {exc}", a)
-                break
+        a = None
+        try:
+            with self._release_context():
+                for a, p in run.plan.members().items():
+                    self.arms[a].execute(p.plan_id)
+                    run.releases[a] = self._clock()
+                    # In-process refusals must stop the release of the partner.
+                    self._poll(a)
+                    if run.lifecycle is not PairLifecycle.EXECUTING:
+                        break
+        except Exception as exc:
+            self._abort(PairLifecycle.FAULTED, f"{a}: release failed: {exc}", a)
 
     def cancel_pair(self, reason="operator cancellation"):
         if self._run and self.lifecycle.active:

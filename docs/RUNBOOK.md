@@ -217,8 +217,10 @@ shared-object hardware configurations are refused. A `shared_object` explicitly
 marked `virtual: true` supports empty-Hand coordination without welds or payload.
 The consuming Control command is
 `python tools/run.py real dual` (port 7521), after its experimental RT deployment.
-`--check` validates configuration without connecting. Paired hardware uses PC
-barrier release; physical start skew and concurrent FCI timing remain unqualified.
+`--check` validates configuration without connecting. Paired hardware uses a
+common PC trajectory epoch and sample time, computing both commands before
+dispatch. Release/send times remain distinct; physical start skew and concurrent
+FCI timing remain unqualified.
 
 For a virtual object, choose **Virtual object**, ARM both controllers, then
 **Plan to virtual grasps** → review → Stage → Execute. Keep both Hands empty
@@ -229,8 +231,13 @@ actual object-to-TCP transforms without moving either arm or the virtual plate;
 these transforms stay fixed until leaving shared mode. They are included in
 preview identity and passed unchanged to the planning worker. Translate/rotate
 the plate and use the usual preview/stage/execute
-workflow. The displayed pose is inferred from the first TCP, with agreement
-checked against the second; it is not an object sensor measurement. Divergence
+workflow. In shared mode, the displayed pose and closure check use joint
+positions interpolated to one RT publication timestamp, with fresh bracketing
+samples from the same host and authority epoch. No extrapolation is allowed:
+receipt age above 50 ms, publication skew or interpolation gaps above 20 ms,
+or invalid feedback stops the pair. Controllers retain raw measured feedback.
+The object pose is inferred from the first TCP, with agreement checked against
+the second; it is not an object sensor measurement. Divergence
 above 3 mm / 2° faults the console and disarms both arms. Hand commands stay
 locked during coupling. Returning to **Independent arms** freezes the virtual
 plate at its current pose and invalidates previews; it needs no physical support.
@@ -243,8 +250,9 @@ measured-pose hold behavior.
 A shared-object runtime fault prints the measured disagreement and requests
 both arms to stop. Hardware runtime faults save the last 500 PC ticks under
 `$ARM_CONTROL_ROOT/.cache/dual_arm/faults/` and print the JSON path. The report
-includes measured joints, PC/RT references, packet timestamps, captured grasps
-and the planned trajectories. Receipt and RT publication times are not
+includes measured joints, PC/RT references, packet timestamps, common reference
+times, interpolation brackets, captured grasps and the planned trajectories.
+Receipt and RT publication times are not
 synchronized physical capture times. Preserve the report before clearing the
 cache; a planner pass alone does not qualify measured tracking or synchronization.
 

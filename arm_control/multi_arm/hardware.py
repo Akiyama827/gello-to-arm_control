@@ -22,6 +22,8 @@ from arm_control.messages import (
 )
 from arm_control.model_bundle import pose_provenance
 from arm_control.multi_arm.interface import LocalArmHandle, QueueControllerNode
+from arm_control.multi_arm.synchronization import SharedReferenceClock
+from arm_control.multi_arm.feedback import align_feedback
 from arm_control.multi_arm.cooperative import (
     CooperativeKinematics, RigidGrasps, pose_error, virtual_capture_reason,
 )
@@ -67,7 +69,7 @@ class RemoteHardware:
     """
 
     backend_name = "remote_rt"
-    timing_status = "Hardware: PC barrier release; physical synchronization unqualified"
+    timing_status = "Hardware: common PC references; physical synchronization unqualified"
     mode = "independent"
     mode_revision = 0
     paused = False
@@ -88,9 +90,13 @@ class RemoteHardware:
         self._measured_fingers = {}
         self._hand_results = {}
         self._observations, self._observed_health = {}, {}
+        self._closure_positions, self._feedback_alignment = None, None
         self._closed = False
         self._connect_started = False
         self.period = 0.01
+        self.reference_clock = SharedReferenceClock()
+        self.release_context = self.reference_clock.batch
+        self._reference_time = None
         backend_factory = backend_factory or RtBackend.from_config
         self._hand_factory = hand_factory or BridgeClient
         offset = 0
@@ -114,6 +120,7 @@ class RemoteHardware:
                 c = ArmController(
                     _HardwareNode(self, a), executor, arm_id=a,
                     gripper=gripper_command_cfg(cfg), clock=time.monotonic,
+                    reference_clock=self.reference_clock,
                     execution_policy=policy, plant_reports_health=True,
                     model_token=config.model_tokens[a], pose_provenance=pose_provenance(cfg),
                     settle_timeout_s=float((cfg.get("arm") or {}).get("settle_timeout_s", 5)),
@@ -201,6 +208,22 @@ class RemoteHardware:
             for key in ("position", "velocity")
         }
 
+    def _align_feedback(self, histories=None):
+        if histories is None:
+            histories = {a: link.recent_states() for a, link in self.links.items()}
+        try:
+            positions, report = align_feedback(self.links, histories, now=time.monotonic())
+        except ValueError as exc:
+            self._feedback_alignment = dict(error=str(exc))
+            raise
+        self._closure_positions, self._feedback_alignment = positions, report
+
+    def closure_joint_state(self):
+        """Shared closure uses common-time estimates; control uses raw states."""
+        if self.mode != "shared":
+            return self.joint_state()
+        return {"position": np.concatenate(list(self._closure_positions.values()))}
+
     def finger_positions(self):
         for a, hand in self.hands.items():
             state = hand.snapshot()
@@ -227,10 +250,10 @@ class RemoteHardware:
         if self.kinematics is None:
             return None
         if self.mode == "shared":
-            # A virtual pose inferred from the first measured TCP, never an
+            # A virtual pose inferred from the first time-aligned TCP, never an
             # object sensor measurement. The console checks agreement of BOTH
             # TCP-inferred poses and stops if they diverge.
-            poses = self.kinematics.objects({a: c.last_state.position for a, c in self.controllers.items()})
+            poses = self.kinematics.objects(self._closure_positions)
             return next(iter(poses.values())).copy()
         return self._object_pose.copy()
 
@@ -284,7 +307,8 @@ class RemoteHardware:
         pose = self.object_pose()
         captured = None
         if enabled:
-            measured = self.kinematics.tcp({a: c.last_state.position for a, c in self.controllers.items()})
+            self._align_feedback()
+            measured = self.kinematics.tcp(self._closure_positions)
             nominal = obj.grasps.targets(pose)
             errors = {a: pose_error(T, nominal[a]) for a, T in measured.items()}
             reason = virtual_capture_reason(errors)
@@ -342,11 +366,14 @@ class RemoteHardware:
                 q_cmd_pc=None if command is None else command.q_des.tolist(),
                 dq_cmd_pc=None if command is None else command.qd_des.tolist(),
                 plan_id=c.current_plan_id,
-                trajectory_elapsed_s=c.executor.elapsed(now) if c.executor.has_trajectory else None,
+                trajectory_elapsed_s=(c.executor.elapsed(self._reference_time)
+                                      if c.executor.has_trajectory and self._reference_time is not None else None),
             )
-        return dict(pc_monotonic=now, arms=arms)
+        return dict(pc_monotonic=now, reference_time_pc=self._reference_time, arms=arms,
+                    feedback_alignment=self._feedback_alignment if self.mode == "shared" else None)
 
     def step(self):
+        histories = {a: link.recent_states() for a, link in self.links.items()}
         for a, c in self.controllers.items():
             if a in self.hands:
                 for result in self.hands[a].pop_move_results():
@@ -368,7 +395,7 @@ class RemoteHardware:
                 health = dict(health, any_fault=True, latched_fault=self._faults[a])
             self._observed_health[a] = health
             c.on_motor_health(pack_json_message("motor_health", health))
-            state, received = link.latest_state()
+            state, received = histories[a][-1] if histories[a] else (None, 0.)
             if state is not None and health["state_fresh"] and state.state_seq != self._seen[a]:
                 self._seen[a] = state.state_seq
                 self._observations[a] = (state, received)
@@ -377,7 +404,17 @@ class RemoteHardware:
                 # A rejected non-finite sample deliberately clears this stamp.
                 if c._last_state_at is not None:
                     c._last_state_at = received
-            c.tick()
+        if self.mode == "shared":
+            self._align_feedback(histories)
+        # Receive both arms before doing dynamics work; sample both trajectories
+        # at the same PC time, then dispatch the two resulting commands together.
+        # This removes computation-order skew, not network/physical-cycle skew.
+        with self.reference_clock.batch() as sampled:
+            self._reference_time = sampled
+            for c in self.controllers.values():
+                c.tick()
+        for a, c in self.controllers.items():
+            link = self.links[a]
             keep = []
             for topic, value in c.node.sent:
                 if topic == "motor_command":

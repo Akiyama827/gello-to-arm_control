@@ -73,6 +73,7 @@ class ArmController:
         plant_reports_health: bool = True,
         jog_timeout_s: float = 0.2,
         clock=None,
+        reference_clock=None,
         execution_policy=None,
         settle_timeout_s: float = 5.0,
         settle_dwell_s: float = 0.2,
@@ -126,6 +127,11 @@ class ArmController:
             )
         self.session_id = uuid.uuid4().hex
         self._clock = clock or time.monotonic
+        # Local paired controllers may sample one common reference time while
+        # safety checks above/below continue to use the advancing wall clock.
+        if reference_clock is not None and self._state_period is not None:
+            raise ValueError("reference_clock cannot be combined with motor_state_period_s")
+        self._reference_clock = reference_clock or self._clock
         self.execution_policy = execution_policy
         if execution_policy is not None:
             if execution_policy.torque_limits.shape != (self.n_arm,):
@@ -534,7 +540,7 @@ class ArmController:
         stamps ``t_start`` from this property), so the executor never sees the
         absolute value -- only differences.
         """
-        return self._plant_t if self._state_period is not None else self._clock()
+        return self._plant_t if self._state_period is not None else self._reference_clock()
 
     def _release(self, plan_id: str) -> None:
         """Start a named plan. Anchors t_start NOW, never at plan time.

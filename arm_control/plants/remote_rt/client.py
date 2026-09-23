@@ -38,6 +38,7 @@ import queue
 import socket
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -179,6 +180,7 @@ class RtBackend:
         self._stop = threading.Event()
         self._state_lock = threading.Lock()
         self._state: rtp.State | None = None
+        self._state_history = deque(maxlen=32)
         self._state_rx_t = 0.0
         self._status_q: queue.Queue = queue.Queue()
         self._latched_fault = ""
@@ -446,6 +448,11 @@ class RtBackend:
         with self._state_lock:
             return self._state, self._state_rx_t
 
+    def recent_states(self) -> tuple:
+        """Bounded received packets for timestamp alignment; no extrapolation."""
+        with self._state_lock:
+            return tuple(self._state_history)
+
     def motor_state(self, *, state=None) -> dict[str, np.ndarray]:
         if state is None:
             state, _ = self.latest_state()
@@ -542,6 +549,7 @@ class RtBackend:
                 self._link_rx_t = now
                 if self._state is None or state.state_seq != self._state.state_seq:
                     self._state_rx_t = now
+                    self._state_history.append((state, now))
                 self._state = state
 
     def _ctl_loop(self) -> None:

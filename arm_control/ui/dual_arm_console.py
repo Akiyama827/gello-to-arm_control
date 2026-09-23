@@ -312,7 +312,8 @@ class DualArmConsole:
             initializer=_planner_init,
         )
         self.coordinator = BimanualCoordinator(
-            self.runtime.handles, clock=lambda: self.runtime.t, admission=self._admit
+            self.runtime.handles, clock=lambda: self.runtime.t, admission=self._admit,
+            release_context=getattr(self.runtime, "release_context", None),
         )
         self.coordinator.on_pair_result(self._pair_result)
         if self.config.backend == "remote_rt":
@@ -356,7 +357,8 @@ class DualArmConsole:
                 self._check_closure()
 
     def _object_errors(self):
-        q = self.runtime.joint_state()["position"]
+        state = getattr(self.runtime, "closure_joint_state", self.runtime.joint_state)()
+        q = state["position"]
         inferred = self.kin.objects({a: q[sl] for a, sl in self.runtime.slices.items()})
         errors = [pose_error(T, self.runtime.object_pose()) for T in inferred.values()]
         return np.max(errors, axis=0)
@@ -570,6 +572,12 @@ class DualArmConsole:
                 self.coordinator.cancel_pair("console runtime failed")
                 self.runtime.stop()
                 self.status, self.error = "faulted", str(exc)
+                if self.config.backend == "remote_rt" and "paired feedback" in str(exc):
+                    # Alignment can fail before the normal sample is recorded.
+                    # Preserve its raw packets too, after requesting stop.
+                    sample = self.runtime.diagnostic_sample()
+                    sample.update(mode=self.runtime.mode, closure=None)
+                    self._trace.record(sample)
                 print(f"[dual_console] runtime fault: {exc}", flush=True)
                 self._save_fault_trace(str(exc))
 

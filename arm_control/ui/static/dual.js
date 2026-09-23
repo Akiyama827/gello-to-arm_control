@@ -312,7 +312,8 @@ function render(s) {
     setObject(objectMeshes.measured,o.pose);
     $('object-heading').textContent=o.virtual?'Virtual plate · empty Hands':'Shared object · fixed grasps';
     $('object-sync').textContent=o.virtual?'Use current virtual pose':'Use measured object pose';
-    $('object-detail').textContent=`${o.virtual?'Virtual pose inferred from TCPs; real arms move.':o.paused?'Physics paused until both arms are armed.':'Simulated rigid grasps active.'} TCP agreement error: ${o.closure_mm.toFixed(3)} mm / ${o.closure_deg.toFixed(3)}°. Object target is in shared world coordinates.`;
+    const poseNote=o.virtual?(sharedMode(s)?'Virtual pose inferred from time-aligned TCPs; real arms move.':'Virtual plate at preparation pose; real arms move.'):(o.paused?'Physics paused until both arms are armed.':'Simulated rigid grasps active.');
+    $('object-detail').textContent=`${poseNote} TCP agreement error: ${o.closure_mm.toFixed(3)} mm / ${o.closure_deg.toFixed(3)}°. Object target is in shared world coordinates.`;
     if (!sharedMode(s)) { objectMeshes.target.visible=false; objectMeshes.preview.visible=false; }
   }
   renderMode(s, fresh, blocked);

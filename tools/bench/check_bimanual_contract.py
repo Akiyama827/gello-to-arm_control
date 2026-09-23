@@ -24,7 +24,7 @@ def measured(n):
 
 
 class Harness:
-    def __init__(self, *, staging_timeout_s=2, state_timeout_s=1):
+    def __init__(self, *, staging_timeout_s=2, state_timeout_s=1, controller_kwargs=None):
         self.t = 10.0
         self.controllers, self.handles = {}, {}
         for a, n in [("fr3_1", 7), ("other_arm", 6)]:
@@ -37,8 +37,8 @@ class Harness:
                 ),
                 clock=lambda: self.t,
                 plant_reports_health=False,
-                state_period_s=0.01,
                 model_token=f"{a}:model:r2",
+                **(dict(state_period_s=0.01) | (controller_kwargs or {})),
             )
             c.on_control(pack_control_update(arm=True))
             c.on_motor_state(measured(n))
@@ -52,17 +52,18 @@ class Harness:
             state_timeout_s=state_timeout_s,
         )
 
-    def pair(self, name="pair", *, bad_model=False, bad_gains=False):
+    def pair(self, name="pair", *, bad_model=False, bad_gains=False, distance=0.):
         members = []
         for i, (a, c) in enumerate(self.controllers.items()):
             q = np.zeros((2, c.n_arm))
+            q[-1] = distance
             payload = pack_plan(
                 plan_id=f"{name}:{a}",
                 phase="test",
                 gated=True,
                 times=[0.0, 1.0],
                 positions=q,
-                velocities=q,
+                velocities=np.zeros_like(q),
                 kp=np.full(c.n_arm, -1.0 if bad_gains and i else 600.0),
                 kd=np.full(c.n_arm, 20.0),
                 model_token="wrong" if bad_model and i else c.model_token,

@@ -48,6 +48,7 @@ the same staging, release, cancellation and per-arm control operations.
 |---|---|
 | `multi_arm/types.py`, `interface.py` | Public pair values and handles; arm ids remain attached to each member |
 | `multi_arm/coordinator.py`, `synchronization.py` | Fresh-state admission, session/model binding, both-member ACK barrier, cancellation acknowledgements and timing records |
+| `multi_arm/feedback.py` | Same-host timestamp alignment for the closure monitor; bounded interpolation, raw controller feedback unchanged |
 | `contracts/multi_arm.py`, `multi_arm/adapter.py` | Arrow envelope and Dora transport; `nodes/multi_arm_coordinator.py` is only an entry point |
 | `multi_arm/planning.py` | Combined joint-space search with both moving geometries and one retimed trajectory, split back into arm-keyed plans |
 | `multi_arm/cooperative.py` | Fixed object-to-TCP transforms, continuation IK along one object path, grasp/path checks on the retimed Hermite curve |
@@ -133,20 +134,30 @@ enters the hardware runtime.
 Hardware independent/paired motion remains experimental; physical shared-object
 mode is refused. Explicitly virtual objects allow guided preparation and fixed
 TCP relationships with empty Hands: no weld, Hand command or payload is added.
-Their pose follows the first measured TCP; both inferred poses must agree within
+Their pose follows the first time-aligned TCP; both inferred poses must agree within
 3 mm / 2° or both arms are disarmed. Entry requires stationary TCPs within
 10 mm / 2° of the nominal edge poses and a separate empty-Hand confirmation.
 After collision admission it captures both measured object-to-TCP transforms;
 no joint/object pose changes. These frames are fixed for the session, hashed
 into preview identity and passed to the planning worker. Exit restores nominal
 grasp frames for the next approach. Physical grasp confirmation cannot authorize
-virtual coupling. PC barrier release is observable but physical start skew is
-not. Scheduled hardware start and measured inter-arm timing remain separate
-work. The historical independent-world graph is an isolation diagnostic.
+virtual coupling. Local hardware controllers share a PC reference epoch and
+one sampled trajectory time per tick; both commands are computed before dispatch.
+Freshness checks keep the unfrozen wall clock. Actual PC releases remain
+sequential and observable; physical start skew is not measured. Scheduled RT
+start remains separate work. The historical independent-world graph is an
+isolation diagnostic.
+
+The relative-pose monitor uses fresh packets bracketing a common publication
+timestamp on one RT host. It refuses extrapolation, invalid/reordered packets,
+wrong authority, receipt age over 50 ms, or skew/interpolation gaps over 20 ms.
+This removes comparison error from asynchronous streams; it does not establish
+physical capture synchronization. Controllers still consume raw measurements.
 
 The hardware adapter retains the packets consumed by each controller, so
 `multi_arm.diagnostics` can keep a bounded PC history of feedback, references
-and timestamps. Rejected raw packets remain distinct from the controller's
+and timestamps, including the reference time and interpolation brackets.
+Rejected raw packets remain distinct from the controller's
 last accepted measurement. Runtime faults request pair cancellation and disarm
 before a background writer serializes a detached history; shutdown waits at
 most one second for that writer. The closure guard keeps its 3 mm / 2° limits

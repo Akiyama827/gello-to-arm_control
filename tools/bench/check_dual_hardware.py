@@ -117,7 +117,19 @@ def check_virtual(app, action, wait, refinement):
         pair = state["preview_id"]
         action("stage", pair_id=pair, reviewed=True)
         wait(lambda s: s["pair"]["lifecycle"] == "ready")
-        action("execute", pair_id=pair)
+        right = list(app.runtime.handles.values())[1]
+        execute_member = right.execute
+
+        def delayed_release(plan_id):
+            time.sleep(.02)
+            execute_member(plan_id)
+
+        with patch.object(right, "execute", delayed_release):
+            action("execute", pair_id=pair)
+        with app._lock:
+            starts = [c.executor._t_start for c in app.runtime.controllers.values()]
+            assert starts[0] == starts[1], starts
+            assert app.coordinator.pair_state().release_skew_sec >= .02
         state = wait(lambda s: s["pair"]["lifecycle"] in {"complete", "faulted", "cancelled"}, timeout=60)
         assert state["pair"]["lifecycle"] == "complete", state["error"]
         wait(lambda s: not s["transition_reason"])
@@ -169,13 +181,30 @@ def check_virtual(app, action, wait, refinement):
     goal[2] += 10
     goal[5] += 2
     action("plan", object_target=goal)
-    shared = execute()
+    first_executor = next(iter(app.runtime.controllers.values())).executor
+    step = first_executor.step
+
+    def delayed_dynamics(*args, **kwargs):
+        time.sleep(.003)
+        return step(*args, **kwargs)
+
+    with patch.object(first_executor, "step", delayed_dynamics):
+        shared = execute()
     state = app.snapshot()
     error = pose_error(_pose_matrix(state["shared_object"]["values"]), _pose_matrix(goal))
     assert error[0] < .001 and error[1] < np.deg2rad(.5), error
     assert state["shared_object"]["closure_mm"] < 3
     assert app._virtual_grasps() == captured, "captured grasps changed during motion"
     print(f"Virtual 10 mm / 2 degree move ({refinement}): PASS; error {error[0]*1000:.4f} mm / {np.rad2deg(error[1]):.5f} degrees", flush=True)
+    moving = [s for s in app._trace.samples if s.get("closure") is not None
+              and all(a["plan_id"] == f"{shared}:{name}" and a["trajectory_elapsed_s"] is not None
+                      for name, a in s["arms"].items())]
+    assert moving, "no moving shared-object samples captured"
+    for s in moving:
+        phases = [a["trajectory_elapsed_s"] for a in s["arms"].values()]
+        np.testing.assert_allclose(phases[0], phases[1], atol=1e-12)
+    peak = max(s["closure"][0] for s in moving) * 1000
+    print(f"20 ms release / 3 ms dynamics delays: equal reference phases, peak closure {peak:.4f} mm: PASS", flush=True)
     refused("set_mode", mode="independent", support_confirmed=True)
     action("set_mode", mode="independent", virtual_release_confirmed=True)
     assert app.runtime.kinematics.grasps is nominal and app.runtime.grasp_capture is None
@@ -214,7 +243,8 @@ def check_virtual(app, action, wait, refinement):
     assert trace["context"]["pair"]["pair_id"] == pair
     assert trace["context"]["trajectories"]
     last = trace["samples"][-1]
-    inferred = app.kin.objects({a: np.asarray(s["q_controller"]) for a, s in last["arms"].items()})
+    alignment = last["feedback_alignment"]
+    inferred = app.kin.objects({a: np.asarray(s["q"]) for a, s in alignment["brackets"].items()})
     measured = pose_error(*inferred.values())
     np.testing.assert_allclose(last["closure"], measured, atol=1e-12)
     assert measured[0] > .003 or measured[1] > np.deg2rad(2)
