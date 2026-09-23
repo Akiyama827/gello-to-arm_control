@@ -1,0 +1,8 @@
+<mujoco model="shared_plate">
+  <worldbody>
+    <body name="plate">
+      <freejoint name="free"/>
+      <geom name="slab" type="box" size="0.10 0.15 0.006" mass="1" rgba="0.55 0.64 0.75 1"/>
+    </body>
+  </worldbody>
+</mujoco>

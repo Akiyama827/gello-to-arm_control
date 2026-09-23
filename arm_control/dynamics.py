@@ -21,8 +21,13 @@ except ImportError as exc:  # pragma: no cover
 class PinocchioDynamics:
     """Compute RNEA torques over a named joint subset of a Pinocchio model."""
 
-    def __init__(self, urdf_path: str | Path, joint_names: Sequence[str]) -> None:
+    def __init__(self, urdf_path: str | Path, joint_names: Sequence[str], *, gravity=None) -> None:
         self._model = pin.buildModelFromUrdf(str(urdf_path))
+        if gravity is not None:
+            gravity = np.asarray(gravity, dtype=float)
+            if gravity.shape != (3,) or not np.isfinite(gravity).all():
+                raise ValueError("gravity must be three finite values in the model base frame")
+            self._model.gravity.linear = gravity
         self._data = pin.Data(self._model)
         self._joint_names = list(joint_names)
 
@@ -112,7 +117,8 @@ class PinocchioDynamics:
         The URDF knows only the bare arm; after a grasp the held module's
         weight is unmodeled and pure PD carries it with steady-state sag
         (~0.02 rad at the shadow-run gains — measured). This is the missing
-        feedforward: tau = J_p(q)^T · (m g ẑ) at the payload's CoM point p.
+        feedforward: tau = J_p(q)^T · (-m gravity) at the payload's CoM point p,
+        with gravity expressed in the model's base frame.
 
         ``com_offset`` is the CoM in the frame's LOCAL coordinates. A module
         gripped ~12 cm out of the flange torques the wrist; hanging its
@@ -138,5 +144,5 @@ class PinocchioDynamics:
             oMf = pin.updateFramePlacement(self._model, self._data, frame_id)
             r = oMf.rotation @ np.asarray(com_offset, dtype=float).ravel()
             J_lin = J_lin - pin.skew(r) @ J[3:]
-        tau_full = J_lin.T @ np.array([0.0, 0.0, 9.81 * float(mass_kg)])
+        tau_full = J_lin.T @ (-np.asarray(self._model.gravity.linear) * float(mass_kg))
         return np.asarray(tau_full[self._v_indices], dtype=float)

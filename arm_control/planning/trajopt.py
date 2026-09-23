@@ -151,6 +151,69 @@ def _native_timing(env, world, positions, vmax, amax):
                  for getter in ('getTime', 'getPosition', 'getVelocity', 'getAcceleration'))
 
 
+def _optimize_constrained(env, world, seed, targets):
+    """Native TrajOpt SQP with simultaneous Cartesian constraints on both arms.
+
+    Use the low-level constraint API because the waypoint profile exposes only
+    one TCP per knot. Projection, collision profiles, timing and final validation
+    are shared with the existing unconstrained refiner.
+    """
+    from tesseract_robotics import trajopt_ifopt as ti, trajopt_sqp as sqp
+    from tesseract_robotics.tesseract_common import Isometry3d
+
+    variables = ti.createNodesVariables(
+        'trajectory', world.joint_names, list(seed), ti.toBounds(world.lower, world.upper))
+    positions = [node.getVar('joints') for node in variables.getNodes()]
+    nlp = sqp.IfoptProblem(variables)
+    group = env.getJointGroup('manipulator')
+    terms = []  # Native constraint references must outlive the solve.
+    for index in (0, len(seed) - 1):
+        terms.append(ti.JointPosConstraint(seed[index], positions[index],
+                                          np.ones(seed.shape[1]), f'endpoint_{index}'))
+    for name, poses in targets.items():
+        body = world.model.body(name).id
+        if np.shape(poses) != (len(seed), 4, 4) or not np.isfinite(poses).all():
+            raise ValueError('Cartesian constraints must provide one finite pose per knot')
+        for index in range(1, len(seed) - 1):
+            terms.append(ti.CartPosConstraint(
+                positions[index], group, f'body_{body}', 'body_0',
+                Isometry3d.Identity(), Isometry3d(poses[index]), f'{name}_{index}'))
+    for term in terms:
+        nlp.addConstraintSet(term)
+    problem = sqp.IfoptQPProblem(nlp)
+    costs = [
+        ti.JointVelConstraint(np.zeros(seed.shape[1]), positions, np.ones(seed.shape[1]), 'velocity'),
+        ti.JointAccelConstraint(np.zeros(seed.shape[1]), positions, np.full(seed.shape[1], 10.), 'acceleration'),
+    ]
+    for cost in costs:
+        problem.addCostSet(cost, sqp.CostPenaltyType.SQUARED)
+    profile = _collision_profile(env, world)
+    evaluators = []
+    for index in range(1, len(seed)):
+        evaluator = ti.LVSDiscreteCollisionEvaluator(group, env, profile.collision_constraint_config)
+        evaluators.append(evaluator)
+        term = ti.ContinuousCollisionConstraint(
+            evaluator, positions[index - 1], positions[index], index == 1,
+            index == len(seed) - 1, 20, False, f'collision_{index}')
+        terms.append(term)
+        problem.addConstraintSet(term)
+    problem.setup()
+    qp = sqp.OSQPEigenSolver()
+    solver = sqp.TrustRegionSQPSolver(qp)
+    solver.verbose = False
+    solver.params.max_iterations = 100
+    solver.params.max_time = 120.
+    solver.params.cnt_tolerance = 1e-6
+    solver.solve(problem)
+    if solver.getStatus() != sqp.SQPStatus.NLP_CONVERGED:
+        raise ValueError(f'constrained TrajOpt failed: {solver.getStatus()}')
+    result = np.asarray(solver.getResults().best_var_vals).reshape(seed.shape)
+    if not np.isfinite(result).all() or not np.allclose(result[[0, -1]], seed[[0, -1]], atol=1e-6, rtol=0):
+        raise ValueError('constrained TrajOpt changed fixed endpoints')
+    result[[0, -1]] = seed[[0, -1]]
+    return result
+
+
 def _spline_extrema(spline):
     """Exact per-joint cubic extrema, including either side of every knot."""
     extrema = []
@@ -171,13 +234,13 @@ def _check_positions(world, positions):
         raise ValueError('trajectory exceeds finite joint position limits')
 
 
-def _check_collision(world, positions):
+def _check_collision(world, positions, collision_fn=None):
     for q in positions:
-        if world.in_collision(q):
+        if world.in_collision(q) or (collision_fn is not None and collision_fn(q)):
             raise ValueError('trajectory fails canonical MuJoCo collision validation')
 
 
-def _validate_timing(world, positions, t, q, v, a, vmax, amax):
+def _validate_timing(world, positions, t, q, v, a, vmax, amax, *, collision_fn=None):
     from scipy.interpolate import CubicHermiteSpline
     from arm_control.motion import JointTrajectory
 
@@ -218,16 +281,17 @@ def _validate_timing(world, positions, t, q, v, a, vmax, amax):
     max_speed = float(np.max(np.abs(extrema[1])))
     for index, (start, end) in enumerate(zip(q[:-1], q[1:])):
         intervals = max(1, int(np.ceil(np.max(np.abs(end - start)) / .001)))
-        _check_collision(world, start + np.linspace(0, 1, intervals + 1)[:, None] * (end - start))
+        _check_collision(world, start + np.linspace(0, 1, intervals + 1)[:, None] * (end - start), collision_fn)
         intervals = max(1, int(np.ceil((t[index + 1] - t[index]) * max_speed / .001)))
         samples = spline(np.linspace(t[index], t[index + 1], intervals + 1))
         _check_positions(world, samples)
-        _check_collision(world, samples)
+        _check_collision(world, samples, collision_fn)
     return JointTrajectory(t, q, v)
 
 
 def refine_trajectory(world, seed_positions, vmax, amax, *,
-                      soft_clearance_exempt_pairs=None, arm_id='arm'):
+                      soft_clearance_exempt_pairs=None, arm_id='arm',
+                      cartesian_targets=None, collision_fn=None):
     """Refine >=2 finite seed knots against a fresh canonical collision world.
 
     ``world`` is the raw MuJoCoCollisionWorld snapshot, not a callback/cache.
@@ -248,6 +312,10 @@ def refine_trajectory(world, seed_positions, vmax, amax, *,
     if any(np.shape(values) != (joints,) or not np.isfinite(values).all() for values in (world.lower, world.upper)) or np.any(world.lower >= world.upper):
         raise ValueError('TrajOpt requires finite ordered joint bounds')
     _check_positions(world, seed)
+    if cartesian_targets is not None and collision_fn is None:
+        raise ValueError('constrained refinement requires a task-path validation callback')
+    if cartesian_targets is not None and len(seed) < 4:
+        raise ValueError('constrained refinement requires at least four seed knots')
     while len(seed) < 4:
         index = int(np.argmax(np.linalg.norm(np.diff(seed, axis=0), axis=1)))
         seed = np.insert(seed, index + 1, (seed[index] + seed[index + 1]) / 2, axis=0)
@@ -257,14 +325,17 @@ def refine_trajectory(world, seed_positions, vmax, amax, *,
     env = project_world(world)
     print(f'[trajopt:{arm_id}] stage=projection elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
     stage_started = perf_counter()
-    positions = _optimize(env, world, seed, soft_clearance_exempt_pairs=soft_clearance_exempt_pairs)
+    if cartesian_targets is None:
+        positions = _optimize(env, world, seed, soft_clearance_exempt_pairs=soft_clearance_exempt_pairs)
+    else:
+        positions = _optimize_constrained(env, world, seed, cartesian_targets)
     print(f'[trajopt:{arm_id}] stage=optimization elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
     _check_positions(world, positions)
     stage_started = perf_counter()
     timing = _native_timing(env, world, positions, vmax, amax)
     print(f'[trajopt:{arm_id}] stage=native_timing elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
     stage_started = perf_counter()
-    trajectory = _validate_timing(world, positions, *timing, vmax, amax)
+    trajectory = _validate_timing(world, positions, *timing, vmax, amax, collision_fn=collision_fn)
     print(f'[trajopt:{arm_id}] stage=validation elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
     print(f'[trajopt:{arm_id}] stage=total elapsed_s={perf_counter() - started:.6f}', flush=True)
     lengths = [float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()) for path in (seed, positions)]

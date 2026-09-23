@@ -467,6 +467,14 @@ def compose_workcell_scene(
                 ),
             )
             spec.add_equality(**equality)
+    for weld in scene.welds:
+        spec.add_equality(
+            name=weld.name, type=mujoco.mjtEq.mjEQ_WELD,
+            objtype=mujoco.mjtObj.mjOBJ_BODY, name1=weld.body1, name2=weld.body2,
+            active=True, data=[0., 0., 0., *weld.relpose, 1.0], solref=list(weld.solref),
+        )
+    for index, (body1, body2) in enumerate(scene.contact_exclusions):
+        spec.add_exclude(name=f"scene_grasp_{index}", bodyname1=body1, bodyname2=body2)
     for actuator in list(spec.actuators):
         spec.delete(actuator)
     return spec

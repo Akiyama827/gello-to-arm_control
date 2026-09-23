@@ -114,7 +114,7 @@ def main():
     world = SimpleNamespace(lower=np.full(7, -3.), upper=np.full(7, 3.),
                             in_collision=lambda q: False)
     ompl = SimpleNamespace(plan=lambda start, end: corner(15))
-    with patch('arm_control.ui.arm_console.collision_checked_retiming',
+    with patch('arm_control.planning.refinement.collision_checked_retiming',
                side_effect=ValueError('final curve collision')):
         try:
             plan_trajectory(world, ompl, corner(15)[0], corner(15)[-1], vmax, amax)

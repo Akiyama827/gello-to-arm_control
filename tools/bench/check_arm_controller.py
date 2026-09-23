@@ -365,7 +365,8 @@ def _check_model_binding() -> None:
     for bad in (None, token.replace(":r1:", ":r2:"), token.replace("fr3_2", "fr3_1")):
         c.on_plan(plan("stale", bad))
         assert c._plan is None, f"plan with model {bad!r} was loaded"
-    refused = [e for e in c.node.sent if e[0] == "controller_event"]
+    refused = [e for e in c.node.sent if e[0] == "controller_event"
+               and unpack_controller_event(e[1])["kind"] == "leg_result"]
     assert len(refused) == 3, "each refused leg must be reported back to its planner"
     c.on_plan(plan("fresh", token))
     assert c._plan is not None and c._plan["plan_id"] == "fresh"

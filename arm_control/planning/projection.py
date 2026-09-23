@@ -94,6 +94,8 @@ def project_world(world):
             joint = Joint(model.joint(joint_id).name if active else f'fixed_body_{body}')
             joint.type = JointType.REVOLUTE if active else JointType.FIXED
             parent = model.body_parentid[body]
+            if body in getattr(world, '_rigid_bodies', {}):
+                parent = world._rigid_bodies[body][0]
             joint.parent_link_name, joint.child_link_name = body_names[parent], name
             joint.parent_to_joint_origin_transform = Isometry3d(np.linalg.inv(body_transforms[parent]) @ body_transforms[body])
             if active:

@@ -446,8 +446,9 @@ class RtBackend:
         with self._state_lock:
             return self._state, self._state_rx_t
 
-    def motor_state(self) -> dict[str, np.ndarray]:
-        state, _ = self.latest_state()
+    def motor_state(self, *, state=None) -> dict[str, np.ndarray]:
+        if state is None:
+            state, _ = self.latest_state()
         if state is None:
             zeros = np.zeros(self.n)
             return {

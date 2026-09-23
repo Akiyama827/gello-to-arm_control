@@ -56,6 +56,16 @@
         </div>
       </div>
 
+      <section id="carry-panel" class="rail-section" hidden>
+        <div class="rail-head">Carried object <output id="carry-status"></output></div>
+        <strong id="carry-title"></strong>
+        <p id="carry-payload"></p>
+        <p id="carry-detail"></p>
+        <div id="carry-checks" class="command-stack"></div>
+        <div id="carry-actions" class="command-stack"></div>
+        <p id="carry-feedback" aria-live="polite"></p>
+      </section>
+
       <div class="rail-section">
         <div class="rail-head">Move</div>
         <p>Plan → Preview → ARM → Execute. Runs until complete or stopped.</p>
@@ -80,6 +90,8 @@
         </div>
         <p>Copy fills Desired only. Apply sets the target without moving.</p>
         <p id="pose-status" aria-live="polite"></p>
+        <label><input id="refine" type="checkbox"> Refine trajectory with TrajOpt</label>
+        <p id="refine-status" aria-live="polite">Changing refinement requires a new preview.</p>
         <div id="buttons" class="command-stack"></div>
       </div>
 

@@ -171,7 +171,7 @@ def pack_control_update(**fields) -> pa.Array:
     # `cancel`, `hold` and `stop` are three DIFFERENT things and the names are
     # worth keeping apart: cancel aborts a leg and stays armed (an operator's
     # Stop button), hold freezes at a milestone forever, stop is terminal.
-    known = {"arm", "payload", "execute", "cancel", "gains", "hold", "stop", "reason", "pose_hold"}
+    known = {"arm", "payload", "execute", "cancel", "gains", "hold", "stop", "reason", "pose_hold", "cancel_plan_id"}
     unknown = set(fields) - known
     if unknown:
         raise ValueError(f"pack_control_update: unknown field(s) {sorted(unknown)}")
@@ -223,9 +223,27 @@ def _completion_progress(value):
     return body
 
 
+def _runtime_state_body(value) -> dict:
+    """Optional controller heartbeat; omitted by older single-arm producers."""
+    if not isinstance(value, dict):
+        raise ValueError("runtime_state must be an object")
+    body = dict(value)
+    if not isinstance(body.get("session_id"), str) or not body["session_id"]:
+        raise ValueError("runtime_state requires a controller session")
+    if type(body.get("n_arm")) is not int or body["n_arm"] <= 0:
+        raise ValueError("runtime_state requires a positive joint count")
+    for key in ("armed", "ready", "executing", "stopped", "frozen"):
+        if type(body.get(key)) is not bool:
+            raise ValueError(f"runtime_state.{key} must be boolean")
+    for key in ("model_token", "plan_id"):
+        if body.get(key) is not None and not isinstance(body[key], str):
+            raise ValueError(f"runtime_state.{key} must be a string or null")
+    return body
+
+
 def pack_controller_event(
     *, kind: str, plan_id: str = "", ok: bool = True, reason: str = "", q=None,
-    qd=None, mode_state=None, completion=None,
+    qd=None, mode_state=None, completion=None, runtime_state=None,
 ) -> pa.Array:
     """Controller -> planner. ``kind`` is one of:
 
@@ -234,6 +252,8 @@ def pack_controller_event(
                    Optional ``qd`` is measured joint velocity from that same
                    sample; omission means unknown, not zero or settled.
     ``leg_result`` ``plan_id`` finished (``ok``) or gave up (``reason``).
+    ``plan_staged`` explicit plan admission ACK (positive or negative).
+    ``plan_cleared`` acknowledgement of a targeted cancellation.
     ``leg_progress`` correlated settling measurements, never a successful result.
     ``fault``      the controller stopped driving; nothing else will move.
     ``mode``       accepted ``soft``/``joint`` in reason, or ok=False refusal.
@@ -244,7 +264,7 @@ def pack_controller_event(
     Optional ``mode_state`` reports the actual law and executor joint gains;
     old senders and receivers may omit it. Mode heartbeats use the same event.
     """
-    if kind not in {"ready", "leg_result", "leg_progress", "fault", "mode"}:
+    if kind not in {"ready", "leg_result", "leg_progress", "fault", "mode", "plan_staged", "plan_cleared"}:
         raise ValueError(f"pack_controller_event: unknown kind {kind!r}")
     return pack_json_message(
         "controller_event",
@@ -257,6 +277,7 @@ def pack_controller_event(
             **({} if qd is None else {"qd": _controller_velocity(q, qd).tolist()}),
             **({} if mode_state is None else {"mode_state": _mode_state_body(mode_state)}),
             **({} if completion is None else {"completion": _completion_progress(completion)}),
+            **({} if runtime_state is None else {"runtime_state": _runtime_state_body(runtime_state)}),
         },
     )
 
@@ -264,7 +285,7 @@ def pack_controller_event(
 def unpack_controller_event(payload: pa.Array) -> dict:
     body = unpack_json_message(payload, expected_schema="controller_event")
     body.pop("schema", None)
-    if body.get('kind') not in {'ready', 'leg_result', 'leg_progress', 'fault', 'mode'}:
+    if body.get('kind') not in {'ready', 'leg_result', 'leg_progress', 'fault', 'mode', 'plan_staged', 'plan_cleared'}:
         raise ValueError('unknown controller event kind')
     if body.get("q") is not None:
         body["q"] = np.asarray(body["q"], dtype=float)
@@ -274,6 +295,8 @@ def unpack_controller_event(payload: pa.Array) -> dict:
         body["mode_state"] = _mode_state_body(body["mode_state"])
     if 'completion' in body:
         body['completion'] = _completion_progress(body['completion'])
+    if "runtime_state" in body:
+        body["runtime_state"] = _runtime_state_body(body["runtime_state"])
     return body
 
 

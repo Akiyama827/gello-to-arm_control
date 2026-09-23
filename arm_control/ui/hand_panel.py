@@ -138,6 +138,8 @@ class HandPanel:
                 and abs(float(width) - self.defaults["open_width_m"]) <= .002):
             self._status = "Open"
         return {
+            "feedback_fresh": fresh and bool(self._state.get("measured")),
+            "is_grasped": self._state.get("is_grasped") if fresh else None,
             "enabled": not reason,
             "reason": reason,
             "status": self._status,

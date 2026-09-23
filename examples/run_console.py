@@ -7,7 +7,7 @@ it is. All this does is the three things a bare `dora run` cannot do for you:
 check the assets are staged, export the two roots, and pick the graph.
 
     python examples/run_console.py                 # one arm, console on :7500
-    python examples/run_console.py --dual          # two arms, :7500 and :7510
+    python examples/run_console.py --dual          # shared-world console, :7520
     python examples/run_console.py --config <path> # your own entry config
 
 Meshes are not vendored here (this repo owns the code; a project owns its CAD),
@@ -31,7 +31,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 SINGLE = REPO_ROOT / "dataflows" / "sim_franka_motion.yml"
-DUAL = REPO_ROOT / "dataflows" / "dual_arm_sim.yml"
+PAIR_CONFIG = REPO_ROOT / "examples" / "configs" / "dual_arm.yaml"
+OBJECT_CONFIG = REPO_ROOT / "examples" / "configs" / "dual_arm_object.yaml"
 DEFAULT_CONFIG = REPO_ROOT / "examples" / "configs" / "sim_arm.yaml"
 
 
@@ -107,14 +108,32 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                         help=f"entry config (default: {DEFAULT_CONFIG.name})")
     parser.add_argument("--dual", action="store_true",
-                        help="two arms in one graph, on two console ports")
+                        help="one shared-world dual-arm simulation console on :7520")
+    parser.add_argument("--pair-config", type=Path, default=PAIR_CONFIG,
+                        help="dual-arm composition (used with --dual)")
+    parser.add_argument("--port", type=int, default=7520, help="dual console loopback port")
     parser.add_argument("--check", action="store_true",
                         help="report readiness and exit, launching nothing")
     args = parser.parse_args()
 
+    if args.dual:
+        if args.config != DEFAULT_CONFIG:
+            parser.error("--config is single-arm; use --pair-config with --dual")
+        if args.pair_config.resolve() in (PAIR_CONFIG, OBJECT_CONFIG):
+            os.environ["ARM_CONTROL_ROOT"] = str(REPO_ROOT)
+        from arm_control.multi_arm.config import load_pair_config
+        config_path = args.pair_config.resolve()
+        if args.check:
+            pair = load_pair_config(config_path)
+            print(f"{pair.backend} configuration: {config_path}, arms={pair.scene.actor_names}; no transports opened")
+            return 0
+        from arm_control.ui.dual_arm_console import main as dual_main
+        dual_main(config_path, port=args.port)
+        return 0
+
     ready, hint = assets_ready()
     config = args.config if args.config.is_absolute() else REPO_ROOT / args.config
-    graph = DUAL if args.dual else SINGLE
+    graph = SINGLE
 
     if args.check or not ready:
         print(f"config: {config}  {'ok' if config.is_file() else 'MISSING'}")
@@ -151,10 +170,7 @@ def main() -> int:
 
     ensure_rerun_viewer()
     print(f"[run_console] {config.name} -> {graph.name}", flush=True)
-    if args.dual:
-        print("[run_console] consoles on http://127.0.0.1:7500 and :7510", flush=True)
-    else:
-        print("[run_console] console on http://127.0.0.1:7500", flush=True)
+    print("[run_console] console on http://127.0.0.1:7500", flush=True)
     print("[run_console] the arm comes up DISARMED — press ARM on the page", flush=True)
     try:
         # start_new_session: the graph gets its OWN session, so teardown can
@@ -256,7 +272,8 @@ def _terminate_graph(proc, grace_s: float = 8.0) -> None:
 def _self_check() -> None:
     """The launcher's own claims: the files it points at have to exist."""
     assert SINGLE.is_file(), SINGLE
-    assert DUAL.is_file(), DUAL
+    assert PAIR_CONFIG.is_file(), PAIR_CONFIG
+    assert OBJECT_CONFIG.is_file(), OBJECT_CONFIG
     assert DEFAULT_CONFIG.is_file(), DEFAULT_CONFIG
     # The entry config must actually load through the include machinery, and
     # name a console port -- the whole reason it lives with the robot.

@@ -34,6 +34,9 @@ CONSOLE_ASSETS: dict[str, tuple[str, str, str]] = {
     # left with its node on 2026-09-07 -- it edits the assembly project's
     # profiles -- and comes back through ConsoleServer(extra_assets=...).
     "console.html": ("text/html; charset=utf-8", "console.html", _NO_STORE),
+    "dual.html": ("text/html; charset=utf-8", "dual.html", _NO_STORE),
+    "static/dual.js": ("text/javascript", "dual.js", _NO_STORE),
+    "static/dual.css": ("text/css; charset=utf-8", "dual.css", _NO_STORE),
     "static/console.js": ("text/javascript", "console.js", _NO_STORE),
     "static/console.css": ("text/css; charset=utf-8", "console.css", _NO_STORE),
     "static/core.js": ("text/javascript", "core.js", _NO_STORE),
@@ -91,12 +94,13 @@ def _check_pages() -> None:
         src = (CONSOLE_DIR / name).read_text()
         # `$("literal")` only; a template literal ($(`${x}-ik`)) is dynamic and
         # cannot be checked here -- those ids are asserted by their page below.
-        return set(re.findall(r'\$\("([^"]+)"\)', src))
+        return set(re.findall(r'''\$\(["']([^"']+)["']\)''', src))
 
     shared = ids_used("core.js")
-    for page, script in (("console.html", "console.js"),):
+    for page, script in (("console.html", "console.js"), ("dual.html", "dual.js")):
         have = ids_in(page)
-        want = ids_used(script) | shared
+        # The dual page shares the scene/gizmo, but owns its identity controls.
+        want = ids_used(script) | (shared if script == "console.js" else {"view", "mode-t", "mode-r"})
         missing = sorted(want - have)
         assert not missing, f"{script} reaches for ids absent from {page}: {missing}"
 
@@ -111,9 +115,9 @@ def _check_pages() -> None:
         for group in re.findall(r"export \{([^}]+)\}", core_src)
         for name in group.split(",")
     }
-    for script in ("console.js",):
+    for script in ("console.js", "dual.js"):
         src = (CONSOLE_DIR / script).read_text()
-        match = re.search(r'import \{([^}]+)\} from "\./core\.js"', src, re.S)
+        match = re.search(r'''import \{([^}]+)\} from ["']\./core\.js["']''', src, re.S)
         assert match, f"{script} does not import from core.js"
         imported = {n.strip() for n in match.group(1).split(",") if n.strip()}
         absent = sorted(imported - exported)

@@ -1,0 +1,24 @@
+# Supported simulation object: prepare and confirm fixed grasps in the console.
+# Robot descriptions, gains and operating limits stay in the shared profiles.
+include: [dual_arm.yaml]
+arms:
+  left:
+    world_origin: [0, 0.55, 0]
+    world_rpy: [0, 0, -1.2217304764]
+  right:
+    world_origin: [0, -0.55, 0]
+    world_rpy: [0, 0, 1.2217304764]
+shared_object:
+  name: payload
+  path: ../assets/shared_plate.xml
+  body: plate
+  pose: {pos: [0.45, 0, 0.4], rpy: [0, 0, 0]}
+  grasps:
+    left:
+      object_T_tcp: {pos: [0, 0.135, 0], rpy: [1.5707963267948966, 0, 0]}
+      finger_position: 0.006
+      contact_bodies: [fr3_hand, fr3_leftfinger, fr3_rightfinger]
+    right:
+      object_T_tcp: {pos: [0, -0.135, 0], rpy: [-1.5707963267948966, 0, 0]}
+      finger_position: 0.006
+      contact_bodies: [fr3_hand, fr3_leftfinger, fr3_rightfinger]

@@ -1,6 +1,8 @@
-# TWO arms, one graph, zero forked code.
+# Isolation diagnostic: TWO INDEPENDENT MuJoCo worlds and single-arm consoles.
+# No cross-arm collisions or pair execution. For the shared-world dual console:
+#   python examples/run_console.py --dual
 #
-# This graph exists to make the two-arm claim checkable. Every node type below
+# This graph checks process/instance separation. Every node type below
 # appears twice and differs only by two environment variables:
 #
 #   ARM_CONTROL_CONFIG  which robot (and, through it, which console port and

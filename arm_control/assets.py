@@ -53,13 +53,55 @@ def _resolve_mesh(urdf: Path, reference: str) -> Path:
     return path
 
 
-def asset_fingerprint(urdf_path: str | Path) -> str:
-    """Hash a URDF and every referenced mesh, independent of its root path."""
+def asset_fingerprint(urdf_path: str | Path, *, root_link: str | None = None) -> str:
+    """Hash an asset, or an explicitly scoped link subtree, plus its meshes.
+
+    The default retains the historical whole-file identity. A tool-local grasp
+    can bind to ``root_link`` and its descendants: upstream arm calibration
+    does not change that grasp, but tool geometry, internal transforms, limits
+    and mesh contents still invalidate it. The subtree is expressed in the
+    root link's frame, so the joint attaching it to its parent is excluded.
+    """
     urdf = Path(urdf_path).resolve(strict=True)
+    root = ET.parse(urdf).getroot()
+    if root_link is None:
+        label, content = f"urdf/{urdf.name}", urdf.read_bytes()
+    else:
+        from copy import deepcopy
+
+        links = {link.get("name"): link for link in root.findall("link")}
+        if root_link not in links:
+            raise ValueError(f"subtree root link absent: {root_link}")
+        selected = {root_link}
+        joints = []
+        pending = list(root.findall("joint"))
+        while True:
+            children = [j for j in pending if j.find("parent").get("link") in selected]
+            if not children:
+                break
+            for joint in children:
+                child = joint.find("child").get("link")
+                if child not in links or child in selected:
+                    raise ValueError("tool subtree is not a valid link tree")
+                selected.add(child)
+                joints.append(joint)
+                pending.remove(joint)
+        subtree = ET.Element("robot", {"name": root_link})
+        for link in sorted(selected):
+            subtree.append(deepcopy(links[link]))
+        for joint in sorted(joints, key=lambda j: j.get("name", "")):
+            subtree.append(deepcopy(joint))
+        material_names = {m.get("name") for m in subtree.findall(".//material")}
+        for material in root.findall("material"):
+            if material.get("name") in material_names:
+                subtree.append(deepcopy(material))
+        root = subtree
+        label = f"urdf-subtree-v1/{root_link}"
+        content = ET.canonicalize(ET.tostring(root, encoding="unicode"), strip_text=True).encode()
     references = sorted(
         {
             mesh.get("filename")
-            for mesh in ET.parse(urdf).getroot().findall(".//mesh")
+            for mesh in root.findall(".//mesh")
             if mesh.get("filename")
         }
     )
@@ -72,7 +114,7 @@ def asset_fingerprint(urdf_path: str | Path) -> str:
         digest.update(len(data).to_bytes(8, "little"))
         digest.update(data)
 
-    add(f"urdf/{urdf.name}", urdf.read_bytes())
+    add(label, content)
     for reference in references:
         add(reference, _resolve_mesh(urdf, reference).read_bytes())
     return digest.hexdigest()
@@ -98,6 +140,38 @@ def _self_check() -> None:
         # one could only ever select a directory already in this list.
         (urdf_dir.parent / "package.xml").write_text("<package/>")
         assert mesh_package_dirs(urdf) == dirs, mesh_package_dirs(urdf)
+
+        mesh = urdf_dir / "tool.stl"
+        mesh.write_bytes(b"tool mesh revision one")
+        source = """<robot name="arm">
+          <link name="base"/><link name="tool"/>
+          <link name="tcp"><visual><geometry>
+            <mesh filename="tool.stl"/>
+          </geometry></visual></link>
+          <joint name="arm_joint" type="fixed"><parent link="base"/>
+            <child link="tool"/><origin xyz="0 0 1"/>
+          </joint>
+          <joint name="tcp_joint" type="fixed"><parent link="tool"/>
+            <child link="tcp"/><origin xyz="0 0 0.1"/>
+          </joint>
+        </robot>"""
+        urdf.write_text(source)
+        whole = asset_fingerprint(urdf)
+        scoped = asset_fingerprint(urdf, root_link="tool")
+        moved = urdf_dir / "calibrated.urdf"
+        moved.write_text(source.replace('xyz="0 0 1"', 'xyz="0 0 1.001"'))
+        assert asset_fingerprint(moved) != whole
+        assert asset_fingerprint(moved, root_link="tool") == scoped
+        moved.write_text(source.replace('xyz="0 0 0.1"', 'xyz="0 0 0.101"'))
+        assert asset_fingerprint(moved, root_link="tool") != scoped
+        mesh.write_bytes(b"tool mesh revision two")
+        assert asset_fingerprint(urdf, root_link="tool") != scoped
+        try:
+            asset_fingerprint(urdf, root_link="missing")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("missing subtree root accepted")
 
     # The boundary IS the feature (same argument as execution/factory.py): the
     # web console draws no Rerun, so it must import with the optional [viz]

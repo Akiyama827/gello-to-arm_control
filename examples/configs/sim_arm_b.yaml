@@ -1,9 +1,9 @@
-# A SECOND arm, to show that two run at once without forking any code.
+# Second independent-world instance for dataflows/dual_arm_sim.yml only.
 #
-# This is the whole two-arm story: an arm is a config, so a second arm is a
-# second config, and the only things that have to differ are the per-INSTANCE
+# The independent consoles differ only in per-INSTANCE
 # facts -- which port its console binds, which log it writes, which Rerun entity
 # root it draws under. Identity, gains, limits and geometry are all inherited.
+# Shared-world pair execution uses dual_arm.yaml and does not load this file.
 #
 #     dora run dataflows/dual_arm_sim.yml
 #

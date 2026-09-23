@@ -96,7 +96,7 @@ def gripper_command_cfg(cfg) -> dict:
 
 
 def build_executor(
-    cfg, *, arm_id: str = "arm", gains: dict | None = None
+    cfg, *, arm_id: str = "arm", gains: dict | None = None, gravity=None
 ) -> JointTrajectoryExecutor:
     """The EXECUTION half of an arm's stack, with no planning half at all.
 
@@ -131,7 +131,7 @@ def build_executor(
     executor = JointTrajectoryExecutor(
         arm_id=arm_id,
         joint_names=joints,
-        dynamics=PinocchioDynamics(arm_urdf(cfg), joints),
+        dynamics=PinocchioDynamics(arm_urdf(cfg), joints, gravity=gravity),
         kp_default=_gain("kp", "kp"),
         kd_default=_gain("kd", "kd"),
         max_torque=_gain("torque_limits", "max_tau"),

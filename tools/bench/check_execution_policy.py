@@ -413,7 +413,7 @@ def check_completion_order():
     c.tick()
     assert c.executor.steps == stepped, "completed trajectory was stepped again"
     assert not c._running
-    assert np.allclose(commands(c)[-1]["position"], .0005)
+    assert np.allclose(commands(c)[-1]["position"], 0), "successful joint goal must retain its endpoint"
     assert commands(c)[-1]["cartesian"] is None
     c, clock = setup(health=False)
     c.on_plan(plan(completion={"vel_tol": 100, "goal_q": [0]*7, "residual_max": 100}))
@@ -427,6 +427,18 @@ def check_completion_order():
     assert results[-1]["kind"] == "leg_result" and not results[-1]["ok"]
     assert np.allclose(commands(c)[-1]["position"], .4)
     check_settle_dwell()
+    # Task-specific completion and timeout still freeze at measured q.
+    for custom in (True, False):
+        c, clock = setup(health=False, settle_dwell_s=0)
+        fields = {"completion": {"vel_tol": .01, "goal_q": [0]*7, "residual_max": .01}} if custom else {}
+        c.on_plan(plan(**fields))
+        c.on_control(pack_control_update(execute="p"))
+        if not custom:
+            c.executor.done = lambda *args, **kwargs: False
+        advance(c, clock, 6.5, q=.005)
+        assert not c._running
+        assert np.allclose(commands(c)[-1]["position"], .005)
+        assert c.frozen is (not custom)
 
 
 def check_settle_dwell():
@@ -460,6 +472,9 @@ def check_settle_dwell():
     c.on_motor_state(state(.0005))
     c.tick()
     assert c.executor.steps == after, "completed trajectory was stepped again"
+    assert np.allclose(commands(c)[-1]["position"], 0), "settle residual became the next hold target"
+    assert np.allclose(commands(c)[-1]["velocity"], 0)
+    print("Joint-goal completion retains endpoint; task completion and timeout hold measured pose: PASS")
 
 
 if __name__ == "__main__":

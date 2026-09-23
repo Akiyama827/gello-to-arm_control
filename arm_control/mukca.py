@@ -203,6 +203,7 @@ def add_ball_joint(urdf_xml: str, parent_link: str, xyz, *, joint: str = "mukca_
     Never written into a runtime description; the fit input is generated.
     """
     root = _parse(urdf_xml)
+    _default_missing_origins(root)
     links = {el.get("name") for el in root.findall("link")}
     if parent_link not in links:
         raise ValueError(f"parent link {parent_link!r} absent")
@@ -214,6 +215,30 @@ def add_ball_joint(urdf_xml: str, parent_link: str, xyz, *, joint: str = "mukca_
     ET.SubElement(j, "parent", link=parent_link)
     ET.SubElement(j, "child", link=link)
     return ET.tostring(root, encoding="unicode")
+
+
+def _default_missing_origins(root: ET.Element) -> list[str]:
+    """Give every joint an explicit <origin>, in place. Returns what was added.
+
+    URDF says a joint with no <origin> is the identity transform, so this adds
+    no geometry -- but the upstream CasADi parser reads ``joint.origin.xyz``
+    unconditionally and dies with AttributeError on a joint that omits it.
+    `fr3_ft_gemini305_parallel` omits it on `fr3_ft_flange_joint` (a fixed
+    identity joint, sha 86b8e737...) and `fr3_hand` does not, so the same fit
+    worked on one arm's URDF and crashed on the other's. Pinocchio and our own
+    reader both accept the omission; this is upstream's parser being stricter
+    than the format.
+
+    Applied to the CALIBRATION-ONLY copy only. The deployed description is not
+    touched: an explicit identity origin is semantically identical, but there
+    is no reason to churn a hashed, referenced asset for a solver's parser.
+    """
+    added = []
+    for j in root.findall("joint"):
+        if j.find("origin") is None:
+            ET.SubElement(j, "origin", xyz="0 0 0", rpy="0 0 0")
+            added.append(j.get("name"))
+    return added
 
 
 # --------------------------------------------------------------------- FK

@@ -37,6 +37,123 @@ Neutral values live in `motion/types.py`; retiming algorithms remain under
 
 ## Installed APIs and executable wrappers
 
+### Pair control and shared planning
+
+`multi_arm` coordinates two named arm endpoints. Each retains its own
+`ArmController`, joint order, model token and motor-command authority. The
+pair coordinator never sends motor commands. Its local and Dora handles expose
+the same staging, release, cancellation and per-arm control operations.
+
+| Owner | Responsibility |
+|---|---|
+| `multi_arm/types.py`, `interface.py` | Public pair values and handles; arm ids remain attached to each member |
+| `multi_arm/coordinator.py`, `synchronization.py` | Fresh-state admission, session/model binding, both-member ACK barrier, cancellation acknowledgements and timing records |
+| `contracts/multi_arm.py`, `multi_arm/adapter.py` | Arrow envelope and Dora transport; `nodes/multi_arm_coordinator.py` is only an entry point |
+| `multi_arm/planning.py` | Combined joint-space search with both moving geometries and one retimed trajectory, split back into arm-keyed plans |
+| `multi_arm/cooperative.py` | Fixed object-to-TCP transforms, continuation IK along one object path, grasp/path checks on the retimed Hermite curve |
+| `multi_arm/simulation.py` | Two stock controllers driving one MuJoCo world on one simulation clock |
+| `multi_arm/config.py`, `ui/dual_arm_console.py` | Compose existing profiles/scenery; run the generic console with planning in a child process |
+
+Pair release requires explicit positive staging ACKs from both controllers,
+fresh measured positions/velocities, known controller sessions, matching model
+tokens and continued readiness. IDs cannot be reused. A member fault, timeout,
+restart or partial release cancels both; unconfirmed cancellations block the
+next pair. A targeted delayed cancellation cannot clear a newer plan.
+Consumer scene admission is checked at staging and release. The console also
+binds previews to their config, scene, start positions and measured Hand widths.
+
+`PairPlanner` checks cross-arm contact, including attached collision geometry,
+through the existing `MujocoCollisionWorld`. It retimes the combined path once,
+then gives both controllers identical sample times. Selecting one moving arm
+holds the other at its measured joints during search and execution. This is
+sampled collision validation of the returned Hermite trajectory, not a proof
+of continuous clearance. Scenes with arm welds refuse unconstrained joint-goal
+planning. `cooperative.py` instead samples a straight SE(3) object path, solves
+both arms from preceding joint seeds, and uses the same retimer and pair plan
+packaging. It checks the returned Hermite curve at at most 0.001 rad joint
+travel per sample, including the moving free object in the canonical collision
+world. Closure and object-path deviations must stay within 1 mm / 0.5°.
+
+`planning/refinement.finish_path` is the shared manual/pair path-finishing seam.
+It selects checked retiming or the existing `planning/trajopt` refiner. Frozen
+peer joints are excluded from optimization and restored with exactly zero
+velocity. The task planner retains its refiner hook into that same native
+implementation. The console selection is bound to the preview revision.
+Both consoles isolate native planning in child processes. The single-arm console
+serializes its current MuJoCo world, including mounts, collision permissions,
+held joints, mocaps and boundary geometry; it does not reload a nominal URDF.
+MuJoCo query data is recreated against that model without duplicating the model
+in the transfer. The parent retains scene checks and rejects superseded results.
+
+For cooperative refinement, native TrajOpt SQP's low-level constraint API adds
+both TCP constraints per knot; the ordinary waypoint profile supports one TCP.
+This shares projection, collision profiles, spline timing and validation with
+unconstrained refinement. A planning-only rigid-body relation makes the object
+follow one grasp in MuJoCo and the projected Tesseract tree. The other grasp
+and commanded object path remain explicit constraints and dense validation
+conditions. No free object is frozen as scenery during this optimization.
+Joint endpoints remain exact; collision/grasp checks are sampled, not continuous
+certification, and jerk is not bounded. Native failure never admits an unchecked
+seed. The simulation/real controller code does not import an optimizer.
+
+`SceneSpec.welds` and exact body-pair `contact_exclusions` describe simulated
+rigid grasps once for both physics and planning. The object starts as an
+externally supported real-mass free body; grasp constraints are inactive.
+`scene_for_mode` selects the same relations for planning. The console plans a
+free-arm approach from measured joints, checks pose/Hand agreement and stopped
+feedback, and requires explicit grasp confirmation before transferring support.
+Mode changes preserve the existing plant and controllers, mutate constraints
+and payload accounting, and invalidate preview/staging identities. Returning
+to independent control requires support confirmation and anchors the object
+at its current pose. Active shared control assigns half the payload mass at its
+center of mass declared to each existing executor. This is equal static load
+sharing, with world gravity expressed in each arm's base frame; it does not
+regulate internal grasp force.
+Shared-mode physics pauses while either controller is disarmed. Measured TCP-to-object
+error above 3 mm / 2° faults the simulated console and disarms both controllers.
+The console locks individual arm targets and Hands in this mode and binds
+admission to the measured object pose as well as the ordinary pair guards.
+Grasp declaration, real attachment sensing and task sequencing remain consumer
+policy. This console's explicit confirmation applies to simulated fixed grasps.
+
+The console selects either `SharedSimulation` or `RemoteHardware` from its
+pair configuration. Both expose measured joints, Hands, controller handles and
+scene geometry through the same small runtime surface. The hardware adapter
+composes the existing session-bound `RtBackend`, `BridgeClient` and stock
+controllers; MuJoCo supplies collision geometry only. Hardware uses each
+profile's real-mode gains and execution policy. Construction prepares models
+without opening transports; the console calls `connect()` after loading its
+visuals and exporting meshes. Native loading can block Python heartbeats past
+the RT session deadline. Admission then applies measured arm/Hand positions to
+the collision world before the UI starts. Authority RPCs stay off the
+100 Hz loop, superseded ARM requests are cancelled, and fault/shutdown paths
+revoke authority without requiring another tick. No simulated joint feedback
+enters the hardware runtime.
+
+Hardware independent/paired motion remains experimental; physical shared-object
+mode is refused. Explicitly virtual objects allow guided preparation and fixed
+TCP relationships with empty Hands: no weld, Hand command or payload is added.
+Their pose follows the first measured TCP; both inferred poses must agree within
+3 mm / 2° or both arms are disarmed. Entry requires stationary TCPs within
+10 mm / 2° of the nominal edge poses and a separate empty-Hand confirmation.
+After collision admission it captures both measured object-to-TCP transforms;
+no joint/object pose changes. These frames are fixed for the session, hashed
+into preview identity and passed to the planning worker. Exit restores nominal
+grasp frames for the next approach. Physical grasp confirmation cannot authorize
+virtual coupling. PC barrier release is observable but physical start skew is
+not. Scheduled hardware start and measured inter-arm timing remain separate
+work. The historical independent-world graph is an isolation diagnostic.
+
+The hardware adapter retains the packets consumed by each controller, so
+`multi_arm.diagnostics` can keep a bounded PC history of feedback, references
+and timestamps. Rejected raw packets remain distinct from the controller's
+last accepted measurement. Runtime faults request pair cancellation and disarm
+before a background writer serializes a detached history; shutdown waits at
+most one second for that writer. The closure guard keeps its 3 mm / 2° limits
+and reports the measured values; trace-write failure cannot replace the fault.
+
+### Entry points
+
 Import implementation through `arm_control.*`, never through sibling node
 files or a `sys.path` entry pointing at `nodes/`. The package owns substantial
 process implementations under `control/`, `plants/`, `ui/`, and `viz/`.
@@ -96,7 +213,9 @@ control or RT path.
 ## Configuration and assets
 
 `examples/configs/` contains minimal reusable examples, not measured deployment
-facts. `examples/profiles/` contains reusable command, float, and motion styles.
+facts. `examples/profiles/` contains reusable command and motion styles;
+Float is a gain preset in the motion console. The retired `plant.mode: float`
+bridge shortcut is rejected before opening hardware.
 The consumer composes final entries from hardware identity, calibration, sensor
 roles, workcell facts, task policy, and simulation overrides. Existing
 `config.load_config_tree` include/deep-merge behavior remains unchanged.
@@ -122,6 +241,14 @@ they do not authorize a reverse import into a particular project.
 UI static files are package data under `arm_control/ui/static/`. Examples,
 Dora wrapper paths, graphs, and tool scripts remain repository files. A wheel
 provides installed APIs and web assets, not an entire deployment checkout.
+
+Keep the README as the component index, this document as the ownership/API map,
+and the runbook as current operating instructions. Add pair layouts by referencing
+existing profiles and scene descriptions; do not copy gains, limits or URDFs
+into another YAML. Dated reports/evidence record what was checked at that time
+and should link to current instructions. Compatibility wrappers need a named
+consumer and migration reason; avoid parallel implementations or new status
+documents that restate these three pages.
 
 ## RT ownership and sim/real parity
 

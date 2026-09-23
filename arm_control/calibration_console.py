@@ -308,7 +308,12 @@ def validate_grasp_profile(
     if ancestor != tool_root_link:
         raise ValueError("grasp.tool_root_link must be an ancestor of ee_frame")
     tool_source_sha256 = grasp.get("tool_source_sha256")
-    if tool_source_sha256 != asset_fingerprint(tool):
+    scope = grasp.get("tool_fingerprint_scope", "urdf")
+    if scope not in {"urdf", "subtree"}:
+        raise ValueError("grasp.tool_fingerprint_scope must be urdf or subtree")
+    if tool_source_sha256 != asset_fingerprint(
+        tool, root_link=tool_root_link if scope == "subtree" else None
+    ):
         raise ValueError("tool fingerprint does not match tool asset")
 
     if not finger_joints or len(set(finger_joints)) != len(finger_joints):

@@ -1,0 +1,67 @@
+body.dual-console { min-width: 0; }
+.dual-console [hidden] { display: none !important; }
+.dual-console .subtitle { margin: .1rem 0 0; color: var(--muted); font-size: .78rem; }
+.dual-console .masthead { height: 4.6rem; }
+.dual-shell { display: grid; grid-template-columns: minmax(0,1fr) minmax(350px,420px); height: calc(100% - 4.6rem); }
+.shared-view { position: relative; min-width: 0; background: var(--view); }
+#view { position: absolute; inset: 0; }
+.legend { position: absolute; top: 5.7rem; left: 1rem; display: flex; flex-wrap: wrap; gap: .8rem; color: #e2e8e6; font-size: .75rem; pointer-events: none; }
+.drag-tools { position: absolute; top: 1rem; left: 1rem; right: 1rem; display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; color: #e2e8e6; font-size: .75rem; }
+.drag-tools label { display: flex; align-items: center; gap: .4rem; }
+.drag-tools button, .drag-tools select { font-size: .75rem; padding: .3rem .5rem; }
+.drag-tools button.selected { background: #f1bb53; color: #202b30; }
+#drag-hint { flex-basis: 100%; }
+.arm-panel.drag-selected { border-left: 3px solid #d9a43d; padding-left: .5rem; }
+.dual-console .target-key { color: #f1bb53; background: none; }
+.path-key { color: #7dcc96; }
+.playback { position: absolute; bottom: 1rem; left: 1rem; right: 1rem; display: flex; align-items: center; gap: .6rem; padding: .6rem; background: #f7f8f5ed; border-radius: 3px; }
+.playback input { min-width: 0; flex: 1; }
+.playback output { font-size: .75rem; min-width: 5.5rem; text-align: right; }
+.dual-rail { overflow-y: auto; background: var(--panel); padding: .85rem; border-left: 1px solid var(--rule); }
+.pair-controls { border-bottom: 1px solid var(--rule); padding-bottom: .75rem; }
+.section-heading { display: flex; gap: .5rem; justify-content: space-between; align-items: center; }
+.dual-console h2 { font-size: .98rem; margin: 0; }
+.dual-console h3 { font-size: .9rem; margin: 0; }
+#phase { font-size: .75rem; color: var(--blue); }
+#active-mode { font-size: .72rem; color: var(--blue); text-align: right; }
+#control-mode { margin: .45rem 0; font-size: .8rem; }
+#mode-transition button { font-size: .78rem; }
+.pair-controls + .pair-controls { padding-top: .7rem; }
+#instruction { font-size: .8rem; margin: .5rem 0; }
+.pair-buttons { display: grid; grid-template-columns: 1.25fr 1fr 1fr; gap: .3rem; }
+.pair-buttons button { padding: .35rem; font-size: .75rem; }
+.dual-console .primary:not(:disabled) { background: var(--blue); color: white; border-color: var(--blue-dark); }
+.dual-console .danger { color: white; background: var(--red); border: 2px solid var(--red); padding: .35rem .8rem; font-weight: 650; }
+.review { display: flex; align-items: center; gap: .3rem; margin: .6rem 0; font-size: .75rem; }
+.detail, .notes { color: var(--muted); font-size: .73rem; line-height: 1.5; }
+.detail { margin: .35rem 0; }
+#error { color: var(--red); font-size: .78rem; overflow-wrap: anywhere; margin: .4rem 0 0; }
+.arm-panel { padding: .8rem 0; border-bottom: 1px solid var(--rule); }
+.arm-panel .arm-heading { display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+.arm-panel .arm-heading h3 { flex: 1; }
+.arm-panel .arm-heading output { font-size: .73rem; color: var(--muted); }
+.arm-actions { display: grid; grid-template-columns: 1fr 1fr; gap: .35rem; margin-bottom: .5rem; }
+.arm-actions button, .target-mode select, .hand-row button { font-size: .75rem; }
+.target-mode { display: grid; grid-template-columns: 1fr 1fr; gap: .35rem; margin-bottom: .4rem; }
+.target-mode label { display: grid; gap: .2rem; font-size: .72rem; }
+.target-mode select { width: 100%; min-width: 0; }
+.target-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .4rem; }
+.target-grid label { font-size: .7rem; color: var(--muted); display: grid; gap: .2rem; }
+.target-grid input { min-width: 0; width: 100%; padding: .28rem; border: 1px solid var(--rule); background: white; border-radius: 2px; font-variant-numeric: tabular-nums; }
+.target-tools { display: flex; gap: .4rem; margin-top: .5rem; }
+.target-tools button { flex: 1; font-size: .75rem; }
+.hand-row { margin-top: .55rem; display: flex; align-items: center; gap: .4rem; }
+.hand-row label { font-size: .73rem; flex: 1; }
+.hand-row input { width: 4.2rem; padding: .25rem; }
+.notes { padding-top: .7rem; }
+.notes summary { cursor: pointer; color: var(--ink); }
+#models { overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  body.dual-console { overflow: auto; height: auto; }
+  .dual-shell { display: flex; flex-direction: column; height: auto; }
+  .shared-view { height: 48vh; min-height: 280px; }
+  .dual-rail { overflow: visible; }
+  .dual-console .masthead { padding: .5rem .7rem; }
+  .dual-console h1 { font-size: 1.4rem; }
+  .dual-console .session { gap: .4rem; }
+}

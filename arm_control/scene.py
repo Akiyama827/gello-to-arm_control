@@ -101,11 +101,34 @@ class Attachment:
 
 
 @dataclass(frozen=True)
+class WeldSpec:
+    """Rigid body relation in the simulator; relpose is xyz + wxyz."""
+
+    name: str
+    body1: str
+    body2: str
+    relpose: tuple[float, ...]
+    solref: tuple[float, float] = (0.005, 1.0)
+
+    def __post_init__(self):
+        if not self.name or not self.body1 or not self.body2:
+            raise ValueError("weld names must be nonempty")
+        if len(self.relpose) != 7 or not all(isfinite(v) for v in self.relpose):
+            raise ValueError("weld relpose needs seven finite values")
+        if abs(sum(v * v for v in self.relpose[3:]) - 1) > 1e-6:
+            raise ValueError("weld quaternion must be normalized")
+        if len(self.solref) != 2 or not all(isfinite(v) and v > 0 for v in self.solref):
+            raise ValueError("weld solref needs two positive finite values")
+
+
+@dataclass(frozen=True)
 class SceneSpec:
     actors: tuple[ActorSpec, ...]
     objects: tuple[ObjectSpec, ...]
     obstacles: tuple[ObstacleSpec, ...]
     fixtures: tuple[FixedModelSpec, ...] = ()
+    welds: tuple[WeldSpec, ...] = ()
+    contact_exclusions: tuple[tuple[str, str], ...] = ()
 
     def state(self) -> "SceneState":
         return SceneState(actor_q={actor.name: list(actor.q) for actor in self.actors})
@@ -225,7 +248,15 @@ def load_scene(path: str | Path) -> SceneSpec:
         )
     if not actors:
         raise ValueError("scene.actors must be non-empty")
-    return SceneSpec(tuple(actors), objects, tuple(obstacles), tuple(fixtures))
+    welds = tuple(
+        WeldSpec(name, value["body1"], value["body2"], tuple(value["relpose"]),
+                 tuple(value.get("solref", (0.005, 1.0))))
+        for name, value in _mapping(scene.get("welds", {}), "scene.welds").items()
+    )
+    exclusions = tuple(tuple(pair) for pair in scene.get("contact_exclusions", ()))
+    if any(len(pair) != 2 or any(not isinstance(v, str) or not v for v in pair) for pair in exclusions):
+        raise ValueError("contact_exclusions needs pairs of body names")
+    return SceneSpec(tuple(actors), objects, tuple(obstacles), tuple(fixtures), welds, exclusions)
 
 
 def _demo() -> None:

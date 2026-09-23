@@ -18,7 +18,8 @@ import numpy as np
 import rerun as rr
 
 
-def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_dir):
+def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_dir,
+                      body_names=False):
     """Export a composed snapshot for file-based viewers, in the given frame.
 
     These are compiled mesh vertices (already scaled/recentered), so geom_xmat
@@ -68,7 +69,7 @@ def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_d
         T = np.eye(4)
         T[:3, :3] = data.geom_xmat[i].reshape(3, 3)
         T[:3, 3] = data.geom_xpos[i]
-        out.append((name, f"mesh{i}", path, np.asarray(root_T_world) @ T))
+        out.append((body if body_names else name, f"mesh{i}", path, np.asarray(root_T_world) @ T))
     return out
 
 

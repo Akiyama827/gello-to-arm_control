@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dual-arm console</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/dual.css">
+  <script type="importmap">{"imports":{"three":"/static/vendor/three.module.js","three/addons/":"/static/vendor/"}}</script>
+</head>
+<body class="dual-console">
+  <header class="masthead">
+    <div><h1>Dual-arm control</h1><p class="subtitle" id="backend-label">Connecting</p></div>
+    <div class="session"><span id="connection" class="status neutral">Connecting</span><button id="stop" class="danger">Stop both / hold</button></div>
+  </header>
+  <main class="dual-shell">
+    <section class="shared-view" aria-label="Shared arm scene">
+      <div id="view"></div>
+      <div class="drag-tools" aria-label="Target manipulation">
+        <label>Drag target <select id="drag-target" aria-label="Drag target"></select></label>
+        <button id="mode-t" class="selected">Translate</button><button id="mode-r">Rotate</button>
+        <span id="drag-hint">Drag edits a target. Plan to preview.</span>
+      </div>
+      <div class="legend"><span>Solid: measured</span><span class="target-key">Amber: target</span><span class="path-key">Green: preview</span></div>
+      <div class="playback">
+        <button id="play" disabled>Play preview</button>
+        <input id="scrub" type="range" min="0" max="1" step="0.001" value="0" aria-label="Preview time" disabled>
+        <output id="preview-time">No preview</output>
+      </div>
+    </section>
+    <aside class="dual-rail" aria-label="Arm and pair controls">
+      <section class="pair-controls" aria-label="Control mode">
+        <div class="section-heading"><h2>Control mode</h2><output id="active-mode">Independent arms</output></div>
+        <label>Choose mode <select id="control-mode"><option value="independent">Independent arms</option><option value="shared">Shared object</option></select></label>
+        <p id="mode-detail" class="detail"></p>
+        <div id="mode-transition" hidden>
+          <button id="plan-grasps">Plan to grasp poses</button>
+          <p id="transition-reason" class="detail" aria-live="polite"></p>
+          <label class="review"><input id="mode-confirmed" type="checkbox"> <span id="mode-confirmation"></span></label>
+          <button id="apply-mode" class="primary" disabled>Enable shared-object mode</button>
+        </div>
+      </section>
+      <section class="pair-controls">
+        <div class="section-heading"><h2>Coordinated motion</h2><span id="phase">Idle</span></div>
+        <p id="instruction">Set targets, then plan both paths.</p>
+        <label class="review"><input id="refine" type="checkbox"> Refine trajectory with TrajOpt</label>
+        <div class="pair-buttons"><button id="plan" class="primary" disabled>Plan + preview</button><button id="stage" disabled>Stage pair</button><button id="execute" disabled>Execute pair</button></div>
+        <label class="review"><input id="reviewed" type="checkbox" disabled> I reviewed both paths in the shared scene</label>
+        <p id="pair-detail" class="detail">Both arms start disarmed.</p>
+        <p id="error" role="alert" aria-live="polite"></p>
+      </section>
+      <section id="object-panel" class="arm-panel" hidden>
+        <h3 id="object-heading">Shared object · fixed grasps</h3>
+        <p id="object-detail" class="detail"></p>
+        <div id="object-fields" class="target-grid"></div>
+        <div class="target-tools"><button id="object-sync">Use measured object pose</button></div>
+      </section>
+      <div id="arms"></div>
+      <details class="notes"><summary>Timing and model details</summary><p id="timing"></p><div id="models"></div><p>Planning uses the configured geometry. Simulation and software checks do not qualify bench accuracy or hardware timing.</p></details>
+    </aside>
+  </main>
+  <script type="module" src="/static/dual.js"></script>
+</body>
+</html>

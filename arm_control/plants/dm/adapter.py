@@ -101,21 +101,23 @@ def _effective_listen_mode(cfg) -> bool:
     return bool(cfg.get("listen_mode", False))
 
 
-_PLANT_MODES = ("listen", "float", "command")
+_PLANT_MODES = ("listen", "command")
 
 
 def _plant_mode(cfg) -> str:
-    """Resolve the bridge plant mode: ``listen`` | ``float`` | ``command``.
+    """Resolve the bridge plant mode: ``listen`` | ``command``.
 
     An explicit ``plant.mode`` in the mode config wins; otherwise derive from
-    ``listen_mode`` for back-compat (true -> listen, false -> command).  ``float``
-    is distinct from ``command``: it enables motors on open and forwards
-    impedance setpoints straight through, with no arm-gate / grasp / deadman
-    layer.  Sharing the ``listen_mode: false`` flag once conflated the two, which
-    left float's motors disabled (safety layer, disarmed).
+    ``listen_mode`` for back-compat (true -> listen, false -> command).
+    Float is a motion-console gain preset under the command-mode gate.
     """
     mode_cfg = _load_mode_config()
     requested = (mode_cfg.get("plant") or {}).get("mode")
+    if requested == "float":
+        raise ValueError(
+            "plant.mode: float is retired; use the motion console's Float preset "
+            "with plant.mode: command"
+        )
     if requested is not None:
         if requested not in _PLANT_MODES:
             raise ValueError(
@@ -164,17 +166,6 @@ def main() -> None:
         if mode == "listen":
             backend.enable_all()
             print("[hardware_interface] listen mode — motors enabled", flush=True)
-        elif mode == "float":
-            # Float mode: enable on open and forward impedance setpoints straight
-            # through. No arm-gate/grasp/deadman — the arm is meant to be live and
-            # backdrivable (gravity comp). enable_all() also solicits the first
-            # feedback reply that bootstraps the impedance loop.
-            backend.enable_all()
-            print(
-                "[hardware_interface] float mode — motors enabled, "
-                "direct impedance forwarding (no safety/grasp gate)",
-                flush=True,
-            )
         else:
             # Command mode: DISARMED by default. Do NOT enable on open — the
             # safety layer sends DM_ENABLE on `arm`, and forwards real setpoints

@@ -21,6 +21,18 @@ def main():
         )
         try:
             state = panel._state()
+            revision = panel.target_revision
+            panel._post("refinement", {"refinement": "trajopt"})
+            assert panel._state()["refinement"] == "trajopt"
+            assert not panel.can_execute(revision), "refinement must invalidate old previews"
+            assert panel.planning_target(with_refinement=True)[2] == "trajopt"
+            panel._post("refinement", {"refinement": "none"})
+            try:
+                panel._post("refinement", {"refinement": "unknown"})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("unknown refinement accepted")
             assert "deadman" not in state
             assert state["jog"]["speed_m_s"] == 0.012
             assert state["jog"]["joint_speed_rad_s"] == 0.2

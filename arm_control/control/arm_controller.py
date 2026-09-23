@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import math
 import time
+import uuid
 
 import numpy as np
 from arm_control.contracts.impedance import pose_hold_values, unpack_pose_hold_values
@@ -123,6 +124,7 @@ class ArmController:
                 f"motor_state_period_s must be finite and positive, "
                 f"got {state_period_s!r}"
             )
+        self.session_id = uuid.uuid4().hex
         self._clock = clock or time.monotonic
         self.execution_policy = execution_policy
         if execution_policy is not None:
@@ -188,6 +190,28 @@ class ArmController:
         return self._plant_t
 
     # -- inputs --------------------------------------------------------------
+    @property
+    def current_plan_id(self) -> str:
+        return "" if self._plan is None else self._plan["plan_id"]
+
+    @property
+    def mode_law(self) -> str:
+        return "soft" if self._pose_hold is not None else "joint"
+
+    @property
+    def runtime_state(self) -> dict:
+        """Controller identity and observed lifecycle, carried by heartbeats."""
+        return dict(session_id=self.session_id, model_token=self.model_token,
+                    n_arm=self.n_arm,
+                    armed=bool(self.armed), ready=bool(self.ready_sent),
+                    executing=bool(self._running), stopped=bool(self.stopped),
+                    frozen=bool(self.frozen), plan_id=self.current_plan_id)
+
+    def _stage_ack(self, plan_id: str, *, ok: bool, reason: str = "") -> None:
+        self.node.send_output("controller_event", pack_controller_event(
+            kind="plan_staged", plan_id=plan_id, ok=ok, reason=reason,
+            runtime_state=self.runtime_state))
+
     def _refuse_plan(self, plan, reason: str, *, report: bool) -> None:
         """Say WHY, always, on the one path an operator can actually read.
 
@@ -206,6 +230,7 @@ class ArmController:
         """
         print(f"[arm_controller] REFUSED plan {plan['plan_id']} "
               f"({plan['phase']}): {reason}", flush=True)
+        self._stage_ack(plan["plan_id"], ok=False, reason=reason)
         if report:
             self.node.send_output("controller_event", pack_controller_event(
                 kind="leg_result", plan_id=plan["plan_id"], ok=False, reason=reason))
@@ -266,6 +291,7 @@ class ArmController:
         self._cartesian_poses = plan.get("cartesian_poses")
         self._pending_traj = traj
         self._running = False
+        self._stage_ack(plan["plan_id"], ok=True)
         if not plan["gated"]:
             self._release(plan["plan_id"])
 
@@ -286,7 +312,19 @@ class ArmController:
         if "pose_hold" in fields:
             self._set_pose_hold(fields["pose_hold"])
         if fields.get("cancel"):
-            self._cancel(str(fields.get("reason") or "cancelled"))
+            requested = fields.get("cancel_plan_id")
+            if requested is None or not self.current_plan_id or requested == self.current_plan_id:
+                cleared = self.current_plan_id or str(requested or "")
+                self._cancel(str(fields.get("reason") or "cancelled"))
+                if requested is not None:
+                    self.node.send_output("controller_event", pack_controller_event(
+                        kind="plan_cleared", plan_id=cleared,
+                        runtime_state=self.runtime_state))
+            else:
+                # A delayed pair cancel must never clear a different plan.
+                self.node.send_output("controller_event", pack_controller_event(
+                    kind="plan_cleared", plan_id=str(requested), ok=False,
+                    reason="another plan is loaded", runtime_state=self.runtime_state))
         if fields.get("hold"):
             # Milestone reached: hold this pose forever rather than disarming.
             self.frozen = True
@@ -388,7 +426,8 @@ class ArmController:
 
     def _report_mode(self, *, ok=True, reason=None, heartbeat=False) -> None:
         law = "soft" if self._pose_hold is not None else "joint"
-        fields = dict(kind="mode", ok=ok, reason=law if reason is None else reason)
+        fields = dict(kind="mode", ok=ok, reason=law if reason is None else reason,
+                      runtime_state=self.runtime_state)
         try:
             event = pack_controller_event(**fields, mode_state=dict(
                 law=law, kp=self.executor.kp, kd=self.executor.kd))
@@ -446,18 +485,26 @@ class ArmController:
             self.ready_sent = True
             self.node.send_output(
                 "controller_event",
-                pack_controller_event(kind="ready", q=arm.position, qd=arm.velocity),
+                pack_controller_event(kind="ready", q=arm.position, qd=arm.velocity,
+                                      runtime_state=self.runtime_state),
             )
             # Fall through: the planner needs a hold streaming from right now,
             # because it is about to spend seconds planning the first leg.
         if (self.execution_policy is not None and self._running
-                and self.executor.has_trajectory and self._check_completion(arm)):
-            # Legacy ordering: completed means measured idle hold NOW, not
-            # one more trajectory sample before dropping into hold.
-            # _check_completion reports the result and anchors a timeout hold.
-            if not self.frozen:
-                self.last_command = self._hold_anchor = None
-            self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
+                and self.executor.has_trajectory):
+            # Ordinary joint-goal completion must retain the planned endpoint.
+            # Re-latching measured q here baked the allowed settle residual into
+            # a new target and added another static tracking error at each stop.
+            # Task-specific/contact completion keeps its measured hold contract.
+            goal = (np.asarray(self._plan["positions"][-1], dtype=float).copy()
+                    if self._plan.get("completion") is None else None)
+            if self._check_completion(arm):
+                if not self.frozen:
+                    self.last_command = self._hold_anchor = (
+                        self.executor.hold_command(arm, q_des=goal)
+                        if goal is not None else None
+                    )
+                self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
         if self._running and self.executor.has_trajectory:
             command = self.executor.step(self.exec_time, arm)
             self._hold_anchor = None  # motion streams: next hold re-anchors
