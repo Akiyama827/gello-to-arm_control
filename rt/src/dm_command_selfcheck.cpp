@@ -15,6 +15,12 @@ constexpr double velocity[] = {0.2, -0.3};
 constexpr double feedforward[] = {1.5, -2.0};
 constexpr double stiffness[] = {50, 60};
 constexpr double damping[] = {2, 3};
+constexpr uint64_t SESSION = 7;
+uint64_t skew = 0;  // simulated elapsed time on top of the per-tick clock
+CommandEnvelope last_command{};
+// No packet for `by` ns: time passes, so the last command's own ingress stamp
+// and this generation's deadline both age.
+void age_stream(uint64_t by) { skew += by; }
 
 class CommandBackend final : public Backend {
  public:
@@ -36,9 +42,7 @@ class CommandBackend final : public Backend {
     state.q[0] = .1;
     state.q[1] = -.75;
     if (tick == 1) {
-      ctx->armed.store(true);
-      ctx->arm_gen.fetch_add(1);
-      ctx->last_cmd_rx_ns.store(mono_ns());
+      begin_arm(*ctx);
     }
     if (tick == 2) {
       PoseHoldCommandPacket packet{};
@@ -51,19 +55,18 @@ class CommandBackend final : public Backend {
         cmd.tau_ff[j] = feedforward[j];
         cmd.kp[j] = stiffness[j]; cmd.kd[j] = damping[j];
       }
-      ctx->cmd_in.write(packet);
-      ctx->last_cmd_rx_ns.store(mono_ns());
+      last_command = CommandEnvelope{packet, mono_ns(), ctx->arm_gen.load(), SESSION};
+      ctx->cmd_in.write(last_command);
     }
     // No new PC packet at tick 3: RT must still forward the native command.
-    if (tick == 4) ctx->last_cmd_rx_ns.store(mono_ns() - 200'000'000);
-    if (tick == 5) ctx->last_cmd_rx_ns.store(mono_ns() - 2'000'000'000);
+    if (tick == 4) age_stream(200'000'000);
+    if (tick == 5) age_stream(2'000'000'000);
     if (tick == 6) {
       assert(ctx->fault_code == FAULT_CMD_LOST);
       // A fresh stray zero-gain packet cannot change the latched hold.
       PoseHoldCommandPacket stray{};
       stray.command.n = 2;
-      ctx->cmd_in.write(stray);
-      ctx->last_cmd_rx_ns.store(mono_ns());
+      ctx->cmd_in.write(CommandEnvelope{stray, mono_ns(), ctx->arm_gen.load(), SESSION});
     }
     if (tick == 7) ctx->armed.store(false);
     if (tick == 8) ctx->shutdown.store(true);
@@ -95,7 +98,7 @@ class CommandBackend final : public Backend {
 };
 }  // namespace
 
-uint64_t mono_ns() { return 10'000'000'000ull + uint64_t(tick) * 2'000'000; }
+uint64_t mono_ns() { return 10'000'000'000ull + uint64_t(tick) * 2'000'000 + skew; }
 std::unique_ptr<Backend> make_fake_backend(int) {
   return std::make_unique<CommandBackend>();
 }
@@ -111,6 +114,7 @@ int main() {
   using namespace arm_rt;
   ServerCtx context;
   ctx = &context;
+  context.session_id.store(SESSION);
   context.cfg.tau_max = 27;
   context.cfg.rt_priority = 0;
   rt_loop(context);

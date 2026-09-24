@@ -1,6 +1,6 @@
 // Loopback plant: a damped double integrator per joint, paced at 1 kHz by an
 // absolute-deadline sleep. PERMANENT test double, not bring-up scaffolding —
-// it is what lets the whole server (threads, sockets, seqlocks, deadman,
+// it is what lets the whole server (threads, sockets, mailboxes, deadman,
 // fault latching) be exercised on any machine, and what failure-injection
 // tests run against. Keep it DUMB: realistic closed-loop behaviour is the
 // MuJoCo twin's job on the PC, never this file's.

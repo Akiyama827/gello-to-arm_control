@@ -217,20 +217,13 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           // The staleness clock starts AT ARM, not at the first command
           // (same semantics as the bench bridges): without this, re-arming
           // after any pause instantly re-latches on the OLD command age.
-          ctx.last_cmd_rx_ns.store(mono_ns());
-          // ...and so does the command epoch: whatever sits in the seqlock
-          // (address-teach prime, pre-fault leftovers) is not authority.
-          // sequence() — NOT read(): a bounded read() that collides with a
-          // mid-write returns 0, and an epoch of 0 re-admits every pre-ARM
-          // packet ever written. The raw counter can never be a spurious 0.
-          ctx.cmd_epoch.store(ctx.cmd_in.sequence());
-          // New ARM = new command flow: udp_rx re-pins the source port to
-          // the first post-ARM sender (see server.hpp: cmd_owner_port).
-          ctx.cmd_owner_port.store(0);
+          // begin_arm (server.hpp): the ARM-start record, the cleared flow
+          // pin and the new peer scope are published before the generation.
+          // Whatever sits in cmd_in (pre-fault leftovers) carries an older
+          // generation and is not authority (CommandAuthority).
           // Generation bump makes this ARM visible to the RT loop even if a
           // DISARM->ARM pair fits between two 1 kHz samples of `armed`.
-          const uint64_t gen = ctx.arm_gen.fetch_add(1) + 1;
-          ctx.armed.store(true);
+          const uint64_t gen = begin_arm(ctx);
           // seq = the ARM epoch every command of this authority must carry.
           send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "armed", uint32_t(gen)));
         }

@@ -18,6 +18,12 @@ constexpr double native_limits[] = {28, 10};
 // saturating at the magnitude cap exactly as before.
 double slew_max = std::numeric_limits<double>::infinity();
 bool slew_case = false;
+constexpr uint64_t SESSION = 7;
+uint64_t skew = 0;  // simulated elapsed time on top of the per-tick clock
+CommandEnvelope last_command{};
+// No packet for `by` ns: time passes, so the last command's own ingress stamp
+// and this generation's deadline both age.
+void age_stream(uint64_t by) { skew += by; }
 
 class ScriptedBackend final : public Backend {
  public:
@@ -45,9 +51,7 @@ class ScriptedBackend final : public Backend {
     state.dq[0] = -100;
     state.dq[1] = 100;
     if (tick == 1) {  // initial hold, before the first command
-      ctx->armed.store(true);
-      ctx->arm_gen.fetch_add(1);
-      ctx->last_cmd_rx_ns.store(mono_ns());
+      begin_arm(*ctx);
     }
     if (tick == 2) {  // opposite initial-hold torque
       state.dq[0] = 100;
@@ -68,11 +72,11 @@ class ScriptedBackend final : public Backend {
         // Echo outside the cap: post-slew clamping must still win.
         if (tick == 4) state.tau_ref[j] = sign * 10000;
       }
-      ctx->cmd_in.write(packet);
-      ctx->last_cmd_rx_ns.store(mono_ns());
+      last_command = CommandEnvelope{packet, mono_ns(), ctx->arm_gen.load(), SESSION};
+      ctx->cmd_in.write(last_command);
     }
-    if (tick == 5) ctx->last_cmd_rx_ns.store(mono_ns() - 200'000'000);
-    if (tick == 6) ctx->last_cmd_rx_ns.store(mono_ns() - 2'000'000'000);
+    if (tick == 5) age_stream(200'000'000);
+    if (tick == 6) age_stream(2'000'000'000);
     if (tick == 7) {
       assert(ctx->fault_code == FAULT_CMD_LOST);
       StatePacket previous{};
@@ -80,7 +84,8 @@ class ScriptedBackend final : public Backend {
       assert(previous.flags & FLAG_HOLDING);
       assert(ctx->clear_latch());
       ctx->latch(FAULT_CTL_LOST, "scripted communication fault");
-      ctx->last_cmd_rx_ns.store(mono_ns());  // fresh commands cannot bypass latch
+      last_command.rx_ns = mono_ns();  // fresh commands cannot bypass latch
+      ctx->cmd_in.write(last_command);
     }
     if (tick == 8) {  // plant failure suppresses torque writes
       assert(ctx->fault_code == FAULT_CTL_LOST);
@@ -119,7 +124,7 @@ class ScriptedBackend final : public Backend {
 };
 }  // namespace
 
-uint64_t mono_ns() { return 10'000'000'000ull + uint64_t(tick) * 1'000'000; }
+uint64_t mono_ns() { return 10'000'000'000ull + uint64_t(tick) * 1'000'000 + skew; }
 std::unique_ptr<Backend> make_fake_backend(int) {
   return std::make_unique<ScriptedBackend>();
 }
@@ -138,7 +143,9 @@ int main() {
   for (double cap : {27., 0., 100., .1}) {
     ServerCtx context;
     ctx = &context;
+    context.session_id.store(SESSION);
     tick = writes = stops = 0;
+    skew = 0;
     context.cfg.tau_max = cap;
     context.cfg.slew = 1000;
     context.cfg.rt_priority = 0;
@@ -151,7 +158,9 @@ int main() {
   {
     ServerCtx context;
     ctx = &context;
+    context.session_id.store(SESSION);
     tick = writes = stops = 0;
+    skew = 0;
     slew_max = 0.5;
     slew_case = true;
     context.cfg.tau_max = 0;      // magnitude cap out of the way

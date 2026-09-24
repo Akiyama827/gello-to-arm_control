@@ -182,9 +182,7 @@ void check_rt_loop() {
     if (!std::strcmp(op, "readOnce")) {
       ++idle_reads;
       if (idle_reads == 1) {  // first sample: ARM
-        ctx->last_cmd_rx_ns.store(mono_ns());
-        ctx->arm_gen.fetch_add(1);
-        ctx->armed.store(true);
+        begin_arm(*ctx);  // CTL_ARM's transition
       }
       if (writes_at_fault >= 0 && idle_reads >= 4) ctx->shutdown.store(true);
     }
@@ -218,9 +216,7 @@ void check_stop_failure_journal() {
   idle_reads = 0;
   script.hook = [](const char* op) {
     if (!std::strcmp(op, "readOnce") && ++idle_reads == 1) {
-      ctx->last_cmd_rx_ns.store(mono_ns());
-      ctx->arm_gen.fetch_add(1);
-      ctx->armed.store(true);
+      begin_arm(*ctx);  // CTL_ARM's transition
     }
     if (!std::strcmp(op, "readOnce") && idle_reads >= 3) ctx->shutdown.store(true);
     if (!std::strcmp(op, "control.readOnce") && script.reads == 4)
@@ -254,9 +250,7 @@ std::string shutdown_export(bool consumer_running) {
   idle_reads = 0;
   script.hook = [](const char* op) {
     if (!std::strcmp(op, "readOnce") && ++idle_reads == 1) {
-      ctx->last_cmd_rx_ns.store(mono_ns());
-      ctx->arm_gen.fetch_add(1);
-      ctx->armed.store(true);
+      begin_arm(*ctx);  // CTL_ARM's transition
     }
     if (!std::strcmp(op, "control.readOnce") && script.reads == 6)
       ctx->shutdown.store(true);  // still armed: the exit path stops the session
