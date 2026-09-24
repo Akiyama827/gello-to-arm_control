@@ -2,6 +2,9 @@
 // truncation, full ring, stalled consumer and concurrent producers. No
 // sockets, no backend, no devices.
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -35,13 +38,9 @@ std::string drain(ServerCtx& ctx, int* count = nullptr) {
   return text;
 }
 
-void disarm(ServerCtx& ctx) {  // the CTL_DISARM clear, in its order
+void disarm(ServerCtx& ctx) {  // what CTL_DISARM does to the latch
   ctx.armed.store(false);
-  ctx.fault.store(false);
-  ctx.fault_code.store(0);
-  ctx.fault_text[0] = '\0';
-  ctx.secondary_codes.store(0);
-  ctx.fault_claim.store(false);
+  assert(ctx.clear_latch());
 }
 
 void check_causes() {
@@ -184,6 +183,119 @@ void check_concurrent() {
   std::printf("concurrent: delivered %d + %d, dropped %u, contended %u\n", delivered[0],
               delivered[1], ctx.fault_dropped.load(), ctx.fault_contended.load());
 }
+
+// R3 (review 2026-09-24): a latch writer that already won the claim is paused
+// before it writes; DISARM must not clear underneath it, a second cause is a
+// secondary record, and after the clear an immediate re-arm latches a new first
+// cause without the old one being reassigned to the new epoch.
+struct Gate {
+  std::mutex m;
+  std::condition_variable cv;
+  bool in = false, go = false;
+};
+void hold_after_claim(void* arg) {
+  auto* g = static_cast<Gate*>(arg);
+  std::unique_lock<std::mutex> lock(g->m);
+  g->in = true;
+  g->cv.notify_all();
+  g->cv.wait(lock, [g] { return g->go; });
+}
+
+std::string line_with(const std::string& log, const std::string& key) {
+  const size_t at = log.find(key);
+  if (at == std::string::npos) return {};
+  const size_t start = log.rfind('\n', at);
+  return log.substr(start == std::string::npos ? 0 : start + 1,
+                    log.find('\n', at) - (start == std::string::npos ? 0 : start + 1));
+}
+
+void check_latch_disarm_race() {
+  ServerCtx ctx;
+  ctx.armed.store(true);
+  ctx.arm_gen.store(1);
+  Gate gate;
+  ctx.latch_seam = hold_after_claim;
+  ctx.latch_seam_arg = &gate;
+  std::thread rt([&] { ctx.latch(FAULT_PLANT, "first cause, epoch 1"); });
+  {
+    std::unique_lock<std::mutex> lock(gate.m);
+    gate.cv.wait(lock, [&] { return gate.in; });
+  }
+  ctx.latch_seam = nullptr;
+  ctx.latch(FAULT_CTL_LOST, "second cause while the first is written");
+  std::atomic<bool> done{false};
+  bool cleared = false;
+  std::thread control([&] {  // CTL_DISARM
+    ctx.armed.store(false);
+    cleared = ctx.clear_latch();
+    done.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  assert(!done.load() && ctx.latch_state.load() == ServerCtx::LATCH_WRITING);
+  {
+    std::lock_guard<std::mutex> lock(gate.m);
+    gate.go = true;
+  }
+  gate.cv.notify_all();
+  rt.join();
+  control.join();
+  assert(cleared && !ctx.fault.load() && ctx.fault_code.load() == 0);
+  assert(ctx.fault_text[0] == '\0' && ctx.latch_state.load() == ServerCtx::LATCH_FREE);
+
+  ctx.arm_gen.store(2);  // immediate re-arm
+  ctx.armed.store(true);
+  ctx.latch(FAULT_CMD_LOST, "epoch 2 cause");
+  assert(ctx.fault.load() && ctx.fault_code.load() == FAULT_CMD_LOST);
+  assert(std::strcmp(ctx.fault_text, "epoch 2 cause") == 0);
+  const std::string log = drain(ctx);
+  const std::string first = line_with(log, "first cause code=3");
+  assert(first.find("arm_epoch=1") != std::string::npos &&
+         first.find("text=\"first cause, epoch 1\"") != std::string::npos);
+  assert(line_with(log, "secondary cause code=2").find("arm_epoch=1") != std::string::npos);
+  const std::string second = line_with(log, "first cause code=1");
+  assert(second.find("arm_epoch=2") != std::string::npos &&
+         second.find("text=\"epoch 2 cause\"") != std::string::npos);
+}
+
+// A writer that never finishes: DISARM gives up after its bound and leaves
+// the latch intact rather than clearing underneath it.
+void check_clear_bounded() {
+  ServerCtx ctx;
+  ctx.latch_state.store(ServerCtx::LATCH_WRITING);
+  const auto t0 = std::chrono::steady_clock::now();
+  assert(!ctx.clear_latch());
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  assert(waited >= std::chrono::milliseconds(90) && waited < std::chrono::seconds(2));
+  assert(ctx.latch_state.load() == ServerCtx::LATCH_WRITING);
+}
+
+// The actual interaction under load (run it under TSan too): the servo
+// latching every tick while DISARM clears. The end state is coherent.
+void check_latch_stress() {
+  ServerCtx ctx;
+  ctx.armed.store(true);
+  std::atomic<bool> stop{false};
+  std::thread rt([&] {
+    while (!stop.load()) ctx.latch(FAULT_PLANT, "persisting cause");
+  });
+  std::thread drainer([&] {  // state_tx keeps consuming the journal
+    FILE* sink = std::fopen("/dev/null", "w");
+    while (!stop.load()) drain_fault_journal(ctx, sink);
+    std::fclose(sink);
+  });
+  int cleared = 0;
+  for (int i = 0; i < 2000; ++i) cleared += ctx.clear_latch();
+  stop.store(true);
+  rt.join();
+  drainer.join();
+  assert(cleared == 2000);
+  const uint32_t s = ctx.latch_state.load();
+  if (s == ServerCtx::LATCH_SET)
+    assert(ctx.fault.load() && ctx.fault_code.load() == FAULT_PLANT &&
+           std::strcmp(ctx.fault_text, "persisting cause") == 0);
+  else
+    assert(s == ServerCtx::LATCH_FREE && !ctx.fault.load() && ctx.fault_code.load() == 0);
+}
 }  // namespace
 
 int main() {
@@ -192,6 +304,10 @@ int main() {
   check_full_ring();
   check_bounded_claim();
   check_concurrent();
+  check_latch_disarm_race();
+  check_clear_bounded();
+  check_latch_stress();
   std::puts("PASS fault journal: first/secondary causes survive DISARM, explicit "
-            "truncation, full ring drops new, concurrent producers intact");
+            "truncation, full ring drops new, concurrent producers intact, latch/DISARM "
+            "lifecycle (paused writer, bounded clear, re-arm, stress)");
 }

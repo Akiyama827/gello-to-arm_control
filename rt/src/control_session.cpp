@@ -237,18 +237,19 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
         break;
       case CTL_DISARM: {
         ctx.armed.store(false);
-        ctx.fault.store(false);
-        ctx.fault_code.store(0);
-        ctx.fault_text[0] = '\0';
-        ctx.secondary_codes.store(0);  // the journal itself is never cleared
-        // Release the latch claim LAST: a latch racing this clear is dropped
-        // (its CAS fails) and simply re-fires on the next tick if the cause
-        // persists — better than letting it scribble a half-cleared slot.
-        ctx.fault_claim.store(false);
+        // The latch is reset only when no writer holds it (server.hpp). A
+        // latch racing this clear is not taken and re-fires on a later tick
+        // if the cause persists. The journal keeps every first cause.
+        const bool cleared = ctx.clear_latch();
+        if (!cleared)
+          std::fprintf(stderr, "[rt] DISARM: fault latch still being written; "
+                               "not cleared\n");
         // AFTER armed=false (rt_loop reads the generation first). The ack is
         // RECEIPT; completion is StatePacket.stop_epoch reaching this value.
         const uint64_t dg = ctx.disarm_gen.fetch_add(1) + 1;
-        send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "disarm requested",
+        send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx),
+                            cleared ? "disarm requested"
+                                    : "disarm requested; fault latch busy, not cleared",
                             uint32_t(dg)));
         break;
       }

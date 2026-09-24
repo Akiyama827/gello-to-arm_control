@@ -178,8 +178,14 @@ void udp_rx_thread(ServerCtx& ctx) {
     ctx.cmd_in.write(decoded);
     ctx.last_cmd_rx_ns.store(rx, std::memory_order_release);
   }
-  ctx.udp_fd.store(-1);  // unpublish before close: state_tx must not race a
-  close(fd);             // reused descriptor
+  // Not closed here: state_tx may already hold this descriptor for a
+  // sendto(), and unpublishing it first does not stop that. main closes it
+  // after every thread is joined (close_udp_socket).
+}
+
+void close_udp_socket(ServerCtx& ctx) {
+  const int fd = ctx.udp_fd.exchange(-1);
+  if (fd >= 0) close(fd);
 }
 
 void finish_fault_journal(ServerCtx& ctx) {
