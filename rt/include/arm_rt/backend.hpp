@@ -38,6 +38,11 @@ struct PlantState {
   double pose[7] = {};  // measured EE pose: xyz,wxyz, base frame
   double coriolis[MAX_JOINTS] = {};  // robot supplies gravity internally
   bool pose_valid = false;
+  // Robot-side clock of the returned sample (franka: RobotState::time) and
+  // the robot's view of our command delivery. 0 / -1 when the plant has none.
+  // Diagnostics only (loop-gap log); never on the wire.
+  uint64_t robot_time_ms = 0;
+  double cmd_success_rate = -1.0;
 };
 
 class Backend {

@@ -189,6 +189,19 @@ void state_tx_thread(ServerCtx& ctx) {
   while (!ctx.shutdown.load()) {
     timespec ts{0, period_ns};
     nanosleep(&ts, nullptr);
+    for (uint32_t tail = ctx.gap_tail.load(std::memory_order_relaxed);
+         tail != ctx.gap_head.load(std::memory_order_acquire); ++tail) {
+      const LoopGap g = ctx.gaps[tail % LOOP_GAP_RING];
+      ctx.gap_tail.store(tail + 1, std::memory_order_release);
+      std::fprintf(stderr,
+                   "[rt] loop gap t=%.6f seq=%u armed=%d period=%.3fms read=%.3fms "
+                   "prev_compute=%.3fms prev_write=%.3fms prev_publish=%.3fms "
+                   "robot_dt=%lldms cmd_success=%.3f dropped=%u\n",
+                   g.t_read_ns / 1e9, g.state_seq, int(g.armed), g.period_ns / 1e6,
+                   g.read_ns / 1e6, g.compute_ns / 1e6, g.write_ns / 1e6,
+                   g.publish_ns / 1e6, (long long)g.robot_dt_ms, g.cmd_success_rate,
+                   ctx.gap_dropped.load(std::memory_order_relaxed));
+    }
     const int ufd = ctx.udp_fd.load();
     if (ufd < 0) continue;
     const uint64_t v = ctx.state_out.read(pkt);

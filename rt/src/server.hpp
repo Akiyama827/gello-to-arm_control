@@ -73,6 +73,23 @@ struct ServerConfig {
 
 constexpr int MAX_OBSERVERS = 4;
 
+// One servo iteration that took > LOOP_GAP_NS from read-return to read-return.
+// The gap = previous iteration's compute+write+publish, then this one's read.
+constexpr uint64_t LOOP_GAP_NS = 2'000'000;
+struct LoopGap {
+  uint64_t t_read_ns;   // this read's return, server clock (== StatePacket stamp domain)
+  uint64_t period_ns;   // read-return to read-return
+  uint64_t read_ns;     // this iteration: blocked inside backend->read()
+  uint64_t compute_ns;  // previous iteration: read-return -> write start
+  uint64_t write_ns;    // previous iteration: inside backend->write_command()
+  uint64_t publish_ns;  // previous iteration: write end -> state seqlock written
+  int64_t robot_dt_ms;  // robot clock advance between the two samples
+  double cmd_success_rate;
+  uint32_t state_seq;
+  bool armed;
+};
+constexpr uint32_t LOOP_GAP_RING = 64;
+
 struct Observer {
   sockaddr_in addr{};
   uint64_t expiry_ns = 0;  // 0 = free slot
@@ -158,6 +175,11 @@ struct ServerCtx {
   bool have_peer = false;
 
   std::atomic<int> udp_fd{-1};  // udp_rx writes, state_tx reads
+
+  // ponytail: SPSC ring, rt_loop produces, state_tx drains to stderr; a full
+  // ring drops the new record (counted), so the RT side never waits or allocates.
+  LoopGap gaps[LOOP_GAP_RING] = {};
+  std::atomic<uint32_t> gap_head{0}, gap_tail{0}, gap_dropped{0};
 
   void latch(uint32_t code, const char* text) {
     bool expected = false;  // first cause wins, decided by ONE atomic claim

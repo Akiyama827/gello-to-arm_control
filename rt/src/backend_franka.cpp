@@ -120,6 +120,8 @@ public:
           active_ ? control_->readOnce().first  // paces the armed loop
                   : robot_.readOnce();          // idle stream, no session
       out.n = FR3_N;
+      out.robot_time_ms = state.time.toMSec();
+      out.cmd_success_rate = state.control_command_success_rate;
       for (int j = 0; j < FR3_N; ++j) {
         out.q[j] = state.q[j];
         out.dq[j] = state.dq[j];

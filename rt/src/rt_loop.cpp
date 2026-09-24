@@ -179,8 +179,13 @@ void rt_loop(ServerCtx& ctx) {
                             // returns 0 on retry exhaustion; without the cache
                             // that tick reads as "stale" and flaps into hold)
 
+  // Loop-gap diagnostics: stamps of the previous iteration's phases.
+  uint64_t prev_t_read = 0, prev_compute = 0, prev_write = 0, prev_publish = 0;
+  uint64_t prev_robot_ms = 0;
   while (!ctx.shutdown.load()) {
+    const uint64_t t_top = mono_ns();
     if (!backend->read(ps)) {
+      prev_t_read = 0;  // a failed read is logged by the fault path already
       // Latch only while ARMED: a transient read hiccup on a DISARMED idle
       // server was blocking the NEXT arm (nothing is being written, so there
       // is nothing to protect — and the first armed write re-latches anyway
@@ -211,6 +216,22 @@ void rt_loop(ServerCtx& ctx) {
       continue;
     }
     read_fail_streak = 0;
+    const uint64_t t_read = mono_ns();
+    if (prev_t_read != 0 && t_read - prev_t_read > LOOP_GAP_NS) {
+      const uint32_t head = ctx.gap_head.load(std::memory_order_relaxed);
+      if (head - ctx.gap_tail.load(std::memory_order_acquire) < LOOP_GAP_RING) {
+        ctx.gaps[head % LOOP_GAP_RING] = LoopGap{
+            t_read, t_read - prev_t_read, t_read - t_top, prev_compute, prev_write,
+            prev_publish, int64_t(ps.robot_time_ms) - int64_t(prev_robot_ms),
+            ps.cmd_success_rate, state_seq + 1, ctx.armed.load()};
+        ctx.gap_head.store(head + 1, std::memory_order_release);
+      } else {
+        ctx.gap_dropped.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    prev_t_read = t_read;
+    prev_robot_ms = ps.robot_time_ms;
+    uint64_t t_w0 = 0, t_w1 = 0;
     ctx.online_mask.store(backend->online_mask(), std::memory_order_release);
     const uint32_t requested =
         ctx.requested_active_mask.load(std::memory_order_acquire);
@@ -333,7 +354,10 @@ void rt_loop(ServerCtx& ctx) {
       std::copy_n(tau_ff, n, selected.tau_ff);
       std::copy_n(kp, n, selected.kp);
       std::copy_n(kd, n, selected.kd);
-      if (!backend->write_command(selected, slew, tau_out)) {
+      t_w0 = mono_ns();
+      const bool wrote = backend->write_command(selected, slew, tau_out);
+      t_w1 = mono_ns();
+      if (!wrote) {
         ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
         plant_ok = false;
         holding = false;
@@ -382,6 +406,11 @@ void rt_loop(ServerCtx& ctx) {
     // flag still reads zeros rather than stale numbers.
     std::memcpy(out.wrench, ps.wrench, sizeof(out.wrench));
     ctx.state_out.write(out);
+    const uint64_t t_pub = mono_ns();
+    if (t_w0 == 0) t_w0 = t_w1 = t_pub;  // no write this tick (disarmed/plant down)
+    prev_compute = t_w0 - t_read;
+    prev_write = t_w1 - t_w0;
+    prev_publish = t_pub - t_w1;
   }
   backend->stop();
 }
