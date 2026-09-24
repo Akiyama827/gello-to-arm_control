@@ -202,6 +202,13 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | N
         out[key] = expand_named_values(
             spec, names=names, default=0.0, clamp_min=0.0, clamp_max=clamp_max
         )
+    # Integral law (executor-side, rides in tau_ff): mode config only, absent
+    # = zero = off. No arm-table fallback -- it is a tuning of one plant's
+    # servo, not a fact about the arm.
+    for key in ("ki", "i_limit"):
+        out[key] = expand_named_values(
+            controller_cfg.get(key), names=names, default=0.0, clamp_min=0.0
+        )
 
     if not float(np.max(np.abs(out["kp"][:n_arm]))) > 0.0:
         # All-zero arm stiffness is never intentional -- it is a limp arm that
@@ -274,6 +281,9 @@ def _check_resolve_gains() -> None:
     out = resolve_gains(cfg, mode, names, 2)
     assert np.allclose(out["kp"], [20.0, 21.0]), out["kp"]
     assert np.allclose(out["kd"], [1.0, 1.1]), out["kd"]   # falls back
+    assert np.allclose(out["ki"], 0.0) and np.allclose(out["i_limit"], 0.0)  # off
+    out = resolve_gains(cfg, {"controller": {"ki": {"j1": 5.0}, "i_limit": 2.0}}, names, 2)
+    assert np.allclose(out["ki"], [5.0, 0.0]) and np.allclose(out["i_limit"], 2.0), out
 
     # 2. No mode config at all: the arm table, exactly as before this existed.
     out = resolve_gains(cfg, {}, names, 2)

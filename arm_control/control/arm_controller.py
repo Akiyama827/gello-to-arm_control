@@ -621,6 +621,7 @@ class ArmController:
         self._cartesian_now = None
         self._last_cartesian_pose = None
         self._pose_hold = spec
+        self._reset_integral()  # the pose-hold law ignores tau_ff
         self._report_mode()
 
     def _set_gains(self, gains: dict) -> None:
@@ -708,6 +709,7 @@ class ArmController:
         if self._pose_hold is not None:
             self._pose_hold = None
             self.last_command = None
+            self._reset_integral()  # accumulated under a law that ignored it
             self._report_mode()
         if self._running:
             self._finish_leg(ok=False, reason=reason)
@@ -965,6 +967,12 @@ class ArmController:
         self._jog.clear()
         self.last_command = None
         self._pose_hold = None
+        self._reset_integral()  # the plant went limp; its bias is gone
+
+    def _reset_integral(self) -> None:
+        reset = getattr(self.executor, "reset_integral", None)
+        if reset is not None:
+            reset()
 
     def _fault(self, reason: str) -> None:
         if self._running:

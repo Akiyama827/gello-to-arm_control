@@ -140,6 +140,8 @@ def build_executor(
         # twice. The legacy standalone executor already honoured this flag; this
         # path silently ignored it.
         gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
+        ki=None if gains is None else gains.get("ki"),
+        i_limit=None if gains is None else gains.get("i_limit"),
         **tolerances,
     )
     # Payload feedforward frame (mass toggles on grasp/release results): RNEA

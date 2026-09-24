@@ -439,7 +439,18 @@ class RemoteHardware:
                     c._last_state_at = received
         holding = self._update_holding(time.monotonic())
         if self.mode == "shared":
-            self._align_feedback(histories, allow_wait=holding)
+            if all(c.armed and c.bridge_armed and c.ready_sent
+                   for c in self.controllers.values()):
+                self._align_feedback(histories, allow_wait=holding)
+            else:
+                # ARM/DISARM changes each arm's authority epoch at a slightly
+                # different instant, so a common time cannot be bracketed
+                # across it -- a clean disarm used to end in "cannot bracket
+                # common time" and a runtime fault. Nothing moves the pair
+                # until both arms are armed and acknowledged; withhold
+                # readiness (the console then cancels pending work and skips
+                # closure) and align again once both are.
+                self._feedback_alignment = dict(error="pair not armed")
         # Receive both arms before doing dynamics work; sample both trajectories
         # at the same PC time, then dispatch the two resulting commands together.
         # This removes computation-order skew, not network/physical-cycle skew.
