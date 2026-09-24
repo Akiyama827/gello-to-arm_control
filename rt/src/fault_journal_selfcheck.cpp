@@ -285,9 +285,10 @@ void check_latch_stress() {
   });
   // Authority is raised only after the word is FREE again: never armed while
   // ARMING. A sample counts only if no new round began during it -- a round
-  // opens after its DISARM, so armed read within it is this round's ARM. The
-  // seam holds the gap between the two stores open long enough to sample;
-  // back to back, x86 publishes them together.
+  // opens after its DISARM, so armed read within it is this round's ARM.
+  // Uninstrumented, this sampler missed reversed stores (killed 0/20 runs;
+  // 14/20 with a null seam compiled in), so the seam holds the gap open here.
+  // check_arm_admission checks the same ordering deterministically.
   ctx.arm_seam = [] {
     timespec pause{0, 20'000};
     nanosleep(&pause, nullptr);
@@ -327,6 +328,19 @@ void check_latch_stress() {
            std::strcmp(ctx.fault_text, "persisting cause") == 0);
   else
     assert(s == ServerCtx::LATCH_FREE && !ctx.fault.load() && ctx.fault_code.load() == 0);
+}
+
+// The interval between arm_unlatched's two final stores, seen via arm_seam.
+struct {
+  ServerCtx* ctx;
+  int calls;
+  uint32_t state;
+  bool armed;
+} between;
+void observe_between() {
+  ++between.calls;
+  between.state = between.ctx->latch_state.load();
+  between.armed = between.ctx->armed.load();
 }
 
 // ARM admission is one transition on the latch word (arm_unlatched).
@@ -395,6 +409,17 @@ void check_arm_admission() {
   assert(line_with(log, "secondary cause code=3").find("arm_epoch=5") != std::string::npos);
   ctx.latch(FAULT_PLANT, "epoch 6 cause", 6);
   assert(ctx.fault.load() && ctx.fault_gen.load() == 6);
+
+  // Ordering, deterministically: a successful ARM releases the word before it
+  // raises authority, so between the two stores the word is FREE, not armed.
+  ctx.armed.store(false);
+  assert(ctx.clear_latch());
+  between = {&ctx, 0, ServerCtx::LATCH_ARMING, true};
+  ctx.arm_seam = observe_between;
+  assert(try_arm(ctx) && ctx.armed.load());
+  ctx.arm_seam = nullptr;
+  assert(between.calls == 1);
+  assert(between.state == ServerCtx::LATCH_FREE && !between.armed);
 }
 
 // CTL_FAULT delivery (control thread): one notice per latch serial, never the
@@ -438,8 +463,8 @@ int main() {
   check_concurrent();
   check_latch_disarm_race();
   check_clear_bounded();
+  check_arm_admission();  // deterministic ordering first, then the stress
   check_latch_stress();
-  check_arm_admission();
   check_fault_notice();
   std::puts("PASS fault journal: first/secondary causes survive DISARM, explicit "
             "truncation, full ring drops new, concurrent producers intact, latch/DISARM "

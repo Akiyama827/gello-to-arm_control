@@ -1,8 +1,8 @@
 // FR3 torque backend over libfranka's external-control (ActiveControl) API.
 //
 // STATUS: encodes every constraint from the 2026-07-26 franka_ros2/libfranka
-// review. Hardware-run on two FR3s at build c23a0c7 (libfranka 0.21.2; the
-// 2026-09-24 timing report: https://github.com/Westlake-Work/modular_robotic_arm/blob/f042a681841393a5a0ad7b82469f8ef0997290c8/Control/docs/status/2026-09-24-dual-arm-rt-timing.md).
+// review. Hardware-run on two FR3s at build c23a0c7 (the 2026-09-24 timing
+// report: https://github.com/Westlake-Work/modular_robotic_arm/blob/f042a681841393a5a0ad7b82469f8ef0997290c8/Control/docs/status/2026-09-24-dual-arm-rt-timing.md).
 // Changes after c23a0c7 (exception containment, the fault journal and latch
 // lifecycle, the RT mailbox) are offline-checked only until deployed and
 // re-qualified. Review notes it implements:
