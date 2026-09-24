@@ -72,6 +72,7 @@ pip install -e rt/bindings                                  # optional: sim same
 PYTHONPATH=. python tools/bench/rt/torque_cap.py build/arm_rt_server  # offline caps + parity
 build/dm_command_selfcheck                                # native command dispatch, no devices
 build/dm_backend_selfcheck                                # DM lifecycle via intercepted CAN syscalls
+build/franka_backend_selfcheck                            # FR3 exception containment, scripted franka::
 ```
 
 ## DM wire mappings

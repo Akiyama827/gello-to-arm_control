@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <thread>
 
 #include "server.hpp"
@@ -29,6 +30,26 @@ arm_rt::ServerCtx* g_ctx = nullptr;
 
 void on_signal(int) {
   if (g_ctx) g_ctx->shutdown.store(true);
+}
+
+// Thread boundary: an exception escaping a server thread was std::terminate
+// (no unwinding, no diagnosable cause). Report it and shut the whole process
+// down nonzero instead -- never resume a thread whose invariants are unknown.
+template <class Fn>
+void guarded(const char* thread, arm_rt::ServerCtx& ctx, Fn fn) {
+  try {
+    fn(ctx);
+  } catch (const std::exception& exc) {
+    std::fprintf(stderr, "[rt] %s thread exception: %s — shutting down\n", thread,
+                 exc.what());
+    ctx.failed.store(true);
+    ctx.shutdown.store(true);
+  } catch (...) {
+    std::fprintf(stderr, "[rt] %s thread: unknown exception — shutting down\n",
+                 thread);
+    ctx.failed.store(true);
+    ctx.shutdown.store(true);
+  }
 }
 
 void usage(const char* argv0) {
@@ -217,10 +238,14 @@ int main(int argc, char** argv) {
               cfg.backend.c_str(), cfg.udp_port, cfg.tcp_port, cfg.state_hz,
               cfg.hold_ms, cfg.fault_ms);
 
-  std::thread udp(arm_rt::udp_rx_thread, std::ref(ctx));
-  std::thread tx(arm_rt::state_tx_thread, std::ref(ctx));
-  std::thread ctl(arm_rt::control_thread, std::ref(ctx));
-  arm_rt::rt_loop(ctx);  // RT thread = main thread; backend constructed here
+  std::thread udp(guarded<void (*)(arm_rt::ServerCtx&)>, "udp_rx", std::ref(ctx),
+                  arm_rt::udp_rx_thread);
+  std::thread tx(guarded<void (*)(arm_rt::ServerCtx&)>, "state_tx", std::ref(ctx),
+                 arm_rt::state_tx_thread);
+  std::thread ctl(guarded<void (*)(arm_rt::ServerCtx&)>, "control", std::ref(ctx),
+                  arm_rt::control_thread);
+  // RT thread = main thread; backend constructed here
+  guarded("rt_loop", ctx, arm_rt::rt_loop);
   ctx.shutdown.store(true);
   udp.join();
   tx.join();

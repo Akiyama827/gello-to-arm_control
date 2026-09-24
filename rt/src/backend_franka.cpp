@@ -21,6 +21,10 @@
 //    arm attempt (which sets the flag) — the second arm recovers it.
 //  - Errors surface on readOnce(), not writeOnce() — read() is where faults
 //    are caught and reported.
+//  - Every device call also catches std::exception: libfranka's transport
+//    can surface Poco network exceptions, which are not franka::Exception
+//    (an FCI drop on 2026-09-24 terminated an armed server this way). They
+//    take the same fault path, with the operation named in the fault text.
 //  - tau_ref for the slew limiter is state.tau_J_d (the robot's echo of the
 //    last ACCEPTED torque), which survives dropped packets; the limiter IS
 //    the startup ramp, first tick included.
@@ -39,6 +43,7 @@
 //    the Cartesian sensing the impedance law and contact detection need.
 #include <array>
 #include <cstdio>
+#include <exception>
 #include <string>
 
 #include "arm_rt/backend.hpp"
@@ -47,10 +52,12 @@
 
 #include <Eigen/Geometry>
 
+#ifndef ARM_RT_FRANKA_SELFCHECK  // franka_backend_selfcheck scripts franka::
 #include <franka/active_control.h>
 #include <franka/exception.h>
 #include <franka/model.h>
 #include <franka/robot.h>
+#endif
 
 namespace arm_rt {
 namespace {
@@ -66,7 +73,10 @@ public:
   // the constructor, and never inside a control loop.
   FrankaBackend(const std::string& ip, double ee_mass, const double ee_com[3])
       : robot_(ip, franka::RealtimeConfig::kEnforce), model_(robot_.loadModel()) {
-    fault_.reserve(256);  // latch path must not allocate on the RT thread
+    // Typical fault texts fit without reallocating. Not a no-allocation
+    // guarantee: an exception path allocates anyway, which is why rt_loop
+    // paces read failures and stops writing until the next ARM.
+    fault_.reserve(256);
     // Payload declaration. setLoad writes m_load, which is ADDITIVE to the
     // Desk-configured end effector (the Hand's m_ee) — pass the camera+mount
     // or module mass alone, never hand+camera. It is a non-realtime command:
@@ -159,7 +169,10 @@ public:
       out.pose_valid = true;
       return true;
     } catch (const franka::Exception& exc) {
-      fail(exc);
+      fail(exc.what());
+      return false;
+    } catch (const std::exception& exc) {
+      fail("read", exc);
       return false;
     }
   }
@@ -186,7 +199,10 @@ public:
       control_->writeOnce(torques);
       return true;
     } catch (const franka::Exception& exc) {
-      fail(exc);
+      fail(exc.what());
+      return false;
+    } catch (const std::exception& exc) {
+      fail("write", exc);
       return false;
     }
   }
@@ -202,6 +218,9 @@ public:
     } catch (const franka::Exception& exc) {
       fault_ = exc.what();
       need_recovery_ = true;
+    } catch (const std::exception& exc) {
+      unexpected("stop", exc);
+      need_recovery_ = true;
     }
     control_.reset();
     active_ = false;
@@ -210,13 +229,29 @@ public:
   const std::string& fault_text() const override { return fault_; }
 
 private:
-  void fail(const franka::Exception& exc) {
+  void fail(const char* what) {
     // Unconditional: an error with NO session open (reflex entered while
     // idle, startTorqueControl refused) must ALSO set need_recovery_, or the
     // documented DISARM->ARM reflex recovery is unreachable — every re-arm
     // repeats the refused start forever. A spurious automaticErrorRecovery()
     // after a mere network blip is a harmless no-op.
-    fault_ = exc.what();
+    fault_ = what;
+    drop_session();
+  }
+
+  // A non-libfranka exception leaves the plant state unknown: same path as a
+  // device fault (no writes until the next ARM reopens the session), with the
+  // failing operation kept in the text so the first cause stays attributable.
+  void fail(const char* op, const std::exception& exc) {
+    unexpected(op, exc);
+    drop_session();
+  }
+
+  void unexpected(const char* op, const std::exception& exc) {
+    fault_.assign(op).append(": non-libfranka exception: ").append(exc.what());
+  }
+
+  void drop_session() {
     control_.reset();  // back to idle reads so state keeps flowing
     active_ = false;
     need_recovery_ = true;
@@ -241,6 +276,10 @@ std::unique_ptr<Backend> make_franka_backend(const std::string& ip, double ee_ma
     // FCI off, robot unreachable, no RT permission — report, exit nonzero,
     // and let systemd's Restart=on-failure keep knocking until it's there.
     std::fprintf(stderr, "[rt] franka backend: %s\n", exc.what());
+    return nullptr;
+  } catch (const std::exception& exc) {
+    std::fprintf(stderr, "[rt] franka backend: session open: non-libfranka "
+                         "exception: %s\n", exc.what());
     return nullptr;
   }
 }
