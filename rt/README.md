@@ -47,8 +47,11 @@ It neither joins nor blocks the arm RT servo loop.
 - Stop is retried while the canceled action is active, then once after its exit
   to cover cancellation just before SDK entry. New commands require a successful
   final stop and a subsequent fresh measured sample. A false/exceptional final
-  stop inhibits commands until an explicit successful GSTOP retry or bridge
-  restart; reconnect alone does not clear the stop-failure latch.
+  stop inhibits commands (META `available 0`). The latch clears only after a
+  retried stop succeeds and a measured sample read after it arrives. A new
+  Hand device session retries the stop once, discarding all old actions; an
+  explicit GSTOP also retries. The recovery never opens, homes or re-sends an
+  action. A PC client reconnect alone does not clear the latch.
 - Client disconnect interrupts an active action and discards queued commands.
   It does not stop an already completed grasp, including when an unsent open was
   queued. Explicit GSTOP does request stop even when idle; do not use it as a
