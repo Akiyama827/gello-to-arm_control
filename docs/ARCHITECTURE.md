@@ -199,13 +199,16 @@ wire schemas. The byte-level remote RT protocol remains separate in
 
 Intentional public compatibility aliases remain:
 
-| API | Canonical owner | Reason |
-|---|---|---|
-| `arm_control.messages` | `arm_control.contracts` | Existing independent consumers use the codecs |
-| `arm_control.planning.trajectory` | `arm_control.motion` and `planning.retiming` | Preserve trajectory imports while values change ownership |
-| `arm_control.rt_protocol` | `arm_control.plants.remote_rt.protocol` | Preserve protocol imports and `python -m ... --hex` |
-| `arm_control.simulation.mujoco_backend` | `arm_control.plants.mujoco.backend` | Preserve class/helper identities and module CLI |
-| `arm_control.simulation.scene_backend` | `arm_control.plants.mujoco.composer` | Independent simulated perception consumes the injected builder |
+| API | Canonical owner | Reason | Retire when |
+|---|---|---|---|
+| `arm_control.messages` | `arm_control.contracts` | Existing independent consumers use the codecs | Its importers here, in `Control/assembly` and in perceptions import `contracts`, and the README self-check moves with them |
+| `arm_control.planning.trajectory` | `arm_control.motion` and `planning.retiming` | Preserve trajectory imports while values change ownership | No importer outside archived plans; remove one release after a deprecation notice |
+| `arm_control.rt_protocol` | `arm_control.plants.remote_rt.protocol` | Preserve protocol imports and `python -m ... --hex` | No current command or importer uses it; remove one release after a deprecation notice |
+| `arm_control.simulation.mujoco_backend` | `arm_control.plants.mujoco.backend` | Preserve class/helper identities and module CLI | No current command or importer uses it; remove one release after a deprecation notice |
+| `arm_control.simulation.scene_backend` | `arm_control.plants.mujoco.composer` | Independent simulated perception consumes the injected builder | perceptions `nodes/sim_perception.py` imports `plants.mujoco.composer` |
+
+Callers were audited on 2026-09-24 across this library, `Control/` and
+perceptions.
 
 These are package-level re-exports, not node-source APIs. Removing them requires
 an explicit consumer migration, not a directory-cleanup sweep.

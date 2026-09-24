@@ -297,6 +297,9 @@ struct ServerCtx {
   // Test seam: called right after a successful claim. Null in the server.
   void (*latch_seam)(void*) = nullptr;
   void* latch_seam_arg = nullptr;
+  // Test seam: called between arm_unlatched's two final stores, to hold that
+  // ordering window open. Null in the server.
+  void (*arm_seam)() = nullptr;
   std::atomic<uint32_t> fault_code{0};
   std::atomic<bool> shutdown{false};
   std::atomic<bool> failed{false};   // startup/bind failure -> nonzero exit,
@@ -437,6 +440,7 @@ struct ServerCtx {
       return false;
     prepare();
     latch_state.store(LATCH_FREE, std::memory_order_release);
+    if (arm_seam) arm_seam();
     armed.store(true, std::memory_order_release);
     return true;
   }

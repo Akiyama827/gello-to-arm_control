@@ -2107,7 +2107,7 @@ class MuJoCoBackend:
 def _demo() -> None:
     """Self-check for the compiled servo law this plant closes.
 
-    Run: ``python -m arm_control.simulation.mujoco_backend --demo``.
+    Run: ``python -m arm_control.plants.mujoco.backend --demo``.
     The smallest thing that fails if the Cartesian math breaks — no scene, no
     physics, just the law.
     """

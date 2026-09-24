@@ -23,7 +23,7 @@ no daemon, no Python, no graph lifecycle owning the arm.
 | `src/udp_link.cpp` | Commands in (latest-wins), state out (paced) |
 | `src/control_session.cpp` | TCP: arm/disarm/ping + STATUS/FAULT events |
 | `src/backend_fake.cpp` | Damped-integrator loopback plant — the PERMANENT test double (see below) |
-| `src/backend_franka.cpp` | FR3 over libfranka ActiveControl (`-DWITH_FRANKA=ON`), **unvalidated on hardware** |
+| `src/backend_franka.cpp` | FR3 over libfranka ActiveControl (`-DWITH_FRANKA=ON`); hardware-run at `c23a0c7` ([timing report](https://github.com/Westlake-Work/modular_robotic_arm/blob/f042a681841393a5a0ad7b82469f8ef0997290c8/Control/docs/status/2026-09-24-dual-arm-rt-timing.md)), later changes offline-checked only |
 | `src/backend_dm.cpp` | DM FDCAN backend with exact reply-ID filters and MIT wire-format self-check |
 | `src/hand_bridge.cpp` | Generic Franka Hand TCP bridge; built with libfranka |
 | `bindings/` | Optional pybind module `arm_rt_servo` so the MuJoCo twin closes the same compiled law |

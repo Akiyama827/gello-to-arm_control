@@ -158,8 +158,8 @@ def pack_control_update(**fields) -> pa.Array:
     """Control-plane updates that are not a leg: arm, payload, execute, cancel,
     gains, pose_hold, hold, stop.
 
-    NOT ``rt_protocol.pack_control``, which is the RT server's binary link
-    frame (ctl_type / seq / t_mono_ns) and has nothing to do with this. Same
+    NOT ``plants.remote_rt.protocol.pack_control``, which is the RT server's
+    binary link frame (ctl_type / seq / t_mono_ns) and has nothing to do with this. Same
     package, unrelated jobs -- hence the longer name here.
 
     One topic rather than five, because they are all the same thing -- the

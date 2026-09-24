@@ -1,10 +1,11 @@
 // FR3 torque backend over libfranka's external-control (ActiveControl) API.
 //
-// STATUS: compiles against libfranka >= 0.13-style ActiveControl headers and
-// encodes every constraint from the 2026-07-26 franka_ros2/libfranka review,
-// but it is UNVALIDATED ON HARDWARE — the first live run is a bring-up rung
-// (gravity-hold, operator on the stop), not a formality. Review notes it
-// implements:
+// STATUS: encodes every constraint from the 2026-07-26 franka_ros2/libfranka
+// review. Hardware-run on two FR3s at build c23a0c7 (libfranka 0.21.2; the
+// 2026-09-24 timing report: https://github.com/Westlake-Work/modular_robotic_arm/blob/f042a681841393a5a0ad7b82469f8ef0997290c8/Control/docs/status/2026-09-24-dual-arm-rt-timing.md).
+// Changes after c23a0c7 (exception containment, the fault journal and latch
+// lifecycle, the RT mailbox) are offline-checked only until deployed and
+// re-qualified. Review notes it implements:
 //
 //  - Robot is constructed ON THE LOOP THREAD: libfranka raises the calling
 //    thread's scheduling in the constructor, so construct-then-move loses RT

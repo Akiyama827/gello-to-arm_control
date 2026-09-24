@@ -283,9 +283,31 @@ void check_latch_stress() {
     while (!stop.load()) drain_fault_journal(ctx, sink);
     std::fclose(sink);
   });
+  // Authority is raised only after the word is FREE again: never armed while
+  // ARMING. A sample counts only if no new round began during it -- a round
+  // opens after its DISARM, so armed read within it is this round's ARM. The
+  // seam holds the gap between the two stores open long enough to sample;
+  // back to back, x86 publishes them together.
+  ctx.arm_seam = [] {
+    timespec pause{0, 20'000};
+    nanosleep(&pause, nullptr);
+  };
+  std::atomic<int> round{0};
+  std::atomic<long> samples{0}, armed_while_arming{0};
+  std::thread sampler([&] {
+    while (!stop.load()) {
+      const int r = round.load();
+      const bool a = ctx.armed.load(std::memory_order_acquire);
+      const uint32_t s = ctx.latch_state.load(std::memory_order_acquire);
+      if (round.load() != r) continue;
+      ++samples;
+      armed_while_arming += a && s == ServerCtx::LATCH_ARMING;
+    }
+  });
   int cleared = 0, armed = 0;
   for (int i = 0; i < 2000; ++i) {  // DISARM, then an ARM attempt
     ctx.armed.store(false);
+    round.store(i + 1);
     cleared += ctx.clear_latch();
     uint64_t prepared = 0;
     const bool ok = ctx.arm_unlatched([&] { prepared = ctx.arm_gen.fetch_add(1) + 1; });
@@ -295,7 +317,9 @@ void check_latch_stress() {
   stop.store(true);
   rt.join();
   drainer.join();
+  sampler.join();
   assert(cleared == 2000);
+  assert(samples > 0 && armed_while_arming == 0);
   std::printf("latch stress: %d ARMs admitted of 2000 against a latching servo\n", armed);
   const uint32_t s = ctx.latch_state.load();
   if (s == ServerCtx::LATCH_SET)

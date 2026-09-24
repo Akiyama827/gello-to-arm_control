@@ -1,10 +1,11 @@
 // Wire protocol between the PC's rt_backend.py and the RT server.
 //
-// Mirrored BY HAND in arm_control/rt_protocol.py — the two must byte-match.
-// Parity is enforced, not hoped for: `protocol_selfcheck` prints canonical
-// golden packets as hex and `python -m arm_control.rt_protocol --hex` prints
-// the same; rt_backend's _demo diffs them automatically. Any field change
-// bumps VERSION and edits both files in one commit.
+// Mirrored BY HAND in arm_control/plants/remote_rt/protocol.py — the two
+// must byte-match. Parity is enforced, not hoped for: `protocol_selfcheck`
+// prints canonical golden packets as hex and
+// `python -m arm_control.plants.remote_rt.protocol --hex` prints the same;
+// rt_backend's _demo diffs them automatically. Any field change bumps VERSION
+// and edits both files in one commit.
 //
 // Layout rules that make the mirror trivial:
 //  - little-endian POD, natural alignment, and field order chosen so there is

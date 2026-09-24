@@ -1,8 +1,9 @@
 // Prints the three canonical golden packets as hex — one line each, prefixed
-// CMD / STATE / CTL. `python -m arm_control.rt_protocol --hex` prints the
-// identical lines from the hand-mirrored Python layout; rt_backend's _demo
-// diffs the two automatically. If this ever disagrees, the wire is broken:
-// fix protocol.hpp + rt_protocol.py in the same commit and bump VERSION.
+// CMD / STATE / CTL. `python -m arm_control.plants.remote_rt.protocol --hex`
+// prints the identical lines from the hand-mirrored Python layout;
+// rt_backend's _demo diffs the two automatically. If this ever disagrees, the
+// wire is broken: fix protocol.hpp + plants/remote_rt/protocol.py in the same
+// commit and bump VERSION.
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
