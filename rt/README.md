@@ -18,7 +18,7 @@ no daemon, no Python, no graph lifecycle owning the arm.
 |------|------|
 | `include/arm_rt/protocol.hpp` | Wire structs — hand-mirrored in `arm_control/plants/remote_rt/protocol.py`, parity enforced (below) |
 | `include/arm_rt/servo_law.hpp` | THE torque law, header-only: PD + ff, clamp, slew vs the robot's own `tau_J_d` echo. Shared by the RT loop and the sim binding |
-| `include/arm_rt/seqlock.hpp` | The non-RT↔RT seam (single-writer seqlock, latest-wins) |
+| `include/arm_rt/mailbox.hpp` | The non-RT↔RT seam (SPSC triple-buffer mailbox, latest-wins, ownership by atomic exchange) |
 | `src/rt_loop.cpp` | The servo thread: backend read → staleness policy → law → write. Constructs the backend ON this thread (libfranka requirement) |
 | `src/udp_link.cpp` | Commands in (latest-wins), state out (paced) |
 | `src/control_session.cpp` | TCP: arm/disarm/ping + STATUS/FAULT events |
@@ -72,6 +72,7 @@ pip install -e rt/bindings                                  # optional: sim same
 PYTHONPATH=. python tools/bench/rt/torque_cap.py build/arm_rt_server  # offline caps + parity
 build/dm_command_selfcheck                                # native command dispatch, no devices
 build/dm_backend_selfcheck                                # DM lifecycle via intercepted CAN syscalls
+build/ipc_selfcheck                                       # mailbox, command admission; also build with -fsanitize=thread
 ```
 
 ## DM wire mappings
@@ -246,9 +247,13 @@ Authority ladder while ARMED, most-alive first:
 DISARM explicitly drops authority (backend `stop()`: for the FR3 that is the
 last accepted torque + `motion_finished` — a controlled stop, never zero
 torque, which would drop a loaded arm). The staleness clock starts AT ARM,
-matching the bench bridges — and so does the **command epoch**: whatever the
-command seqlock held before ARM (the client's zero-authority address-teach
-packet, a pre-fault leftover setpoint) is never tracked. Found live on the
+matching the bench bridges — and so does the **command epoch**: each accepted
+command is published as one envelope (payload, its own receive time, the ARM
+generation it was validated under), and only the current generation is ever
+tracked, so a pre-ARM leftover (the client's zero-authority address-teach
+packet, a pre-fault setpoint) never is. Every admission check (joint count,
+session, host, ARM epoch, flow pin, sequence) runs before any side effect: a
+rejected packet cannot pin the flow, refresh the deadman or teach the peer. Found live on the
 FR3 impedance rung: the prime packet's zero gains were adopted as "the
 task's gains" and the hold spring never engaged. The servo's slew limiter doubles as the startup
 ramp: first tick slews from the robot's measured `tau_J_d`, so there is no
@@ -277,8 +282,8 @@ review-caught, all in the stale-authority class):
   treats ~1.2 s of silence as session loss (a half-open socket from a dead
   PC otherwise takes the kernel's 2-hour keepalive to notice).
 - NaN/Inf commands are dropped at the UDP boundary; misconfigured safety
-  flags (`hold-ms >= fault-ms`, `slew <= 0`) refuse to start; the seqlock
-  read is bounded (a preempted writer can't spin the FIFO reader).
+  flags (`hold-ms >= fault-ms`, `slew <= 0`) refuse to start; the mailbox
+  read never waits or retries (a preempted writer can't spin the FIFO reader).
 
 ## Bring-up ladder
 
@@ -345,7 +350,7 @@ review-caught, all in the stale-authority class):
 
 ## backend_fake is permanent
 
-Most of this server is not the servo law — it is threads, sockets, seqlocks,
+Most of this server is not the servo law — it is threads, sockets, mailboxes,
 staleness policy, and latching, all of which `backend_fake` exercises on any
 machine in seconds. It is also the only safe place to rehearse the failure
 paths (packet loss, session death, latched re-arm). It stays dumb by rule: a

@@ -87,6 +87,13 @@ target_include_directories(dm_command_selfcheck PRIVATE include)
 target_link_libraries(dm_command_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
 target_compile_options(dm_command_selfcheck PRIVATE -UNDEBUG)
 
+# RT <-> non-RT transport: mailbox, command admission, envelope freshness.
+# Build it with -fsanitize=thread as well (see README); no sockets are opened.
+add_executable(ipc_selfcheck src/ipc_selfcheck.cpp src/udp_link.cpp)
+target_include_directories(ipc_selfcheck PRIVATE include)
+target_link_libraries(ipc_selfcheck PRIVATE Threads::Threads)
+target_compile_options(ipc_selfcheck PRIVATE -UNDEBUG)
+
 add_executable(dm_backend_selfcheck src/dm_backend_selfcheck.cpp src/backend_dm.cpp)
 target_include_directories(dm_backend_selfcheck PRIVATE include)
 target_compile_options(dm_backend_selfcheck PRIVATE -UNDEBUG)

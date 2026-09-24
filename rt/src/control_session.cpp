@@ -218,15 +218,11 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           // (same semantics as the bench bridges): without this, re-arming
           // after any pause instantly re-latches on the OLD command age.
           ctx.last_cmd_rx_ns.store(mono_ns());
-          // ...and so does the command epoch: whatever sits in the seqlock
-          // (address-teach prime, pre-fault leftovers) is not authority.
-          // sequence() — NOT read(): a bounded read() that collides with a
-          // mid-write returns 0, and an epoch of 0 re-admits every pre-ARM
-          // packet ever written. The raw counter can never be a spurious 0.
-          ctx.cmd_epoch.store(ctx.cmd_in.sequence());
+          // Whatever sits in cmd_in (pre-fault leftovers) carries an older
+          // generation and is not authority (server.hpp: CommandEnvelope).
           // New ARM = new command flow: udp_rx re-pins the source port to
-          // the first post-ARM sender (see server.hpp: cmd_owner_port).
-          ctx.cmd_owner_port.store(0);
+          // the first valid post-ARM sender (see server.hpp: cmd_owner).
+          ctx.cmd_owner.store(0);
           // Generation bump makes this ARM visible to the RT loop even if a
           // DISARM->ARM pair fits between two 1 kHz samples of `armed`.
           const uint64_t gen = ctx.arm_gen.fetch_add(1) + 1;

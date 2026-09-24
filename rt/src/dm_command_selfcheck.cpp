@@ -15,6 +15,14 @@ constexpr double velocity[] = {0.2, -0.3};
 constexpr double feedforward[] = {1.5, -2.0};
 constexpr double stiffness[] = {50, 60};
 constexpr double damping[] = {2, 3};
+CommandEnvelope last_command{};
+// No packet for `by` ns: the deadman clock and the last command's own stamp
+// both age (the loop's fake clock does not advance that far on its own).
+void age_stream(uint64_t by) {
+  last_command.rx_ns = mono_ns() - by;
+  ctx->cmd_in.write(last_command);
+  ctx->last_cmd_rx_ns.store(mono_ns() - by);
+}
 
 class CommandBackend final : public Backend {
  public:
@@ -51,18 +59,19 @@ class CommandBackend final : public Backend {
         cmd.tau_ff[j] = feedforward[j];
         cmd.kp[j] = stiffness[j]; cmd.kd[j] = damping[j];
       }
-      ctx->cmd_in.write(packet);
+      last_command = CommandEnvelope{packet, mono_ns(), ctx->arm_gen.load()};
+      ctx->cmd_in.write(last_command);
       ctx->last_cmd_rx_ns.store(mono_ns());
     }
     // No new PC packet at tick 3: RT must still forward the native command.
-    if (tick == 4) ctx->last_cmd_rx_ns.store(mono_ns() - 200'000'000);
-    if (tick == 5) ctx->last_cmd_rx_ns.store(mono_ns() - 2'000'000'000);
+    if (tick == 4) age_stream(200'000'000);
+    if (tick == 5) age_stream(2'000'000'000);
     if (tick == 6) {
       assert(ctx->fault_code == FAULT_CMD_LOST);
       // A fresh stray zero-gain packet cannot change the latched hold.
       PoseHoldCommandPacket stray{};
       stray.command.n = 2;
-      ctx->cmd_in.write(stray);
+      ctx->cmd_in.write(CommandEnvelope{stray, mono_ns(), ctx->arm_gen.load()});
       ctx->last_cmd_rx_ns.store(mono_ns());
     }
     if (tick == 7) ctx->armed.store(false);

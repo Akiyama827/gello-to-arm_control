@@ -1,10 +1,14 @@
 // Shared context between the four server threads:
-//   udp_rx    (non-RT)  commands in  -> cmd_in seqlock, learns the peer addr
-//   state_tx  (non-RT)  state_out seqlock -> UDP to the peer, paced
+//   udp_rx    (non-RT)  commands in  -> cmd_in mailbox, learns the peer addr
+//   state_tx  (non-RT)  state_out mailbox -> UDP to the peer, paced
 //   control   (non-RT)  TCP session: arm/disarm/ping + fault/status events
 //   rt_loop   (RT)      backend read -> servo law -> backend write
 //
-// The RT thread touches ONLY atomics and seqlocks; every blocking object
+// Channel topology (each Mailbox is exactly one writer, one reader):
+//   cmd_in    udp_rx -> rt_loop      state_out  rt_loop -> state_tx
+// state_tx fans the state out to the peer and observers from its own copy.
+//
+// The RT thread touches ONLY atomics and mailboxes; every blocking object
 // (sockets) lives on the non-RT threads. latch() is lock-free: a CAS claims
 // the one fault slot (two threads can latch concurrently — RT loop and the
 // control thread), the winner writes the text, then release-stores the
@@ -12,6 +16,7 @@
 #pragma once
 
 #include <netinet/in.h>
+#include <sys/types.h>
 
 #include <atomic>
 #include <cstdio>
@@ -22,7 +27,7 @@
 
 #include "arm_rt/backend.hpp"
 #include "arm_rt/protocol.hpp"
-#include "arm_rt/seqlock.hpp"
+#include "arm_rt/mailbox.hpp"
 
 namespace arm_rt {
 
@@ -82,13 +87,35 @@ struct LoopGap {
   uint64_t read_ns;     // this iteration: blocked inside backend->read()
   uint64_t compute_ns;  // previous iteration: read-return -> write start
   uint64_t write_ns;    // previous iteration: inside backend->write_command()
-  uint64_t publish_ns;  // previous iteration: write end -> state seqlock written
+  uint64_t publish_ns;  // previous iteration: write end -> state mailbox written
   int64_t robot_dt_ms;  // robot clock advance between the two samples
   double cmd_success_rate;
   uint32_t state_seq;
   bool armed;
 };
 constexpr uint32_t LOOP_GAP_RING = 64;
+
+// One accepted command, published as ONE value together with the facts that
+// made it authority: its own receive time and the ARM generation it was
+// validated against. The RT loop never pairs a payload with another packet's
+// timestamp or epoch (they used to be published separately).
+struct CommandEnvelope {
+  PoseHoldCommandPacket packet;
+  uint64_t rx_ns;    // server clock at acceptance
+  uint64_t arm_gen;  // generation this packet's arm_epoch was checked against
+};
+
+// Tracking authority for one servo tick: published (version != 0) under the
+// CURRENT ARM generation, right joint count, and its OWN receive age within
+// hold. Signed, clamped age: udp_rx stamps in parallel with the tick, so rx
+// can be nanoseconds in the future.
+inline bool command_fresh(uint64_t version, const CommandEnvelope& e, uint64_t arm_gen,
+                          int n, uint64_t now, double hold_ns) {
+  if (version == 0 || e.arm_gen != arm_gen || e.packet.command.n != uint16_t(n))
+    return false;
+  const int64_t age = int64_t(now) - int64_t(e.rx_ns);
+  return double(age < 0 ? 0 : age) <= hold_ns;
+}
 
 struct Observer {
   sockaddr_in addr{};
@@ -116,17 +143,19 @@ struct ServerCtx {
   std::mutex obs_mu;
   Observer observers[MAX_OBSERVERS];
 
-  SeqLock<PoseHoldCommandPacket> cmd_in;
-  SeqLock<StatePacket> state_out;
+  Mailbox<CommandEnvelope> cmd_in;
+  Mailbox<StatePacket> state_out;
 
+  // Deadman clock: the last accepted command's receive time, or the ARM time
+  // (the staleness clock starts at ARM). Drives CMD_LOST only; tracking
+  // freshness uses each envelope's own rx_ns.
   std::atomic<uint64_t> last_cmd_rx_ns{0};
-  // Commands from BEFORE the current ARM are never authority: ARM stores the
-  // command seqlock's version here and the RT loop only tracks newer ones.
-  // Kills two live hazards: the client's zero-authority address-teach packet
-  // being adopted as "the task's gains" (found on the FR3 impedance rung:
-  // the spring never engaged), and a pre-fault leftover q_des yanking the
-  // arm for the first hold-ms after a re-arm.
-  std::atomic<uint64_t> cmd_epoch{0};
+  // Commands from BEFORE the current ARM are never authority: each envelope
+  // carries the generation it was validated under and the RT loop tracks only
+  // the current one. Kills two live hazards: the client's zero-authority
+  // address-teach packet being adopted as "the task's gains" (found on the
+  // FR3 impedance rung: the spring never engaged), and a pre-fault leftover
+  // q_des yanking the arm for the first hold-ms after a re-arm.
   // ARM generation: bumped by every accepted CTL_ARM. The RT loop compares
   // against the last generation it acted on, so a DISARM->ARM pair that
   // completes between two 1 kHz samples is still seen as an edge (sampling
@@ -144,8 +173,11 @@ struct ServerCtx {
   // zero-gain prime packet would be accepted as a fresh command and become
   // the gains snapshot of an ARMED arm (audit 2026-07-29, three independent
   // reviewers). ARM clears this; udp_rx pins the first post-ARM sender's
-  // UDP source port and drops every other port until the next ARM.
-  std::atomic<uint16_t> cmd_owner_port{0};  // network order; 0 = unpinned
+  // UDP source port and drops every other port until the next ARM. Stored
+  // with the generation it was taken under (gen << 16 | port, network-order
+  // port): a pin from another generation is no pin at all, so a packet that
+  // raced an ARM can never lock the new flow out.
+  std::atomic<uint64_t> cmd_owner{0};  // 0 = unpinned
   std::atomic<bool> armed{false};
   std::atomic<bool> fault{false};
   std::atomic<bool> fault_claim{false};  // CAS gate: exactly one latch writes
@@ -194,6 +226,26 @@ struct ServerCtx {
 };
 
 uint64_t mono_ns();
+
+// udp_rx's own admission memory (one flow, one thread).
+struct CommandFlow {
+  uint64_t seq_gen = 0;
+  uint32_t seq_ip = 0, last_seq = 0;
+  uint16_t seq_port = 0;
+  bool have_seq = false;
+  // Warn-once state for the drop logs.
+  uint64_t warned_session = 0;
+  uint32_t warned_epoch = 0;
+  bool have_warned_session = false, have_warned_epoch = false;
+  uint32_t dropped_ip = 0;
+  uint16_t dropped_port = 0, warned_n = 0;
+};
+
+// One received datagram: an observer lease or a command. Every check runs
+// before any side effect (flow pin, sequence memory, peer, deadman,
+// publication), so a rejected packet changes nothing. True = published.
+bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_t size,
+                     const sockaddr_in& src);
 
 void udp_rx_thread(ServerCtx& ctx);
 void state_tx_thread(ServerCtx& ctx);

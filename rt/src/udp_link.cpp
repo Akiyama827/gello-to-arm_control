@@ -1,4 +1,4 @@
-// UDP fast path: commands in (latest-wins into the seqlock), state out
+// UDP fast path: commands in (latest-wins into the mailbox), state out
 // (paced re-publish of whatever the RT loop last wrote). Loss handling is
 // the RT loop's staleness logic — nothing here retries anything.
 #include <arpa/inet.h>
@@ -20,6 +20,150 @@ uint64_t mono_ns() {
   return uint64_t(ts.tv_sec) * 1'000'000'000ull + uint64_t(ts.tv_nsec);
 }
 
+bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_t got,
+                     const sockaddr_in& src) {
+  if (got == ssize_t(sizeof(ObserveRequest))) {
+    // Read-only subscription: never touches the command peer, the deadman,
+    // the flow pin or the mailbox. A full table refuses newcomers.
+    ObserveRequest req{};
+    std::memcpy(&req, data, sizeof(req));
+    if (req.magic != MAGIC_OBS || req.version != VERSION ||
+        req.lease_ms < 100 || req.lease_ms > 5000) return false;
+    const uint64_t now = mono_ns();
+    std::lock_guard<std::mutex> lock(ctx.obs_mu);
+    Observer* slot = nullptr;
+    for (auto& o : ctx.observers) {
+      if (o.expiry_ns > now && o.addr.sin_addr.s_addr == src.sin_addr.s_addr &&
+          o.addr.sin_port == src.sin_port) { slot = &o; break; }
+    }
+    if (!slot)
+      for (auto& o : ctx.observers)
+        if (o.expiry_ns <= now) { slot = &o; slot->addr = src; break; }
+    if (slot) slot->expiry_ns = now + uint64_t(req.lease_ms) * 1'000'000ull;
+    else std::fprintf(stderr, "[rt] observer table full; lease refused\n");
+    return false;
+  }
+  PoseHoldCommandPacket decoded{};
+  if (got < 0 || !decode_command(data, size_t(got), ctx.supports_pose_hold.load(), decoded))
+    return false;
+  const auto& pkt = decoded.command;
+  // Wrong joint count is dropped HERE, before the rx-stamp: the servo
+  // rejects such packets on its own n-check, but if they refresh
+  // last_cmd_rx_ns the CMD_LOST deadman never fires and the arm parks
+  // silently forever behind a healthy-looking stream (audit 2026-07-29).
+  const int want_n = ctx.backend_ready.load() ? ctx.backend_n.load() : ctx.cfg.n;
+  if (pkt.n != uint16_t(want_n)) {
+    if (flow.warned_n != pkt.n) {
+      flow.warned_n = pkt.n;
+      std::fprintf(stderr, "[rt] dropping commands with n=%u (server n=%d)\n",
+                   pkt.n, want_n);
+    }
+    return false;
+  }
+  // Session binding: a command belongs to the CURRENT, CLAIMED control
+  // session or it is nothing -- not authority, not a state-stream address,
+  // not a deadman refresh. Replaces trusting whichever datagram came first.
+  const uint64_t session = ctx.session_id.load(std::memory_order_acquire);
+  if (session == 0 || pkt.session_id != session ||
+      !ctx.claim_ok.load(std::memory_order_acquire)) {
+    if (!flow.have_warned_session || flow.warned_session != pkt.session_id) {
+      flow.have_warned_session = true;
+      flow.warned_session = pkt.session_id;
+      std::fprintf(stderr, "[rt] dropping commands: session %016llx is not the "
+                           "claimed control session\n",
+                   (unsigned long long)pkt.session_id);
+    }
+    return false;
+  }
+  if (!ctx.armed.load(std::memory_order_acquire)) {
+    // Disarmed: the session may teach its state-stream address, nothing else.
+    // Nothing is written to the servo's mailbox while there is no authority.
+    if (src.sin_addr.s_addr == ctx.ctl_peer_ip.load(std::memory_order_acquire)) {
+      std::lock_guard<std::mutex> lock(ctx.peer_mu);
+      ctx.peer = src;
+      ctx.have_peer = true;
+    }
+    return false;
+  }
+  // While ARMED, only the control client's FLOW has authority. The IP alone
+  // is not enough — every PC-side tool shares it, and a stray tool's
+  // zero-gain prime packet must not become the gains snapshot or steal the
+  // state stream.
+  const uint32_t owner_ip = ctx.ctl_peer_ip.load(std::memory_order_acquire);
+  if (owner_ip != 0 && src.sin_addr.s_addr != owner_ip) {
+    if (flow.dropped_ip != src.sin_addr.s_addr) {
+      flow.dropped_ip = src.sin_addr.s_addr;
+      char buf[INET_ADDRSTRLEN] = {};
+      inet_ntop(AF_INET, &src.sin_addr, buf, sizeof(buf));
+      std::fprintf(stderr, "[rt] dropping commands from %s (armed; owner"
+                           " is the control client)\n", buf);
+    }
+    return false;
+  }
+  // The ARM epoch is checked BEFORE the flow pin: a stale-epoch packet from an
+  // old port used to pin that port and then be dropped, locking the valid new
+  // flow out for the whole ARM. Loading the generation first also means a
+  // pin cleared by that ARM is visible below (ARM clears, then bumps).
+  const uint64_t gen = ctx.arm_gen.load(std::memory_order_acquire);
+  if (pkt.arm_epoch != uint32_t(gen)) {
+    if (!flow.have_warned_epoch || flow.warned_epoch != pkt.arm_epoch) {
+      flow.have_warned_epoch = true;
+      flow.warned_epoch = pkt.arm_epoch;
+      std::fprintf(stderr, "[rt] dropping commands from ARM epoch %u (current %u)\n",
+                   pkt.arm_epoch, uint32_t(gen));
+    }
+    return false;
+  }
+  const uint64_t owner = ctx.cmd_owner.load(std::memory_order_acquire);
+  const bool pinned = owner != 0 && (owner >> 16) == gen;
+  const uint16_t pinned_port = uint16_t(owner & 0xFFFFu);
+  if (pinned && src.sin_port != pinned_port) {
+    if (flow.dropped_port != src.sin_port) {
+      flow.dropped_port = src.sin_port;
+      std::fprintf(stderr, "[rt] dropping commands from port %u (armed; "
+                           "flow is pinned to %u)\n",
+                   ntohs(src.sin_port), ntohs(pinned_port));
+    }
+    return false;
+  }
+  if (gen != flow.seq_gen || src.sin_addr.s_addr != flow.seq_ip ||
+      src.sin_port != flow.seq_port)
+    flow.have_seq = false;
+  if (flow.have_seq &&
+      (pkt.seq - flow.last_seq == 0 || pkt.seq - flow.last_seq >= 0x80000000u))
+    return false;
+  // Accepted. Side effects from here on only.
+  if (!pinned) {
+    uint64_t expected = owner;
+    if (!ctx.cmd_owner.compare_exchange_strong(expected, (gen << 16) | src.sin_port,
+                                               std::memory_order_acq_rel))
+      return false;  // an ARM cleared it meanwhile; the next packet re-pins
+    std::fprintf(stderr, "[rt] command flow pinned to port %u for this ARM\n",
+                 ntohs(src.sin_port));
+  }
+  flow.seq_gen = gen;
+  flow.seq_ip = src.sin_addr.s_addr;
+  flow.seq_port = src.sin_port;
+  flow.last_seq = pkt.seq;
+  flow.have_seq = true;
+  {
+    std::lock_guard<std::mutex> lock(ctx.peer_mu);
+    ctx.peer = src;
+    ctx.have_peer = true;
+  }
+  const uint64_t rx = mono_ns();
+  const uint64_t prev = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
+  if (prev != 0 && rx - prev > 300'000'000ull)
+    std::fprintf(stderr, "[rt] cmd accept gap %.2fs (seq %u)\n",
+                 double(rx - prev) / 1e9, pkt.seq);
+  // An ARM landing after the checks above leaves this envelope with the old
+  // generation: the RT loop will not track it (command_fresh). Its deadman
+  // refresh and peer update fall inside that microsecond window.
+  ctx.cmd_in.write(CommandEnvelope{decoded, rx, gen});
+  ctx.last_cmd_rx_ns.store(rx, std::memory_order_release);
+  return true;
+}
+
 void udp_rx_thread(ServerCtx& ctx) {
   const int fd = socket(AF_INET, SOCK_DGRAM, 0);
   sockaddr_in addr = {};
@@ -36,145 +180,14 @@ void udp_rx_thread(ServerCtx& ctx) {
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ctx.udp_fd.store(fd);
 
-  PoseHoldCommandPacket received{}, decoded{};
-  uint64_t warned_session = 0;
-  uint32_t warned_epoch = 0;
-  bool have_warned_session = false, have_warned_epoch = false;
-  sockaddr_in src = {};
-  socklen_t srclen = sizeof(src);
-  uint32_t dropped_ip = 0;
-  uint16_t dropped_port = 0;
-  uint16_t warned_n = 0;
-  uint64_t seq_epoch = 0;
-  uint32_t seq_ip = 0, last_seq = 0;
-  uint16_t seq_port = 0;
-  bool have_seq = false;
+  PoseHoldCommandPacket received{};
+  CommandFlow flow;
   while (!ctx.shutdown.load()) {
-    srclen = sizeof(src);
+    sockaddr_in src = {};
+    socklen_t srclen = sizeof(src);
     const ssize_t got = recvfrom(fd, &received, sizeof(received), MSG_TRUNC,
                                  reinterpret_cast<sockaddr*>(&src), &srclen);
-    if (got == ssize_t(sizeof(ObserveRequest))) {
-      // Read-only subscription: never touches the command peer, the deadman,
-      // the flow pin or the seqlock. A full table refuses newcomers.
-      ObserveRequest req{};
-      std::memcpy(&req, &received, sizeof(req));
-      if (req.magic != MAGIC_OBS || req.version != VERSION ||
-          req.lease_ms < 100 || req.lease_ms > 5000) continue;
-      const uint64_t now = mono_ns();
-      std::lock_guard<std::mutex> lock(ctx.obs_mu);
-      Observer* slot = nullptr;
-      for (auto& o : ctx.observers) {
-        if (o.expiry_ns > now && o.addr.sin_addr.s_addr == src.sin_addr.s_addr &&
-            o.addr.sin_port == src.sin_port) { slot = &o; break; }
-      }
-      if (!slot)
-        for (auto& o : ctx.observers)
-          if (o.expiry_ns <= now) { slot = &o; slot->addr = src; break; }
-      if (slot) slot->expiry_ns = now + uint64_t(req.lease_ms) * 1'000'000ull;
-      else std::fprintf(stderr, "[rt] observer table full; lease refused\n");
-      continue;
-    }
-    if(got<0 || !decode_command(&received,size_t(got),ctx.supports_pose_hold.load(),decoded)) continue;
-    const auto& pkt=decoded.command;
-    // Wrong joint count is dropped HERE, before the rx-stamp: the servo
-    // rejects such packets on its own n-check, but if they refresh
-    // last_cmd_rx_ns the CMD_LOST deadman never fires and the arm parks
-    // silently forever behind a healthy-looking stream (audit 2026-07-29).
-    const int want_n = ctx.backend_ready.load() ? ctx.backend_n.load()
-                                                : ctx.cfg.n;
-    if (pkt.n != uint16_t(want_n)) {
-      if (warned_n != pkt.n) {
-        warned_n = pkt.n;
-        std::fprintf(stderr, "[rt] dropping commands with n=%u (server n=%d)\n",
-                     pkt.n, want_n);
-      }
-      continue;
-    }
-    // Session binding: a command belongs to the CURRENT, CLAIMED control
-    // session or it is nothing -- not authority, not a state-stream address,
-    // not a deadman refresh. Replaces trusting whichever datagram came first.
-    const uint64_t session = ctx.session_id.load(std::memory_order_acquire);
-    if (session == 0 || pkt.session_id != session ||
-        !ctx.claim_ok.load(std::memory_order_acquire)) {
-      if (!have_warned_session || warned_session != pkt.session_id) {
-        have_warned_session = true;
-        warned_session = pkt.session_id;
-        std::fprintf(stderr, "[rt] dropping commands: session %016llx is not the "
-                             "claimed control session\n",
-                     (unsigned long long)pkt.session_id);
-      }
-      continue;
-    }
-    if (!ctx.armed.load(std::memory_order_acquire)) {
-      // Disarmed: the session may teach its state-stream address, nothing else.
-      // Nothing is written to the servo's buffer while there is no authority.
-      if (src.sin_addr.s_addr == ctx.ctl_peer_ip.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(ctx.peer_mu);
-        ctx.peer = src;
-        ctx.have_peer = true;
-      }
-      continue;
-    }
-    // While ARMED, only the control client's FLOW has authority. The IP alone
-    // is not enough — every PC-side tool shares it, and a stray tool's
-    // zero-gain prime packet must not become the gains snapshot or steal the
-    // state stream. First post-ARM sender pins the port; ARM resets the pin.
-    if (ctx.armed.load(std::memory_order_acquire)) {
-      const uint32_t owner = ctx.ctl_peer_ip.load(std::memory_order_acquire);
-      if (owner != 0 && src.sin_addr.s_addr != owner) {
-        if (dropped_ip != src.sin_addr.s_addr) {
-          dropped_ip = src.sin_addr.s_addr;
-          char buf[INET_ADDRSTRLEN] = {};
-          inet_ntop(AF_INET, &src.sin_addr, buf, sizeof(buf));
-          std::fprintf(stderr, "[rt] dropping commands from %s (armed; owner"
-                               " is the control client)\n", buf);
-        }
-        continue;
-      }
-      uint16_t oport = ctx.cmd_owner_port.load(std::memory_order_acquire);
-      if (oport == 0) {
-        ctx.cmd_owner_port.store(src.sin_port, std::memory_order_release);
-        oport = src.sin_port;
-        std::fprintf(stderr, "[rt] command flow pinned to port %u for this "
-                             "ARM\n", ntohs(oport));
-      }
-      if (src.sin_port != oport) {
-        if (dropped_port != src.sin_port) {
-          dropped_port = src.sin_port;
-          std::fprintf(stderr, "[rt] dropping commands from port %u (armed; "
-                               "flow is pinned to %u)\n",
-                       ntohs(src.sin_port), ntohs(oport));
-        }
-        continue;
-      }
-    }
-    const uint64_t epoch=ctx.arm_gen.load(std::memory_order_acquire);
-    if (pkt.arm_epoch != uint32_t(epoch)) {
-      if (!have_warned_epoch || warned_epoch != pkt.arm_epoch) {
-        have_warned_epoch = true;
-        warned_epoch = pkt.arm_epoch;
-        std::fprintf(stderr, "[rt] dropping commands from ARM epoch %u (current %u)\n",
-                     pkt.arm_epoch, uint32_t(epoch));
-      }
-      continue;
-    }
-    if(epoch!=seq_epoch || src.sin_addr.s_addr!=seq_ip || src.sin_port!=seq_port)
-      have_seq=false;
-    if(have_seq && (pkt.seq-last_seq==0 || pkt.seq-last_seq>=0x80000000u)) continue;
-    seq_epoch=epoch; seq_ip=src.sin_addr.s_addr; seq_port=src.sin_port;
-    last_seq=pkt.seq; have_seq=true;
-    {
-      std::lock_guard<std::mutex> lock(ctx.peer_mu);
-      ctx.peer = src;
-      ctx.have_peer = true;
-    }
-    const uint64_t rx = mono_ns();
-    const uint64_t prev = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
-    if (prev != 0 && rx - prev > 300'000'000ull)
-      std::fprintf(stderr, "[rt] cmd accept gap %.2fs (seq %u)\n",
-                   double(rx - prev) / 1e9, pkt.seq);
-    ctx.cmd_in.write(decoded);
-    ctx.last_cmd_rx_ns.store(rx, std::memory_order_release);
+    handle_datagram(ctx, flow, &received, got, src);
   }
   ctx.udp_fd.store(-1);  // unpublish before close: state_tx must not race a
   close(fd);             // reused descriptor

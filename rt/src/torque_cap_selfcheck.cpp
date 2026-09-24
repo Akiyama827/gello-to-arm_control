@@ -18,6 +18,14 @@ constexpr double native_limits[] = {28, 10};
 // saturating at the magnitude cap exactly as before.
 double slew_max = std::numeric_limits<double>::infinity();
 bool slew_case = false;
+CommandEnvelope last_command{};
+// No packet for `by` ns: the deadman clock and the last command's own stamp
+// both age (the loop's fake clock does not advance that far on its own).
+void age_stream(uint64_t by) {
+  last_command.rx_ns = mono_ns() - by;
+  ctx->cmd_in.write(last_command);
+  ctx->last_cmd_rx_ns.store(mono_ns() - by);
+}
 
 class ScriptedBackend final : public Backend {
  public:
@@ -68,11 +76,12 @@ class ScriptedBackend final : public Backend {
         // Echo outside the cap: post-slew clamping must still win.
         if (tick == 4) state.tau_ref[j] = sign * 10000;
       }
-      ctx->cmd_in.write(packet);
+      last_command = CommandEnvelope{packet, mono_ns(), ctx->arm_gen.load()};
+      ctx->cmd_in.write(last_command);
       ctx->last_cmd_rx_ns.store(mono_ns());
     }
-    if (tick == 5) ctx->last_cmd_rx_ns.store(mono_ns() - 200'000'000);
-    if (tick == 6) ctx->last_cmd_rx_ns.store(mono_ns() - 2'000'000'000);
+    if (tick == 5) age_stream(200'000'000);
+    if (tick == 6) age_stream(2'000'000'000);
     if (tick == 7) {
       assert(ctx->fault_code == FAULT_CMD_LOST);
       StatePacket previous{};

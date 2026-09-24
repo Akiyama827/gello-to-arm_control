@@ -145,7 +145,8 @@ void rt_loop(ServerCtx& ctx) {
   const double fault_ns = ctx.cfg.fault_ms * 1e6;
 
   PlantState ps;
-  PoseHoldCommandPacket incoming = {};
+  CommandEnvelope envelope = {};
+  const PoseHoldCommandPacket& incoming = envelope.packet;
   const CommandPacket& cmd=incoming.command;
   PoseHold pose_hold;
   double pose_tau[MAX_JOINTS]{};
@@ -155,7 +156,7 @@ void rt_loop(ServerCtx& ctx) {
   bool have_cmd_gains = false;
   double q_hold[MAX_JOINTS] = {};
   // Gains SNAPSHOTTED at command acceptance. The hold branch must never
-  // dereference the live seqlock buffer: any datagram that lands there
+  // use the latest mailbox value: any datagram that lands there
   // (address-teach prime, wrong-n, post-fault stray) would otherwise become
   // the hold spring's authority — a zero-gain packet silently un-springs a
   // parked arm (found by adversarial review after the FR3 impedance rung).
@@ -175,9 +176,6 @@ void rt_loop(ServerCtx& ctx) {
   bool plant_ok = true;  // false after any backend failure; reset only by ARM
   uint64_t seen_gen = ctx.arm_gen.load(std::memory_order_acquire);
   int read_fail_streak = 0;
-  uint64_t cmd_v_seen = 0;  // survives a seqlock read-collision tick (read()
-                            // returns 0 on retry exhaustion; without the cache
-                            // that tick reads as "stale" and flaps into hold)
 
   // Loop-gap diagnostics: stamps of the previous iteration's phases.
   uint64_t prev_t_read = 0, prev_compute = 0, prev_write = 0, prev_publish = 0;
@@ -250,14 +248,12 @@ void rt_loop(ServerCtx& ctx) {
     const bool armed = ctx.armed.load(std::memory_order_acquire);
     bool faulted = ctx.fault.load(std::memory_order_acquire);
 
-    // A failed seqlock retry can have copied a partial payload; only publish
-    // a successful read to the cached command used for this servo tick.
-    PoseHoldCommandPacket candidate{};
-    const uint64_t cmd_v_raw = ctx.cmd_in.read(candidate);
-    if (cmd_v_raw != 0) { incoming=candidate; cmd_v_seen = cmd_v_raw; }
-    const uint64_t cmd_v = cmd_v_seen;
+    // The mailbox read cannot fail or tear: it is the whole latest envelope
+    // (or the previous one again). One read per tick, whatever udp_rx does.
+    const uint64_t cmd_v = ctx.cmd_in.read(envelope);
+    const uint64_t gen = ctx.arm_gen.load(std::memory_order_acquire);
     const uint64_t rx_ns = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
-    // SIGNED, clamped age. rx_ns is stamped by udp_rx (or the ARM handler)
+    // Deadman age (CMD_LOST). SIGNED, clamped age. rx_ns is stamped by udp_rx (or the ARM handler)
     // in parallel with this tick: a packet stamped between our `now` sample
     // above and this load is nanoseconds IN THE FUTURE, and the old unsigned
     // `now - rx_ns` underflowed to ~1.8e19 ns — an instant spurious CMD_LOST
@@ -268,9 +264,10 @@ void rt_loop(ServerCtx& ctx) {
     // autopsy after every stream instrument reported healthy flow.
     const int64_t raw_age = int64_t(now) - int64_t(rx_ns);
     const double age_ns = rx_ns == 0 ? 1e18 : double(raw_age < 0 ? 0 : raw_age);
-    // Only commands from AFTER the current ARM are authority (cmd_epoch).
-    const bool fresh = cmd_v > ctx.cmd_epoch.load(std::memory_order_acquire) &&
-                       cmd.n == uint16_t(n) && age_ns <= hold_ns;
+    // Only commands validated under the CURRENT ARM, received within hold by
+    // their OWN stamp, are authority: a newer packet's receive time can no
+    // longer freshen an older cached payload.
+    const bool fresh = command_fresh(cmd_v, envelope, gen, n, now, hold_ns);
 
     const double* q_des = zeros;
     const double* qd_des = zeros;
@@ -281,7 +278,6 @@ void rt_loop(ServerCtx& ctx) {
     // The ARM edge is a GENERATION, not a level: a DISARM->ARM pair that
     // completes between two 1 kHz samples still changes arm_gen, so the
     // per-epoch resets can never be skipped by fast recovery cycles.
-    const uint64_t gen = ctx.arm_gen.load(std::memory_order_acquire);
     if (gen != seen_gen) {
       seen_gen = gen;
       if (prev_armed) backend->stop();  // the DISARM we never sampled

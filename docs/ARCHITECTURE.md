@@ -270,7 +270,7 @@ documents that restate these three pages.
 
 ## RT ownership and sim/real parity
 
-The reusable C++ core keeps the protocol, seqlock, servo law, RT loop, fake/DM/
+The reusable C++ core keeps the protocol, mailbox, servo law, RT loop, fake/DM/
 Franka backends, server, bindings, and generic Hand bridge. Concrete systemd
 units, CAN-link setup, and task-specific device bridges belong to the consumer.
 See [the RT reference](../rt/README.md) for core protocol and safety details;
