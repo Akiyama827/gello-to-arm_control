@@ -148,12 +148,14 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   ControlPacket rx;
   size_t have = 0;
   while (!ctx.shutdown.load()) {
-    if (ctx.fault_event_pending.load()) {
-      // Clear only on a DELIVERED frame — consuming the flag before a failed
-      // send loses the one CTL_FAULT event this latch will ever emit.
-      if (!send_frame(fd, make(CTL_FAULT, ctx.fault_code.load(), ctx.fault_text)))
-        break;
-      ctx.fault_event_pending.store(false);
+    ServerCtx::FaultNotice notice;
+    if (ctx.pending_fault_notice(notice)) {
+      // Acknowledge only a DELIVERED frame, and only its own serial: a failed
+      // send keeps the notice owed, and a newer latch is never discarded by
+      // the acknowledgement of an older one. A latch DISARM has cleared is
+      // not owed at all (the journal keeps it).
+      if (!send_frame(fd, make(CTL_FAULT, notice.code, notice.text))) break;
+      ctx.ack_fault_notice(notice.seq);
     }
     const uint64_t now = mono_ns();
     if (now - last_ping_ns > PING_EVERY_NS) {
@@ -200,12 +202,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           // client's ack rule already reads this as a refusal.
           send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx),
                               "refused: no accepted CLAIM on this session"));
-        } else if (ctx.fault.load()) {
-          // Refused: flags still show ARMED when the server is fault-holding
-          // (authority is deliberately retained) — the FAULTED bit is the
-          // refusal, and clients must check it, not just ARMED.
-          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), ctx.fault_text));
-        } else if (ctx.armed.load()) {
+        } else if (ctx.armed.load() && !ctx.fault.load()) {
           // Already armed: ACK without a generation bump. A duplicate ARM
           // (double click, client retry after a lost ack) must not tear down
           // and re-open the live torque session mid-flight — the arm_gen edge
@@ -214,25 +211,43 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "already armed",
                               uint32_t(ctx.arm_gen.load())));
         } else {
-          // The staleness clock starts AT ARM, not at the first command
-          // (same semantics as the bench bridges): without this, re-arming
-          // after any pause instantly re-latches on the OLD command age.
-          ctx.last_cmd_rx_ns.store(mono_ns());
-          // ...and so does the command epoch: whatever sits in the seqlock
-          // (address-teach prime, pre-fault leftovers) is not authority.
-          // sequence() — NOT read(): a bounded read() that collides with a
-          // mid-write returns 0, and an epoch of 0 re-admits every pre-ARM
-          // packet ever written. The raw counter can never be a spurious 0.
-          ctx.cmd_epoch.store(ctx.cmd_in.sequence());
-          // New ARM = new command flow: udp_rx re-pins the source port to
-          // the first post-ARM sender (see server.hpp: cmd_owner_port).
-          ctx.cmd_owner_port.store(0);
-          // Generation bump makes this ARM visible to the RT loop even if a
-          // DISARM->ARM pair fits between two 1 kHz samples of `armed`.
-          const uint64_t gen = ctx.arm_gen.fetch_add(1) + 1;
-          ctx.armed.store(true);
-          // seq = the ARM epoch every command of this authority must carry.
-          send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "armed", uint32_t(gen)));
+          // Admission and publication are ONE transition on the latch word
+          // (server.hpp: arm_unlatched): a latched fault, a latch still being
+          // written -- even one whose DISARM clear timed out before fault was
+          // published -- or a reset in progress refuses the ARM. Refused:
+          // flags still show ARMED when the server is fault-holding (authority
+          // is deliberately retained) — the FAULTED bit is the refusal, and
+          // clients must check it, not just ARMED.
+          uint64_t gen = 0;
+          const bool admitted = ctx.arm_unlatched([&] {
+            // The staleness clock starts AT ARM, not at the first command
+            // (same semantics as the bench bridges): without this, re-arming
+            // after any pause instantly re-latches on the OLD command age.
+            ctx.last_cmd_rx_ns.store(mono_ns());
+            // ...and so does the command epoch: whatever sits in the seqlock
+            // (address-teach prime, pre-fault leftovers) is not authority.
+            // sequence() — NOT read(): a bounded read() that collides with a
+            // mid-write returns 0, and an epoch of 0 re-admits every pre-ARM
+            // packet ever written. The raw counter can never be a spurious 0.
+            ctx.cmd_epoch.store(ctx.cmd_in.sequence());
+            // New ARM = new command flow: udp_rx re-pins the source port to
+            // the first post-ARM sender (see server.hpp: cmd_owner_port).
+            ctx.cmd_owner_port.store(0);
+            // Generation bump makes this ARM visible to the RT loop even if a
+            // DISARM->ARM pair fits between two 1 kHz samples of `armed`.
+            gen = ctx.arm_gen.fetch_add(1) + 1;
+          });  // armed is raised inside, after the latch word is FREE again
+          if (admitted) {
+            // seq = the ARM epoch every command of this authority must carry.
+            send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "armed", uint32_t(gen)));
+          } else if (ctx.latch_state.load() == ServerCtx::LATCH_SET) {
+            std::fprintf(stderr, "[rt] ARM refused: fault latched in ARM epoch %llu\n",
+                         (unsigned long long)ctx.fault_gen.load());
+            send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), ctx.fault_text));
+          } else {
+            send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx),
+                                "refused: fault latch busy (DISARM again)"));
+          }
         }
         break;
       case CTL_DISARM: {
@@ -287,7 +302,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
     }
   }
   if (ctx.armed.load()) {
-    ctx.latch(FAULT_CTL_LOST, "control session lost while armed");
+    ctx.latch(FAULT_CTL_LOST, "control session lost while armed", ctx.arm_gen.load());
   }
   // The session is over: its commands are no longer admissible and the state
   // stream stops going to its address. Observers keep their own leases.

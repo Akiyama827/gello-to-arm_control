@@ -189,8 +189,14 @@ void close_udp_socket(ServerCtx& ctx) {
 }
 
 void finish_fault_journal(ServerCtx& ctx) {
+  // Leave SCHED_FIFO before stdio. If that fails the servo has already
+  // stopped, so exporting at FIFO priority is still better than losing the
+  // records; the failure itself is reported first.
   const sched_param normal{};
-  pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+  const int demoted = pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+  if (demoted != 0)
+    std::fprintf(ctx.journal_out, "[rt] fault journal: could not leave real-time "
+                 "scheduling (%s); exporting anyway\n", std::strerror(demoted));
   drain_fault_journal(ctx, ctx.journal_out);
   const uint32_t dropped = ctx.fault_dropped.load(std::memory_order_relaxed);
   const uint32_t contended = ctx.fault_contended.load(std::memory_order_relaxed);

@@ -275,13 +275,25 @@ ring drops new records (`dropped=`); a producer that loses the slot claim
 most 4 claim attempts and one scan/copy of at most 240 bytes. That is a step
 bound, not a measured RT latency.
 
-The wire latch has one state word: FREE → WRITING → SET, and CLEARING while
-DISARM resets it. DISARM never clears a latch that is still being written. It
-waits for the writer, which normally takes microseconds, for at most about
-100 ms. If the writer has not finished by then, DISARM still drops authority
-but leaves the latch and says so in its reply. The servo never waits. A
-cause that arrives while the latch is written or cleared is journaled as a
-secondary cause, and it re-latches on a later tick if it persists.
+The wire latch has one state word: FREE → WRITING → SET, CLEARING while
+DISARM resets it, and ARMING while ARM prepares a generation.
+- DISARM never clears a latch that is still being written. It waits for the
+  writer, which normally takes microseconds, until a 100 ms monotonic
+  deadline. If the writer has not finished by then, DISARM still drops
+  authority but leaves the latch and says so in its reply.
+- ARM is admitted only by moving the word FREE → ARMING. A latched fault, a
+  latch still being written (even one whose clear timed out before `fault`
+  was published) or a reset in progress refuses it ("DISARM again").
+  Authority is raised only after the word is FREE again.
+- Every latch and journal record carries the ARM generation it arose in. A
+  latch from an older generation that lands while ARM prepares the next one
+  is journaled as a secondary cause with its own generation.
+- The servo never waits. A cause that arrives while the latch is being
+  written, cleared or armed is journaled as a secondary cause, and it
+  re-latches on a later tick if it persists.
+- `CTL_FAULT` goes out once per latch serial, and only for a SET latch. A
+  latch that DISARM cleared before delivery is not sent (the journal keeps
+  it). An acknowledgement never discards a newer latch's notice.
 
 Export is best effort. `state_tx` drains the ring while running. After every
 thread is joined, `main` drops its inherited SCHED_FIFO priority and drains

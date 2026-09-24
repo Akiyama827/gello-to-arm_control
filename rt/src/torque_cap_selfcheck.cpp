@@ -79,7 +79,7 @@ class ScriptedBackend final : public Backend {
       assert(ctx->state_out.read(previous));
       assert(previous.flags & FLAG_HOLDING);
       assert(ctx->clear_latch());
-      ctx->latch(FAULT_CTL_LOST, "scripted communication fault");
+      ctx->latch(FAULT_CTL_LOST, "scripted communication fault", ctx->arm_gen.load());
       ctx->last_cmd_rx_ns.store(mono_ns());  // fresh commands cannot bypass latch
     }
     if (tick == 8) {  // plant failure suppresses torque writes
