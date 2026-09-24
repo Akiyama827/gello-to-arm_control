@@ -87,6 +87,13 @@ target_include_directories(dm_command_selfcheck PRIVATE include)
 target_link_libraries(dm_command_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
 target_compile_options(dm_command_selfcheck PRIVATE -UNDEBUG)
 
+# FR3 backend + rt_loop against a scripted franka:: surface: builds and runs
+# without libfranka or a robot (exception containment, fault attribution).
+add_executable(franka_backend_selfcheck src/franka_backend_selfcheck.cpp src/rt_loop.cpp)
+target_include_directories(franka_backend_selfcheck PRIVATE include)
+target_link_libraries(franka_backend_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
+target_compile_options(franka_backend_selfcheck PRIVATE -UNDEBUG)
+
 add_executable(dm_backend_selfcheck src/dm_backend_selfcheck.cpp src/backend_dm.cpp)
 target_include_directories(dm_backend_selfcheck PRIVATE include)
 target_compile_options(dm_backend_selfcheck PRIVATE -UNDEBUG)
