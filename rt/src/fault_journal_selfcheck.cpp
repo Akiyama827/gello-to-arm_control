@@ -94,6 +94,20 @@ void check_truncation() {
   assert(exact == ctx.fault_text);
 }
 
+// Bounded text work, and an uncontended claim costs no contention count.
+// Claim exhaustion under contention is exercised by check_concurrent, which
+// accounts every record as delivered, dropped (full) or contended.
+void check_bounded_claim() {
+  ServerCtx ctx;
+  const char* text = "x";
+  // bounded_copy scans at most cap bytes, even for longer input.
+  char small[8];
+  assert(bounded_copy(small, sizeof small, "0123456789") && std::strcmp(small, "0123456") == 0);
+  assert(!bounded_copy(small, sizeof small, "0123456") && std::strcmp(small, "0123456") == 0);
+  ctx.journal(FAULT_SECONDARY, 1, text);
+  assert(ctx.fault_head == 1 && ctx.fault_contended == 0);
+}
+
 void check_full_ring() {
   ServerCtx ctx;  // stalled consumer: producers never wait, never overwrite
   for (uint32_t i = 0; i < FAULT_RING + 5; ++i) {
@@ -163,10 +177,12 @@ void check_concurrent() {
       ++delivered[who];
     }
   }
-  assert(delivered[0] + delivered[1] + int(ctx.fault_dropped.load()) == 2 * PER);
+  // Every record is delivered or accounted: ring full or claim contention.
+  assert(delivered[0] + delivered[1] + int(ctx.fault_dropped.load()) +
+             int(ctx.fault_contended.load()) == 2 * PER);
   assert(delivered[0] > 0 && delivered[1] > 0);
-  std::printf("concurrent: delivered %d + %d, dropped %u\n", delivered[0],
-              delivered[1], ctx.fault_dropped.load());
+  std::printf("concurrent: delivered %d + %d, dropped %u, contended %u\n", delivered[0],
+              delivered[1], ctx.fault_dropped.load(), ctx.fault_contended.load());
 }
 }  // namespace
 
@@ -174,6 +190,7 @@ int main() {
   check_causes();
   check_truncation();
   check_full_ring();
+  check_bounded_claim();
   check_concurrent();
   std::puts("PASS fault journal: first/secondary causes survive DISARM, explicit "
             "truncation, full ring drops new, concurrent producers intact");

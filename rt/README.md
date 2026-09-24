@@ -270,7 +270,16 @@ and session. It also gets one `secondary cause` line per different code while
 latched, and a `stop failed` line when a backend stop fails. DISARM and client
 disconnects do not erase these lines. Text past the 104-byte wire field ends in
 `...`; text past the 240-byte record is marked `(truncated)`. A full 16-record
-ring drops new records and counts them in `dropped=`.
+ring drops new records (`dropped=`); a producer that loses the slot claim
+4 times drops its record (`contended=`). Each enqueue does bounded work: at
+most 4 claim attempts and one scan/copy of at most 240 bytes. That is a step
+bound, not a measured RT latency.
+
+Export is best effort. `state_tx` drains the ring while running. After every
+thread is joined, `main` drops its inherited SCHED_FIFO priority and drains
+once more. That delivers records from the final backend stop or a last control
+fault, and it prints a lost-record count if any records were lost. SIGKILL,
+power loss or a failed log sink can still lose the tail.
 
 Hardening from the post-rung-2 adversarial review (all bench-triggered or
 review-caught, all in the stale-authority class):

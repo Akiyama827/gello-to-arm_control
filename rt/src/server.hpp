@@ -109,11 +109,29 @@ struct FaultRecord {
   char text[FAULT_RECORD_TEXT];
 };
 constexpr uint32_t FAULT_RING = 16;
-// Multi-producer (RT loop, control thread), single consumer (state_tx). A
+// Multi-producer (RT loop, control thread), one consumer at a time (state_tx
+// while running, then finish_fault_journal after every thread is joined). A
 // producer claims an index by CAS on head only while head - tail < RING, so
 // it never writes a slot the consumer has not released; `ready` = index + 1
 // publishes that slot (release), the consumer copies after acquiring it and
-// then advances tail (release). Full ring: the NEW record is dropped, counted.
+// then advances tail (release). Full ring: the NEW record is dropped
+// (fault_dropped). Bounded work per call: at most FAULT_CLAIM_TRIES claim
+// attempts (a lost race past that drops the record, fault_contended) and one
+// scan/copy of at most FAULT_RECORD_TEXT bytes -- bounded steps given
+// lock-free atomics on the target, not an RT latency measurement.
+constexpr int FAULT_CLAIM_TRIES = 4;
+static_assert(std::atomic<uint32_t>::is_always_lock_free, "journal needs lock-free atomics");
+
+// Copies at most cap-1 bytes of `src` and NUL-terminates; scans at most cap
+// bytes. True = `src` did not fit (the copy is truncated).
+inline bool bounded_copy(char* dst, size_t cap, const char* src) {
+  const size_t len = strnlen(src, cap);
+  const size_t n = len < cap ? len : cap - 1;
+  std::memcpy(dst, src, n);
+  dst[n] = '\0';
+  return len >= cap;
+}
+
 struct FaultSlot {
   std::atomic<uint32_t> ready{0};
   FaultRecord rec{};
@@ -213,21 +231,27 @@ struct ServerCtx {
   std::atomic<uint32_t> gap_head{0}, gap_tail{0}, gap_dropped{0};
 
   FaultSlot fault_ring[FAULT_RING];
-  std::atomic<uint32_t> fault_head{0}, fault_tail{0}, fault_dropped{0};
+  std::atomic<uint32_t> fault_head{0}, fault_tail{0}, fault_dropped{0}, fault_contended{0};
+  FILE* journal_out = stderr;  // the consumer's sink (a check substitutes a buffer)
   // Codes already journaled as SECONDARY in this latch: a persisting cause
   // re-latches every tick and is not new information. Cleared by DISARM.
   std::atomic<uint32_t> secondary_codes{0};
 
   void journal(FaultKind kind, uint32_t code, const char* text) {
     uint32_t head = fault_head.load(std::memory_order_relaxed);
-    do {
+    for (int tries = 0;; ++tries) {
       if (head - fault_tail.load(std::memory_order_acquire) >= FAULT_RING) {
         fault_dropped.fetch_add(1, std::memory_order_relaxed);
         return;
       }
-    } while (!fault_head.compare_exchange_weak(head, head + 1,
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_relaxed));
+      if (fault_head.compare_exchange_strong(head, head + 1, std::memory_order_acq_rel,
+                                             std::memory_order_relaxed))
+        break;
+      if (tries + 1 >= FAULT_CLAIM_TRIES) {
+        fault_contended.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
     FaultSlot& slot = fault_ring[head % FAULT_RING];
     FaultRecord& r = slot.rec;
     r.t_ns = mono_ns();
@@ -236,8 +260,7 @@ struct ServerCtx {
     r.arm_epoch = uint32_t(arm_gen.load(std::memory_order_acquire));
     r.kind = kind;
     r.armed = armed.load(std::memory_order_acquire);
-    r.truncated = std::strlen(text) >= sizeof(r.text);
-    std::snprintf(r.text, sizeof(r.text), "%s", text);
+    r.truncated = bounded_copy(r.text, sizeof(r.text), text);
     slot.ready.store(head + 1, std::memory_order_release);
   }
 
@@ -251,8 +274,7 @@ struct ServerCtx {
         journal(FAULT_SECONDARY, code, text);
       return;
     }
-    std::snprintf(fault_text, sizeof(fault_text), "%s", text);
-    if (std::strlen(text) >= sizeof(fault_text))  // the wire copy says so too
+    if (bounded_copy(fault_text, sizeof(fault_text), text))  // the wire copy says so too
       std::memcpy(fault_text + sizeof(fault_text) - 4, "...", 4);
     fault_code.store(code, std::memory_order_release);
     fault.store(true, std::memory_order_release);
@@ -275,10 +297,11 @@ inline int drain_fault_journal(ServerCtx& ctx, FILE* out) {
     ctx.fault_tail.store(tail + 1, std::memory_order_release);
     std::fprintf(out,
                  "[rt] fault journal: %s code=%u t=%.6f arm_epoch=%u armed=%d "
-                 "session=%016llx dropped=%u text=\"%s\"%s\n",
+                 "session=%016llx dropped=%u contended=%u text=\"%s\"%s\n",
                  kinds[r.kind < 3 ? r.kind : 1], r.code, r.t_ns / 1e9, r.arm_epoch,
                  int(r.armed), (unsigned long long)r.session_id,
-                 ctx.fault_dropped.load(std::memory_order_relaxed), r.text,
+                 ctx.fault_dropped.load(std::memory_order_relaxed),
+                 ctx.fault_contended.load(std::memory_order_relaxed), r.text,
                  r.truncated ? " (truncated)" : "");
   }
   return written;
@@ -286,6 +309,13 @@ inline int drain_fault_journal(ServerCtx& ctx, FILE* out) {
 
 void udp_rx_thread(ServerCtx& ctx);
 void state_tx_thread(ServerCtx& ctx);
+// Orderly-shutdown export. Call ONLY after every producer (rt_loop, control)
+// and the running consumer (state_tx) have returned: it is then the one
+// consumer, so records enqueued by the final backend stop or a last control
+// fault still reach the sink. Demotes the calling thread to SCHED_OTHER
+// first -- main IS the servo thread and still holds its FIFO priority. Best
+// effort: SIGKILL, power loss or a failed sink still lose the tail.
+void finish_fault_journal(ServerCtx& ctx);
 void control_thread(ServerCtx& ctx);
 void rt_loop(ServerCtx& ctx);  // constructs the backend ON this thread
 

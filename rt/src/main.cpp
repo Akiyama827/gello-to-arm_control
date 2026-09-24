@@ -250,6 +250,7 @@ int main(int argc, char** argv) {
   udp.join();
   tx.join();
   ctl.join();
+  arm_rt::finish_fault_journal(ctx);  // every producer and consumer is joined
   std::printf("[rt] down\n");
   return ctx.failed.load() ? 1 : 0;
 }
