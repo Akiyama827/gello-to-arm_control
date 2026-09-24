@@ -21,7 +21,7 @@ uint64_t mono_ns() {
 }
 
 bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_t got,
-                     const sockaddr_in& src) {
+                     const sockaddr_in& src, uint64_t ingress_ns) {
   if (got == ssize_t(sizeof(ObserveRequest))) {
     // Read-only subscription: never touches the command peer, the deadman,
     // the flow pin or the mailbox. A full table refuses newcomers.
@@ -47,9 +47,9 @@ bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_
   if (got < 0 || !decode_command(data, size_t(got), ctx.supports_pose_hold.load(), decoded))
     return false;
   const auto& pkt = decoded.command;
-  // Wrong joint count is dropped HERE, before the rx-stamp: the servo
-  // rejects such packets on its own n-check, but if they refresh
-  // last_cmd_rx_ns the CMD_LOST deadman never fires and the arm parks
+  // Wrong joint count is dropped HERE, before anything is published: the
+  // servo rejects such packets on its own n-check, but if they refreshed the
+  // CMD_LOST deadline the deadman would never fire and the arm would park
   // silently forever behind a healthy-looking stream (audit 2026-07-29).
   const int want_n = ctx.backend_ready.load() ? ctx.backend_n.load() : ctx.cfg.n;
   if (pkt.n != uint16_t(want_n)) {
@@ -78,10 +78,14 @@ bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_
   if (!ctx.armed.load(std::memory_order_acquire)) {
     // Disarmed: the session may teach its state-stream address, nothing else.
     // Nothing is written to the servo's mailbox while there is no authority.
+    const uint64_t gen = ctx.arm_gen.load(std::memory_order_acquire);
     if (src.sin_addr.s_addr == ctx.ctl_peer_ip.load(std::memory_order_acquire)) {
       std::lock_guard<std::mutex> lock(ctx.peer_mu);
-      ctx.peer = src;
-      ctx.have_peer = true;
+      if (gen >= ctx.peer_gen) {  // not after an ARM this handler predates
+        ctx.peer = src;
+        ctx.have_peer = true;
+        ctx.peer_gen = gen;
+      }
     }
     return false;
   }
@@ -133,6 +137,7 @@ bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_
       (pkt.seq - flow.last_seq == 0 || pkt.seq - flow.last_seq >= 0x80000000u))
     return false;
   // Accepted. Side effects from here on only.
+  if (flow.after_checks) flow.after_checks(flow.seam_arg);
   if (!pinned) {
     uint64_t expected = owner;
     if (!ctx.cmd_owner.compare_exchange_strong(expected, (gen << 16) | src.sin_port,
@@ -147,20 +152,25 @@ bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_
   flow.last_seq = pkt.seq;
   flow.have_seq = true;
   {
+    // The peer is scoped by generation under its own lock (begin_arm raises
+    // peer_gen under it): a handler of a retired generation cannot redirect
+    // the state stream of the current one.
     std::lock_guard<std::mutex> lock(ctx.peer_mu);
-    ctx.peer = src;
-    ctx.have_peer = true;
+    if (gen >= ctx.peer_gen) {
+      ctx.peer = src;
+      ctx.have_peer = true;
+      ctx.peer_gen = gen;
+    }
   }
-  const uint64_t rx = mono_ns();
-  const uint64_t prev = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
-  if (prev != 0 && rx - prev > 300'000'000ull)
+  if (flow.last_accept_rx != 0 && ingress_ns - flow.last_accept_rx > 300'000'000ull)
     std::fprintf(stderr, "[rt] cmd accept gap %.2fs (seq %u)\n",
-                 double(rx - prev) / 1e9, pkt.seq);
-  // An ARM landing after the checks above leaves this envelope with the old
-  // generation: the RT loop will not track it (command_fresh). Its deadman
-  // refresh and peer update fall inside that microsecond window.
-  ctx.cmd_in.write(CommandEnvelope{decoded, rx, gen});
-  ctx.last_cmd_rx_ns.store(rx, std::memory_order_release);
+                 double(ingress_ns - flow.last_accept_rx) / 1e9, pkt.seq);
+  flow.last_accept_rx = ingress_ns;
+  // Published with the generation and session it was checked against and its
+  // ingress stamp. If an ARM or session change landed after the checks, the
+  // RT loop's CommandAuthority neither tracks it nor lets it move the new
+  // generation's deadline: there is no shared deadman stamp left to refresh.
+  ctx.cmd_in.write(CommandEnvelope{decoded, ingress_ns, gen, session});
   return true;
 }
 
@@ -187,7 +197,8 @@ void udp_rx_thread(ServerCtx& ctx) {
     socklen_t srclen = sizeof(src);
     const ssize_t got = recvfrom(fd, &received, sizeof(received), MSG_TRUNC,
                                  reinterpret_cast<sockaddr*>(&src), &srclen);
-    handle_datagram(ctx, flow, &received, got, src);
+    const uint64_t ingress = mono_ns();  // the documented ingress boundary
+    handle_datagram(ctx, flow, &received, got, src, ingress);
   }
   ctx.udp_fd.store(-1);  // unpublish before close: state_tx must not race a
   close(fd);             // reused descriptor

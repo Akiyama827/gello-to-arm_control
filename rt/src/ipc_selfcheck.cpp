@@ -1,10 +1,13 @@
 // RT <-> non-RT transport (CTRL-012): the Mailbox primitive, command
-// admission (handle_datagram) and tracking freshness (command_fresh). No
+// admission (handle_datagram) and RT-side authority (CommandAuthority). No
 // sockets are opened: datagrams are handed to the production admission
 // function directly. No backend, no devices.
 #include <arpa/inet.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -102,31 +105,40 @@ CommandPacket command(uint32_t epoch, uint32_t seq, uint64_t session = SESSION,
 struct Bench {
   ServerCtx ctx;
   CommandFlow flow;
+  // The RT side of one servo tick: the single reader of both mailboxes.
+  CommandAuthority rt;
+  ArmStart start{};
+  CommandEnvelope envelope{};
   Bench() {
     ctx.cfg.n = 2;
     ctx.session_id.store(SESSION);
     ctx.claim_ok.store(true);
     ctx.ctl_peer_ip.store(CLIENT_IP);
   }
-  void arm() {  // CTL_ARM's order (control_session.cpp)
-    ctx.last_cmd_rx_ns.store(mono_ns());
-    ctx.cmd_owner.store(0);
-    ctx.arm_gen.fetch_add(1);
-    ctx.armed.store(true);
-  }
+  uint64_t arm() { return begin_arm(ctx); }  // CTL_ARM's transition
   void disarm() { ctx.armed.store(false); }
-  bool send(const CommandPacket& c, const sockaddr_in& src) {
-    return handle_datagram(ctx, flow, &c, ssize_t(sizeof(c)), src);
+  bool send(const CommandPacket& c, const sockaddr_in& src, uint64_t ingress = 0,
+            CommandFlow* f = nullptr) {
+    return handle_datagram(ctx, f ? *f : flow, &c, ssize_t(sizeof(c)), src,
+                           ingress ? ingress : mono_ns());
   }
   uint16_t pin() const {
     const uint64_t o = ctx.cmd_owner.load();
     return (o >> 16) == ctx.arm_gen.load() ? ntohs(uint16_t(o & 0xFFFF)) : 0;
   }
-  CommandEnvelope latest(uint64_t* version = nullptr) {  // test is the one reader
-    CommandEnvelope e{};
-    const uint64_t v = ctx.cmd_in.read(e);
-    if (version) *version = v;
-    return e;
+  uint64_t tick() {  // rt_loop's order: generation first, then the mailboxes
+    const uint64_t gen = ctx.arm_gen.load();
+    ctx.arm_start.read(start);
+    const uint64_t v = ctx.cmd_in.read(envelope);
+    rt.observe(gen, start, v, envelope);
+    return v;
+  }
+  bool fresh(uint64_t now = 0) const {
+    return rt.fresh(ctx.session_id.load(), 2, now ? now : mono_ns(), 100e6);
+  }
+  uint16_t peer_port() {
+    std::lock_guard<std::mutex> lock(ctx.peer_mu);
+    return ntohs(ctx.peer.sin_port);
   }
 };
 
@@ -136,34 +148,32 @@ void check_admission() {
 
   // Disarmed: the session may teach its address; nothing is published.
   assert(!b.send(command(0, 1), a));
-  assert(b.ctx.have_peer && b.ctx.peer.sin_port == htons(5000));
-  uint64_t v = 0;
-  b.latest(&v);
-  assert(v == 0 && b.ctx.last_cmd_rx_ns == 0);
+  assert(b.ctx.have_peer && b.peer_port() == 5000);
+  assert(b.tick() == 0 && !b.rt.have && b.rt.deadman_base() == 0);
 
-  b.arm();  // epoch 1
-  const uint64_t armed_rx = b.ctx.last_cmd_rx_ns;
+  b.arm();  // epoch 1: its deadline starts now
+  b.tick();
+  const uint64_t armed_base = b.rt.deadman_base();
+  assert(armed_base != 0 && armed_base == b.start.t_ns && b.start.gen == 1);
   // Rejected before any side effect: wrong n, wrong session, other host,
-  // wrong epoch. None pins, refreshes the deadman or publishes.
+  // wrong epoch. None pins, publishes or moves the deadline.
   assert(!b.send(command(1, 2, SESSION, 3), a));
   assert(!b.send(command(1, 2, 0x999), a));
   assert(!b.send(command(1, 2), from(OTHER_IP, 5000)));
   assert(!b.send(command(7, 2), a));
-  assert(b.pin() == 0 && b.ctx.last_cmd_rx_ns == armed_rx);
-  b.latest(&v);
-  assert(v == 0);
+  assert(b.pin() == 0 && b.tick() == 0 && b.rt.deadman_base() == armed_base);
 
-  assert(b.send(command(1, 10), a));  // first valid sender pins its port
+  const uint64_t ingress = mono_ns();
+  assert(b.send(command(1, 10), a, ingress));  // first valid sender pins its port
   assert(b.pin() == 5000);
-  CommandEnvelope e = b.latest(&v);
-  assert(v == 1 && e.arm_gen == 1 && e.packet.command.kp[0] == 10);
-  assert(e.rx_ns == b.ctx.last_cmd_rx_ns);  // payload and stamp are one value
+  assert(b.tick() == 1 && b.rt.have && b.rt.current.packet.command.kp[0] == 10);
+  assert(b.rt.current.rx_ns == ingress && b.rt.current.session_id == SESSION);
+  assert(b.rt.deadman_base() == ingress && b.fresh());
   assert(!b.send(command(1, 11), from(CLIENT_IP, 5001)));  // other port
   assert(!b.send(command(1, 10), a));                      // duplicate seq
   assert(!b.send(command(1, 9), a));                       // older seq
   assert(b.send(command(1, 11), a));
-  b.latest(&v);
-  assert(v == 2);
+  assert(b.tick() == 2);
 
   // F02: after DISARM -> ARM, a stale epoch-1 packet from the OLD port
   // arrives first. It must not pin: the valid new flow from another port wins.
@@ -171,10 +181,11 @@ void check_admission() {
   b.arm();  // epoch 2
   assert(!b.send(command(1, 12), a));
   assert(b.pin() == 0);
+  b.tick();
+  assert(!b.rt.have && !b.fresh());  // epoch 1's command is not authority now
   assert(b.send(command(2, 1), c));  // new flow, seq restarts in the new epoch
   assert(b.pin() == 5002);
-  e = b.latest(&v);
-  assert(v == 3 && e.arm_gen == 2 && e.packet.command.kp[0] == 1);
+  assert(b.tick() == 3 && b.rt.current.arm_gen == 2 && b.fresh());
   assert(!b.send(command(2, 13), a));  // the old port stays out
 
   // A pin taken under another generation is no pin: an ARM that races the
@@ -186,32 +197,132 @@ void check_admission() {
   // Observer leases never touch command state, even from the control host
   // while armed and unpinned.
   b.arm();  // epoch 4
-  const uint64_t rx = b.ctx.last_cmd_rx_ns;
-  const sockaddr_in peer_before = b.ctx.peer;
+  b.tick();
+  const uint64_t base = b.rt.deadman_base();
+  const uint16_t peer_before = b.peer_port();
   ObserveRequest obs{MAGIC_OBS, VERSION, 0, 1000, 0};
   assert(!handle_datagram(b.ctx, b.flow, &obs, ssize_t(sizeof(obs)),
-                          from(CLIENT_IP, 6000)));
-  assert(b.pin() == 0 && b.ctx.last_cmd_rx_ns == rx);
-  assert(b.ctx.peer.sin_port == peer_before.sin_port);
+                          from(CLIENT_IP, 6000), mono_ns()));
+  assert(b.pin() == 0 && b.tick() == 4 && b.rt.deadman_base() == base);
+  assert(b.peer_port() == peer_before);
   bool leased = false;
   for (const auto& o : b.ctx.observers) leased |= o.addr.sin_port == htons(6000);
   assert(leased);
 }
 
+// R1 (review 2026-09-24): a VALID epoch-N handler stalls after its checks,
+// DISARM/ARM establishes N+1, time passes, then the handler resumes. It must
+// not be tracked, must not refresh N+1's deadline, must not redirect the
+// state stream, and must not keep N+1's own flow out.
+struct Pause {
+  std::mutex m;
+  std::condition_variable cv;
+  bool paused = false, released = false;
+};
+void stall(void* arg) {
+  auto* p = static_cast<Pause*>(arg);
+  std::unique_lock<std::mutex> lock(p->m);
+  p->paused = true;
+  p->cv.notify_all();
+  p->cv.wait(lock, [p] { return p->released; });
+}
+
+void check_retired_handler() {
+  Bench b;
+  const auto a = from(CLIENT_IP, 5000), c = from(CLIENT_IP, 5002);
+  b.arm();  // epoch 1
+  assert(b.send(command(1, 1), a));
+  b.tick();
+  assert(b.fresh() && b.pin() == 5000 && b.peer_port() == 5000);
+
+  Pause pause;
+  b.flow.after_checks = stall;  // udp_rx itself stalls: nothing else admits
+  b.flow.seam_arg = &pause;
+  const uint64_t old_ingress = mono_ns();
+  std::thread udp_rx([&] { assert(b.send(command(1, 2), a, old_ingress)); });
+  {
+    std::unique_lock<std::mutex> lock(pause.m);
+    pause.cv.wait(lock, [&] { return pause.paused; });
+  }
+  // Control thread meanwhile: DISARM, the new client teaches port 5002 while
+  // disarmed (its own flow state), ARM -> epoch 2. The servo keeps ticking.
+  b.disarm();
+  CommandFlow teach;
+  assert(!b.send(command(0, 1), c, 0, &teach) && b.peer_port() == 5002);
+  b.arm();
+  b.tick();
+  const uint64_t epoch2_base = b.rt.deadman_base();
+  assert(b.start.gen == 2 && epoch2_base == b.start.t_ns && !b.rt.have);
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));  // the stall lasts
+  {
+    std::lock_guard<std::mutex> lock(pause.m);
+    pause.released = true;
+  }
+  pause.cv.notify_all();
+  udp_rx.join();
+  b.flow.after_checks = nullptr;
+
+  // The late epoch-1 publish did happen (the mailbox holds it) ...
+  assert(b.tick() == 2 && b.envelope.arm_gen == 1);
+  // ... but it is not tracked, does not move epoch 2's deadline, and did not
+  // redirect the state stream.
+  assert(!b.rt.have && !b.fresh() && b.rt.deadman_base() == epoch2_base);
+  assert(b.peer_port() == 5002 && b.ctx.peer_gen == 2);
+  // Its CAS may have written an epoch-1 pin; that is no pin for epoch 2.
+  assert(b.pin() == 0);
+  // The valid epoch-2 flow is admitted, tracked, and owns the new deadline.
+  const uint64_t ingress = mono_ns();
+  assert(b.send(command(2, 1), c, ingress) && b.pin() == 5002);
+  assert(b.tick() == 3 && b.rt.have && b.fresh() && b.rt.deadman_base() == ingress);
+  assert(!b.send(command(2, 3), a));  // the retired port stays out
+
+  // Owner/session loss inside the epoch: tracking stops at once (the
+  // CTL_LOST latch follows separately), and a new session's claim does not
+  // adopt the old session's commands.
+  b.ctx.session_id.store(0);
+  assert(!b.fresh());
+  b.ctx.session_id.store(SESSION + 1);
+  assert(!b.fresh());
+  b.ctx.session_id.store(SESSION);
+  assert(b.fresh());
+
+  // Delayed ingress within one epoch: stamped at ingress, so a packet whose
+  // handler ran late is stale by its own age and cannot extend the deadline.
+  b.arm();  // epoch 3
+  b.tick();
+  const uint64_t epoch3_base = b.rt.deadman_base();
+  assert(b.send(command(3, 1), c, epoch3_base - 200'000'000));
+  assert(b.tick() == 4 && b.rt.have && !b.fresh(epoch3_base));
+  assert(b.rt.deadman_base() == epoch3_base);
+}
+
 // ---- Freshness at consumption ----------------------------------------------
 
 void check_freshness() {
+  CommandAuthority rt;
   CommandEnvelope e{};
   e.packet.command = command(5, 1);
   e.rx_ns = 1'000'000'000;
   e.arm_gen = 5;
+  e.session_id = SESSION;
   const double hold = 100e6;
-  assert(command_fresh(1, e, 5, 2, e.rx_ns + 50'000'000, hold));
-  assert(!command_fresh(0, e, 5, 2, e.rx_ns, hold));                // unpublished
-  assert(!command_fresh(1, e, 6, 2, e.rx_ns, hold));                // ARM raced it
-  assert(!command_fresh(1, e, 5, 3, e.rx_ns, hold));                // joint count
-  assert(!command_fresh(1, e, 5, 2, e.rx_ns + 150'000'000, hold));  // own age
-  assert(command_fresh(1, e, 5, 2, e.rx_ns - 1000, hold));          // future stamp
+  rt.observe(5, ArmStart{5, 900'000'000}, 0, e);  // nothing published yet
+  assert(!rt.have && rt.deadman_base() == 900'000'000);
+  rt.observe(5, ArmStart{5, 900'000'000}, 1, e);
+  assert(rt.fresh(SESSION, 2, e.rx_ns + 50'000'000, hold));
+  assert(rt.fresh(SESSION, 2, e.rx_ns - 1000, hold));            // future stamp
+  assert(!rt.fresh(SESSION, 3, e.rx_ns, hold));                  // joint count
+  assert(!rt.fresh(SESSION, 2, e.rx_ns + 150'000'000, hold));    // own age
+  assert(!rt.fresh(0, 2, e.rx_ns, hold));                        // no session
+  assert(rt.deadman_base() == e.rx_ns);
+  CommandEnvelope older = e;
+  older.rx_ns -= 10;  // a late publish never moves time backwards
+  rt.observe(5, ArmStart{5, 900'000'000}, 2, older);
+  assert(rt.current.rx_ns == e.rx_ns);
+  rt.observe(6, ArmStart{5, 900'000'000}, 2, e);  // ARM raced it: new generation
+  assert(!rt.have && rt.deadman_base() == 0);      // (its record not seen yet)
+  rt.observe(6, ArmStart{6, 1'100'000'000}, 2, e);
+  assert(!rt.have && rt.deadman_base() == 1'100'000'000);
 }
 }  // namespace
 
@@ -223,7 +334,9 @@ int main() {
   check_mailbox_sequential();
   check_mailbox_concurrent();
   check_admission();
+  check_retired_handler();
   check_freshness();
   std::puts("PASS RT IPC: mailbox latest-wins without tearing, admission before "
-            "side effects (stale-port pin, epochs, observers), envelope freshness");
+            "side effects (stale-port pin, epochs, observers), retired-handler and session "
+            "scoping, generation-owned deadline");
 }

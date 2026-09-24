@@ -145,8 +145,10 @@ void rt_loop(ServerCtx& ctx) {
   const double fault_ns = ctx.cfg.fault_ms * 1e6;
 
   PlantState ps;
-  CommandEnvelope envelope = {};
-  const PoseHoldCommandPacket& incoming = envelope.packet;
+  CommandEnvelope envelope = {};  // this tick's mailbox copy
+  ArmStart arm_start = {};
+  CommandAuthority authority;     // RT-owned; tracking + deadline derive here
+  const PoseHoldCommandPacket& incoming = authority.current.packet;
   const CommandPacket& cmd=incoming.command;
   PoseHold pose_hold;
   double pose_tau[MAX_JOINTS]{};
@@ -248,13 +250,17 @@ void rt_loop(ServerCtx& ctx) {
     const bool armed = ctx.armed.load(std::memory_order_acquire);
     bool faulted = ctx.fault.load(std::memory_order_acquire);
 
-    // The mailbox read cannot fail or tear: it is the whole latest envelope
-    // (or the previous one again). One read per tick, whatever udp_rx does.
-    const uint64_t cmd_v = ctx.cmd_in.read(envelope);
+    // Generation FIRST, then the mailboxes: begin_arm publishes the
+    // ARM-start record before the generation, so a new generation seen here
+    // comes with its record. The mailbox reads cannot fail or tear; one read
+    // each per tick, whatever udp_rx or the control thread does.
     const uint64_t gen = ctx.arm_gen.load(std::memory_order_acquire);
-    const uint64_t rx_ns = ctx.last_cmd_rx_ns.load(std::memory_order_acquire);
-    // Deadman age (CMD_LOST). SIGNED, clamped age. rx_ns is stamped by udp_rx (or the ARM handler)
-    // in parallel with this tick: a packet stamped between our `now` sample
+    ctx.arm_start.read(arm_start);
+    const uint64_t cmd_v = ctx.cmd_in.read(envelope);
+    authority.observe(gen, arm_start, cmd_v, envelope);
+    const uint64_t rx_ns = authority.deadman_base();
+    // Deadman age (CMD_LOST), from this generation only. SIGNED, clamped age:
+    // stamps are taken in parallel with this tick: a packet stamped between our `now` sample
     // above and this load is nanoseconds IN THE FUTURE, and the old unsigned
     // `now - rx_ns` underflowed to ~1.8e19 ns — an instant spurious CMD_LOST
     // latch on a perfectly healthy 100 Hz stream. Odds ~ packet rate x the
@@ -262,12 +268,13 @@ void rt_loop(ServerCtx& ctx) {
     // preemptible), i.e. one false latch per minutes of armed time — found
     // live on rung 3 and root-caused with a fake-plant soak + process
     // autopsy after every stream instrument reported healthy flow.
-    const int64_t raw_age = int64_t(now) - int64_t(rx_ns);
-    const double age_ns = rx_ns == 0 ? 1e18 : double(raw_age < 0 ? 0 : raw_age);
-    // Only commands validated under the CURRENT ARM, received within hold by
-    // their OWN stamp, are authority: a newer packet's receive time can no
-    // longer freshen an older cached payload.
-    const bool fresh = command_fresh(cmd_v, envelope, gen, n, now, hold_ns);
+    const double age_ns = rx_ns == 0 ? 1e18 : clamped_age_ns(now, rx_ns);
+    // Only commands of the CURRENT generation and session, received within
+    // hold by their OWN ingress stamp, are authority: a newer packet's stamp
+    // can no longer freshen an older payload, and a retired handler's late
+    // publish is neither tracked nor able to move this generation's deadline.
+    const bool fresh = authority.fresh(ctx.session_id.load(std::memory_order_acquire),
+                                       n, now, hold_ns);
 
     const double* q_des = zeros;
     const double* qd_des = zeros;

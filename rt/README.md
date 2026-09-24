@@ -253,7 +253,17 @@ generation it was validated under), and only the current generation is ever
 tracked, so a pre-ARM leftover (the client's zero-authority address-teach
 packet, a pre-fault setpoint) never is. Every admission check (joint count,
 session, host, ARM epoch, flow pin, sequence) runs before any side effect: a
-rejected packet cannot pin the flow, refresh the deadman or teach the peer. Found live on the
+rejected packet cannot pin the flow or teach the peer.
+
+The RT loop owns tracking authority and the CMD_LOST deadline
+(`CommandAuthority`). Both derive from the current generation only: its
+ARM-start record, which the ARM handler publishes before the generation, and
+its newest accepted envelope. A receive time is stamped when `recvfrom`
+returns, and a handler delayed after that point does not re-date it. So a
+handler of a retired generation that publishes late is neither tracked nor
+able to move the new generation's deadline. The state-stream peer is scoped
+by generation under its lock, so such a handler cannot redirect it either.
+A command is tracked only while its session is the current claimed one. Found live on the
 FR3 impedance rung: the prime packet's zero gains were adopted as "the
 task's gains" and the hold spring never engaged. The servo's slew limiter doubles as the startup
 ramp: first tick slews from the robot's measured `tau_J_d`, so there is no

@@ -101,21 +101,70 @@ constexpr uint32_t LOOP_GAP_RING = 64;
 // timestamp or epoch (they used to be published separately).
 struct CommandEnvelope {
   PoseHoldCommandPacket packet;
-  uint64_t rx_ns;    // server clock at acceptance
-  uint64_t arm_gen;  // generation this packet's arm_epoch was checked against
+  uint64_t rx_ns;       // server clock at INGRESS (recvfrom return), never
+                        // re-dated by a handler that was delayed afterwards
+  uint64_t arm_gen;     // generation this packet's arm_epoch was checked against
+  uint64_t session_id;  // control session it was admitted under
 };
 
-// Tracking authority for one servo tick: published (version != 0) under the
-// CURRENT ARM generation, right joint count, and its OWN receive age within
-// hold. Signed, clamped age: udp_rx stamps in parallel with the tick, so rx
-// can be nanoseconds in the future.
-inline bool command_fresh(uint64_t version, const CommandEnvelope& e, uint64_t arm_gen,
-                          int n, uint64_t now, double hold_ns) {
-  if (version == 0 || e.arm_gen != arm_gen || e.packet.command.n != uint16_t(n))
-    return false;
-  const int64_t age = int64_t(now) - int64_t(e.rx_ns);
-  return double(age < 0 ? 0 : age) <= hold_ns;
+// When an ARM generation began: the no-first-command deadline's baseline.
+// Written by the ARM handler BEFORE it publishes the generation, so an RT
+// tick that loads the new generation and then reads this sees its record.
+struct ArmStart {
+  uint64_t gen;
+  uint64_t t_ns;
+};
+
+inline double clamped_age_ns(uint64_t now, uint64_t then) {
+  // Signed, clamped: udp_rx and the ARM handler stamp in parallel with the
+  // tick, so `then` can be nanoseconds in the future.
+  const int64_t age = int64_t(now) - int64_t(then);
+  return double(age < 0 ? 0 : age);
 }
+
+// The RT loop's own view of command authority, updated once per tick from
+// the two mailboxes (after loading the current generation). Everything that
+// decides tracking and the CMD_LOST deadline derives from here, scoped to
+// ONE generation: a handler of a retired generation that publishes late can
+// neither be tracked nor move this generation's deadline, and a delayed
+// same-generation packet carries its own old ingress stamp.
+struct CommandAuthority {
+  CommandEnvelope current{};  // newest accepted envelope of `gen`
+  bool have = false;
+  uint64_t gen = 0;
+  uint64_t arm_start_ns = 0;  // start of `gen`, 0 = not seen yet
+
+  void observe(uint64_t gen_now, const ArmStart& start, uint64_t version,
+               const CommandEnvelope& e) {
+    if (gen_now != gen) {  // new generation: nothing of the old one survives
+      gen = gen_now;
+      have = false;
+      arm_start_ns = 0;
+    }
+    if (start.gen == gen) arm_start_ns = start.t_ns;
+    // A retired or not-yet-current generation is ignored; within this one,
+    // the latest ingress wins (a late publish never moves time backwards).
+    if (version != 0 && e.arm_gen == gen && (!have || e.rx_ns >= current.rx_ns)) {
+      current = e;
+      have = true;
+    }
+  }
+
+  // CMD_LOST baseline: the later of this generation's start and its newest
+  // accepted ingress. 0 = nothing of this generation yet (no deadline).
+  uint64_t deadman_base() const {
+    const uint64_t rx = have ? current.rx_ns : 0;
+    return rx > arm_start_ns ? rx : arm_start_ns;
+  }
+
+  // Tracking authority for this tick: a command of THIS generation, from
+  // the CURRENT claimed session, right joint count, own ingress within hold.
+  bool fresh(uint64_t session, int n, uint64_t now, double hold_ns) const {
+    return have && session != 0 && current.session_id == session &&
+           current.packet.command.n == uint16_t(n) &&
+           clamped_age_ns(now, current.rx_ns) <= hold_ns;
+  }
+};
 
 struct Observer {
   sockaddr_in addr{};
@@ -145,11 +194,9 @@ struct ServerCtx {
 
   Mailbox<CommandEnvelope> cmd_in;
   Mailbox<StatePacket> state_out;
-
-  // Deadman clock: the last accepted command's receive time, or the ARM time
-  // (the staleness clock starts at ARM). Drives CMD_LOST only; tracking
-  // freshness uses each envelope's own rx_ns.
-  std::atomic<uint64_t> last_cmd_rx_ns{0};
+  // control thread (CTL_ARM) -> rt_loop. The staleness clock starts AT ARM;
+  // the RT loop owns the deadline (CommandAuthority), not a shared stamp.
+  Mailbox<ArmStart> arm_start;
   // Commands from BEFORE the current ARM are never authority: each envelope
   // carries the generation it was validated under and the RT loop tracks only
   // the current one. Kills two live hazards: the client's zero-authority
@@ -202,9 +249,12 @@ struct ServerCtx {
 
   // State-stream peer, learned from the last command datagram (direct link,
   // one client). Guarded: udp_rx writes, state_tx reads.
+  // Tagged with the generation of its last writer: a handler of an older
+  // generation cannot redirect the stream after an ARM (begin_arm raises it).
   std::mutex peer_mu;
   sockaddr_in peer = {};
   bool have_peer = false;
+  uint64_t peer_gen = 0;
 
   std::atomic<int> udp_fd{-1};  // udp_rx writes, state_tx reads
 
@@ -227,6 +277,23 @@ struct ServerCtx {
 
 uint64_t mono_ns();
 
+// CTL_ARM's state transition, in its required order; the control thread is
+// its only caller in the server. The ARM-start record is published before
+// the generation, the flow pin is cleared, the peer is scoped to the new
+// generation, then authority is raised. Returns the new generation.
+inline uint64_t begin_arm(ServerCtx& ctx) {
+  const uint64_t gen = ctx.arm_gen.load(std::memory_order_relaxed) + 1;
+  ctx.arm_start.write(ArmStart{gen, mono_ns()});
+  ctx.cmd_owner.store(0);
+  {
+    std::lock_guard<std::mutex> lock(ctx.peer_mu);
+    ctx.peer_gen = gen;
+  }
+  ctx.arm_gen.store(gen);
+  ctx.armed.store(true);
+  return gen;
+}
+
 // udp_rx's own admission memory (one flow, one thread).
 struct CommandFlow {
   uint64_t seq_gen = 0;
@@ -239,13 +306,19 @@ struct CommandFlow {
   bool have_warned_session = false, have_warned_epoch = false;
   uint32_t dropped_ip = 0;
   uint16_t dropped_port = 0, warned_n = 0;
+  uint64_t last_accept_rx = 0;  // accept-gap log only
+  // Test seam: called after every check passed, before any side effect.
+  // Null in the server; a check uses it to stall a handler across an ARM.
+  void (*after_checks)(void*) = nullptr;
+  void* seam_arg = nullptr;
 };
 
 // One received datagram: an observer lease or a command. Every check runs
-// before any side effect (flow pin, sequence memory, peer, deadman,
-// publication), so a rejected packet changes nothing. True = published.
+// before any side effect (flow pin, sequence memory, peer, publication), so a
+// rejected packet changes nothing. `ingress_ns` is the server clock when the
+// datagram left recvfrom. True = published.
 bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_t size,
-                     const sockaddr_in& src);
+                     const sockaddr_in& src, uint64_t ingress_ns);
 
 void udp_rx_thread(ServerCtx& ctx);
 void state_tx_thread(ServerCtx& ctx);
