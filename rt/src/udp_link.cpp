@@ -2,6 +2,8 @@
 // (paced re-publish of whatever the RT loop last wrote). Loss handling is
 // the RT loop's staleness logic — nothing here retries anything.
 #include <arpa/inet.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -176,8 +178,26 @@ void udp_rx_thread(ServerCtx& ctx) {
     ctx.cmd_in.write(decoded);
     ctx.last_cmd_rx_ns.store(rx, std::memory_order_release);
   }
-  ctx.udp_fd.store(-1);  // unpublish before close: state_tx must not race a
-  close(fd);             // reused descriptor
+  // Not closed here: state_tx may already hold this descriptor for a
+  // sendto(), and unpublishing it first does not stop that. main closes it
+  // after every thread is joined (close_udp_socket).
+}
+
+void close_udp_socket(ServerCtx& ctx) {
+  const int fd = ctx.udp_fd.exchange(-1);
+  if (fd >= 0) close(fd);
+}
+
+void finish_fault_journal(ServerCtx& ctx) {
+  const sched_param normal{};
+  pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+  drain_fault_journal(ctx, ctx.journal_out);
+  const uint32_t dropped = ctx.fault_dropped.load(std::memory_order_relaxed);
+  const uint32_t contended = ctx.fault_contended.load(std::memory_order_relaxed);
+  if (dropped || contended)
+    std::fprintf(ctx.journal_out, "[rt] fault journal: %u record(s) lost (%u ring full, "
+                 "%u claim contention)\n", dropped + contended, dropped, contended);
+  std::fflush(ctx.journal_out);
 }
 
 void state_tx_thread(ServerCtx& ctx) {
@@ -189,6 +209,7 @@ void state_tx_thread(ServerCtx& ctx) {
   while (!ctx.shutdown.load()) {
     timespec ts{0, period_ns};
     nanosleep(&ts, nullptr);
+    drain_fault_journal(ctx, ctx.journal_out);
     for (uint32_t tail = ctx.gap_tail.load(std::memory_order_relaxed);
          tail != ctx.gap_head.load(std::memory_order_acquire); ++tail) {
       const LoopGap g = ctx.gaps[tail % LOOP_GAP_RING];

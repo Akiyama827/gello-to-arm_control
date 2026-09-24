@@ -207,14 +207,16 @@ public:
     }
   }
 
-  void stop() override {
+  bool stop() override {
     // Controlled stop: last accepted torque + motion_finished. Never zero.
-    if (!active_) return;
+    if (!active_) return true;
+    bool ok = false;
     try {
       franka::Torques torques{{0, 0, 0, 0, 0, 0, 0}};
       for (int j = 0; j < FR3_N; ++j) torques.tau_J[j] = last_tau_ref_[j];
       torques.motion_finished = true;
       control_->writeOnce(torques);
+      ok = true;
     } catch (const franka::Exception& exc) {
       fault_ = exc.what();
       need_recovery_ = true;
@@ -224,6 +226,7 @@ public:
     }
     control_.reset();
     active_ = false;
+    return ok;
   }
 
   const std::string& fault_text() const override { return fault_; }

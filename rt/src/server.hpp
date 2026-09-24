@@ -5,10 +5,11 @@
 //   rt_loop   (RT)      backend read -> servo law -> backend write
 //
 // The RT thread touches ONLY atomics and seqlocks; every blocking object
-// (sockets) lives on the non-RT threads. latch() is lock-free: a CAS claims
-// the one fault slot (two threads can latch concurrently — RT loop and the
-// control thread), the winner writes the text, then release-stores the
-// flag. Readers copy the buffer only after seeing fault==true.
+// (sockets) lives on the non-RT threads. The wire latch has ONE state word
+// (latch_state): latch() claims FREE->WRITING by CAS, fills the slot and
+// publishes SET last; clear_latch() (DISARM) takes SET/FREE->CLEARING, never
+// a slot still being written. The servo never waits on it: a lost claim is a
+// secondary cause. Readers copy the text only after seeing fault==true.
 #pragma once
 
 #include <netinet/in.h>
@@ -16,6 +17,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -90,6 +93,54 @@ struct LoopGap {
 };
 constexpr uint32_t LOOP_GAP_RING = 64;
 
+// Fault journal: the non-RT record of every latch's FIRST cause, of a
+// different cause arriving while latched (once per code per latch), and of
+// failed backend stops. state_tx drains it to stderr (journald). DISARM and a
+// client disconnect clear the wire latch, never these records, so a closed
+// GUI no longer means an unrecorded fault. Truncation is flagged, not silent.
+constexpr int FAULT_RECORD_TEXT = 240;
+enum FaultKind : uint8_t { FAULT_FIRST = 0, FAULT_SECONDARY = 1, FAULT_STOP_FAILED = 2 };
+struct FaultRecord {
+  uint64_t t_ns;        // server clock (StatePacket stamp domain)
+  uint64_t session_id;
+  uint32_t code;
+  uint32_t arm_epoch;
+  uint8_t kind;
+  bool armed;
+  bool truncated;
+  char text[FAULT_RECORD_TEXT];
+};
+constexpr uint32_t FAULT_RING = 16;
+// Multi-producer (RT loop, control thread), one consumer at a time (state_tx
+// while running, then finish_fault_journal after every thread is joined). A
+// producer claims an index by CAS on head only while head - tail < RING, so
+// it never writes a slot the consumer has not released; `ready` = index + 1
+// publishes that slot (release), the consumer copies after acquiring it and
+// then advances tail (release). Full ring: the NEW record is dropped
+// (fault_dropped). Bounded work per call: at most FAULT_CLAIM_TRIES claim
+// attempts (a lost race past that drops the record, fault_contended) and one
+// scan/copy of at most FAULT_RECORD_TEXT bytes -- bounded steps given
+// lock-free atomics on the target, not an RT latency measurement.
+constexpr int FAULT_CLAIM_TRIES = 4;
+static_assert(std::atomic<uint32_t>::is_always_lock_free, "journal needs lock-free atomics");
+
+// Copies at most cap-1 bytes of `src` and NUL-terminates; scans at most cap
+// bytes. True = `src` did not fit (the copy is truncated).
+inline bool bounded_copy(char* dst, size_t cap, const char* src) {
+  const size_t len = strnlen(src, cap);
+  const size_t n = len < cap ? len : cap - 1;
+  std::memcpy(dst, src, n);
+  dst[n] = '\0';
+  return len >= cap;
+}
+
+struct FaultSlot {
+  std::atomic<uint32_t> ready{0};
+  FaultRecord rec{};
+};
+
+uint64_t mono_ns();
+
 struct Observer {
   sockaddr_in addr{};
   uint64_t expiry_ns = 0;  // 0 = free slot
@@ -148,7 +199,14 @@ struct ServerCtx {
   std::atomic<uint16_t> cmd_owner_port{0};  // network order; 0 = unpinned
   std::atomic<bool> armed{false};
   std::atomic<bool> fault{false};
-  std::atomic<bool> fault_claim{false};  // CAS gate: exactly one latch writes
+  // Wire-latch lifecycle; see latch()/clear_latch(). Only the WRITING owner
+  // touches fault_text/fault_code/fault until it publishes SET; only the
+  // CLEARING owner resets them.
+  enum : uint32_t { LATCH_FREE = 0, LATCH_WRITING = 1, LATCH_SET = 2, LATCH_CLEARING = 3 };
+  std::atomic<uint32_t> latch_state{LATCH_FREE};
+  // Test seam: called right after a successful claim. Null in the server.
+  void (*latch_seam)(void*) = nullptr;
+  void* latch_seam_arg = nullptr;
   std::atomic<uint32_t> fault_code{0};
   std::atomic<bool> fault_event_pending{false};  // control thread pushes CTL_FAULT
   std::atomic<bool> shutdown{false};
@@ -181,22 +239,125 @@ struct ServerCtx {
   LoopGap gaps[LOOP_GAP_RING] = {};
   std::atomic<uint32_t> gap_head{0}, gap_tail{0}, gap_dropped{0};
 
+  FaultSlot fault_ring[FAULT_RING];
+  std::atomic<uint32_t> fault_head{0}, fault_tail{0}, fault_dropped{0}, fault_contended{0};
+  FILE* journal_out = stderr;  // the consumer's sink (a check substitutes a buffer)
+  // Codes already journaled as SECONDARY in this latch: a persisting cause
+  // re-latches every tick and is not new information. Cleared by DISARM.
+  std::atomic<uint32_t> secondary_codes{0};
+
+  void journal(FaultKind kind, uint32_t code, const char* text) {
+    uint32_t head = fault_head.load(std::memory_order_relaxed);
+    for (int tries = 0;; ++tries) {
+      if (head - fault_tail.load(std::memory_order_acquire) >= FAULT_RING) {
+        fault_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      if (fault_head.compare_exchange_strong(head, head + 1, std::memory_order_acq_rel,
+                                             std::memory_order_relaxed))
+        break;
+      if (tries + 1 >= FAULT_CLAIM_TRIES) {
+        fault_contended.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+    FaultSlot& slot = fault_ring[head % FAULT_RING];
+    FaultRecord& r = slot.rec;
+    r.t_ns = mono_ns();
+    r.session_id = session_id.load(std::memory_order_acquire);
+    r.code = code;
+    r.arm_epoch = uint32_t(arm_gen.load(std::memory_order_acquire));
+    r.kind = kind;
+    r.armed = armed.load(std::memory_order_acquire);
+    r.truncated = bounded_copy(r.text, sizeof(r.text), text);
+    slot.ready.store(head + 1, std::memory_order_release);
+  }
+
   void latch(uint32_t code, const char* text) {
-    bool expected = false;  // first cause wins, decided by ONE atomic claim
-    if (!fault_claim.compare_exchange_strong(expected, true,
-                                             std::memory_order_acq_rel))
+    uint32_t expected = LATCH_FREE;  // first cause wins, decided by ONE claim
+    if (!latch_state.compare_exchange_strong(expected, LATCH_WRITING,
+                                             std::memory_order_acq_rel)) {
+      // Latched, being written, or being cleared. Never waited on: a cause
+      // that persists re-latches on a later tick once DISARM has cleared.
+      const uint32_t bit = 1u << (code & 31u);
+      if (code != fault_code.load(std::memory_order_acquire) &&
+          !(secondary_codes.fetch_or(bit, std::memory_order_acq_rel) & bit))
+        journal(FAULT_SECONDARY, code, text);
       return;
-    std::snprintf(fault_text, sizeof(fault_text), "%s", text);
+    }
+    if (latch_seam) latch_seam(latch_seam_arg);
+    if (bounded_copy(fault_text, sizeof(fault_text), text))  // the wire copy says so too
+      std::memcpy(fault_text + sizeof(fault_text) - 4, "...", 4);
     fault_code.store(code, std::memory_order_release);
     fault.store(true, std::memory_order_release);
     fault_event_pending.store(true, std::memory_order_release);
+    journal(FAULT_FIRST, code, text);   // the record is stamped in this epoch
+    latch_state.store(LATCH_SET, std::memory_order_release);  // LAST
+  }
+
+  // DISARM's latch reset (control thread only). Waits for an in-progress
+  // writer -- the RT loop fills a slot in microseconds -- for at most
+  // ~100 ms, never clearing underneath it. False = the writer did not finish;
+  // the latch is left intact (DISARM still drops authority). The journal
+  // records are never cleared.
+  bool clear_latch() {
+    for (int i = 0;; ++i) {
+      uint32_t s = latch_state.load(std::memory_order_acquire);
+      if (s == LATCH_WRITING) {
+        if (i >= 2000) return false;
+        timespec pause{0, 50'000};
+        nanosleep(&pause, nullptr);
+        continue;
+      }
+      if (latch_state.compare_exchange_strong(s, LATCH_CLEARING,
+                                              std::memory_order_acq_rel))
+        break;
+    }
+    fault.store(false, std::memory_order_release);
+    fault_code.store(0, std::memory_order_release);
+    fault_text[0] = '\0';
+    secondary_codes.store(0, std::memory_order_release);
+    latch_state.store(LATCH_FREE, std::memory_order_release);
+    return true;
   }
 };
 
-uint64_t mono_ns();
+// Drain the fault journal to stderr; returns the number of records written.
+// Non-RT only (state_tx): formatting and stdio stay off the servo thread.
+inline int drain_fault_journal(ServerCtx& ctx, FILE* out) {
+  static const char* const kinds[] = {"first cause", "secondary cause",
+                                      "stop failed"};
+  int written = 0;
+  for (uint32_t tail = ctx.fault_tail.load(std::memory_order_relaxed);
+       ctx.fault_ring[tail % FAULT_RING].ready.load(std::memory_order_acquire) ==
+       tail + 1;
+       ++tail, ++written) {
+    const FaultRecord r = ctx.fault_ring[tail % FAULT_RING].rec;
+    ctx.fault_tail.store(tail + 1, std::memory_order_release);
+    std::fprintf(out,
+                 "[rt] fault journal: %s code=%u t=%.6f arm_epoch=%u armed=%d "
+                 "session=%016llx dropped=%u contended=%u text=\"%s\"%s\n",
+                 kinds[r.kind < 3 ? r.kind : 1], r.code, r.t_ns / 1e9, r.arm_epoch,
+                 int(r.armed), (unsigned long long)r.session_id,
+                 ctx.fault_dropped.load(std::memory_order_relaxed),
+                 ctx.fault_contended.load(std::memory_order_relaxed), r.text,
+                 r.truncated ? " (truncated)" : "");
+  }
+  return written;
+}
 
 void udp_rx_thread(ServerCtx& ctx);
 void state_tx_thread(ServerCtx& ctx);
+// After every thread is joined: the only safe point to close the UDP socket
+// both udp_rx (recvfrom) and state_tx (sendto) used.
+void close_udp_socket(ServerCtx& ctx);
+// Orderly-shutdown export. Call ONLY after every producer (rt_loop, control)
+// and the running consumer (state_tx) have returned: it is then the one
+// consumer, so records enqueued by the final backend stop or a last control
+// fault still reach the sink. Demotes the calling thread to SCHED_OTHER
+// first -- main IS the servo thread and still holds its FIFO priority. Best
+// effort: SIGKILL, power loss or a failed sink still lose the tail.
+void finish_fault_journal(ServerCtx& ctx);
 void control_thread(ServerCtx& ctx);
 void rt_loop(ServerCtx& ctx);  // constructs the backend ON this thread
 

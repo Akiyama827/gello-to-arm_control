@@ -284,7 +284,8 @@ void rt_loop(ServerCtx& ctx) {
     const uint64_t gen = ctx.arm_gen.load(std::memory_order_acquire);
     if (gen != seen_gen) {
       seen_gen = gen;
-      if (prev_armed) backend->stop();  // the DISARM we never sampled
+      if (prev_armed && !backend->stop())  // the DISARM we never sampled
+        ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str());
       plant_ok = true;         // ARM = explicit plant retry
       have_cmd_gains = false;  // fresh epoch: hold gains until the task speaks
       holding = false;         // re-capture the hold pose in this epoch
@@ -365,7 +366,8 @@ void rt_loop(ServerCtx& ctx) {
       }
     } else {
       pose_hold.reset();
-      if (prev_armed) backend->stop();
+      if (prev_armed && !backend->stop())
+        ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str());
       holding = false;
       std::memset(tau_out, 0, sizeof(tau_out));
       // Disarmed at this sample and any stop() returned: the request is done
@@ -412,7 +414,8 @@ void rt_loop(ServerCtx& ctx) {
     prev_write = t_w1 - t_w0;
     prev_publish = t_pub - t_w1;
   }
-  backend->stop();
+  if (!backend->stop())
+    ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str());
 }
 
 } // namespace arm_rt

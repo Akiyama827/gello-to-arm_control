@@ -96,8 +96,10 @@ public:
     return write(tau_out, command.n);
   }
 
-  // Drop to zero authority safely (disarm path). Idempotent.
-  virtual void stop() = 0;
+  // Drop to zero authority safely (disarm path). Idempotent. False = the
+  // stop itself failed (reason via fault_text()); the RT loop journals it as
+  // a secondary event, separate from the latched first cause.
+  virtual bool stop() = 0;
 
   virtual const std::string& fault_text() const = 0;
 };

@@ -76,6 +76,7 @@ PYTHONPATH=. python tools/bench/rt/torque_cap.py build/arm_rt_server  # offline 
 build/dm_command_selfcheck                                # native command dispatch, no devices
 build/dm_backend_selfcheck                                # DM lifecycle via intercepted CAN syscalls
 build/franka_backend_selfcheck                            # FR3 exception containment, scripted franka::
+build/fault_journal_selfcheck                             # first-cause fault journal ring
 ```
 
 ## DM wire mappings
@@ -264,6 +265,32 @@ flag on purpose. Symmetrically, a DISARM ack is not proof authority dropped
 (the RT loop applies it at its next sample, seconds away inside a blocking
 plant call) — `safe_stop()` confirms against the state stream and returns
 the verdict.
+
+Every latch is also journaled on the box, not only sent as `CTL_FAULT` to a
+connected client. The server's stderr (journald) gets
+`[rt] fault journal: first cause ...` with code, time, ARM epoch, armed flag
+and session. It also gets one `secondary cause` line per different code while
+latched, and a `stop failed` line when a backend stop fails. DISARM and client
+disconnects do not erase these lines. Text past the 104-byte wire field ends in
+`...`; text past the 240-byte record is marked `(truncated)`. A full 16-record
+ring drops new records (`dropped=`); a producer that loses the slot claim
+4 times drops its record (`contended=`). Each enqueue does bounded work: at
+most 4 claim attempts and one scan/copy of at most 240 bytes. That is a step
+bound, not a measured RT latency.
+
+The wire latch has one state word: FREE → WRITING → SET, and CLEARING while
+DISARM resets it. DISARM never clears a latch that is still being written. It
+waits for the writer, which normally takes microseconds, for at most about
+100 ms. If the writer has not finished by then, DISARM still drops authority
+but leaves the latch and says so in its reply. The servo never waits. A
+cause that arrives while the latch is written or cleared is journaled as a
+secondary cause, and it re-latches on a later tick if it persists.
+
+Export is best effort. `state_tx` drains the ring while running. After every
+thread is joined, `main` drops its inherited SCHED_FIFO priority and drains
+once more. That delivers records from the final backend stop or a last control
+fault, and it prints a lost-record count if any records were lost. SIGKILL,
+power loss or a failed log sink can still lose the tail.
 
 Hardening from the post-rung-2 adversarial review (all bench-triggered or
 review-caught, all in the stale-authority class):

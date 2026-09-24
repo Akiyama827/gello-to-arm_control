@@ -27,7 +27,7 @@ class ScriptedBackend final : public Backend {
   const double* tau_limit() const override { return native_limits; }
   double tau_slew_max() const override { return slew_max; }
   const std::string& fault_text() const override { return error_; }
-  void stop() override { ++stops; }
+  bool stop() override { ++stops; return true; }
 
   bool read(PlantState& state) override {
     ++tick;
@@ -78,8 +78,7 @@ class ScriptedBackend final : public Backend {
       StatePacket previous{};
       assert(ctx->state_out.read(previous));
       assert(previous.flags & FLAG_HOLDING);
-      ctx->fault.store(false);
-      ctx->fault_claim.store(false);
+      assert(ctx->clear_latch());
       ctx->latch(FAULT_CTL_LOST, "scripted communication fault");
       ctx->last_cmd_rx_ns.store(mono_ns());  // fresh commands cannot bypass latch
     }

@@ -12,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 struct Script {
@@ -59,7 +60,7 @@ struct ActiveControlBase {
     return {RobotState{}, Duration{1}};
   }
   void writeOnce(const Torques& t) {
-    step("control.writeOnce");
+    step(t.motion_finished ? "control.stop" : "control.writeOnce");
     ++script.writes;
     script.finished += t.motion_finished;
   }
@@ -91,12 +92,7 @@ struct Robot {
 #include "backend_franka.cpp"
 #include "server.hpp"
 
-namespace arm_rt {
-uint64_t mono_ns() {
-  timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return uint64_t(ts.tv_sec) * 1'000'000'000ull + uint64_t(ts.tv_nsec);
-}
+namespace arm_rt {  // mono_ns, state_tx_thread, finish_fault_journal: udp_link.cpp
 std::unique_ptr<Backend> make_fake_backend(int) { std::abort(); }
 std::unique_ptr<Backend> make_dm_backend(const std::string&, uint32_t, double) {
   std::abort();
@@ -157,13 +153,13 @@ void check_backend() {
   script.hook = nullptr;
   assert(b->write(tau, 7) && script.sessions == 1);
   const int finished = script.finished;
-  script.hook = throw_at("control.writeOnce", NetLike());
-  b->stop();  // controlled-stop write throws: contained, session closed
+  script.hook = throw_at("control.stop", NetLike());
+  assert(!b->stop());  // controlled-stop write throws: contained, reported
   assert(script.sessions == 0 && script.finished == finished);
   assert(b->fault_text() == "stop: " + net);
   script.hook = nullptr;
   const int writes = script.writes;
-  b->stop();  // idle: no device call
+  assert(b->stop());  // idle: no device call, nothing failed
   assert(script.writes == writes);
 }
 
@@ -204,12 +200,101 @@ void check_rt_loop() {
   assert(script.sessions == 0 && context.fault && context.armed);
   assert(context.fault_code == FAULT_PLANT);
   assert(std::strcmp(context.fault_text, "read: non-libfranka exception: Net Exception") == 0);
+  const FaultRecord& first = context.fault_ring[0].rec;  // journaled, not only on the wire
+  assert(context.fault_head == 1 && first.kind == FAULT_FIRST && first.armed);
+  assert(first.code == FAULT_PLANT && first.arm_epoch == 1);
+  assert(std::strcmp(first.text, context.fault_text) == 0);
+}
+
+// DISARM whose controlled stop fails: a separate stop-failed record, no latch.
+void check_stop_failure_journal() {
+  ServerCtx context;
+  ctx = &context;
+  context.cfg.backend = "franka";
+  context.cfg.instance_id = "selfcheck";
+  for (int j = 0; j < 7; ++j) context.cfg.joint_names.push_back("j" + std::to_string(j));
+  context.cfg.rt_priority = 0;
+  script = {};
+  idle_reads = 0;
+  script.hook = [](const char* op) {
+    if (!std::strcmp(op, "readOnce") && ++idle_reads == 1) {
+      ctx->last_cmd_rx_ns.store(mono_ns());
+      ctx->arm_gen.fetch_add(1);
+      ctx->armed.store(true);
+    }
+    if (!std::strcmp(op, "readOnce") && idle_reads >= 3) ctx->shutdown.store(true);
+    if (!std::strcmp(op, "control.readOnce") && script.reads == 4)
+      ctx->armed.store(false);  // DISARM sampled on this tick
+    if (!std::strcmp(op, "control.stop")) throw NetLike();
+  };
+  rt_loop(context);
+  assert(!context.failed && !context.fault && script.sessions == 0);
+  assert(context.fault_head == 1);
+  const FaultRecord& r = context.fault_ring[0].rec;
+  assert(r.kind == FAULT_STOP_FAILED && r.code == FAULT_PLANT && !r.armed);
+  assert(std::strcmp(r.text, "stop: non-libfranka exception: Net Exception") == 0);
 }
 }  // namespace
+
+// Orderly shutdown while ARMED whose final controlled stop fails: that record
+// is enqueued after rt_loop's loop exits. It must reach the sink exactly once,
+// whether the running state_tx drains it or finish_fault_journal does after
+// every thread is joined -- and it must reach it with no consumer running.
+std::string shutdown_export(bool consumer_running) {
+  ServerCtx context;
+  ctx = &context;
+  context.cfg.backend = "franka";
+  context.cfg.instance_id = "selfcheck";
+  for (int j = 0; j < 7; ++j) context.cfg.joint_names.push_back("j" + std::to_string(j));
+  context.cfg.rt_priority = 0;
+  char* buf = nullptr;
+  size_t len = 0;
+  context.journal_out = open_memstream(&buf, &len);
+  script = {};
+  idle_reads = 0;
+  script.hook = [](const char* op) {
+    if (!std::strcmp(op, "readOnce") && ++idle_reads == 1) {
+      ctx->last_cmd_rx_ns.store(mono_ns());
+      ctx->arm_gen.fetch_add(1);
+      ctx->armed.store(true);
+    }
+    if (!std::strcmp(op, "control.readOnce") && script.reads == 6)
+      ctx->shutdown.store(true);  // still armed: the exit path stops the session
+    if (!std::strcmp(op, "control.stop")) throw NetLike();
+  };
+  std::thread tx;
+  if (consumer_running) tx = std::thread(state_tx_thread, std::ref(context));
+  rt_loop(context);
+  if (tx.joinable()) tx.join();
+  assert(context.fault_head == 1);  // enqueued after the loop, before this drain
+  finish_fault_journal(context);    // as main does after its joins
+  std::fclose(context.journal_out);
+  std::string out(buf, len);
+  free(buf);
+  return out;
+}
+
+void check_shutdown_export() {
+  const std::string line =
+      "stop failed code=3 t=";
+  const std::string text = "text=\"stop: non-libfranka exception: Net Exception\"\n";
+  for (bool running : {false, true}) {
+    const std::string out = shutdown_export(running);
+    size_t count = 0;
+    for (size_t at = out.find(line); at != std::string::npos; at = out.find(line, at + 1))
+      ++count;
+    assert(count == 1);  // exactly once
+    assert(out.find(text) != std::string::npos);
+    assert(out.find("lost") == std::string::npos);
+  }
+}
 
 int main() {
   check_backend();
   check_rt_loop();
+  check_stop_failure_journal();
+  check_shutdown_export();
   std::puts("PASS FR3 backend: non-libfranka exceptions in open/read/write/stop contained, "
-            "cause attributed, armed read fault latches with writes suppressed");
+            "cause attributed and journaled, armed read fault latches with writes "
+            "suppressed, failed stop journaled separately and exported once at shutdown");
 }
