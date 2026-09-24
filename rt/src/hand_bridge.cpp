@@ -127,6 +127,7 @@ void observe_state(const franka::GripperState& st) {
   have_real = true;
   real_t = mono_s();
   ++sample_seq;
+  admission.sampled();
   real_w = std::clamp(st.width, 0.0, .08);
   real_grasped = st.is_grasped;
 }
@@ -202,9 +203,14 @@ void actor(const char* robot_ip) {
         std::printf("[hand] connected to %s\n", robot_ip);
         std::lock_guard<std::mutex> lk(mx);
         hand_session = hand;
-        admission.connected = true;
         seen_robot_sample = false;
         warned = false;
+        if (admission.stop_fault)
+          std::printf("[hand] retrying the failed stop on the new session; "
+                      "commands stay inhibited until it succeeds and a fresh "
+                      "sample follows\n");
+        admission.session_opened();
+        cv.notify_all();
       } catch (const franka::Exception& e) {
         if (!warned) {
           warned = true;

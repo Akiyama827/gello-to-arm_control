@@ -68,9 +68,19 @@ void check_stop_dispatch() {
   stop_release.set_value();
   assert(sdk_stop.wait_for(2s) == std::future_status::ready);
   sdk_stop.get();
-  assert(!admission.stopping && !admission.stop_fault && !have_real);
+  // Successful retry after a failure: still latched until a measured sample.
+  assert(!admission.stopping && admission.stop_fault && !have_real);
+  {
+    std::lock_guard<std::mutex> lock(mx);
+    franka::GripperState fresh{};
+    fresh.width = .03;
+    fresh.time = franka::Duration(1);
+    seen_robot_sample = false;
+    observe_state(fresh);
+    assert(have_real && !admission.stop_fault);
+  }
   admission = {};
-  std::puts("PASS production stop dispatch: active/pre-entry race, unlocked SDK, failure latch");
+  std::puts("PASS production stop dispatch: active/pre-entry race, unlocked SDK, failure latch, sampled recovery");
 }
 
 int main() {

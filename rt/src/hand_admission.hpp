@@ -43,11 +43,15 @@ struct HandAdmission {
   bool connected = false, client = false, acting = false;
   bool dispatch_committed = false;
   bool stopping = false, stop_fault = false;
+  // A failed stop is cleared by a successful retried stop AND a measured
+  // sample read after it -- never by a connection or a client existing.
+  bool stop_retried_ok = false;
   uint64_t stop_serial = 0;
   void cancel() { pending = {}; ++epoch; }
   void request_stop() {
     cancel();
     stopping = true;
+    stop_retried_ok = false;
     ++stop_serial;
   }
   void finish_stop(uint64_t serial, bool was_acting, bool ok) {
@@ -56,7 +60,18 @@ struct HandAdmission {
     // after action exit. New actions are barred throughout this interval.
     if (serial != stop_serial || was_acting || acting) return;
     stopping = false;
-    stop_fault = !ok;
+    if (!ok) stop_fault = true;
+    stop_retried_ok = ok && stop_fault;
+  }
+  // A new device session. A stop that failed on the old one is retried here,
+  // once per session (a refused retry waits for the next session or GSTOP).
+  void session_opened() {
+    connected = true;
+    if (stop_fault) request_stop();
+  }
+  // A measured sample whose read began after the final stop returned.
+  void sampled() {
+    if (stop_retried_ok && !stopping) stop_fault = stop_retried_ok = false;
   }
   const char* admit(HandAction action, bool fresh) {
     if (!connected || !client) return "offline";
