@@ -83,7 +83,7 @@ class ScriptedBackend final : public Backend {
       assert(ctx->state_out.read(previous));
       assert(previous.flags & FLAG_HOLDING);
       assert(ctx->clear_latch());
-      ctx->latch(FAULT_CTL_LOST, "scripted communication fault");
+      ctx->latch(FAULT_CTL_LOST, "scripted communication fault", ctx->arm_gen.load());
       last_command.rx_ns = mono_ns();  // fresh commands cannot bypass latch
       ctx->cmd_in.write(last_command);
     }

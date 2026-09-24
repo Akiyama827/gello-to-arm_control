@@ -191,7 +191,9 @@ void rt_loop(ServerCtx& ctx) {
       // is nothing to protect — and the first armed write re-latches anyway
       // if the plant is really down).
       if (ctx.armed.load(std::memory_order_acquire)) {
-        ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
+        // Before this tick's generation edge: the generation armed now.
+        ctx.latch(FAULT_PLANT, backend->fault_text().c_str(),
+                  ctx.arm_gen.load(std::memory_order_acquire));
       } else if (read_fail_streak == 0) {
         std::fprintf(stderr, "[rt] plant read failed while disarmed (%s) — "
                              "not latching\n", backend->fault_text().c_str());
@@ -286,9 +288,11 @@ void rt_loop(ServerCtx& ctx) {
     // completes between two 1 kHz samples still changes arm_gen, so the
     // per-epoch resets can never be skipped by fast recovery cycles.
     if (gen != seen_gen) {
+      const uint64_t stopped_gen = seen_gen;
       seen_gen = gen;
       if (prev_armed && !backend->stop())  // the DISARM we never sampled
-        ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str());
+        ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str(),
+                    stopped_gen);
       plant_ok = true;         // ARM = explicit plant retry
       have_cmd_gains = false;  // fresh epoch: hold gains until the task speaks
       holding = false;         // re-capture the hold pose in this epoch
@@ -297,7 +301,7 @@ void rt_loop(ServerCtx& ctx) {
     if(armed) {
       for(int j=0;j<n;++j) {
         if(!std::isfinite(ps.q[j]) || !std::isfinite(ps.dq[j]) || !std::isfinite(ps.tau_ref[j])) {
-          ctx.latch(FAULT_PLANT,"non-finite measured joint state; torque writes suppressed");
+          ctx.latch(FAULT_PLANT, "non-finite measured joint state; torque writes suppressed", seen_gen);
           plant_ok=false;
           break;
         }
@@ -323,7 +327,7 @@ void rt_loop(ServerCtx& ctx) {
           if(!backend->supports_pose_hold() || !ps.pose_valid || !ps.jacobian_valid ||
              !pose_hold.torque(n,ps.q,ps.dq,ps.jacobian,ps.pose,ps.coriolis,
                                incoming.pose_hold,backend->tick_s(),pose_tau)) {
-            ctx.latch(FAULT_PLANT,"pose hold requires valid measured pose/J/model state");
+            ctx.latch(FAULT_PLANT, "pose hold requires valid measured pose/J/model state", seen_gen);
             faulted=true;
           } else {
             q_des=ps.q; qd_des=zeros; tau_ff=pose_tau; kp=zeros; kd=zeros;
@@ -337,7 +341,7 @@ void rt_loop(ServerCtx& ctx) {
           std::memcpy(q_hold, ps.q, sizeof(double) * size_t(n));
         }
         if (!faulted && rx_ns != 0 && age_ns > fault_ns) {
-          ctx.latch(FAULT_CMD_LOST, "command stream lost (staleness > fault-ms)");
+          ctx.latch(FAULT_CMD_LOST, "command stream lost (staleness > fault-ms)", seen_gen);
           faulted = true;
         }
         q_des = q_hold;
@@ -362,7 +366,7 @@ void rt_loop(ServerCtx& ctx) {
       const bool wrote = backend->write_command(selected, slew, tau_out);
       t_w1 = mono_ns();
       if (!wrote) {
-        ctx.latch(FAULT_PLANT, backend->fault_text().c_str());
+        ctx.latch(FAULT_PLANT, backend->fault_text().c_str(), seen_gen);
         plant_ok = false;
         holding = false;
         std::fill_n(tau_out, n, 0.0);  // rejected output is not commanded torque
@@ -370,7 +374,7 @@ void rt_loop(ServerCtx& ctx) {
     } else {
       pose_hold.reset();
       if (prev_armed && !backend->stop())
-        ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str());
+        ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str(), seen_gen);
       holding = false;
       std::memset(tau_out, 0, sizeof(tau_out));
       // Disarmed at this sample and any stop() returned: the request is done
@@ -418,7 +422,7 @@ void rt_loop(ServerCtx& ctx) {
     prev_publish = t_pub - t_w1;
   }
   if (!backend->stop())
-    ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str());
+    ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str(), seen_gen);
 }
 
 } // namespace arm_rt

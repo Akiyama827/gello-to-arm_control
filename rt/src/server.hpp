@@ -13,7 +13,8 @@
 // (sockets) lives on the non-RT threads. The wire latch has ONE state word
 // (latch_state): latch() claims FREE->WRITING by CAS, fills the slot and
 // publishes SET last; clear_latch() (DISARM) takes SET/FREE->CLEARING, never
-// a slot still being written. The servo never waits on it: a lost claim is a
+// a slot still being written; ARM is admitted only by FREE->ARMING on the
+// same word (arm_unlatched). The servo never waits on it: a lost claim is a
 // secondary cause. Readers copy the text only after seeing fault==true.
 #pragma once
 
@@ -279,16 +280,24 @@ struct ServerCtx {
   std::atomic<uint64_t> cmd_owner{0};  // 0 = unpinned
   std::atomic<bool> armed{false};
   std::atomic<bool> fault{false};
-  // Wire-latch lifecycle; see latch()/clear_latch(). Only the WRITING owner
-  // touches fault_text/fault_code/fault until it publishes SET; only the
-  // CLEARING owner resets them.
-  enum : uint32_t { LATCH_FREE = 0, LATCH_WRITING = 1, LATCH_SET = 2, LATCH_CLEARING = 3 };
+  // Wire-latch lifecycle; see latch(), clear_latch(), arm_unlatched(). Only
+  // the WRITING owner touches fault_text/fault_code/fault_gen/fault until it
+  // publishes SET; only the CLEARING owner resets them; ARMING is CTL_ARM
+  // preparing a generation. The control thread owns every transition except
+  // the claim.
+  enum : uint32_t {
+    LATCH_FREE = 0, LATCH_WRITING = 1, LATCH_SET = 2, LATCH_CLEARING = 3, LATCH_ARMING = 4
+  };
   std::atomic<uint32_t> latch_state{LATCH_FREE};
+  std::atomic<uint64_t> fault_gen{0};  // ARM generation the latched fault arose in
+  // Latch serial, advanced by each latch before it publishes SET. The control
+  // thread delivers CTL_FAULT for a serial once (fault_notified is its own).
+  std::atomic<uint64_t> fault_seq{0};
+  uint64_t fault_notified = 0;
   // Test seam: called right after a successful claim. Null in the server.
   void (*latch_seam)(void*) = nullptr;
   void* latch_seam_arg = nullptr;
   std::atomic<uint32_t> fault_code{0};
-  std::atomic<bool> fault_event_pending{false};  // control thread pushes CTL_FAULT
   std::atomic<bool> shutdown{false};
   std::atomic<bool> failed{false};   // startup/bind failure -> nonzero exit,
                                      // so systemd's Restart=on-failure retries
@@ -329,7 +338,9 @@ struct ServerCtx {
   // re-latches every tick and is not new information. Cleared by DISARM.
   std::atomic<uint32_t> secondary_codes{0};
 
-  void journal(FaultKind kind, uint32_t code, const char* text) {
+  // `origin_gen` is the ARM generation the event arose in, never re-read at
+  // enqueue time, so a record is never reassigned to a later epoch.
+  void journal(FaultKind kind, uint32_t code, const char* text, uint64_t origin_gen) {
     uint32_t head = fault_head.load(std::memory_order_relaxed);
     for (int tries = 0;; ++tries) {
       if (head - fault_tail.load(std::memory_order_acquire) >= FAULT_RING) {
@@ -349,45 +360,49 @@ struct ServerCtx {
     r.t_ns = mono_ns();
     r.session_id = session_id.load(std::memory_order_acquire);
     r.code = code;
-    r.arm_epoch = uint32_t(arm_gen.load(std::memory_order_acquire));
+    r.arm_epoch = uint32_t(origin_gen);
     r.kind = kind;
     r.armed = armed.load(std::memory_order_acquire);
     r.truncated = bounded_copy(r.text, sizeof(r.text), text);
     slot.ready.store(head + 1, std::memory_order_release);
   }
 
-  void latch(uint32_t code, const char* text) {
+  void latch(uint32_t code, const char* text, uint64_t origin_gen) {
     uint32_t expected = LATCH_FREE;  // first cause wins, decided by ONE claim
     if (!latch_state.compare_exchange_strong(expected, LATCH_WRITING,
                                              std::memory_order_acq_rel)) {
-      // Latched, being written, or being cleared. Never waited on: a cause
+      // Latched, being written, cleared or armed. Never waited on: a cause
       // that persists re-latches on a later tick once DISARM has cleared.
       const uint32_t bit = 1u << (code & 31u);
       if (code != fault_code.load(std::memory_order_acquire) &&
           !(secondary_codes.fetch_or(bit, std::memory_order_acq_rel) & bit))
-        journal(FAULT_SECONDARY, code, text);
+        journal(FAULT_SECONDARY, code, text, origin_gen);
       return;
     }
     if (latch_seam) latch_seam(latch_seam_arg);
     if (bounded_copy(fault_text, sizeof(fault_text), text))  // the wire copy says so too
       std::memcpy(fault_text + sizeof(fault_text) - 4, "...", 4);
     fault_code.store(code, std::memory_order_release);
+    fault_gen.store(origin_gen, std::memory_order_release);
+    fault_seq.fetch_add(1, std::memory_order_acq_rel);
     fault.store(true, std::memory_order_release);
-    fault_event_pending.store(true, std::memory_order_release);
-    journal(FAULT_FIRST, code, text);   // the record is stamped in this epoch
+    journal(FAULT_FIRST, code, text, origin_gen);
     latch_state.store(LATCH_SET, std::memory_order_release);  // LAST
   }
 
   // DISARM's latch reset (control thread only). Waits for an in-progress
-  // writer -- the RT loop fills a slot in microseconds -- for at most
-  // ~100 ms, never clearing underneath it. False = the writer did not finish;
-  // the latch is left intact (DISARM still drops authority). The journal
-  // records are never cleared.
+  // writer -- the RT loop fills a slot in microseconds -- until a monotonic
+  // deadline LATCH_CLEAR_BUDGET_NS away, never clearing underneath it. False
+  // = the writer did not finish; the latch is left intact (DISARM still drops
+  // authority) and arm_unlatched() keeps refusing until a later DISARM
+  // clears it. The journal records are never cleared.
+  static constexpr uint64_t LATCH_CLEAR_BUDGET_NS = 100'000'000;
   bool clear_latch() {
-    for (int i = 0;; ++i) {
+    const uint64_t deadline = mono_ns() + LATCH_CLEAR_BUDGET_NS;
+    for (;;) {
       uint32_t s = latch_state.load(std::memory_order_acquire);
       if (s == LATCH_WRITING) {
-        if (i >= 2000) return false;
+        if (mono_ns() >= deadline) return false;
         timespec pause{0, 50'000};
         nanosleep(&pause, nullptr);
         continue;
@@ -396,12 +411,58 @@ struct ServerCtx {
                                               std::memory_order_acq_rel))
         break;
     }
+    // An undelivered notice for this latch is simply no longer owed:
+    // pending_fault_notice() reports only a SET latch. The journal holds it.
     fault.store(false, std::memory_order_release);
     fault_code.store(0, std::memory_order_release);
+    fault_gen.store(0, std::memory_order_release);
     fault_text[0] = '\0';
     secondary_codes.store(0, std::memory_order_release);
     latch_state.store(LATCH_FREE, std::memory_order_release);
     return true;
+  }
+
+  // CTL_ARM's admission, coherent with the latch (control thread only). The
+  // word goes FREE->ARMING by CAS: a latch still being written (including one
+  // whose DISARM clear timed out before fault was published), a latched
+  // fault, or a reset in progress refuses the ARM, and no latch can claim the
+  // word while the new generation is prepared (an old-generation latch still
+  // in flight is journaled as secondary with its own generation). Authority
+  // is raised only after the word is FREE again, so every fault of the new
+  // generation can latch. False = refused; nothing was prepared.
+  template <class Prepare>
+  bool arm_unlatched(Prepare prepare) {
+    uint32_t s = LATCH_FREE;
+    if (!latch_state.compare_exchange_strong(s, LATCH_ARMING, std::memory_order_acq_rel))
+      return false;
+    prepare();
+    latch_state.store(LATCH_FREE, std::memory_order_release);
+    armed.store(true, std::memory_order_release);
+    return true;
+  }
+
+  // The CTL_FAULT still owed to the client, if any (control thread only): a
+  // SET latch whose serial has not been delivered. Only a published latch is
+  // owed -- one DISARM cleared, or one still being written, is not -- and its
+  // text is stable while SET, because only this thread can clear it.
+  struct FaultNotice {
+    uint64_t seq;
+    uint32_t code;
+    char text[sizeof(fault_text)];
+  };
+  bool pending_fault_notice(FaultNotice& out) const {
+    if (latch_state.load(std::memory_order_acquire) != LATCH_SET) return false;
+    const uint64_t seq = fault_seq.load(std::memory_order_acquire);
+    if (seq == fault_notified) return false;
+    out.seq = seq;
+    out.code = fault_code.load(std::memory_order_acquire);
+    std::memcpy(out.text, fault_text, sizeof(out.text));
+    return true;
+  }
+  // Delivered. Monotonic: acknowledging an older notice never discards a
+  // newer one.
+  void ack_fault_notice(uint64_t seq) {
+    if (seq > fault_notified) fault_notified = seq;
   }
 };
 
@@ -429,20 +490,25 @@ inline int drain_fault_journal(ServerCtx& ctx, FILE* out) {
   return written;
 }
 
-// CTL_ARM's state transition, in its required order; the control thread is
-// its only caller in the server. The ARM-start record is published before
-// the generation, the flow pin is cleared, the peer is scoped to the new
-// generation, then authority is raised. Returns the new generation.
+// CTL_ARM's state transition (control thread only; checks arm through it
+// too). Admission is ONE transition on the latch word (arm_unlatched): a
+// latched, unfinished or resetting latch refuses the ARM and nothing is
+// prepared. Admitted, in order: the ARM-start record is published before the
+// generation, the flow pin is cleared, the peer is scoped to the new
+// generation, the generation is published, and authority is raised last,
+// after the latch word is FREE again. Returns the new generation, 0 = refused.
 inline uint64_t begin_arm(ServerCtx& ctx) {
-  const uint64_t gen = ctx.arm_gen.load(std::memory_order_relaxed) + 1;
-  ctx.arm_start.write(ArmStart{gen, mono_ns()});
-  ctx.cmd_owner.store(0);
-  {
-    std::lock_guard<std::mutex> lock(ctx.peer_mu);
-    ctx.peer_gen = gen;
-  }
-  ctx.arm_gen.store(gen);
-  ctx.armed.store(true);
+  uint64_t gen = 0;
+  ctx.arm_unlatched([&] {
+    gen = ctx.arm_gen.load(std::memory_order_relaxed) + 1;
+    ctx.arm_start.write(ArmStart{gen, mono_ns()});
+    ctx.cmd_owner.store(0);
+    {
+      std::lock_guard<std::mutex> lock(ctx.peer_mu);
+      ctx.peer_gen = gen;
+    }
+    ctx.arm_gen.store(gen);
+  });
   return gen;
 }
 
