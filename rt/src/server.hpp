@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -89,6 +90,36 @@ struct LoopGap {
   bool armed;
 };
 constexpr uint32_t LOOP_GAP_RING = 64;
+
+// Fault journal: the non-RT record of every latch's FIRST cause, of a
+// different cause arriving while latched (once per code per latch), and of
+// failed backend stops. state_tx drains it to stderr (journald). DISARM and a
+// client disconnect clear the wire latch, never these records, so a closed
+// GUI no longer means an unrecorded fault. Truncation is flagged, not silent.
+constexpr int FAULT_RECORD_TEXT = 240;
+enum FaultKind : uint8_t { FAULT_FIRST = 0, FAULT_SECONDARY = 1, FAULT_STOP_FAILED = 2 };
+struct FaultRecord {
+  uint64_t t_ns;        // server clock (StatePacket stamp domain)
+  uint64_t session_id;
+  uint32_t code;
+  uint32_t arm_epoch;
+  uint8_t kind;
+  bool armed;
+  bool truncated;
+  char text[FAULT_RECORD_TEXT];
+};
+constexpr uint32_t FAULT_RING = 16;
+// Multi-producer (RT loop, control thread), single consumer (state_tx). A
+// producer claims an index by CAS on head only while head - tail < RING, so
+// it never writes a slot the consumer has not released; `ready` = index + 1
+// publishes that slot (release), the consumer copies after acquiring it and
+// then advances tail (release). Full ring: the NEW record is dropped, counted.
+struct FaultSlot {
+  std::atomic<uint32_t> ready{0};
+  FaultRecord rec{};
+};
+
+uint64_t mono_ns();
 
 struct Observer {
   sockaddr_in addr{};
@@ -181,19 +212,77 @@ struct ServerCtx {
   LoopGap gaps[LOOP_GAP_RING] = {};
   std::atomic<uint32_t> gap_head{0}, gap_tail{0}, gap_dropped{0};
 
+  FaultSlot fault_ring[FAULT_RING];
+  std::atomic<uint32_t> fault_head{0}, fault_tail{0}, fault_dropped{0};
+  // Codes already journaled as SECONDARY in this latch: a persisting cause
+  // re-latches every tick and is not new information. Cleared by DISARM.
+  std::atomic<uint32_t> secondary_codes{0};
+
+  void journal(FaultKind kind, uint32_t code, const char* text) {
+    uint32_t head = fault_head.load(std::memory_order_relaxed);
+    do {
+      if (head - fault_tail.load(std::memory_order_acquire) >= FAULT_RING) {
+        fault_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    } while (!fault_head.compare_exchange_weak(head, head + 1,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_relaxed));
+    FaultSlot& slot = fault_ring[head % FAULT_RING];
+    FaultRecord& r = slot.rec;
+    r.t_ns = mono_ns();
+    r.session_id = session_id.load(std::memory_order_acquire);
+    r.code = code;
+    r.arm_epoch = uint32_t(arm_gen.load(std::memory_order_acquire));
+    r.kind = kind;
+    r.armed = armed.load(std::memory_order_acquire);
+    r.truncated = std::strlen(text) >= sizeof(r.text);
+    std::snprintf(r.text, sizeof(r.text), "%s", text);
+    slot.ready.store(head + 1, std::memory_order_release);
+  }
+
   void latch(uint32_t code, const char* text) {
     bool expected = false;  // first cause wins, decided by ONE atomic claim
     if (!fault_claim.compare_exchange_strong(expected, true,
-                                             std::memory_order_acq_rel))
+                                             std::memory_order_acq_rel)) {
+      const uint32_t bit = 1u << (code & 31u);
+      if (code != fault_code.load(std::memory_order_acquire) &&
+          !(secondary_codes.fetch_or(bit, std::memory_order_acq_rel) & bit))
+        journal(FAULT_SECONDARY, code, text);
       return;
+    }
     std::snprintf(fault_text, sizeof(fault_text), "%s", text);
+    if (std::strlen(text) >= sizeof(fault_text))  // the wire copy says so too
+      std::memcpy(fault_text + sizeof(fault_text) - 4, "...", 4);
     fault_code.store(code, std::memory_order_release);
     fault.store(true, std::memory_order_release);
     fault_event_pending.store(true, std::memory_order_release);
+    journal(FAULT_FIRST, code, text);
   }
 };
 
-uint64_t mono_ns();
+// Drain the fault journal to stderr; returns the number of records written.
+// Non-RT only (state_tx): formatting and stdio stay off the servo thread.
+inline int drain_fault_journal(ServerCtx& ctx, FILE* out) {
+  static const char* const kinds[] = {"first cause", "secondary cause",
+                                      "stop failed"};
+  int written = 0;
+  for (uint32_t tail = ctx.fault_tail.load(std::memory_order_relaxed);
+       ctx.fault_ring[tail % FAULT_RING].ready.load(std::memory_order_acquire) ==
+       tail + 1;
+       ++tail, ++written) {
+    const FaultRecord r = ctx.fault_ring[tail % FAULT_RING].rec;
+    ctx.fault_tail.store(tail + 1, std::memory_order_release);
+    std::fprintf(out,
+                 "[rt] fault journal: %s code=%u t=%.6f arm_epoch=%u armed=%d "
+                 "session=%016llx dropped=%u text=\"%s\"%s\n",
+                 kinds[r.kind < 3 ? r.kind : 1], r.code, r.t_ns / 1e9, r.arm_epoch,
+                 int(r.armed), (unsigned long long)r.session_id,
+                 ctx.fault_dropped.load(std::memory_order_relaxed), r.text,
+                 r.truncated ? " (truncated)" : "");
+  }
+  return written;
+}
 
 void udp_rx_thread(ServerCtx& ctx);
 void state_tx_thread(ServerCtx& ctx);

@@ -27,7 +27,7 @@ class ScriptedBackend final : public Backend {
   const double* tau_limit() const override { return native_limits; }
   double tau_slew_max() const override { return slew_max; }
   const std::string& fault_text() const override { return error_; }
-  void stop() override { ++stops; }
+  bool stop() override { ++stops; return true; }
 
   bool read(PlantState& state) override {
     ++tick;

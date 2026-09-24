@@ -575,19 +575,22 @@ public:
     return true;
   }
 
-  void stop() override {
+  bool stop() override {
     // Zero-gain hold then DISABLE per motor — the Python
-    // _zero_torque_and_disable sequence. Errors ignored: never throws, and
-    // the disarmed elicit keeps state flowing afterwards.
-    if (fd_ < 0) return;
+    // _zero_torque_and_disable sequence. Every frame is still attempted
+    // after a failure (never throws; the disarmed elicit keeps state
+    // flowing); the result only reports whether all of them went out.
+    if (fd_ < 0) return true;
     uint8_t zt[8];
+    bool ok = true;
     for (const Motor& m : motors_) {
       pack_mit(0, 0, 0, 0, 0, m.lim, zt);
-      send8(m.id, zt);
-      send8(m.id, DM_DISABLE_FRAME);
+      ok = send8(m.id, zt) && ok;
+      ok = send8(m.id, DM_DISABLE_FRAME) && ok;
     }
     for (size_t j = 0; j < motors_.size(); ++j) last_tau_[j] = 0.0;
     enabled_mask_ = 0;
+    return ok;
   }
 
   const std::string& fault_text() const override { return fault_; }

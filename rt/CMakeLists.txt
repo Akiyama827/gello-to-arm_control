@@ -94,6 +94,12 @@ target_include_directories(franka_backend_selfcheck PRIVATE include)
 target_link_libraries(franka_backend_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
 target_compile_options(franka_backend_selfcheck PRIVATE -UNDEBUG)
 
+# Fault journal ring: causes, truncation, full ring, concurrent producers.
+add_executable(fault_journal_selfcheck src/fault_journal_selfcheck.cpp)
+target_include_directories(fault_journal_selfcheck PRIVATE include)
+target_link_libraries(fault_journal_selfcheck PRIVATE Threads::Threads)
+target_compile_options(fault_journal_selfcheck PRIVATE -UNDEBUG)
+
 add_executable(dm_backend_selfcheck src/dm_backend_selfcheck.cpp src/backend_dm.cpp)
 target_include_directories(dm_backend_selfcheck PRIVATE include)
 target_compile_options(dm_backend_selfcheck PRIVATE -UNDEBUG)

@@ -81,8 +81,9 @@ public:
     return true;
   }
 
-  void stop() override {
+  bool stop() override {
     for (int j = 0; j < n_; ++j) tau_[j] = 0.0;
+    return true;
   }
 
   const std::string& fault_text() const override { return fault_; }

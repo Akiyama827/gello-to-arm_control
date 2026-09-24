@@ -189,6 +189,7 @@ void state_tx_thread(ServerCtx& ctx) {
   while (!ctx.shutdown.load()) {
     timespec ts{0, period_ns};
     nanosleep(&ts, nullptr);
+    drain_fault_journal(ctx, stderr);
     for (uint32_t tail = ctx.gap_tail.load(std::memory_order_relaxed);
          tail != ctx.gap_head.load(std::memory_order_acquire); ++tail) {
       const LoopGap g = ctx.gaps[tail % LOOP_GAP_RING];

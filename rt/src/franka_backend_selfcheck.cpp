@@ -158,12 +158,12 @@ void check_backend() {
   assert(b->write(tau, 7) && script.sessions == 1);
   const int finished = script.finished;
   script.hook = throw_at("control.writeOnce", NetLike());
-  b->stop();  // controlled-stop write throws: contained, session closed
+  assert(!b->stop());  // controlled-stop write throws: contained, reported
   assert(script.sessions == 0 && script.finished == finished);
   assert(b->fault_text() == "stop: " + net);
   script.hook = nullptr;
   const int writes = script.writes;
-  b->stop();  // idle: no device call
+  assert(b->stop());  // idle: no device call, nothing failed
   assert(script.writes == writes);
 }
 
@@ -204,12 +204,47 @@ void check_rt_loop() {
   assert(script.sessions == 0 && context.fault && context.armed);
   assert(context.fault_code == FAULT_PLANT);
   assert(std::strcmp(context.fault_text, "read: non-libfranka exception: Net Exception") == 0);
+  const FaultRecord& first = context.fault_ring[0].rec;  // journaled, not only on the wire
+  assert(context.fault_head == 1 && first.kind == FAULT_FIRST && first.armed);
+  assert(first.code == FAULT_PLANT && first.arm_epoch == 1);
+  assert(std::strcmp(first.text, context.fault_text) == 0);
+}
+
+// DISARM whose controlled stop fails: a separate stop-failed record, no latch.
+void check_stop_failure_journal() {
+  ServerCtx context;
+  ctx = &context;
+  context.cfg.backend = "franka";
+  context.cfg.instance_id = "selfcheck";
+  for (int j = 0; j < 7; ++j) context.cfg.joint_names.push_back("j" + std::to_string(j));
+  context.cfg.rt_priority = 0;
+  script = {};
+  idle_reads = 0;
+  script.hook = [](const char* op) {
+    if (!std::strcmp(op, "readOnce") && ++idle_reads == 1) {
+      ctx->last_cmd_rx_ns.store(mono_ns());
+      ctx->arm_gen.fetch_add(1);
+      ctx->armed.store(true);
+    }
+    if (!std::strcmp(op, "readOnce") && idle_reads >= 3) ctx->shutdown.store(true);
+    if (!std::strcmp(op, "control.readOnce") && script.reads == 4)
+      ctx->armed.store(false);  // DISARM sampled on this tick
+    if (!std::strcmp(op, "control.writeOnce") && !ctx->armed.load()) throw NetLike();
+  };
+  rt_loop(context);
+  assert(!context.failed && !context.fault && script.sessions == 0);
+  assert(context.fault_head == 1);
+  const FaultRecord& r = context.fault_ring[0].rec;
+  assert(r.kind == FAULT_STOP_FAILED && r.code == FAULT_PLANT && !r.armed);
+  assert(std::strcmp(r.text, "stop: non-libfranka exception: Net Exception") == 0);
 }
 }  // namespace
 
 int main() {
   check_backend();
   check_rt_loop();
+  check_stop_failure_journal();
   std::puts("PASS FR3 backend: non-libfranka exceptions in open/read/write/stop contained, "
-            "cause attributed, armed read fault latches with writes suppressed");
+            "cause attributed and journaled, armed read fault latches with writes "
+            "suppressed, failed stop journaled separately");
 }

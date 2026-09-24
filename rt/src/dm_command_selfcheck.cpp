@@ -23,7 +23,7 @@ class CommandBackend final : public Backend {
   double tick_s() const override { return .002; }
   const double* tau_limit() const override { return limits; }
   const std::string& fault_text() const override { return error_; }
-  void stop() override { ++stops; }
+  bool stop() override { ++stops; return true; }
   bool write(const double*, int) override {
     std::fputs("FAIL: RT discarded native MIT fields and called torque-only write\n", stderr);
     std::abort();

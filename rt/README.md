@@ -73,6 +73,7 @@ PYTHONPATH=. python tools/bench/rt/torque_cap.py build/arm_rt_server  # offline 
 build/dm_command_selfcheck                                # native command dispatch, no devices
 build/dm_backend_selfcheck                                # DM lifecycle via intercepted CAN syscalls
 build/franka_backend_selfcheck                            # FR3 exception containment, scripted franka::
+build/fault_journal_selfcheck                             # first-cause fault journal ring
 ```
 
 ## DM wire mappings
@@ -261,6 +262,15 @@ flag on purpose. Symmetrically, a DISARM ack is not proof authority dropped
 (the RT loop applies it at its next sample, seconds away inside a blocking
 plant call) — `safe_stop()` confirms against the state stream and returns
 the verdict.
+
+Every latch is also journaled on the box, not only sent as `CTL_FAULT` to a
+connected client. The server's stderr (journald) gets
+`[rt] fault journal: first cause ...` with code, time, ARM epoch, armed flag
+and session. It also gets one `secondary cause` line per different code while
+latched, and a `stop failed` line when a backend stop fails. DISARM and client
+disconnects do not erase these lines. Text past the 104-byte wire field ends in
+`...`; text past the 240-byte record is marked `(truncated)`. A full 16-record
+ring drops new records and counts them in `dropped=`.
 
 Hardening from the post-rung-2 adversarial review (all bench-triggered or
 review-caught, all in the stale-authority class):

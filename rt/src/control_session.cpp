@@ -240,6 +240,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
         ctx.fault.store(false);
         ctx.fault_code.store(0);
         ctx.fault_text[0] = '\0';
+        ctx.secondary_codes.store(0);  // the journal itself is never cleared
         // Release the latch claim LAST: a latch racing this clear is dropped
         // (its CAS fails) and simply re-fires on the next tick if the cause
         // persists — better than letting it scribble a half-cleared slot.
