@@ -123,6 +123,10 @@ def main() -> None:
     # Completion observed on feedback, but the plant never accepted a command.
     rt = runtime(StubLink(accept=False))
     try:
+        # The shared controller builder carried this config's values, not defaults.
+        c = rt.controller
+        assert (c._settling.timeout_s, c._settling.dwell_s) == (3.0, 0.1), c._settling
+        assert c.executor.kp.tolist() == [100.0] * 3 and c.execution_policy is not None
         armed(rt)
         s = rt.submit("owner", move("unaccepted", np.zeros(3), [0.05, 0.05, 0.05], 1.0))
         s = settle(rt, s.execution_id)
