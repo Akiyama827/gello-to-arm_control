@@ -404,7 +404,7 @@ def check_cartesian_lifecycle():
             c.on_control(pack_control_update(cancel=True))
         c.tick()
         assert commands(c)[-1]["cartesian"] is None, (stop, commands(c)[-1])
-        assert c._cartesian_now is None and c._cartesian_poses is None
+        assert c._cartesian_now is None and c.reference is None
         assert c._last_cartesian_pose is None
 
 
@@ -420,7 +420,7 @@ def check_completion_order():
     # is SUPPOSED to keep stepping. Play the reference out first.
     advance(c, clock, .9, q=.0005)
     assert c._running and c.executor.steps, "the reference must play out first"
-    c.executor.done = lambda *args, **kwargs: True
+    c.executor.at_goal = lambda *args, **kwargs: True
     stepped = c.executor.steps
     clock[0] += .1                           # t == _leg_end; dwell 0 completes now
     c.on_motor_state(state(.0005))
@@ -438,9 +438,8 @@ def check_completion_order():
     c, clock = setup(health=False)
     c.on_plan(plan(completion={"vel_tol": 100, "goal_q": [0]*7, "residual_max": 100}))
     c.on_control(pack_control_update(execute="p"))
-    # The permissive per-plan completion path passes infinite tolerances;
-    # the legacy safety profile must still use the executor's own tolerances.
-    c.executor.done = lambda *args, **kwargs: bool(kwargs)
+    # A permissive per-plan completion rule does not override the policy's
+    # tracking abort: far from the reference, the leg fails and holds.
     c.on_motor_state(state(.4))
     c.tick()
     results = [unpack_json_message(v) for t, v in c.node.sent if t == "controller_event"]
@@ -454,7 +453,7 @@ def check_completion_order():
         c.on_plan(plan(**fields))
         c.on_control(pack_control_update(execute="p"))
         if not custom:
-            c.executor.done = lambda *args, **kwargs: False
+            c.executor.at_goal = lambda *args, **kwargs: False
         advance(c, clock, 6.5, q=.005)
         assert not c._running
         assert np.allclose(commands(c)[-1]["position"], .005)
@@ -474,7 +473,7 @@ def check_settle_dwell():
     c.on_plan(plan(start=.0, ident="dwell"))
     c.on_control(pack_control_update(execute="dwell"))
     advance(c, clock, .9, q=.0005)
-    c.executor.done = lambda *args, **kwargs: True
+    c.executor.at_goal = lambda *args, **kwargs: True
     clock[0] += .1                           # t == _leg_end: settling starts
     c.on_motor_state(state(.0005))
     c.tick()

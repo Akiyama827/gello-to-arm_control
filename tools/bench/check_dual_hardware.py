@@ -128,7 +128,7 @@ def check_virtual(app, action, wait, refinement):
         with patch.object(right, "execute", delayed_release):
             action("execute", pair_id=pair)
         with app._lock:
-            starts = [c.executor._t_start for c in app.runtime.controllers.values()]
+            starts = [c.reference.t_start for c in app.runtime.controllers.values()]
             assert starts[0] == starts[1], starts
             assert app.coordinator.pair_state().release_skew_sec >= .02
         state = wait(lambda s: s["pair"]["lifecycle"] in {"complete", "faulted", "cancelled"}, timeout=60)

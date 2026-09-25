@@ -40,8 +40,6 @@ class _FakeExecutor:
 
     def __init__(self, n: int = 7) -> None:
         self.n_joints = n
-        self._traj = None
-        self._t_start = 0.0
         self.kp = np.full(n, 1200.0)
         self.kd = np.full(n, 30.0)
         self.payload = (0.0, None)
@@ -60,20 +58,7 @@ class _FakeExecutor:
     def set_payload(self, mass_kg, frame_name="", com_offset=None) -> None:
         self.payload = (float(mass_kg), com_offset)
 
-    @property
-    def has_trajectory(self) -> bool:
-        return self._traj is not None
-
-    def load_trajectory(self, traj, t_start: float) -> None:
-        self._traj, self._t_start = traj, float(t_start)
-
-    def elapsed(self, t_now: float) -> float:
-        return float(t_now) - self._t_start
-
-    def clear_trajectory(self) -> None:
-        self._traj = None
-
-    def step(self, t_now, state) -> JointServoCommand:
+    def step(self, point, state) -> JointServoCommand:
         self.steps += 1
         n = self.n_joints
         return JointServoCommand(
@@ -88,8 +73,8 @@ class _FakeExecutor:
             q_des=q, qd_des=np.zeros(n), tau_ff=np.zeros(n), kp=self.kp, kd=self.kd
         )
 
-    def done(self, t_now, state, pos_tol=None, vel_tol=None) -> bool:
-        return self._traj is not None and t_now - self._t_start >= self._traj.duration_sec
+    def at_goal(self, goal, state, pos_tol=None, vel_tol=None) -> bool:
+        return True  # completion is the reference playing out
 
 
 _GRIPPER = {"n_motors": 7, "mimic": None, "open_finger_m": 0.04, "gains": (100.0, 1.0)}

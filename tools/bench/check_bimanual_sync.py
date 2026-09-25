@@ -68,17 +68,16 @@ def check_reference_phase():
         h.coord.execute_pair("pair")
         assert h.coord.lifecycle is PairLifecycle.EXECUTING
         assert abs(h.coord.pair_state().release_skew_sec - .02) < 1e-10
-        starts = [c.executor._t_start for c in h.controllers.values()]
+        starts = [c.reference.t_start for c in h.controllers.values()]
         assert (abs(starts[0] - starts[1]) < 1e-12) == shared
-        # Make the fake executor evaluate the actual cubic so assertions cover
+        # Make the fake executor command the sampled cubic so assertions cover
         # commands produced by ArmController, not just clock accessor values.
         for c in h.controllers.values():
             executor = c.executor
             original = executor.step
 
-            def sample(t, state, executor=executor, original=original):
-                command = original(t, state)
-                point = executor._traj.sample_at(executor.elapsed(t))
+            def sample(point, state, original=original):
+                command = original(point, state)
                 return replace(command, q_des=point.position, qd_des=point.velocity)
 
             executor.step = sample

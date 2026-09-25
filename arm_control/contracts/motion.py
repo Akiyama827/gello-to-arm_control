@@ -88,8 +88,8 @@ def pack_plan(
 
     ``completion`` carries the leg-completion RULE with the leg, so the
     controller never has to know which leg is special -- or what makes it
-    special. Absent (the default) means the executor's own done(): the plan
-    played out and the arm is at the target. Present, it is the SETTLE rule --
+    special. Absent (the default) means the reference played out and the arm
+    is at the target. Present, it is the SETTLE rule --
     the plan played out, the arm has stopped to ``vel_tol``, and (if
     ``goal_q`` is given) it stopped within ``residual_max`` of it. The caller
     picks those numbers because the caller is the one that knows why this leg

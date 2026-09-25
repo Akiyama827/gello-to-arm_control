@@ -8,7 +8,7 @@ import numpy as np
 
 from arm_control.control.gains import validate_torque_limits
 from arm_control.dynamics import PinocchioDynamics
-from arm_control.motion import JointServoCommand, JointState, JointTrajectory
+from arm_control.motion import JointServoCommand, JointState, TrajectoryPoint
 
 
 def gain_error(kp, kd) -> str | None:
@@ -41,8 +41,10 @@ def gain_error(kp, kd) -> str | None:
 
 
 class JointTrajectoryExecutor:
-    """Samples a JointTrajectory and produces joint servo commands.
+    """Turns a sampled reference point into a joint servo command.
 
+    It holds no trajectory and no trajectory time: the controller's
+    ``control.reference.TrajectoryReference`` owns both and passes the point.
     The feedforward torque is RNEA(q_meas, qd_des, qdd_des), all three taken
     off the SAME trajectory polynomial. This adds gravity, Coriolis, and
     inertia feedforward in one call. The downstream PD law (which lives in the
@@ -93,12 +95,10 @@ class JointTrajectoryExecutor:
         # post-clamp subtraction downstream let |tau| reach clamp+|g| and made
         # the configured torque_limits decorative (audit 2026-07-29).
         self._gravity_comp = bool(gravity_comp)
-        self._traj: JointTrajectory | None = None
-        self._t_start: float = 0.0
         # Leg-completion tolerances. Joint stiction (frictionloss vs the soft
         # wrist kp) parks a settle short of the target — 1e-3 rad assumes a
         # frictionless plant; a sim with the noslip pass (or a real geared
-        # joint) stalls at ~frictionloss/kp and done() would never fire.
+        # joint) stalls at ~frictionloss/kp and completion would never fire.
         self._done_pos_tol = float(done_pos_tol)
         self._done_vel_tol = float(done_vel_tol)
         # Clamped integral torque on (q_des - q), riding in tau_ff. A pure PD
@@ -126,10 +126,6 @@ class JointTrajectoryExecutor:
     def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
         """(lower, upper) FACTORY limits off the URDF this executor loaded."""
         return self._dyn.joint_limits
-
-    @property
-    def has_trajectory(self) -> bool:
-        return self._traj is not None
 
     @property
     def kp(self) -> np.ndarray:
@@ -244,32 +240,7 @@ class JointTrajectoryExecutor:
                 raise ValueError(f"kd shape {kd.shape} != expected {self._kd.shape}")
             self._kd = kd
 
-    def load_trajectory(self, traj: JointTrajectory, t_start: float) -> None:
-        if traj.num_joints != self.n_joints:
-            raise ValueError(
-                f"trajectory has {traj.num_joints} joints, executor expects {self.n_joints}"
-            )
-        self._traj = traj
-        self._t_start = float(t_start)
-
-    def elapsed(self, t_now: float) -> float:
-        """Seconds into the loaded trajectory -- the executor's OWN clock.
-
-        The controller needs this to index a Cartesian pose alongside the joint
-        reference, and used to read ``executor._t_start`` directly. Both sides
-        must agree on the anchor, so the anchor stays private and the elapsed
-        time is what crosses the seam.
-        """
-        return float(t_now) - self._t_start
-
-    def clear_trajectory(self) -> None:
-        self._traj = None
-
-    def step(self, t_now: float, state: JointState) -> JointServoCommand:
-        if self._traj is None:
-            raise RuntimeError("step() called before load_trajectory()")
-        tau_local = float(t_now) - self._t_start
-        pt = self._traj.sample_at(tau_local)
+    def step(self, pt: TrajectoryPoint, state: JointState) -> JointServoCommand:
         # qdd comes off the SAME polynomial as q and qd (JointTrajectory is a
         # cubic Hermite). It used to be a 1 ms forward difference of qd, which
         # both lagged half a step and straddled knots -- and differenced a qd
@@ -288,22 +259,17 @@ class JointTrajectoryExecutor:
             kd=self._kd.copy(),
         )
 
-    def done(
+    def at_goal(
         self,
-        t_now: float,
+        goal: np.ndarray,
         state: JointState,
         pos_tol: float | None = None,
         vel_tol: float | None = None,
     ) -> bool:
-        if self._traj is None:
-            return True
+        """At ``goal`` and at rest, within this arm's completion tolerances."""
         pos_tol = self._done_pos_tol if pos_tol is None else float(pos_tol)
         vel_tol = self._done_vel_tol if vel_tol is None else float(vel_tol)
-        tau_local = float(t_now) - self._t_start
-        if tau_local < self._traj.duration_sec:
-            return False
-        last = self._traj.sample_at(self._traj.duration_sec)
-        pos_ok = bool(np.max(np.abs(state.position - last.position)) <= pos_tol)
+        pos_ok = bool(np.max(np.abs(state.position - goal)) <= pos_tol)
         vel_ok = bool(np.max(np.abs(state.velocity)) <= vel_tol)
         return pos_ok and vel_ok
 

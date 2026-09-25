@@ -32,6 +32,20 @@ hardware behavior remain part of the runtime contract.
 Use `planning.stack.build_planner` and `build_preview` for planner-side
 construction, and `control.factory.build_executor` for the streaming side.
 The planner builder does not instantiate an executor just to obtain gains.
+
+On the streaming side, the controller owns the released reference as one
+`control.reference.TrajectoryReference` (CTRL-030): the trajectory, its start
+on the controller's clock, and its sampling (`JointTrajectory.sample_at`, the
+only reference evaluator). Sampling is pure, so any order or repetition gives
+the same point, and it clamps to the endpoints. The executor
+(`JointTrajectoryExecutor`) receives that sampled point and turns it into a
+servo command: feedforward, payload, integral and gains. It stores no
+trajectory and no trajectory time. Completion is the reference having played
+out plus, by default, `executor.at_goal` on the reference end; a plan's
+`completion` rule replaces the goal test. The RT server holds the last
+command and does not interpolate, so there is no native sampler to keep in
+parity yet. Native evaluation and bounded horizons are later CTRL-030 slices
+and change the wire.
 Neutral values live in `motion/types.py`; retiming algorithms remain under
 `planning/retiming.py`. Execution does not depend on a planning-owned value type.
 

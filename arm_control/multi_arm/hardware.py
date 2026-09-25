@@ -382,8 +382,8 @@ class RemoteHardware:
                 q_cmd_pc=None if command is None else command.q_des.tolist(),
                 dq_cmd_pc=None if command is None else command.qd_des.tolist(),
                 plan_id=c.current_plan_id,
-                trajectory_elapsed_s=(c.executor.elapsed(self._reference_time)
-                                      if c.executor.has_trajectory and self._reference_time is not None else None),
+                trajectory_elapsed_s=(c.reference.elapsed(self._reference_time)
+                                      if c.reference is not None and self._reference_time is not None else None),
             )
         return dict(pc_monotonic=now, reference_time_pc=self._reference_time, arms=arms,
                     feedback_ready=self.feedback_ready,

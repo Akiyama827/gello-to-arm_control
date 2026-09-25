@@ -42,6 +42,7 @@ from arm_control.contracts.impedance import pose_hold_values, unpack_pose_hold_v
 
 from arm_control.control.jog_hold import JogHold
 from arm_control.control.leg_settling import SETTLED, TIMED_OUT, LegSettling
+from arm_control.control.reference import TrajectoryReference
 from arm_control.control.trajectory_executor import gain_error
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
 from arm_control.joint_motor_map import (
@@ -164,7 +165,6 @@ class ArmController:
         self.last_command: JointServoCommand | None = None
         self._hold_anchor: JointServoCommand | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
-        self._cartesian_poses: np.ndarray | None = None
         self._last_cartesian_pose: np.ndarray | None = None
         self._pose_hold: dict | None = None
         self.supports_pose_hold = False
@@ -185,9 +185,11 @@ class ArmController:
         self.frozen = False         # milestone hold / failed settle; cancel clears
         self.stopped = False
 
-        # The one loaded plan and whether it has been released to run.
+        # The one loaded plan, its staged trajectory, and once released the
+        # reference being executed (trajectory, start time, sampling).
         self._plan: dict | None = None
         self._pending_traj: JointTrajectory | None = None
+        self._reference: TrajectoryReference | None = None
         self._running = False
 
     # -- clock ---------------------------------------------------------------
@@ -212,6 +214,11 @@ class ArmController:
                     armed=bool(self.armed), ready=bool(self.ready_sent),
                     executing=bool(self._running), stopped=bool(self.stopped),
                     frozen=bool(self.frozen), plan_id=self.current_plan_id)
+
+    @property
+    def reference(self) -> TrajectoryReference | None:
+        """The released reference being executed, or None."""
+        return self._reference
 
     def _stage_ack(self, plan_id: str, *, ok: bool, reason: str = "") -> None:
         self.node.send_output("controller_event", pack_controller_event(
@@ -294,7 +301,6 @@ class ArmController:
         self.executor.set_gains(kp=plan["kp"], kd=plan["kd"])
         self._plan = plan
         self._cartesian_now = plan.get("cartesian")
-        self._cartesian_poses = plan.get("cartesian_poses")
         self._pending_traj = traj
         self._running = False
         self._stage_ack(plan["plan_id"], ok=True)
@@ -335,7 +341,7 @@ class ArmController:
             # Milestone reached: hold this pose forever rather than disarming.
             self.frozen = True
             self._running = False
-            self.executor.clear_trajectory()
+            self._reference = None
             print(
                 f"[arm_controller] holding: {fields.get('reason', 'milestone')}",
                 flush=True,
@@ -501,7 +507,7 @@ class ArmController:
             # Fall through: the planner needs a hold streaming from right now,
             # because it is about to spend seconds planning the first leg.
         if (self.execution_policy is not None and self._running
-                and self.executor.has_trajectory):
+                and self._reference is not None):
             # Ordinary joint-goal completion must retain the planned endpoint.
             # Re-latching measured q here baked the allowed settle residual into
             # a new target and added another static tracking error at each stop.
@@ -514,9 +520,9 @@ class ArmController:
                         self.executor.hold_command(arm, q_des=goal)
                         if goal is not None else None
                     )
-                self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
-        if self._running and self.executor.has_trajectory:
-            command = self.executor.step(self.exec_time, arm)
+                self._cartesian_now = self._last_cartesian_pose = None
+        if self._running and self._reference is not None:
+            command = self.executor.step(self._reference.sample(self.exec_time), arm)
             self._hold_anchor = None  # motion streams: next hold re-anchors
             if self._send(command, self._cartesian_for_time(self.exec_time)) is False:
                 return
@@ -583,8 +589,9 @@ class ArmController:
                 self._pending_traj = None
                 return
         start = self.exec_time
-        self.executor.load_trajectory(self._pending_traj, t_start=start)
-        self._settling.begin(start + self._pending_traj.duration_sec)
+        self._reference = TrajectoryReference(
+            self._pending_traj, start, self._plan.get("cartesian_poses"))
+        self._settling.begin(start + self._reference.duration_sec)
         self._completion_sample_at = None
         self._running = True
         print(
@@ -709,7 +716,7 @@ class ArmController:
             and np.max(np.abs(self.last_state.velocity)) < .01
         )
         if self.execution_policy is not None:
-            self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
+            self._cartesian_now = self._last_cartesian_pose = None
         if self._pose_hold is not None:
             self._pose_hold = None
             self.last_command = None
@@ -721,7 +728,7 @@ class ArmController:
         self._plan = None
         self._pending_traj = None
         self._running = False
-        self.executor.clear_trajectory()
+        self._reference = None
         self._jog.clear()
         if not keep_anchor:
             self._hold_anchor = None
@@ -731,7 +738,7 @@ class ArmController:
     def _leg_done(self, state: JointState) -> bool:
         """Has this leg finished? The RULE arrives with the plan.
 
-        No rule means the executor's own done(): the plan played out and the
+        No rule means the default: the reference played out and the
         arm is at the target. A ``completion`` spec means the SETTLE rule
         instead -- the plan played out, the arm has genuinely STOPPED, and it
         did not stop absurdly far from the plan. That rule exists for legs
@@ -740,13 +747,14 @@ class ArmController:
         one that gets to know which legs those are, or what tolerances their
         physics deserves. Both numbers ride in with the leg.
         """
+        ref = self._reference
+        if ref is None:
+            return True
+        if not ref.played_out(self.exec_time):
+            return False  # the plan has not played out yet
         spec = (self._plan or {}).get("completion")
         if spec is None:
-            return self.executor.done(self.exec_time, state)
-        if not self.executor.done(
-            self.exec_time, state, pos_tol=float("inf"), vel_tol=float("inf")
-        ):
-            return False  # the plan has not played out yet
+            return self.executor.at_goal(ref.end.position, state)
         if float(np.max(np.abs(np.asarray(state.velocity)))) > spec["vel_tol"]:
             return False  # still moving: not settled yet
         goal = spec.get("goal_q")
@@ -798,7 +806,7 @@ class ArmController:
             # A failed settle must not turn into another motion or release an
             # attached object. Freeze at the measured pose with zero velocity.
             self.last_command = self._hold_anchor = self._static_hold()
-            self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
+            self._cartesian_now = self._last_cartesian_pose = None
             self._pending_traj = None
             self.frozen = True
             self._finish_leg(ok=False, reason=reason, completion=progress)
@@ -816,7 +824,7 @@ class ArmController:
 
     def _finish_leg(self, *, ok: bool, reason: str, completion=None) -> None:
         plan_id = "" if self._plan is None else self._plan["plan_id"]
-        self.executor.clear_trajectory()
+        self._reference = None
         self._running = False
         self._plan = None
         self.node.send_output(
@@ -886,13 +894,7 @@ class ArmController:
         (which is FK(q_des)) rides along with the plan rather than being
         re-derived here from a model this node is not allowed to load.
         """
-        poses = self._cartesian_poses
-        if poses is None or self._plan is None:
-            return None
-        times = self._plan["times"]
-        tau = np.clip(self.executor.elapsed(t_now), times[0], times[-1])
-        idx = int(np.searchsorted(times, tau, side="right")) - 1
-        return poses[max(0, min(idx, len(poses) - 1))]
+        return None if self._reference is None else self._reference.cartesian_pose(t_now)
 
     def _send(self, command: JointServoCommand, cartesian_pose) -> bool:
         aborted = False
@@ -964,7 +966,7 @@ class ArmController:
         self._plan = None
         self._pending_traj = None
         self._running = False
-        self.executor.clear_trajectory()
+        self._reference = None
         self.ready_sent = False
         self.bridge_armed = not self._needs_health
         self._hold_anchor = None
