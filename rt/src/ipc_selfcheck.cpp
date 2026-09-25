@@ -115,6 +115,8 @@ struct Bench {
     ctx.session_id.store(SESSION);
     ctx.claim_ok.store(true);
     ctx.ctl_peer_ip.store(CLIENT_IP);
+    ctx.backend_n.store(2);         // rt_loop publishes the backend,
+    ctx.backend_ready.store(true);  // then its RT setup and readiness
   }
   uint64_t arm() { return begin_arm(ctx); }  // CTL_ARM's transition
   void disarm() { ctx.armed.store(false); }
@@ -402,7 +404,29 @@ void check_rt_setup() {
   assert(!std::strcmp(names, "ok"));
 }
 
+// A refused ARM leaves no trace of a new generation.
+void assert_nothing_prepared(Bench& b, uint64_t owner) {
+  ArmStart start{};
+  assert(b.ctx.arm_start.read(start) == 0);  // never written
+  assert(b.ctx.arm_gen.load() == 0 && !b.ctx.armed.load());
+  assert(b.ctx.cmd_owner.load() == owner && b.ctx.peer_gen == 0);
+  assert(b.ctx.latch_state.load() == ServerCtx::LATCH_FREE);
+}
+
 void check_rt_setup_gate() {
+  {  // before rt_loop publishes: the setup fields are still permissive
+     // defaults, and ARM is refused anyway, preparing nothing
+    Bench b;
+    b.ctx.backend_ready.store(false);
+    assert(!b.ctx.rt_setup_blocks_arm());  // the defaults alone would admit
+    const uint64_t owner = b.ctx.cmd_owner.load();
+    for (int i = 0; i < 3; ++i) {
+      assert(b.arm() == 0);
+      assert_nothing_prepared(b, owner);
+    }
+    b.ctx.backend_ready.store(true);  // published: now admitted
+    assert(b.arm() == 1 && b.ctx.armed.load());
+  }
   {  // real backend, setup failed: ARM refused, repeatedly, preparing nothing
     Bench b;
     b.ctx.rt_setup_failed.store(RT_SETUP_MLOCK | RT_SETUP_SCHED);
@@ -410,11 +434,7 @@ void check_rt_setup_gate() {
     const uint64_t owner = b.ctx.cmd_owner.load();
     for (int i = 0; i < 3; ++i) {
       assert(b.arm() == 0);
-      ArmStart start{};
-      assert(b.ctx.arm_start.read(start) == 0);  // never written
-      assert(b.ctx.arm_gen.load() == 0 && !b.ctx.armed.load());
-      assert(b.ctx.cmd_owner.load() == owner && b.ctx.peer_gen == 0);
-      assert(b.ctx.latch_state.load() == ServerCtx::LATCH_FREE);
+      assert_nothing_prepared(b, owner);
     }
     char why[sizeof(ControlPacket{}.text)];
     rt_setup_refusal(b.ctx, why, sizeof(why));
@@ -447,7 +467,8 @@ int main() {
   check_retired_handler();
   check_freshness();
   std::puts("PASS RT IPC: process RT setup (mlockall/FIFO/affinity failures read back, "
-            "gate refuses ARM for real backends before any preparation, fake permitted), "
+            "no ARM before the backend is ready, gate refuses ARM for real backends before any "
+            "preparation, fake permitted), "
             "mailbox latest-wins without tearing, admission before side effects (stale-port pin, "
             "epochs, observers), retired-handler and session scoping, generation-owned deadline");
 }

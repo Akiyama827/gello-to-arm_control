@@ -578,9 +578,11 @@ inline void rt_setup_refusal(const ServerCtx& ctx, char* out, size_t cap) {
 }
 
 inline uint64_t begin_arm(ServerCtx& ctx) {
-  // Checked first: a process that could not establish its RT setup prepares
-  // nothing of a new generation.
-  if (ctx.rt_setup_blocks_arm()) return 0;
+  // Checked first, before anything of a new generation is prepared: no ARM
+  // until rt_loop has published the backend and its RT setup result (the
+  // setup fields are permissive defaults until then), and none when that
+  // setup failed.
+  if (!ctx.backend_ready.load(std::memory_order_acquire) || ctx.rt_setup_blocks_arm()) return 0;
   uint64_t gen = 0;
   ctx.arm_unlatched([&] {
     gen = ctx.arm_gen.load(std::memory_order_relaxed) + 1;

@@ -109,12 +109,18 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   // hang until SIGKILL). A short send timeout turns that into session loss.
   timeval stv{0, 500'000};
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
-  // HELLO only once the backend exists — a client connecting during franka
-  // construction (~1 s) must not be told "0 joints".
-  for (int i = 0; i < 300 && !ctx.backend_ready.load() && !ctx.shutdown.load();
-       ++i) {
+  // HELLO only once the backend exists and its RT setup is published — a
+  // client connecting during franka construction (~1 s) must not be told
+  // "0 joints" or rt=ok before the setup ran. No timeout: a server that never
+  // becomes ready says nothing (the client's own timeout reports it).
+  while (!ctx.backend_ready.load() && !ctx.shutdown.load()) {
     timespec ts{0, 10'000'000};
     nanosleep(&ts, nullptr);
+  }
+  if (!ctx.backend_ready.load()) {  // shutting down before ready: no session was used
+    ctx.session_id.store(0);
+    close(fd);
+    return;
   }
   // HELLO text carries the launch-time SAFETY flags, not just the backend
   // name: the client must be able to refuse a server whose deadman is
@@ -230,7 +236,10 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           // deliberately retained) — the FAULTED bit is the refusal, and
           // clients must check it, not just ARMED.
           const uint64_t gen = begin_arm(ctx);
-          if (gen == 0 && ctx.rt_setup_blocks_arm()) {
+          if (gen == 0 && !ctx.backend_ready.load()) {
+            send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx),
+                                "refused: backend not ready (RT setup pending)"));
+          } else if (gen == 0 && ctx.rt_setup_blocks_arm()) {
             char why[sizeof(ControlPacket{}.text)];
             rt_setup_refusal(ctx, why, sizeof(why));
             std::fprintf(stderr, "[rt] ARM %s\n", why);
