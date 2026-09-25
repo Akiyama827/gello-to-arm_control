@@ -255,7 +255,7 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     time.sleep(0.3)
     t0 = time.monotonic()
     cancelled = arm.cancel(long.execution_id, "operator stop")
-    assert time.monotonic() - t0 < 1.0, "cancel waited behind another thread's wait"
+    assert time.monotonic() - t0 < 0.5, "cancel waited behind another thread's wait"
     waiter.join(timeout=2)
     assert not waiter.is_alive()
     assert cancelled.phase is Phase.CANCELLED and cancelled.reason == "operator stop"

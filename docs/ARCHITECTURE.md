@@ -566,6 +566,9 @@ server.
   - Dora processes need `.[dora]`.
   - `tools/bench/check_sdk_supervisor.py` drives all of it device-free,
     including from a clean numpy-only install.
+  - `tools/bench/check_supervisor_ledger.py` covers the ledger rules the fake
+    server cannot provoke: completion without acceptance, ARM during a
+    pending DISARM, and retention.
 - **One writer.** Until the Dora adapters delegate to the supervisor, a robot
   is driven by either the supervisor or a Dora graph (PC-controlled mode),
   never both. The RT server admits one control session, so a second commander
