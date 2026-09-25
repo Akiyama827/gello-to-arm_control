@@ -116,16 +116,13 @@ def child(kind: str, stop: str, directory: Path) -> None:
         Node.next = next_connected
     else:
         from arm_control.control import adapter
+        from arm_control.control.arm_controller import ArmController
         from arm_control.control.doubles import _FakeExecutor, _GRIPPER
 
-        names = [f"joint_{i}" for i in range(7)]
-        adapter.load_robot_config = lambda: SimpleNamespace(
-            joint_names=names, motor_names=names, get=lambda key: None)
-        adapter.arm_joints = lambda cfg: names
+        adapter.load_robot_config = lambda: SimpleNamespace(get=lambda key: None)
         adapter._load_mode_config = lambda: {}
-        adapter.resolve_gains = lambda *args: None
-        adapter.build_executor = lambda *args, **kwargs: _FakeExecutor()
-        adapter.gripper_command_cfg = lambda cfg: dict(_GRIPPER)
+        adapter.build_arm_controller = lambda cfg, node, *, arm_id, mode_cfg, **kw: (
+            ArmController(node, _FakeExecutor(), arm_id=arm_id, gripper=dict(_GRIPPER), **kw))
     adapter.Node = Node
     try:
         adapter.main()

@@ -25,12 +25,11 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from arm_control.config import arm_joints
 from arm_control.control.arm_controller import ArmController
-from arm_control.control.execution_policy import build_execution_policy
-from arm_control.control.factory import build_executor, gripper_command_cfg
+from arm_control.control.factory import build_arm_controller
 from arm_control.execution import codec
 from arm_control.execution.contract import (
     CONTRACT_VERSION, Authority, Capabilities, Clock, ExecutionStatus, Lifecycle, Phase,
@@ -41,16 +40,11 @@ from arm_control.messages import (
     pack_control_update, pack_json_message, pack_motor_state_dict, pack_plan,
     unpack_controller_event, unpack_json_message, unpack_motor_command,
 )
-from arm_control.model_bundle import model_token, pose_provenance
-from arm_control.multi_arm.interface import QueueControllerNode
-from arm_control.node_utils import resolve_gains
+from arm_control.control.inprocess import QueueControllerNode
 from arm_control.plants.remote_rt import protocol as rtp
 from arm_control.plants.remote_rt.client import RtBackend, epoch_reached
 from arm_control.plants.remote_rt.observation import AppliedTracker, authority, robot_state
 
-#: How long a completion observed on feedback may wait for plant acceptance
-#: evidence before the execution is FAULTED instead of COMPLETED.
-APPLIED_GRACE_S = 0.5
 #: Executions kept for status queries and request_id idempotency.
 #: ponytail: fixed window; persist the ledger if replay needs more (CTRL-050).
 RETAINED = 512
@@ -101,6 +95,11 @@ class RobotRuntime:
         self.instance_id = str((cfg.get("rt") or {}).get("instance_id", ""))
         self.link = link if link is not None else RtBackend.from_config(cfg)
         self.domain = monotonic_domain()
+        # How long a completion observed on feedback may wait for acceptance
+        # evidence before the execution is FAULTED instead of COMPLETED. That
+        # evidence is the next state packet, which the link's own freshness
+        # bound already promises; past it the link is stale anyway.
+        self.applied_grace_s = float(self.link.config.state_timeout_s)
         self.controller = self._build_controller()
         self.period = self.controller.execution_policy.period
         self._profile_gains = (self.controller.executor.kp.copy(),
@@ -130,27 +129,9 @@ class RobotRuntime:
 
     # -- construction ----------------------------------------------------------
     def _build_controller(self) -> ArmController:
-        """The same executor, policy and controller the Dora adapter builds.
-        ponytail: a third copy of that recipe (control/adapter.py, RemoteHardware);
-        fold them into one builder when those callers migrate here."""
-        cfg, n = self.cfg, len(self.joints)
-        gains = resolve_gains(cfg, cfg.get("control_mode") or {},
-                              list(cfg.get("joint_names") or cfg.get("motor_names") or []), n)
-        executor = build_executor(cfg, arm_id=self.instance_id, gains=gains)
-        policy = build_execution_policy(
-            cfg.get("execution_policy"),
-            torque_limits=None if gains is None else gains["torque_limits"][:n],
-            joint_limits=executor.joint_limits)
-        if policy is None:
-            raise ValueError("the supervisor needs an execution_policy (100 Hz deadline mode)")
-        arm = cfg.get("arm") or {}
-        return ArmController(
-            _Node(self), executor, arm_id=self.instance_id,
-            gripper=gripper_command_cfg(cfg), clock=time.monotonic,
-            execution_policy=policy, plant_reports_health=True,
-            model_token=model_token(cfg), pose_provenance=pose_provenance(cfg),
-            settle_timeout_s=float(arm.get("settle_timeout_s", 5.0)),
-            settle_dwell_s=float(arm.get("settle_dwell_s", 0.2)))
+        return build_arm_controller(
+            self.cfg, _Node(self), arm_id=self.instance_id, require_policy=True,
+            clock=time.monotonic, plant_reports_health=True)
 
     # -- lifecycle ---------------------------------------------------------------
     def start(self) -> None:
@@ -498,7 +479,7 @@ class RobotRuntime:
             if ex.completed_at is not None:
                 if phase is Phase.APPLIED:
                     self._receipt(ex, Phase.COMPLETED)
-                elif now - ex.completed_at > APPLIED_GRACE_S:
+                elif now - ex.completed_at > self.applied_grace_s:
                     self._receipt(ex, Phase.FAULTED, "completed on feedback without plant "
                                                      "acceptance evidence")
                 continue
@@ -642,17 +623,15 @@ class RobotRuntime:
             state, rt_identity, received_ns=int(rx * 1e9), now_ns=int(now * 1e9),
             max_age_s=float(link.config.state_timeout_s), pc_domain=self.domain,
             rt_domain=f"rt:{self.instance_id}")
+        # ``session`` stays the RT control session (the frozen contract); the
+        # client that owns the robot shows only as CLAIMED vs CONNECTED.
         if state is None or not health["state_fresh"]:
-            self._authority = Authority(Lifecycle.DISCONNECTED, self._owner)
+            self._authority = Authority(Lifecycle.DISCONNECTED)
             return
         rt = authority(state, claimed_session=link.session_id,
                        fault_text=health["latched_fault"])
-        if rt.lifecycle in (Lifecycle.ARMED, Lifecycle.FAULTED):
-            self._authority = Authority(rt.lifecycle, self._owner, rt.arm_epoch, rt.stop_epoch,
-                                        rt.fault, rt.holding)
-        elif rt.lifecycle is Lifecycle.CLAIMED:  # the supervisor holds the RT claim
-            self._authority = Authority(
-                Lifecycle.CLAIMED if self._owner else Lifecycle.CONNECTED, self._owner,
-                0, rt.stop_epoch, holding=rt.holding)
-        else:
-            self._authority = Authority(Lifecycle.DISCONNECTED, self._owner)
+        if rt.lifecycle is Lifecycle.CLAIMED and self._owner is None:
+            rt = replace(rt, lifecycle=Lifecycle.CONNECTED)  # supervisor's claim, no owner
+        elif rt.lifecycle is Lifecycle.CONNECTED:  # another RT session's packet
+            rt = Authority(Lifecycle.DISCONNECTED)
+        self._authority = rt

@@ -14,7 +14,8 @@ from arm_control import frames
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.factory import build_executor, gripper_command_cfg
 from arm_control.messages import pack_motor_state, unpack_motor_command
-from arm_control.multi_arm.interface import LocalArmHandle, QueueControllerNode
+from arm_control.control.inprocess import QueueControllerNode
+from arm_control.multi_arm.interface import LocalArmHandle
 from arm_control.multi_arm.config import scene_for_mode
 from arm_control.plants.mujoco.backend import MuJoCoBackend
 

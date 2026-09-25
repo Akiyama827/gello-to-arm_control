@@ -23,9 +23,16 @@ import numpy as np
 
 from arm_control.config import CONTROL_ROOT, _arm_block, arm_joints, ee_frame
 from arm_control.dynamics import PinocchioDynamics
+from arm_control.control.arm_controller import ArmController
+from arm_control.control.execution_policy import build_execution_policy
 from arm_control.control.trajectory_executor import JointTrajectoryExecutor
+from arm_control.model_bundle import model_token, pose_provenance
+from arm_control.node_utils import resolve_gains
 
-__all__ = ["arm_urdf", "gain_vector", "gripper_command_cfg", "build_executor"]
+__all__ = [
+    "arm_urdf", "gain_vector", "gripper_command_cfg", "build_executor",
+    "build_arm_controller",
+]
 
 
 def arm_urdf(cfg) -> str:
@@ -149,6 +156,48 @@ def build_executor(
     # phase gains (centimeters at the EE — measured in the twin).
     executor.set_payload(0.0, ee_frame(cfg))
     return executor
+
+
+def build_arm_controller(
+    cfg, node, *, arm_id: str, mode_cfg: dict | None = None, gravity=None,
+    require_policy: bool = False, **options,
+) -> ArmController:
+    """The one recipe for an arm's ``ArmController`` from its config.
+
+    Gains (mode config first, arm table second; ``mode_cfg`` defaults to the
+    config's ``control_mode``), executor, execution policy, model binding,
+    pose provenance and settling are decided here and nowhere else. Callers
+    pass what their process owns -- the node, clocks, health reporting -- as
+    ``options``; ``require_policy`` refuses a config without the 100 Hz
+    deadline policy.
+    """
+    n = len(arm_joints(cfg))
+    names = list(cfg.get("joint_names") or cfg.get("motor_names") or [])
+    if mode_cfg is None:
+        mode_cfg = cfg.get("control_mode") or {}
+    gains = resolve_gains(cfg, mode_cfg, names, n)
+    executor = build_executor(cfg, arm_id=arm_id, gains=gains, gravity=gravity)
+    policy_cfg = cfg.get("execution_policy")
+    if policy_cfg is not None and gains is None:
+        raise ValueError("execution_policy requires resolved per-joint torque limits")
+    # The position envelope comes from the robot description, not from YAML --
+    # see build_execution_policy.
+    policy = build_execution_policy(
+        policy_cfg,
+        torque_limits=None if gains is None else gains["torque_limits"][:n],
+        joint_limits=executor.joint_limits,
+    )
+    if require_policy and policy is None:
+        raise ValueError(f"{arm_id}: needs an execution_policy (100 Hz deadline mode)")
+    arm = cfg.get("arm") or {}
+    return ArmController(
+        node, executor, arm_id=arm_id, gripper=gripper_command_cfg(cfg),
+        execution_policy=policy, model_token=model_token(cfg),
+        pose_provenance=pose_provenance(cfg),
+        settle_timeout_s=float(arm.get("settle_timeout_s", 5.0)),
+        settle_dwell_s=float(arm.get("settle_dwell_s", 0.2)),
+        **options,
+    )
 
 
 

@@ -14,7 +14,7 @@ from arm_control.multi_arm import (
     LocalArmHandle,
 )
 from arm_control.multi_arm.coordinator import BimanualCoordinator
-from arm_control.multi_arm.interface import QueueControllerNode
+from arm_control.control.inprocess import QueueControllerNode
 from arm_control.multi_arm.types import PairLifecycle as P
 
 

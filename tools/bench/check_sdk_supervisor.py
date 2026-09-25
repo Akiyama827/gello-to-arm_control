@@ -174,7 +174,10 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     # Connecting is observation only: nothing claimed, armed or moved.
     time.sleep(0.3)
     auth = arm.authority()
-    assert auth.lifecycle is Lifecycle.CONNECTED and auth.session is None, auth
+    # Authority.session is the supervisor's RT control session, never a client's.
+    assert auth.lifecycle is Lifecycle.CONNECTED and auth.session, auth
+    rt_session = auth.session
+    assert rt_session != arm.session
     state = arm.state()
     assert state.validity.value == "valid" and state.selected_q is None, state
     assert arm.capabilities.rt_setup != "unknown" and "joint_impedance" in arm.capabilities.profiles
@@ -186,7 +189,8 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     expect_refused(lambda: arm.execute(move("r0", zero, target, 1.0)), "claim sdk_arm first")
 
     # One owner.
-    assert arm.claim().lifecycle is Lifecycle.CLAIMED
+    claimed = arm.claim()
+    assert claimed.lifecycle is Lifecycle.CLAIMED and claimed.session == rt_session, claimed
     other = ArmClient("sdk_arm", socket_path=sock)
     expect_refused(other.claim, "already owned")
     expect_refused(lambda: other.execute(move("r0", zero, target, 1.0)), "owned by another")
@@ -304,8 +308,8 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     s = other.status(h.execution_id)
     assert s.phase is Phase.CANCELLED and s.reason == "owner disconnected", s
     auth = other.authority()
-    assert auth.lifecycle is Lifecycle.ARMED and auth.session is None, auth
-    assert other.claim().session == other.session
+    assert auth.lifecycle is Lifecycle.ARMED and auth.session == rt_session, auth
+    assert other.claim().session == rt_session  # nobody owns it any more
 
     # An owner PROCESS that dies inside a long wait is noticed within ~1 s.
     other.unclaim()
@@ -321,7 +325,7 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     s = other.status(eid)
     assert s.phase is Phase.CANCELLED and s.reason == "owner disconnected", s
     print(f"  owner process killed mid-wait: cancelled after {time.monotonic() - t0:.2f}s")
-    assert other.claim().session == other.session
+    assert other.claim().session == rt_session
 
     # A plant that disappears mid-run faults the execution; nothing hangs.
     k = other.execute(move("r13", other.state().q, zero, 3.0))

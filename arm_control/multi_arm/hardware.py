@@ -12,22 +12,19 @@ import numpy as np
 
 from arm_control import frames
 from arm_control.config import arm_joints, gripper_joints
-from arm_control.control.arm_controller import ArmController
-from arm_control.control.execution_policy import build_execution_policy
-from arm_control.control.factory import build_executor, gripper_command_cfg
+from arm_control.control.factory import build_arm_controller
 from arm_control.end_effectors.franka_adapter import BridgeClient
 from arm_control.messages import (
     pack_control_update, pack_json_message, pack_motor_state_dict,
     unpack_json_message, unpack_motor_command,
 )
-from arm_control.model_bundle import pose_provenance
-from arm_control.multi_arm.interface import LocalArmHandle, QueueControllerNode
+from arm_control.control.inprocess import QueueControllerNode
+from arm_control.multi_arm.interface import LocalArmHandle
 from arm_control.multi_arm.synchronization import SharedReferenceClock
 from arm_control.multi_arm.feedback import FeedbackGap, align_feedback
 from arm_control.multi_arm.cooperative import (
     CooperativeKinematics, RigidGrasps, pose_error, virtual_capture_reason,
 )
-from arm_control.node_utils import resolve_gains
 from arm_control.plants.remote_rt.client import RtBackend
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 
@@ -106,28 +103,15 @@ class RemoteHardware:
             for actor in config.scene.actors:
                 a, cfg = actor.name, config.robots[actor.name]
                 joints = arm_joints(cfg)
-                gains = resolve_gains(cfg, cfg.get("control_mode") or {}, joints, len(joints))
-                executor = build_executor(
-                    cfg, arm_id=a, gains=gains,
+                # Model binding is enforced for remote_rt by load_pair_config.
+                c = build_arm_controller(
+                    cfg, _HardwareNode(self, a), arm_id=a, require_policy=True,
                     gravity=frames.world_T_arm(cfg)[:3, :3].T @ np.array([0., 0., -9.81]),
+                    clock=time.monotonic, reference_clock=self.reference_clock,
+                    plant_reports_health=True,
                 )
-                policy = build_execution_policy(
-                    cfg.get("execution_policy"), torque_limits=gains["torque_limits"],
-                    joint_limits=executor.joint_limits,
-                )
-                if policy is None or not config.model_tokens[a]:
-                    raise ValueError(f"{a}: hardware needs an execution policy and model binding")
-                if abs(policy.period - self.period) > 1e-9:
+                if abs(c.execution_policy.period - self.period) > 1e-9:
                     raise ValueError("pair hardware controllers require a common 100 Hz policy")
-                c = ArmController(
-                    _HardwareNode(self, a), executor, arm_id=a,
-                    gripper=gripper_command_cfg(cfg), clock=time.monotonic,
-                    reference_clock=self.reference_clock,
-                    execution_policy=policy, plant_reports_health=True,
-                    model_token=config.model_tokens[a], pose_provenance=pose_provenance(cfg),
-                    settle_timeout_s=float((cfg.get("arm") or {}).get("settle_timeout_s", 5)),
-                    settle_dwell_s=float((cfg.get("arm") or {}).get("settle_dwell_s", .2)),
-                )
                 self.controllers[a] = c
                 self.handles[a] = _HardwareHandle(c, self)
                 self.slices[a] = slice(offset, offset + len(joints))

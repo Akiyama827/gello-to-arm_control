@@ -549,6 +549,9 @@ server.
   - CLAIMED means a client owns the robot through the supervisor's RT claim.
   - CONNECTED means nobody owns it.
   - DISCONNECTED means no fresh RT state.
+  - `session` is the supervisor's RT control session, as frozen; a client
+    session never appears there. A client knows it owns the robot because
+    its `claim` succeeded.
 - **Admission.**
   - Contract admission (`admission_refusal`, then `supersession_refusal`)
     runs first.
@@ -558,7 +561,16 @@ server.
     expiry and `selection_refusal`.
 - **Completion.** A feedback completion becomes COMPLETED only once APPLIED is
   reached. It becomes FAULTED if acceptance evidence has not arrived within
-  0.5 s.
+  the link's state freshness bound (`rt.state_timeout_s`): that evidence is
+  the next state packet, and past that bound the link is stale anyway.
+- **One controller recipe.** `control.factory.build_arm_controller` resolves
+  gains, executor, execution policy, model token, pose provenance and
+  settling for the supervisor, the Dora `arm_controller` node and
+  `RemoteHardware`; each passes only its node, clocks and health reporting.
+  The in-process controller seam (`control.inprocess.QueueControllerNode`)
+  sits under both the supervisor and `multi_arm`. The shared MuJoCo pair
+  (`multi_arm.simulation`) still builds its sim controllers directly: no
+  gains table, no deadline policy, simulation time.
 - **Install.**
   - The minimal SDK needs numpy only (`pip install .`).
   - The supervisor needs `.[supervisor]` (pyarrow for the controller's
@@ -577,9 +589,10 @@ server.
 Not in this slice:
 
 - `RobotGroup` and group reservation (CTRL-040)
-- migrating the Dora `arm_controller` node, the consoles and `RemoteHardware`
-  onto the runtime; they still build their own `ArmController`, the same
-  recipe
+- moving the Dora `arm_controller` node and the consoles onto the SDK, and
+  `RemoteHardware`'s pair execution onto supervisors (after CTRL-040, which
+  gives the pair a scheduled group commit; until then the pair keeps its
+  shared PC reference clock in one process)
 - a client lease or heartbeat beyond connection liveness
 - clearing a completion-timeout freeze without DISARM: a FAULTED settle
   leaves the controller frozen, and later submits are refused until DISARM

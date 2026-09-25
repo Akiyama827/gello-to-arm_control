@@ -14,8 +14,7 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
-import pyarrow as pa
-
+from arm_control.control.inprocess import QueueControllerNode
 from arm_control.messages import (
     pack_control_update,
     pack_motor_command,
@@ -58,37 +57,6 @@ class ArmHandle(Protocol):
     def set_gains(self, kp=None, kd=None) -> None: ...
 
     def command_gripper(self, finger_m: float) -> None: ...
-
-
-class QueueControllerNode:
-    """An in-process controller node: collects outputs, feeds inputs.
-
-    This is the local seam for driving an ``ArmController`` inside one
-    process (bench checks, single-process demos). It implements exactly the
-    two methods ``ArmController.run``/handlers use -- ``send_output`` and
-    ``next`` -- plus ``drain_controller_events`` for a handle to poll.
-    """
-
-    def __init__(self) -> None:
-        self.sent: list[tuple[str, pa.Array]] = []
-        self._inputs: list[dict] = []
-
-    def send_output(self, topic: str, arrow) -> None:
-        self.sent.append((topic, arrow))
-
-    def inject(self, event: dict) -> None:
-        """Queue one Dora-shaped event (``{"type": "INPUT", ...}``)."""
-        self._inputs.append(event)
-
-    def next(self, *, timeout: float = 0.0):
-        if self._inputs:
-            return self._inputs.pop(0)
-        return None
-
-    def drain_controller_events(self) -> list[pa.Array]:
-        events = [arrow for topic, arrow in self.sent if topic == "controller_event"]
-        self.sent = [(t, a) for t, a in self.sent if t != "controller_event"]
-        return events
 
 
 class LocalArmHandle:
