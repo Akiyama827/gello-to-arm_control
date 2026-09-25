@@ -24,13 +24,15 @@ from arm_control.sdk import MAX_MESSAGE, default_socket_path
 from arm_control.supervisor.runtime import Refused, RobotRuntime
 
 MAX_CLIENTS = 8
-MAX_WAIT_S = 60.0
+#: Longest a single request may block its connection thread. Clients wait
+#: longer by repeating short waits, so a dropped owner is noticed within this.
+MAX_WAIT_S = 1.0
 
 
 def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
     """One named supervisor operation -> a JSON-able result. The same names
     and arguments whatever the transport."""
-    wait = min(float(args.get("timeout_s", args.get("wait_for_s", 0.0)) or 0.0), MAX_WAIT_S)
+    wait = min(max(float(args.get("wait_for_s", 0.0) or 0.0), 0.0), MAX_WAIT_S)
     enc = codec.encode
     if op == "hello":
         return dict(session=session, contract_version=CONTRACT_VERSION,
@@ -45,7 +47,10 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
     if op in ("claim", "unclaim"):
         return enc(getattr(runtime, op)(session))
     if op in ("arm", "disarm"):
-        return enc(getattr(runtime, op)(session, timeout_s=wait or 5.0))
+        return {"gen": getattr(runtime, op)(session)}
+    if op == "await_authority":
+        auth = runtime.await_authority(int(args["gen"]), armed=bool(args["armed"]), wait_s=wait)
+        return {"settled": auth is not None, "authority": enc(auth)}
     if op == "submit":
         return enc(runtime.submit(session, codec.request_from(args["request"])))
     if op == "release":

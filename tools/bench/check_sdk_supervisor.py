@@ -249,7 +249,15 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     # SELECTED or later is never replaced.
     x = arm.execute(move("r9", zero, target, 1.0, supersedes=long.execution_id))
     assert x.phase is Phase.REJECTED and "only admitted" in x.reason, x
+    # A long wait on one thread does not hold the channel against a cancel.
+    waiter = threading.Thread(target=lambda: arm.wait(long.execution_id, 20), daemon=True)
+    waiter.start()
+    time.sleep(0.3)
+    t0 = time.monotonic()
     cancelled = arm.cancel(long.execution_id, "operator stop")
+    assert time.monotonic() - t0 < 1.0, "cancel waited behind another thread's wait"
+    waiter.join(timeout=2)
+    assert not waiter.is_alive()
     assert cancelled.phase is Phase.CANCELLED and cancelled.reason == "operator stop"
     time.sleep(0.5)
     auth, state = arm.authority(), arm.state()
@@ -299,6 +307,22 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     assert auth.lifecycle is Lifecycle.ARMED and auth.session is None, auth
     assert other.claim().session == other.session
 
+    # An owner PROCESS that dies inside a long wait is noticed within ~1 s.
+    other.unclaim()
+    owner = subprocess.Popen([sys.executable, "-c", OWNER_SCRIPT, str(sock)],
+                             stdout=subprocess.PIPE, text=True)
+    eid = owner.stdout.readline().strip()
+    wait_phase(other, eid, Phase.APPLIED)
+    owner.kill()
+    t0 = time.monotonic()
+    while not other.status(eid).terminal:
+        assert time.monotonic() - t0 < 1.5, "owner death not noticed"
+        time.sleep(0.02)
+    s = other.status(eid)
+    assert s.phase is Phase.CANCELLED and s.reason == "owner disconnected", s
+    print(f"  owner process killed mid-wait: cancelled after {time.monotonic() - t0:.2f}s")
+    assert other.claim().session == other.session
+
     # A plant that disappears mid-run faults the execution; nothing hangs.
     k = other.execute(move("r13", other.state().q, zero, 3.0))
     wait_phase(other, k.execution_id, Phase.APPLIED)
@@ -320,6 +344,24 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     assert not heavy, f"the SDK process imported {heavy}"
     print("  receipts, ownership, idempotency, supersession, expiry, cancel, stalls, "
           "disarm, owner loss, plant loss: ok; SDK process imported nothing heavy")
+
+
+OWNER_SCRIPT = """
+import sys
+import numpy as np
+from arm_control.execution.contract import TrajectoryRequest
+from arm_control.motion import JointTrajectory
+from arm_control.sdk import ArmClient
+arm = ArmClient("sdk_arm", socket_path=sys.argv[1])
+arm.claim()
+q0 = arm.state().q
+q1 = np.array([0.3, -0.2, 0.25])
+traj = JointTrajectory([0.0, 1.5, 3.0], np.stack([q0, (q0 + q1) / 2, q1]),
+                       np.stack([0 * q0, (q1 - q0) / 2, 0 * q0]))
+status = arm.execute(TrajectoryRequest("owner-proc", "sdk_arm", ("j1", "j2", "j3"), traj))
+print(status.execution_id, flush=True)
+arm.wait(status.execution_id, 30)
+"""
 
 
 def wait_phase(arm: ArmClient, eid: str, phase: Phase, timeout_s: float = 3.0) -> None:

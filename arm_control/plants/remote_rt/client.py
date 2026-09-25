@@ -419,7 +419,7 @@ class RtBackend:
     def apply_command(self, command: dict[str, Any]) -> int | None:
         """Stream one joint-servo word (the full bridge contract — the server
         applies torque clamp + slew; nothing is dropped on this side).
-        Returns the wire seq sent, or None while closed."""
+        Returns the wire seq sent, or None if nothing left (closed, send error)."""
         if command.get("cartesian") is not None:
             raise RtLinkError("RT backend does not support the legacy cartesian command tail")
         pose_hold = command.get("pose_hold")
@@ -436,7 +436,7 @@ class RtBackend:
             pose_hold=pose_hold,
         )
 
-    def _send_command_raw(self, q, qd, tau, kp, kd, pose_hold=None) -> int:
+    def _send_command_raw(self, q, qd, tau, kp, kd, pose_hold=None) -> int | None:
         self._cmd_seq = (self._cmd_seq + 1) & 0xFFFFFFFF
         pkt = rtp.pack_command(
             n=self.n,
@@ -465,6 +465,7 @@ class RtBackend:
             if now - self._last_send_err > 1.0:
                 self._last_send_err = now
                 print(f"[rt_link] UDP send failed: {exc}", flush=True)
+            return None
         return self._cmd_seq
 
     # -- feedback -------------------------------------------------------------

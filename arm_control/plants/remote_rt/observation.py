@@ -98,9 +98,11 @@ class AppliedTracker:
     session's state stream: which command seq the backend has ACCEPTED in the
     current ARM generation.
 
-    ``feed`` every newly received state in arrival order; call
-    ``disarm_sent`` when a DISARM leaves this session. A seq is confirmed by an
-    ARMED state carrying it plus a LATER ARMED, non-FAULTED state of the same
+    ``feed`` every received state; call ``disarm_sent`` when a DISARM leaves
+    this session. Only a state NEWER than the last one fed (serial
+    ``state_seq``, and never an older ARM generation) counts, so a duplicate
+    or reordered datagram is never "later" evidence. A seq is confirmed by an
+    ARMED state carrying it plus a later ARMED, non-FAULTED state of the same
     generation received before any DISARM; a FAULTED or disarmed state closes
     the generation, and nothing after it confirms. Assumes the client seeds
     its seqs above the generation's first ``last_cmd_seq`` (``RtBackend``
@@ -109,14 +111,23 @@ class AppliedTracker:
 
     def __init__(self) -> None:
         self.epoch: int | None = None
+        self._last: int | None = None
         self._candidate: int | None = None
         self._confirmed: int | None = None
         self._closed = False
+        self._faulted = False
 
     def feed(self, state: rtp.State) -> None:
-        if state.arm_epoch != self.epoch:
-            self.epoch, self._candidate, self._confirmed = state.arm_epoch, None, None
-            self._closed = False
+        if self.epoch is None or _newer(state.arm_epoch, self.epoch):
+            self.epoch, self._last, self._candidate, self._confirmed = (
+                state.arm_epoch, None, None, None)
+            self._closed = self._faulted = False
+        elif state.arm_epoch != self.epoch:
+            return  # a delayed packet of an older generation
+        if self._last is not None and not _newer(state.state_seq, self._last):
+            return
+        self._last = state.state_seq
+        self._faulted = self._faulted or bool(state.flags & rtp.FLAG_FAULTED)
         if self._closed:
             return
         if not state.flags & rtp.FLAG_ARMED or state.flags & rtp.FLAG_FAULTED:
@@ -132,6 +143,15 @@ class AppliedTracker:
     def confirmed(self, epoch: int) -> int | None:
         """Highest accepted seq of ``epoch``, or None."""
         return self._confirmed if epoch == self.epoch else None
+
+    def fault_seen(self, epoch: int) -> bool:
+        """A FAULTED state was received in ``epoch``."""
+        return self._faulted and epoch == self.epoch
+
+
+def _newer(a: int, b: int) -> bool:
+    """32-bit serial comparison: ``a`` comes after ``b``."""
+    return 0 < ((int(a) - int(b)) & 0xFFFFFFFF) < 0x80000000
 
 
 def _self_check() -> None:
@@ -186,9 +206,19 @@ def _self_check() -> None:
     idle = rtp.State(**{**st.__dict__, "flags": 0, "session_id": 0, "arm_epoch": 0})
     assert authority(idle).lifecycle is Lifecycle.OBSERVING
     # APPLIED: confirmation needs a later ARMED, non-FAULTED state of the epoch.
-    def pkt(seq, flags=rtp.FLAG_ARMED, epoch=7):
+    counter = iter(range(1000, 2000))
+
+    def pkt(seq, flags=rtp.FLAG_ARMED, epoch=7, state_seq=None):
         return rtp.State(**{**st.__dict__, "last_cmd_seq": seq, "flags": flags,
-                            "arm_epoch": epoch})
+                            "arm_epoch": epoch,
+                            "state_seq": next(counter) if state_seq is None else state_seq})
+    t = AppliedTracker()
+    t.feed(pkt(5, state_seq=11))
+    t.feed(pkt(4, state_seq=10))  # reordered: an older sample is not later evidence
+    t.feed(pkt(5, state_seq=11))  # duplicate
+    assert t.confirmed(7) is None
+    t.feed(pkt(2, epoch=6))  # delayed packet of an older generation: ignored
+    assert t.epoch == 7 and not t.fault_seen(7)
     t = AppliedTracker()
     t.feed(pkt(5))
     assert t.confirmed(7) is None  # selected by the servo, not yet confirmed
@@ -196,7 +226,7 @@ def _self_check() -> None:
     assert t.confirmed(7) == 5 and t.confirmed(8) is None
     t.feed(pkt(7, rtp.FLAG_ARMED | rtp.FLAG_FAULTED))  # the write of 6 was rejected
     t.feed(pkt(7))  # e.g. a later clean state straddling recovery: never evidence
-    assert t.confirmed(7) == 5
+    assert t.confirmed(7) == 5 and t.fault_seen(7)
     t.feed(pkt(9, epoch=8))
     t.disarm_sent()
     t.feed(pkt(9, epoch=8))  # state straddling our DISARM

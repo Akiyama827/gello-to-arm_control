@@ -172,6 +172,8 @@ class RobotRuntime:
         if self._thread is not None:
             self._thread.join(timeout=timeout_s)
         self._tracker.disarm_sent()
+        for fut, _, _ in self._pending:
+            fut.cancel()  # queued ARM/DISARM work; link.close() disarms itself
         closing = self._rpc.submit(self.link.close)
         try:
             closing.result(timeout=timeout_s)
@@ -201,13 +203,13 @@ class RobotRuntime:
     def unclaim(self, session: str) -> Authority:
         return self._call(self._unclaim, session)
 
-    def arm(self, session: str, timeout_s: float = 5.0) -> Authority:
-        gen = self._call(self._arm, session)
-        return self._await_authority(gen, armed=True, timeout_s=timeout_s)
+    def arm(self, session: str) -> int:
+        """Request ARM; returns the request generation for ``await_authority``."""
+        return self._call(self._arm, session)
 
-    def disarm(self, session: str, timeout_s: float = 5.0) -> Authority:
-        gen = self._call(self._disarm, session)
-        return self._await_authority(gen, armed=False, timeout_s=timeout_s)
+    def disarm(self, session: str) -> int:
+        """Request DISARM; returns the request generation for ``await_authority``."""
+        return self._call(self._disarm, session)
 
     def submit(self, session: str, request: TrajectoryRequest) -> ExecutionStatus:
         return self._call(self._submit, session, request)
@@ -238,7 +240,10 @@ class RobotRuntime:
         with self._cv:
             return self._authority
 
-    def _await_authority(self, gen: int, *, armed: bool, timeout_s: float) -> Authority:
+    def await_authority(self, gen: int, *, armed: bool, wait_s: float) -> Authority | None:
+        """The authority once request ``gen`` has settled (ARMED and ready, or
+        the DISARM confirmed), None if not within ``wait_s``; Refused if the
+        request failed."""
         def settled():
             if self._authority_failed[0] >= gen:
                 return True
@@ -248,9 +253,8 @@ class RobotRuntime:
             return (self._authority_done >= gen
                     and self._authority.lifecycle is not Lifecycle.ARMED)
         with self._cv:
-            if not self._cv.wait_for(settled, timeout=timeout_s):
-                raise TimeoutError(f"{'ARM' if armed else 'DISARM'} not confirmed "
-                                   f"within {timeout_s}s; check authority()")
+            if not self._cv.wait_for(settled, timeout=max(0.0, wait_s)):
+                return None
             failed_gen, reason = self._authority_failed
             if failed_gen >= gen:
                 raise Refused(reason)
@@ -287,6 +291,9 @@ class RobotRuntime:
     def _owner_lost(self, session: str) -> None:
         if self._owner == session:
             self._abandon("owner disconnected")
+        # Every op this session queued ran before this one (FIFO), and its
+        # connection has ended: nothing can name it again.
+        self._closed_sessions.discard(session)
 
     def _abandon(self, reason: str) -> None:
         """Cancel the owner's live executions and hold; stay armed."""
@@ -347,8 +354,9 @@ class RobotRuntime:
             residual_max=request.completion.residual_max)
         traj = request.trajectory
         try:
-            plan = pack_plan(plan_id=eid, phase=request.request_id,
-                             gated=request.start is Start.ON_RELEASE, times=traj.times,
+            # Always staged gated: selection (expiry, ARM) is the supervisor's
+            # decision for both starts, taken just before the release.
+            plan = pack_plan(plan_id=eid, phase=request.request_id, gated=True, times=traj.times,
                              positions=traj.positions, velocities=traj.velocities,
                              kp=kp, kd=kd, completion=completion,
                              model_token=request.model_token)
@@ -359,6 +367,8 @@ class RobotRuntime:
         self._pump_controller()
         if ex.status.phase is Phase.REQUESTED:
             self._receipt(ex, Phase.REJECTED, "the controller did not acknowledge the plan")
+        elif ex.status.phase is Phase.ADMITTED and request.start is Start.ON_ADMIT:
+            self._select(ex)
         return ex.status
 
     def _release(self, session: str, execution_id: str) -> ExecutionStatus:
@@ -368,17 +378,20 @@ class RobotRuntime:
             return ex.status  # already selected or ended: release is idempotent
         if ex.request.start is not Start.ON_RELEASE:
             raise Refused(f"{execution_id} starts on admission, not on release")
+        self._select(ex)
+        return ex.status
+
+    def _select(self, ex: _Execution) -> None:
+        """Expiry, then ARM, then the controller's own release checks."""
         if self._expire(ex):
-            return ex.status
+            return
         refusal = selection_refusal(self._authority)
         if refusal:
-            ex.cancel_reason = refusal
-            self._drop_staged(ex, refusal)
             self._receipt(ex, Phase.REJECTED, refusal)
-            return ex.status
-        self.controller.on_control(pack_control_update(execute=execution_id))
+            self._drop_staged(ex, refusal)
+            return
+        self.controller.on_control(pack_control_update(execute=ex.status.execution_id))
         self._pump_controller()
-        return ex.status
 
     def _cancel(self, session: str, execution_id: str, reason: str) -> ExecutionStatus:
         self._owns(session)
@@ -412,9 +425,12 @@ class RobotRuntime:
         ex.status = ex.status.apply(r)
         ex.receipts.append(r)
         self._cv.notify_all()
-        if ex.status.terminal and len(self._executions) > RETAINED:
-            for eid in [e for e, x in self._executions.items() if x.status.terminal][
-                    :len(self._executions) - RETAINED]:
+
+    def _prune(self) -> None:
+        """Forget the oldest terminal executions beyond RETAINED."""
+        excess = len(self._executions) - RETAINED
+        if excess > 0:
+            for eid in [e for e, x in self._executions.items() if x.status.terminal][:excess]:
                 self._by_request.pop(self._executions.pop(eid).request.request_id, None)
 
     def _pump_controller(self, *, sent_for: str | None = None, reconcile: bool = True) -> None:
@@ -475,7 +491,7 @@ class RobotRuntime:
         """Executions the controller no longer holds, with no event to say why."""
         now = time.monotonic()
         current = self.controller.current_plan_id
-        for eid, ex in self._executions.items():
+        for eid, ex in list(self._executions.items()):
             phase = ex.status.phase
             if ex.status.terminal:
                 continue
@@ -509,6 +525,8 @@ class RobotRuntime:
         link's ACK timeouts; a DISARM drops queued ARMs (RemoteHardware's rule)."""
         if not armed:
             self._tracker.disarm_sent()
+            if any(not want and not fut.done() for fut, want, _ in self._pending):
+                return  # one DISARM in flight covers this one
             for fut, want, _ in self._pending:
                 if want:
                     fut.cancel()
@@ -587,13 +605,18 @@ class RobotRuntime:
                 if c._last_state_at is not None:
                     c._last_state_at = rx
         self._publish()
-        for ex in self._executions.values():
+        for ex in list(self._executions.values()):
             self._expire(ex)
         c.tick()
         rs = c.runtime_state
         self._pump_controller(sent_for=rs["plan_id"] if rs["executing"] else None)
-        for ex in self._executions.values():
-            if ex.status.phase is Phase.SENT:
+        for ex in list(self._executions.values()):
+            if (ex.first_seq is not None and not ex.status.terminal
+                    and self._tracker.fault_seen(ex.epoch)):
+                # The frozen APPLIED rule: a FAULTED state in the execution's
+                # ARM generation ends it FAULTED; no later clean state undoes it.
+                self._receipt(ex, Phase.FAULTED, "RT fault latched in this ARM generation")
+            elif ex.status.phase is Phase.SENT:
                 confirmed = self._tracker.confirmed(ex.epoch)
                 if confirmed is not None and epoch_reached(confirmed, ex.first_seq):
                     self._receipt(ex, Phase.APPLIED, command_seq=confirmed, arm_epoch=ex.epoch)
@@ -605,6 +628,7 @@ class RobotRuntime:
                   flush=True)
             self.controller = self._build_controller()
             self._reconcile()
+        self._prune()
         self._publish()
 
     def _publish(self) -> None:

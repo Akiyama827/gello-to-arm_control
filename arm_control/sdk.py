@@ -20,6 +20,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from arm_control.execution import codec
@@ -30,6 +31,10 @@ from arm_control.execution.contract import (
 
 #: Upper bound on one message; a long 7-DOF trajectory is well under 1 MB.
 MAX_MESSAGE = 16 << 20
+#: Waits are repeated short requests, so the channel is free between them
+#: (another thread can cancel or DISARM) and the supervisor notices a dropped
+#: client promptly.
+WAIT_SLICE_S = 0.25
 
 
 class SupervisorError(RuntimeError):
@@ -147,13 +152,23 @@ class ArmClient:
 
     def arm(self, timeout_s: float = 5.0) -> Authority:
         """ARM and wait (bounded) until the controller is ready to execute."""
-        return codec.authority_from(
-            self._channel.call("arm", wait_s=timeout_s, timeout_s=timeout_s))
+        return self._await_authority(self._channel.call("arm")["gen"], True, timeout_s)
 
     def disarm(self, timeout_s: float = 5.0) -> Authority:
         """DISARM and wait (bounded) for the stop to be confirmed."""
-        return codec.authority_from(
-            self._channel.call("disarm", wait_s=timeout_s, timeout_s=timeout_s))
+        return self._await_authority(self._channel.call("disarm")["gen"], False, timeout_s)
+
+    def _await_authority(self, gen: int, armed: bool, timeout_s: float) -> Authority:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            left = deadline - time.monotonic()
+            got = self._channel.call("await_authority", wait_s=WAIT_SLICE_S, gen=gen,
+                                     armed=armed, wait_for_s=min(WAIT_SLICE_S, max(left, 0.0)))
+            if got["settled"]:
+                return codec.authority_from(got["authority"])
+            if left <= 0:
+                raise TimeoutError(f"{'ARM' if armed else 'DISARM'} not confirmed within "
+                                   f"{timeout_s}s; check authority()")
 
     # -- execution ---------------------------------------------------------------
     def execute(self, request: TrajectoryRequest) -> ExecutionStatus:
@@ -170,11 +185,17 @@ class ArmClient:
     def wait(self, execution_id: str, timeout_s: float) -> ExecutionStatus:
         """Block until terminal, at most ``timeout_s``; TimeoutError otherwise.
         Never cancels: a timed-out wait leaves the execution running."""
-        status = codec.status_from(self._channel.call(
-            "status", wait_s=timeout_s, execution_id=execution_id, wait_for_s=timeout_s))
-        if not status.terminal:
-            raise TimeoutError(f"{execution_id} still {status.phase.value} after {timeout_s}s")
-        return status
+        deadline = time.monotonic() + timeout_s
+        while True:
+            left = deadline - time.monotonic()
+            status = codec.status_from(self._channel.call(
+                "status", wait_s=WAIT_SLICE_S, execution_id=execution_id,
+                wait_for_s=min(WAIT_SLICE_S, max(left, 0.0))))
+            if status.terminal:
+                return status
+            if left <= 0:
+                raise TimeoutError(
+                    f"{execution_id} still {status.phase.value} after {timeout_s}s")
 
     def cancel(self, execution_id: str, reason: str = "cancelled",
                timeout_s: float = 2.0) -> ExecutionStatus:
