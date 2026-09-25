@@ -603,11 +603,12 @@ def _self_check() -> None:
     done = status.apply(receipt(Phase.COMPLETED))
     assert done.terminal and done.ok and set(done.reached) == {
         Phase.REQUESTED, Phase.ADMITTED, Phase.SELECTED, Phase.APPLIED, Phase.COMPLETED}
-    try:
-        done.apply(receipt(Phase.CANCELLED, "late"))
-        raise AssertionError("terminal execution changed")
-    except IllegalTransition:
-        pass
+    for late in (receipt(Phase.CANCELLED, "late"), receipt(Phase.SENT), receipt(Phase.ADMITTED)):
+        try:
+            done.apply(late)
+            raise AssertionError(f"terminal execution changed by {late.phase.value}")
+        except IllegalTransition:
+            pass
     # Completion needs evidence the plant acted; a selected-only one cannot complete.
     selected = ExecutionStatus.start(receipt(Phase.ADMITTED)).apply(receipt(Phase.SELECTED))
     try:
