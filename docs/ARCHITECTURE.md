@@ -285,33 +285,42 @@ rejection, live-state transfer across MuJoCo recompilation, contacts, and
 attachment behavior must survive structural moves. Import checks alone do not
 verify those behaviors; the consuming project owns its integration rehearsal.
 
-## Execution contract (CTRL-020, proposed for freeze)
+## Execution contract (CTRL-020 v1, proposed for freeze)
 
 `arm_control.execution.contract` holds the transport-independent values that
 applications, the supervisor and transport adapters share. It depends on the
-standard library, numpy and `arm_control.motion` only; importing it loads no
-Arrow, Dora, Rerun, MuJoCo, planner or device SDK. Transports adapt to it:
-`plants/remote_rt/observation.py` maps RT state packets to `RobotState` and
-`Authority`. The RT byte protocol is unchanged, and contract v1 needs no wire
-change.
+standard library, numpy and `arm_control.motion` only. It imports no transport,
+so no RT protocol, Arrow, Dora, Rerun, MuJoCo, planner or device SDK is loaded.
+Transports adapt to it: `plants/remote_rt/observation.py` maps RT state packets
+to `RobotState` and `Authority` and derives the RT identity hash. The RT byte
+protocol is unchanged, and contract v1 needs no wire change.
+
+**Scope of v1:** one robot executing one planned joint trajectory, started
+`ON_ADMIT` or `ON_RELEASE`. Group requests and a group commit (CTRL-040),
+Cartesian requests, and streaming or action-chunk requests (CTRL-030) are later
+contract versions.
 
 ### Where each concept already lives
 
 | Contract value | Existing source it consolidates |
 |---|---|
 | `RobotIdentity.instance_id` | registry instance, RT `--instance-id`, `IDENTITY.instance_id`. Pair slot names such as `left`/`right` are roles, not identities. |
-| `joint_names`, `identity_hash` | RT `--joint-names`, `joint_order_hash`, `identity_hash`, config `arm.joints` |
+| `joint_names` | RT `--joint-names`, config `arm.joints`. The RT `joint_order_hash`/`identity_hash` are derived in the RT adapter (`observation.identity_hash`). |
 | `model_id` | `IDENTITY.model_id`, the plant's task model |
 | request `model_token` | `plan.model_token`, `ArmController.model_token` (model bundle and scene) |
-| `Capabilities` | HELLO tokens (`hold_ms`, `fault_ms`, `active`, `pose_hold`, `rt`), `IDENTITY` capability bits, `VERSION`/`POSE_HOLD_VERSION`. Qualification comes from the registry and evidence, never from the device. |
+| `Capabilities` | HELLO tokens (`hold_ms`, `fault_ms`, `active`, `pose_hold`, `rt`), `IDENTITY` capability bits, `VERSION`/`POSE_HOLD_VERSION`. What the backend advertises only. |
+| qualification (not a contract value) | the deployment registry `qualification` and the evidence records, consulted by the supervisor. Never inferred from what a device advertises. |
 | `Authority.session` | RT `session_id`, one per control connection. Distinct from the controller's `runtime_state.session_id` (a controller instance). |
 | `Lifecycle` | `FLAG_CLAIMED`, `FLAG_ARMED`, `FLAG_FAULTED`; CLAIM, ARM, DISARM |
+| `Authority.holding` | `FLAG_HOLDING` |
 | `arm_epoch`, `stop_epoch` | ARM ack seq, `StatePacket.arm_epoch`/`stop_epoch`, `CommandPacket.arm_epoch` |
 | `Fault` | `fault_code`, CTL_FAULT text, fault journal FIRST record with its ARM generation, controller `fault` event |
-| `RobotState` | `StatePacket` measured `q/dq/tau`, selected `q_cmd/qd_cmd/tau_cmd`, `wrench` + `FLAG_WRENCH_VALID`, `t_mono_ns`, `state_seq`, `last_cmd_seq`, and the PC receive time |
+| `RobotState` measured | `StatePacket.q/dq/tau`, `wrench` + `FLAG_WRENCH_VALID`, `t_mono_ns`, `state_seq`, and the PC receive time |
+| `RobotState.selected_q/selected_qd` | `StatePacket.q_cmd/qd_cmd`: the reference the servo selected after hold, latch and pose-hold handling |
+| `RobotState.output_tau` | `StatePacket.tau_cmd`: the final torque written to the plant (DM: the backend's prediction from its encoded MIT frames) |
+| `RobotState.last_command_seq` | `StatePacket.last_cmd_seq`: the freshest command the servo selected |
 | `Validity` | `ArmControlState` "None is unknown", `align_feedback` age bounds, execution-policy freshness |
-| `TrajectoryRequest` | `pack_plan`. `plan_id` is `request_id` today. `gated` becomes `Start.ON_RELEASE`. `kp/kd` become `gains`, and `completion` keeps its meaning. `phase` stays a label. `cartesian_poses` belongs to a later Cartesian request. |
-| `Start.ON_COMMIT`, `group_id` | `pair_id`, gated `ArmPlan`, `execute_pair` (group semantics are CTRL-040) |
+| `TrajectoryRequest` | `pack_plan`. `plan_id` is `request_id` today. `gated` becomes `Start.ON_RELEASE`. `kp/kd` become `gains`, and `completion` keeps its meaning. `phase` stays a label. `cartesian_poses` belongs to a later Cartesian request. `pair_id` and `execute_pair` are CTRL-040. |
 | `CancelRequest` | control `cancel` + `cancel_plan_id`, which produces `plan_cleared` |
 
 ### Execution phases and the evidence for each
@@ -319,65 +328,120 @@ change.
 | Phase | Meaning | Evidence today |
 |---|---|---|
 | REQUESTED | created by the application | — |
-| ADMITTED | passed admission, staged; not executable authority | `plan_staged ok=True` |
+| ADMITTED | passed admission and staged. Not executable authority, and needs no ARM. | `plan_staged ok=True` |
 | SELECTED | the executor samples it as the active reference | `_release` loads it; **no event** |
-| SENT | a command from it was handed to the plant transport | `apply_command`; **no event** |
-| APPLIED | the plant consumed such a command | `StatePacket.last_cmd_seq` reaches the first command seq sent for it |
+| SENT | a command derived from it left the executor for the plant transport (RT: the UDP command was sent) | `apply_command`; **no event** |
+| APPLIED | the downstream plant/backend **accepted** such a command. This is acceptance evidence, not evidence of physical motion. | RT: see the rule below; **not reported** |
 | COMPLETED | completion rule held on observed feedback | `leg_result ok=True` |
 | REJECTED | refused at admission or selection; never moved | `plan_staged ok=False`; `leg_result ok=False` for a refused release; a wrong-id `execute` is **log-only** |
-| SUPERSEDED | admitted, unselected, replaced by a newer admission | a new `plan` replaces a staged one **silently** |
+| SUPERSEDED | admitted, unselected, replaced by an admitted request naming it | a new `plan` replaces a staged one **silently and implicitly** |
 | EXPIRED | not selected before `admit_by` | **none** |
 | CANCELLED | cancellation confirmed; executor dropped it and holds | `plan_cleared ok=True` |
 | FAULTED | stopped by a fault while it owned the reference | controller `fault`, RT latch, `leg_result ok=False` while running |
 
+**RT APPLIED rule.** The server advances `last_cmd_seq` when it selects a
+fresh command, before `backend->write_command()`. So `last_cmd_seq` alone is
+selection by the servo, not acceptance. A rejected write latches `FAULT_PLANT`,
+and the latch is sticky within the ARM generation. APPLIED therefore requires
+both of these:
+
+- a state of the same `arm_epoch` whose `last_cmd_seq` is at or past the first
+  command seq sent for the execution;
+- a later state of that epoch that is still not FAULTED.
+
+The later state is needed because a cause latched concurrently by another
+thread can surface one tick late. For the FR3 backend, acceptance means
+libfranka's `ActiveControl::writeOnce` returned without an exception. For DM,
+it means every active motor's CAN frame was sent.
+
 The chain REQUESTED → ADMITTED → SELECTED → SENT → APPLIED moves forward only.
 A transport that cannot observe a phase may skip it, but no phase is ever
 revisited. A terminal phase is final, and a duplicate receipt is idempotent.
-COMPLETED requires APPLIED, so "packet accepted" is never "executed". Every
-failed terminal phase carries a reason. `ExecutionStatus.apply` enforces this.
+COMPLETED requires APPLIED, so a sent packet is never "executed". Every failed
+terminal phase carries a reason. `ExecutionStatus.apply` enforces this.
 
 ### Semantics proposed for freeze
 
 - **Identity.** Every vector is in `RobotIdentity.joint_names` order. A
   request names its order and is refused on mismatch; nothing reorders.
-- **IDs.** `request_id` is the caller's idempotency key: resubmitting it
-  returns the same execution. `execution_id` is assigned at admission and
-  never reused. `group_id` names a group; members are keyed by `instance_id`.
+  Instance ids are `[A-Za-z0-9_.-]{1,64}`, with no `:` because frames are
+  `base:<id>`. A transport may be narrower: RT ids are under 32 bytes, and its
+  adapter refuses anything longer.
+- **IDs.**
+  - `request_id` is the caller's idempotency key. Resubmitting it returns the
+    existing execution; it is not admitted again. A resubmission with
+    different content is refused at submission and creates no execution.
+  - `execution_id` is assigned at admission and never reused.
+- **Admission and selection are separate gates.**
+  - `admission_refusal` stages. It checks, in order:
+    1. instance
+    2. joint order
+    3. capability/version
+    4. model token
+    5. `admit_by` clock and deadline
+    6. ownership (CLAIMED or ARMED)
+
+    It does **not** require ARM: a gated plan is reviewed while disarmed.
+  - `selection_refusal` releases, and requires ARMED.
+  - The expiry check runs before it and ends the execution EXPIRED, not
+    REJECTED.
+  - Project admission (workcell, collision, Hand, observation freshness,
+    start tolerance) is composed above both, never folded into them.
 - **Start and expiry.**
+  - `ON_ADMIT` selects as soon as it is admitted.
+  - `ON_RELEASE` selects only on `release(execution_id)`.
   - Trajectory time 0 plays at SELECTED; review time is not charged against
     it.
-  - `admit_by` is the latest selection time; past it the execution EXPIRES.
+  - `admit_by` is the latest selection time. It must be on the admitting
+    supervisor's attested PC monotonic clock. A deadline on another clock or
+    domain, or one already passed, is refused at admission.
+  - Past the deadline, an admitted execution EXPIRES.
   - A selected planned trajectory then runs to COMPLETED, CANCELLED or
     FAULTED. Command freshness below that belongs to the RT deadman.
-- **Supersession.**
-  - A request while another execution is SELECTED or later is REJECTED:
-    never swapped.
-  - A newer admission SUPERSEDES an admitted, unselected one. This is today's
-    behavior, now reported.
+- **Supersession** (`supersession_refusal`), applied after idempotency:
+  - A different request may supersede only an ADMITTED, unselected
+    execution, and only by naming it in `supersedes`. A request that does not
+    name the pending execution is refused while one exists; nothing is
+    replaced implicitly.
+  - SELECTED or later is never replaced; cancel it and wait for CANCELLED.
+  - The old execution ends SUPERSEDED only once the new request is ADMITTED.
+    Its receipt carries `superseded_by`.
 - **Cancellation.**
   - It names one execution and never cancels another.
   - It completes with the CANCELLED receipt: the executor dropped the
     execution and holds.
   - Cancelling a terminal execution reports its status and changes nothing.
   - Cancel is not DISARM.
+- **Holding and faults.**
+  - `Authority.holding` is True while the executor holds a captured pose
+    instead of tracking.
+  - A FAULTED robot holds after a command-stream or controller fault.
+  - After a plant fault it writes nothing (`holding=False`), and the robot's
+    own safety owns the arm. FAULTED does not imply holding.
 - **DISARM** completes when `stop_epoch` reaches the DISARM generation, not
   when the request is acknowledged.
-- **Capability and version.** An unknown controller profile or contract
-  version is refused before actuation (`Capabilities.refusal`). Generic
-  admission (`admission_refusal`) checks, in order:
-  1. instance
-  2. joint order
-  3. capability
-  4. model token
-  5. authority
+- **Capability, version and qualification.**
+  - An unknown controller profile or contract version is refused before
+    actuation.
+  - `Capabilities` is what the backend advertises.
+  - Qualification is a separate deployment/evidence record.
+- **Completion.**
+  - `vel_tol` (rad/s) and `residual_max` are finite and positive.
+  - `residual_max` is rad per joint (`max|q - goal_q|`).
+  - `goal_q` covers every joint, in the request's order.
+- **Observation.** A `RobotState` carries three kinds of joint vector, never
+  mixed:
+  - measured `q/dq/tau`;
+  - the selected reference `selected_q/selected_qd`;
+  - the plant-facing output `output_tau`, the torque written to the plant.
+    A native-impedance plant (DM MIT) is sent the selected reference and
+    gains and closes its own PD, so for it this is the backend's prediction
+    from its encoded frames.
 
-  Project admission (workcell, collision, Hand) is composed above it.
-- **Observation.**
-  - Values are `None` unless VALID.
-  - Freshness is judged on the reader's own clock, never by subtracting RT
-    time from PC time.
-  - The selected reference (`q_ref`...) is what the servo sent, not what was
-    requested.
+  Selected and output are `None` while nothing is selected or written
+  (disarmed, or after a plant fault); they are never zero-filled. All values
+  are `None` unless VALID. Freshness is judged on the reader's own clock,
+  never by subtracting RT time from PC time.
 
 ### Conventions
 
@@ -398,14 +462,12 @@ These are to be closed by the supervisor and executor slices (CTRL-022/030/033)
 without an RT wire change:
 
 - Selection is not reported, and a wrong-id `execute` is log-only.
-- SENT is not reported.
-- SUPERSEDED is silent, and EXPIRED does not exist.
+- SENT and APPLIED are not reported.
+- Supersession is silent and implicit, and EXPIRED does not exist.
 - `plan_id` doubles as the request and execution id, with no idempotency.
 - RT and PC clocks are not attested: there is no host/boot identity on the
   wire (`Stamp.domain` is empty), so cross-host timing stays unmapped.
 - RT fault text arrives only over the control session, not in state.
-- Streaming and Cartesian requests (CTRL-030) and group requests (CTRL-040)
-  are not in contract v1.
 
 ## Known unfinished boundaries
 

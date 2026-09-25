@@ -9,14 +9,15 @@ the RT UDP/TCP protocol, the Dora ``plan``/``control``/``controller_event``
 messages and in-process controllers ADAPT to these values.
 
 Every concept below already existed somewhere; the mapping from the old names
-is in docs/ARCHITECTURE.md ("Execution contract").
+is in docs/ARCHITECTURE.md ("Execution contract"). Contract v1 is one robot
+executing one planned joint trajectory; groups (CTRL-040), Cartesian and
+streaming requests (CTRL-030) are later versions.
 
 Conventions (normative):
 
 * Joint vectors are in the robot's canonical joint order,
-  ``RobotIdentity.joint_names`` -- the same order whose hash the RT server
-  provisions. A request names its order and is refused on mismatch; nothing
-  reorders silently.
+  ``RobotIdentity.joint_names``. A request names its order and is refused on
+  mismatch; nothing reorders silently.
 * Units are SI (``UNITS``). Revolute joints in rad; gains kp N*m/rad,
   kd N*m*s/rad.
 * Poses are ``[x, y, z, qw, qx, qy, qz]`` in metres with a unit quaternion,
@@ -45,7 +46,6 @@ from enum import Enum
 import numpy as np
 
 from arm_control.motion import JointTrajectory
-from arm_control.plants.remote_rt import protocol as _rt
 
 #: Bumped when a public field or phase changes meaning. Adapters report the
 #: version they implement in ``Capabilities.contract_version``.
@@ -73,6 +73,7 @@ WRENCH = {
 }
 
 _ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_INSTANCE = re.compile(r"[A-Za-z0-9_.-]{1,64}")  # no ':' -- frames are "base:<id>"
 
 
 def _identifier(name: str, value: str) -> str:
@@ -131,7 +132,9 @@ def elapsed(later: Stamp, earlier: Stamp) -> float:
 @dataclass(frozen=True)
 class RobotIdentity:
     """Which robot: the deployment instance, its canonical joint order, the
-    plant kind and the task model the plant computes kinematics with."""
+    plant kind and the task model the plant computes kinematics with. A
+    transport that provisions identity on its own terms (the RT server's
+    identity hash) derives it in its adapter."""
 
     instance_id: str
     joint_names: tuple[str, ...]
@@ -139,8 +142,9 @@ class RobotIdentity:
     model_id: str = ""
 
     def __post_init__(self) -> None:
-        if not _rt.valid_id(self.instance_id):
-            raise ValueError(f"instance_id {self.instance_id!r} is not a provisioned id")
+        if not isinstance(self.instance_id, str) or not _INSTANCE.fullmatch(self.instance_id):
+            raise ValueError(f"instance_id must be 1-64 chars of [A-Za-z0-9_.-], "
+                             f"got {self.instance_id!r}")
         names = tuple(self.joint_names)
         if not names or len(set(names)) != len(names) or not all(
                 isinstance(j, str) and j for j in names):
@@ -151,16 +155,12 @@ class RobotIdentity:
     def n(self) -> int:
         return len(self.joint_names)
 
-    @property
-    def identity_hash(self) -> int:
-        """The RT server's identity hash for this instance and joint order."""
-        return _rt.identity_hash(self.instance_id, _rt.joint_order_hash(self.joint_names))
-
 
 @dataclass(frozen=True)
 class Capabilities:
-    """What the backend offers. Qualification is recorded separately and is
-    never inferred from what a device advertises."""
+    """What the backend advertises it can do. Not whether this deployment is
+    QUALIFIED to do it: qualification is a deployment-registry/evidence record,
+    kept out of this value and never inferred from what a device advertises."""
 
     contract_version: int
     profiles: tuple[str, ...]           # controller profiles it can admit
@@ -168,7 +168,6 @@ class Capabilities:
     pose_hold: bool = False
     observer: bool = False
     rt_setup: str = "unknown"           # "ok", the failed parts, or "unknown"
-    qualification: Mapping[str, str] = field(default_factory=dict)
 
     def refusal(self, profile: str) -> str:
         """Unknown capability is refused before actuation."""
@@ -191,14 +190,25 @@ class Validity(str, Enum):
 
 @dataclass(frozen=True)
 class RobotState:
-    """One robot's observation as an application may use it.
+    """One robot's observation as an application may use it. Three kinds of
+    joint vector, never mixed:
 
-    ``q``/``dq``/``tau`` are measured. ``q_ref``/``qd_ref``/``tau_ref`` are
-    what the RT servo actually SELECTED and SENT on that tick (after holds,
-    clamps and slew) -- not what the application requested. Arrays are
-    ``None`` unless ``validity`` is VALID; wrench also needs the plant to
-    report it valid. ``source`` is the sample's RT-host (or plant) time,
-    ``received`` the time it became available to the reader.
+    * measured -- ``q``/``dq``/``tau``;
+    * selected reference -- ``selected_q``/``selected_qd``: the joint
+      reference the executor chose for that tick after holds, latches and
+      pose-hold (not what the application requested). In pose hold it is the
+      measured pose: the Cartesian law, not the joint reference, then acts;
+    * plant-facing output -- ``output_tau``: the joint torque written to the
+      plant that tick (PD + feed-forward, limits, slew). A native-impedance
+      plant (DM MIT) is sent the selected reference and gains and closes its
+      own PD; for it this is the backend's prediction of the torque its
+      encoded frames produce, not the bytes sent.
+
+    Selected and output are ``None`` while nothing is selected or written
+    (disarmed, or a plant fault handed the arm to the robot's own safety).
+    Arrays are ``None`` unless ``validity`` is VALID; wrench also needs the
+    plant to report it valid. ``source`` is the sample's RT-host (or plant)
+    time, ``received`` the time it became available to the reader.
     """
 
     instance_id: str
@@ -207,17 +217,20 @@ class RobotState:
     q: np.ndarray | None = None
     dq: np.ndarray | None = None
     tau: np.ndarray | None = None
-    q_ref: np.ndarray | None = None
-    qd_ref: np.ndarray | None = None
-    tau_ref: np.ndarray | None = None
+    selected_q: np.ndarray | None = None
+    selected_qd: np.ndarray | None = None
+    output_tau: np.ndarray | None = None
     wrench: np.ndarray | None = None
     source: Stamp | None = None
     received: Stamp | None = None
     state_seq: int | None = None
-    last_command_seq: int | None = None  # freshest command the servo consumed
+    #: The freshest command the executor SELECTED as its reference. Not
+    #: evidence the plant accepted it: RT advances it before the backend
+    #: write (see ``Phase.APPLIED``).
+    last_command_seq: int | None = None
 
     def __post_init__(self) -> None:
-        arrays = ("q", "dq", "tau", "q_ref", "qd_ref", "tau_ref")
+        arrays = ("q", "dq", "tau", "selected_q", "selected_qd", "output_tau")
         if self.validity is not Validity.VALID:
             if any(getattr(self, a) is not None for a in (*arrays, "wrench")):
                 raise ValueError(f"a {self.validity.value} observation carries no values")
@@ -241,7 +254,8 @@ class Lifecycle(str, Enum):
     CONNECTED = "connected"    # control session open, not yet claimed
     CLAIMED = "claimed"        # owner of this robot, disarmed
     ARMED = "armed"            # servo holds authority for arm_epoch
-    FAULTED = "faulted"        # latched: still holding, commands ignored; DISARM clears
+    FAULTED = "faulted"        # latched: commands ignored until DISARM (+ARM);
+    #                            holding or not is ``Authority.holding``
 
 
 @dataclass(frozen=True)
@@ -262,6 +276,13 @@ class Authority:
     ``arm_epoch`` is the RT ARM generation commands must carry (0 = none).
     DISARM completes when ``stop_epoch`` reaches the DISARM's generation --
     the servo stopped the plant -- not when the request was acknowledged.
+
+    ``holding`` is True while the executor holds a captured pose instead of
+    tracking commands (stale stream, or latched on a command/controller
+    fault). It is False while tracking and while writing nothing: disarmed,
+    or FAULTED by the plant itself, when the robot's own safety owns the arm.
+    A FAULTED robot is therefore NOT necessarily holding. ``None``: the
+    transport does not report it.
     """
 
     lifecycle: Lifecycle
@@ -269,12 +290,15 @@ class Authority:
     arm_epoch: int = 0
     stop_epoch: int = 0
     fault: Fault | None = None
+    holding: bool | None = None
 
     def __post_init__(self) -> None:
         if (self.lifecycle is Lifecycle.FAULTED) != (self.fault is not None):
             raise ValueError("FAULTED and only FAULTED carries a fault")
         if self.lifecycle in (Lifecycle.ARMED, Lifecycle.FAULTED) and self.arm_epoch <= 0:
             raise ValueError("an armed or faulted robot has an ARM generation")
+        if self.holding and self.lifecycle not in (Lifecycle.ARMED, Lifecycle.FAULTED):
+            raise ValueError("only an armed or faulted robot can be holding")
 
 
 # -- execution requests -------------------------------------------------------
@@ -295,9 +319,11 @@ class JointGains:
 @dataclass(frozen=True)
 class Completion:
     """When a trajectory counts as COMPLETED, judged on observed feedback: it
-    played out, joint speed fell below ``vel_tol``, and -- when given -- the
-    arm stopped within ``residual_max`` of ``goal_q``. ``None`` on a request
-    means the backend's default: played out and at the final sample."""
+    played out, every joint speed fell below ``vel_tol`` (rad/s), and -- when
+    given -- every joint stopped within ``residual_max`` (rad, per joint, i.e.
+    ``max|q - goal_q| <= residual_max``) of ``goal_q``, which is in the
+    request's joint order. ``None`` on a request means the backend's default:
+    played out and at the final sample."""
 
     vel_tol: float
     goal_q: np.ndarray | None = None
@@ -305,16 +331,18 @@ class Completion:
 
     def __post_init__(self) -> None:
         if not (math.isfinite(self.vel_tol) and self.vel_tol > 0):
-            raise ValueError("vel_tol must be positive")
+            raise ValueError("vel_tol must be finite and positive")
         if (self.goal_q is None) != (self.residual_max is None):
             raise ValueError("goal_q and residual_max come together")
+        if self.residual_max is not None and not (
+                math.isfinite(self.residual_max) and self.residual_max > 0):
+            raise ValueError("residual_max must be finite and positive")
         object.__setattr__(self, "goal_q", _vector("goal_q", self.goal_q))
 
 
 class Start(str, Enum):
     ON_ADMIT = "on_admit"      # selected as soon as it is admitted
     ON_RELEASE = "on_release"  # admitted for review; selected only by release(execution_id)
-    ON_COMMIT = "on_commit"    # a group member: selected by the group's commit (CTRL-040)
 
 
 @dataclass(frozen=True)
@@ -325,10 +353,17 @@ class TrajectoryRequest:
     again returns the existing execution, never a second one. ``times`` are
     execution time: the trajectory's first sample plays at selection, never at
     request time (review/gate time is not charged against the motion).
-    ``admit_by`` bounds how long an admitted, unselected request stays
-    selectable; past it the request EXPIRES instead of starting late. Once
+
+    ``admit_by`` is the latest SELECTION time, on the admitting layer's own
+    monotonic clock (``Clock.PC``, attested domain): an admitted, unselected
+    execution past it EXPIRES instead of starting late. A deadline on another
+    clock or domain, or one already passed, is refused at admission. Once
     selected, a planned trajectory runs to completion, cancellation or fault;
-    command freshness below that is the RT deadman's, not this TTL.
+    command freshness below that is the RT deadman's, not this deadline.
+
+    ``supersedes`` names the ``execution_id`` this request replaces. Only an
+    ADMITTED, unselected execution can be superseded, and only by naming it;
+    see ``supersession_refusal``.
     """
 
     request_id: str
@@ -341,30 +376,46 @@ class TrajectoryRequest:
     start: Start = Start.ON_ADMIT
     admit_by: Stamp | None = None
     completion: Completion | None = None
-    group_id: str | None = None
+    supersedes: str | None = None
 
     def __post_init__(self) -> None:
         _identifier("request_id", self.request_id)
-        if self.group_id is not None:
-            _identifier("group_id", self.group_id)
-        if (self.start is Start.ON_COMMIT) != (self.group_id is not None):
-            raise ValueError("a group member starts ON_COMMIT, and only a group member does")
+        if self.supersedes is not None:
+            _identifier("supersedes", self.supersedes)
+        if not isinstance(self.start, Start):
+            raise ValueError("start must be a Start")
         object.__setattr__(self, "joint_names", tuple(self.joint_names))
-        if len(self.joint_names) != self.trajectory.num_joints:
+        n = self.trajectory.num_joints
+        if len(self.joint_names) != n:
             raise ValueError("joint_names must name every trajectory column")
         for arr in (self.trajectory.positions, self.trajectory.velocities):
             if arr is not None and not np.isfinite(arr).all():
                 raise ValueError("trajectory must be finite")
-        if self.gains is not None and self.gains.kp.size != self.trajectory.num_joints:
+        if self.gains is not None and self.gains.kp.size != n:
             raise ValueError("gains must cover every joint")
+        if (self.completion is not None and self.completion.goal_q is not None
+                and self.completion.goal_q.size != n):
+            raise ValueError("completion goal_q must cover every joint")
+        if self.admit_by is not None and (self.admit_by.clock is not Clock.PC
+                                          or not self.admit_by.domain):
+            raise ValueError("admit_by must be on the attested PC monotonic clock")
+
+    def expired(self, now: Stamp) -> bool:
+        """Past ``admit_by`` on ``now``'s clock; ValueError if not comparable."""
+        return self.admit_by is not None and elapsed(now, self.admit_by) > 0
+
+
+_OWNING = (Lifecycle.CLAIMED, Lifecycle.ARMED)
 
 
 def admission_refusal(request: TrajectoryRequest, identity: RobotIdentity,
-                      capabilities: Capabilities, authority: Authority,
-                      *, model_token: str | None = None) -> str:
-    """The generic admission checks every backend applies, in order; ``""``
-    admits. Project admission (workcell, collision, Hand) is composed ABOVE
-    this, never folded into it."""
+                      capabilities: Capabilities, authority: Authority, *,
+                      now: Stamp, model_token: str | None = None) -> str:
+    """The generic checks for ADMISSION (staging), in order; ``""`` admits.
+    Staging needs ownership, not ARM: a gated plan is reviewed while the arm
+    is disarmed, and ``selection_refusal`` checks ARM when it is released.
+    Project admission (workcell, collision, Hand) is composed ABOVE this,
+    never folded into it."""
     if request.instance_id != identity.instance_id:
         return f"request is for {request.instance_id!r}, robot is {identity.instance_id!r}"
     if request.joint_names != identity.joint_names:
@@ -374,6 +425,21 @@ def admission_refusal(request: TrajectoryRequest, identity: RobotIdentity,
         return refused
     if model_token is not None and request.model_token != model_token:
         return f"planned against model {request.model_token!r}, robot runs {model_token!r}"
+    if request.admit_by is not None:
+        if request.admit_by.domain != now.domain or now.clock is not Clock.PC:
+            return (f"admit_by is on {request.admit_by.clock.value}:{request.admit_by.domain}, "
+                    f"this supervisor runs {now.clock.value}:{now.domain}")
+        if request.expired(now):
+            return "admit_by already passed"
+    if authority.lifecycle not in _OWNING:
+        return f"robot is {authority.lifecycle.value}; admission needs a claimed owner"
+    return ""
+
+
+def selection_refusal(authority: Authority) -> str:
+    """The generic check for SELECTION (release), after the ``expired`` check
+    (which ends it EXPIRED, not REJECTED); ``""`` selects. Project checks such
+    as observation freshness and start tolerance compose above it."""
     if authority.lifecycle is not Lifecycle.ARMED:
         return f"robot is {authority.lifecycle.value}, not armed"
     return ""
@@ -388,12 +454,18 @@ class Phase(str, Enum):
     REQUESTED  created by the application; nothing has answered yet
     ADMITTED   passed admission and staged; NOT executable authority yet
     SELECTED   the executor is sampling it as the active reference
-    SENT       a command derived from it was handed to the plant transport
-    APPLIED    the plant consumed such a command (RT: last_command_seq reached
-               it) -- first evidence the robot is acting on it
+    SENT       a command derived from it left the executor for the plant
+               transport (RT: the UDP command was sent)
+    APPLIED    the downstream plant/backend ACCEPTED such a command. RT: a
+               state of the same arm_epoch with last_command_seq at or past
+               the first sent seq, confirmed by a later state of that epoch
+               that is still not FAULTED (the server advances last_cmd_seq
+               when it selects a command, BEFORE backend->write_command();
+               a rejected write latches a plant fault). Acceptance evidence
+               only -- NOT evidence of physical motion.
     COMPLETED  its completion rule held on OBSERVED feedback
     REJECTED   refused at admission or at selection; it never moved
-    SUPERSEDED an admitted, unselected request replaced by a newer admission
+    SUPERSEDED admitted, unselected, and replaced by a request naming it
     EXPIRED    not selected before ``admit_by``
     CANCELLED  cancellation confirmed: the executor dropped it and holds
     FAULTED    stopped by a fault while it owned the reference
@@ -426,7 +498,7 @@ _ENDS = {
     Phase.EXPIRED: {Phase.ADMITTED},
     Phase.CANCELLED: {Phase.ADMITTED, Phase.SELECTED, Phase.SENT, Phase.APPLIED},
     Phase.FAULTED: {Phase.SELECTED, Phase.SENT, Phase.APPLIED},
-    Phase.COMPLETED: {Phase.APPLIED},  # completion needs evidence the plant acted
+    Phase.COMPLETED: {Phase.APPLIED},  # completion needs plant acceptance evidence
 }
 _EVIDENCE_KEYS = 16
 
@@ -441,7 +513,8 @@ class Receipt:
 
     ``execution_id`` is assigned by the admitting layer and never reused;
     ``request_id`` is the caller's key. ``evidence`` is small and bounded:
-    e.g. ``arm_epoch``, ``command_seq``, ``state_seq``, completion residuals.
+    e.g. ``arm_epoch``, ``command_seq``, ``state_seq``, completion residuals,
+    or ``superseded_by`` (an execution_id).
     """
 
     execution_id: str
@@ -451,7 +524,6 @@ class Receipt:
     at: Stamp
     reason: str = ""
     evidence: Mapping[str, int | float | str] = field(default_factory=dict)
-    group_id: str | None = None
 
     def __post_init__(self) -> None:
         _identifier("execution_id", self.execution_id)
@@ -475,7 +547,6 @@ class ExecutionStatus:
     phase: Phase
     reached: Mapping[Phase, Stamp]
     reason: str = ""
-    group_id: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -492,8 +563,7 @@ class ExecutionStatus:
             raise IllegalTransition(f"an execution begins requested/admitted/rejected, "
                                     f"not {receipt.phase.value}")
         return cls(receipt.execution_id, receipt.request_id, receipt.instance_id,
-                   receipt.phase, {receipt.phase: receipt.at}, receipt.reason,
-                   receipt.group_id)
+                   receipt.phase, {receipt.phase: receipt.at}, receipt.reason)
 
     def apply(self, receipt: Receipt) -> ExecutionStatus:
         if (receipt.execution_id, receipt.request_id, receipt.instance_id) != (
@@ -510,6 +580,33 @@ class ExecutionStatus:
             raise IllegalTransition(f"{receipt.phase.value} cannot follow {self.phase.value}")
         return replace(self, phase=receipt.phase, reason=receipt.reason,
                        reached={**self.reached, receipt.phase: receipt.at})
+
+
+def supersession_refusal(request: TrajectoryRequest,
+                         current: ExecutionStatus | None) -> str:
+    """Whether ``request`` may be admitted next to the robot's ``current``
+    (latest non-terminal) execution; ``""`` admits and, if it names one,
+    supersedes it. Call it after idempotency: a resubmitted ``request_id``
+    returns its existing execution and never reaches here.
+
+    * Only an ADMITTED (unselected) execution is replaceable, and only by a
+      request that names it in ``supersedes`` -- never implicitly.
+    * SELECTED or later is never replaced: cancel it and wait for CANCELLED.
+    * The named execution ends SUPERSEDED only once the new request is
+      ADMITTED; a request refused for any other reason leaves it untouched.
+    """
+    live = current is not None and not current.terminal
+    if request.supersedes is not None:
+        if not live or current.execution_id != request.supersedes:
+            return f"{request.supersedes} is not this robot's pending execution"
+        if current.phase is not Phase.ADMITTED:
+            return f"{current.execution_id} is {current.phase.value}; only admitted is replaceable"
+        return ""
+    if live:
+        how = ("name it in supersedes to replace it" if current.phase is Phase.ADMITTED
+               else "cancel it first")
+        return f"{current.execution_id} is {current.phase.value}; {how}"
+    return ""
 
 
 @dataclass(frozen=True)
@@ -533,62 +630,84 @@ def _self_check() -> None:
         now[0] += 1_000_000
         return Stamp(now[0], clock, domain)
 
+    def refused(make, what):
+        try:
+            make()
+        except ValueError:
+            return
+        raise AssertionError(f"{what} accepted")
+
     # Time: only one attested clock may be subtracted from itself.
     a, b = at(), at()
     assert abs(elapsed(b, a) - 1e-3) < 1e-12
     for bad in (Stamp(2, Clock.RT_HOST, "pc:boot-a"), Stamp(2, Clock.PC, "pc:boot-b"),
                 Stamp(2, Clock.PC)):
-        try:
-            elapsed(bad, a)
-            raise AssertionError("cross-clock subtraction accepted")
-        except ValueError:
-            pass
+        refused(lambda bad=bad: elapsed(bad, a), "cross-clock subtraction")
 
     fr3 = RobotIdentity("fr3_1", tuple(f"fr3_joint{i}" for i in range(1, 8)), "franka",
                         "libfranka-vendor")
-    assert fr3.identity_hash == _rt.identity_hash("fr3_1", _rt.joint_order_hash(fr3.joint_names))
-    caps = Capabilities(CONTRACT_VERSION, ("joint_impedance",), protocol_version=_rt.VERSION)
-    armed = Authority(Lifecycle.ARMED, session="s1", arm_epoch=3)
+    refused(lambda: RobotIdentity("fr3:1", fr3.joint_names, "franka"), "':' in an instance id")
+    caps = Capabilities(CONTRACT_VERSION, ("joint_impedance",))
+    claimed = Authority(Lifecycle.CLAIMED, session="s1")
+    armed = Authority(Lifecycle.ARMED, session="s1", arm_epoch=3, holding=False)
     traj = JointTrajectory([0.0, 1.0], np.zeros((2, 7)), np.zeros((2, 7)))
     req = TrajectoryRequest("r1", "fr3_1", fr3.joint_names, traj, model_token="m1")
-    assert admission_refusal(req, fr3, caps, armed, model_token="m1") == ""
+
+    # Admission stages without ARM (gated review while disarmed); selection needs ARM.
+    for authority in (claimed, armed):
+        assert admission_refusal(req, fr3, caps, authority, now=at(), model_token="m1") == ""
+    assert "not armed" in selection_refusal(claimed) and selection_refusal(armed) == ""
+    faulted = Authority(Lifecycle.FAULTED, "s1", 3, fault=Fault("plant", "x", "rt"),
+                        holding=False)  # a plant fault: latched and NOT holding
     swapped = replace(req, joint_names=fr3.joint_names[::-1])
     for request, authority, token, why in (
             (swapped, armed, "m1", "joint order"),
             (replace(req, profile="cartesian_impedance"), armed, "m1", "not offered"),
             (req, armed, "m2", "planned against"),
-            (req, Authority(Lifecycle.CLAIMED, session="s1"), "m1", "not armed")):
-        assert why in admission_refusal(request, fr3, caps, authority, model_token=token)
+            (req, faulted, "m1", "claimed owner"),
+            (req, Authority(Lifecycle.OBSERVING), "m1", "claimed owner")):
+        assert why in admission_refusal(request, fr3, caps, authority, now=at(), model_token=token)
+    assert "not armed" in selection_refusal(faulted)
     assert "contract v" in replace(caps, contract_version=0).refusal("joint_impedance")
-    for bad in (dict(start=Start.ON_COMMIT), dict(group_id="g1"), dict(request_id="has space"),
-                dict(joint_names=fr3.joint_names[:6])):
-        try:
-            replace(req, **bad)
-            raise AssertionError(f"invalid request accepted: {bad}")
-        except ValueError:
-            pass
-    TrajectoryRequest("r2", "fr3_1", fr3.joint_names, traj, start=Start.ON_COMMIT, group_id="g1")
+    refused(lambda: Authority(Lifecycle.CLAIMED, "s1", holding=True), "disarmed holding")
+
+    # admit_by: the supervisor's attested PC clock only, checked at admission and selection.
+    t0 = at()
+    ttl = replace(req, admit_by=Stamp(t0.ns + 5_000_000, Clock.PC, "pc:boot-a"))
+    assert admission_refusal(ttl, fr3, caps, claimed, now=t0) == ""
+    assert not ttl.expired(t0) and ttl.expired(Stamp(t0.ns + 6_000_000, Clock.PC, "pc:boot-a"))
+    assert "already passed" in admission_refusal(
+        ttl, fr3, caps, claimed, now=Stamp(t0.ns + 9_000_000, Clock.PC, "pc:boot-a"))
+    assert "this supervisor runs" in admission_refusal(
+        ttl, fr3, caps, claimed, now=Stamp(t0.ns, Clock.PC, "pc:boot-b"))
+    for bad in (Stamp(1, Clock.RT_HOST, "rt:boot"), Stamp(1, Clock.EXECUTION, "x"),
+                Stamp(1, Clock.PC)):
+        refused(lambda bad=bad: replace(req, admit_by=bad), f"admit_by on {bad}")
+
+    for bad in (dict(request_id="has space"), dict(joint_names=fr3.joint_names[:6]),
+                dict(supersedes="has space"), dict(start="on_commit"),
+                dict(completion=Completion(0.01, np.zeros(6), 0.01))):
+        refused(lambda bad=bad: replace(req, **bad), f"request {bad}")
+    for bad in (dict(vel_tol=0.0), dict(vel_tol=0.01, goal_q=np.zeros(7)),
+                dict(vel_tol=0.01, goal_q=np.zeros(7), residual_max=0.0),
+                dict(vel_tol=0.01, goal_q=np.zeros(7), residual_max=float("inf"))):
+        refused(lambda bad=bad: Completion(**bad), f"completion {bad}")
+    replace(req, completion=Completion(0.01, np.zeros(7), 0.003))
 
     # Observation: unknown is None, and a valid sample is complete and finite.
     assert RobotState("fr3_1", Validity.MISSING, "no state yet").q is None
     for bad in (dict(validity=Validity.STALE, q=np.zeros(7)),
                 dict(validity=Validity.VALID, q=np.zeros(7)),
                 dict(validity=Validity.VALID, q=np.full(7, np.nan), source=a, received=b),
-                dict(validity=Validity.VALID, q=np.zeros(7), dq=np.zeros(6), source=a, received=b)):
-        try:
-            RobotState("fr3_1", reason="x", **bad)
-            raise AssertionError(f"invalid observation accepted: {bad}")
-        except ValueError:
-            pass
-    try:
-        Authority(Lifecycle.ARMED)
-        raise AssertionError("armed without a generation")
-    except ValueError:
-        pass
+                dict(validity=Validity.VALID, q=np.zeros(7), dq=np.zeros(6), source=a, received=b),
+                dict(validity=Validity.VALID, q=np.zeros(7), output_tau=np.zeros(6),
+                     source=a, received=b)):
+        refused(lambda bad=bad: RobotState("fr3_1", reason="x", **bad), f"observation {bad}")
+    refused(lambda: Authority(Lifecycle.ARMED), "armed without a generation")
 
     # Execution: the forward chain, skips forward only, terminals final.
-    def receipt(phase, reason=""):
-        return Receipt("e1", "r1", "fr3_1", phase, at(), reason)
+    def receipt(phase, reason="", eid="e1", rid="r1"):
+        return Receipt(eid, rid, "fr3_1", phase, at(), reason)
 
     status = ExecutionStatus.start(receipt(Phase.REQUESTED))
     for phase in (Phase.ADMITTED, Phase.SELECTED, Phase.APPLIED):  # SENT unobserved
@@ -609,33 +728,43 @@ def _self_check() -> None:
             raise AssertionError(f"terminal execution changed by {late.phase.value}")
         except IllegalTransition:
             pass
-    # Completion needs evidence the plant acted; a selected-only one cannot complete.
-    selected = ExecutionStatus.start(receipt(Phase.ADMITTED)).apply(receipt(Phase.SELECTED))
-    try:
-        selected.apply(receipt(Phase.COMPLETED))
-        raise AssertionError("completed without application evidence")
-    except IllegalTransition:
-        pass
+    # Completion needs plant acceptance evidence; SENT alone is not enough.
+    admitted = ExecutionStatus.start(receipt(Phase.ADMITTED))
+    selected = admitted.apply(receipt(Phase.SELECTED))
+    for unapplied in (selected, selected.apply(receipt(Phase.SENT))):
+        try:
+            unapplied.apply(receipt(Phase.COMPLETED))
+            raise AssertionError("completed without acceptance evidence")
+        except IllegalTransition:
+            pass
     cancelled = selected.apply(receipt(Phase.CANCELLED, "operator"))
     assert cancelled.terminal and cancelled.ok is False and cancelled.reason == "operator"
-    try:
-        receipt(Phase.REJECTED)  # a refusal must say why
-        raise AssertionError("reasonless rejection accepted")
-    except ValueError:
-        pass
-    try:
-        Receipt("e1", "r1", "fr3_1", Phase.SENT, at(),
-                evidence={f"k{i}": i for i in range(_EVIDENCE_KEYS + 1)})
-        raise AssertionError("unbounded evidence accepted")
-    except ValueError:
-        pass
+    refused(lambda: receipt(Phase.REJECTED), "reasonless rejection")
+    refused(lambda: Receipt("e1", "r1", "fr3_1", Phase.SENT, at(),
+                            evidence={f"k{i}": i for i in range(_EVIDENCE_KEYS + 1)}),
+            "unbounded evidence")
     try:
         status.apply(Receipt("e2", "r1", "fr3_1", Phase.SENT, at()))
         raise AssertionError("foreign receipt accepted")
     except IllegalTransition:
         pass
-    print("execution contract self-check: PASS (clock domains, identity hash, admission "
-          "order, observation validity, phase chain/skips/terminals, bounded receipts)")
+
+    # Supersession: explicit, admitted-only; selected or later is never replaced.
+    r2 = replace(req, request_id="r2")
+    assert supersession_refusal(r2, None) == "" and supersession_refusal(r2, done) == ""
+    assert "supersedes" in supersession_refusal(r2, admitted)  # implicit replace refused
+    assert supersession_refusal(replace(r2, supersedes="e1"), admitted) == ""
+    assert "cancel it first" in supersession_refusal(r2, selected)
+    assert "only admitted" in supersession_refusal(replace(r2, supersedes="e1"), selected)
+    for stale_target in (None, done, ExecutionStatus.start(receipt(Phase.ADMITTED, eid="e9"))):
+        assert "not this robot's pending" in supersession_refusal(
+            replace(r2, supersedes="e1"), stale_target)
+    gone = admitted.apply(Receipt("e1", "r1", "fr3_1", Phase.SUPERSEDED, at(), "replaced",
+                                  {"superseded_by": "e2"}))
+    assert gone.terminal and gone.reason == "replaced"
+    print("execution contract self-check: PASS (clock domains, admission vs selection, "
+          "admit_by clock/expiry, completion shape, observation validity, holding, "
+          "phase chain/skips/terminals, explicit supersession, bounded receipts)")
 
 
 if __name__ == "__main__":
