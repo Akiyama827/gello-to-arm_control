@@ -382,7 +382,9 @@ review-caught, all in the stale-authority class):
 
 At startup the servo thread applies `mlockall`, `SCHED_FIFO` at `--rt-priority`
 and, when `--rt-cpu` is given, its CPU pin. It reads back the policy, priority
-and CPU mask. This finishes before the backend is published as ready. For
+and CPU mask. This finishes before the backend is published as ready. Until
+then ARM is refused (`refused: backend not ready (RT setup pending)`), and
+HELLO waits for readiness, so it never reports a setup that has not run. For
 `franka` and `dm`, any failed part refuses ARM for the life of the process:
 `refused: RT process setup failed (<parts>); fix limits, restart`. The state
 stream and observers keep working. The fake backend runs degraded unless
