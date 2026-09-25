@@ -73,6 +73,16 @@ def main():
         return state, targets
 
     try:
+        # A cancel holds the measured fingers even when soft MuJoCo limits let
+        # them read past the model range (seen: 1.7 mm over the 40 mm limit).
+        with app._lock:
+            limits = app.runtime.finger_limits
+            app.runtime.finger_positions = lambda: {a: hi + 0.002 for a, (_, hi) in limits.items()}
+            try:
+                app.runtime.cancel_hands()
+            finally:
+                del app.runtime.finger_positions
+            assert app.runtime.fingers == {a: hi for a, (_, hi) in limits.items()}
         assert b"Dual-arm control" in fetch("")
         assert b"currentPreview" in fetch("static/dual.js")
         geometry = fetch("geometry")
@@ -171,7 +181,7 @@ def check_launcher_shutdown():
             selector.register(process.stdout, selectors.EVENT_READ)
             assert selector.select(timeout=15), "launcher did not become ready"
             line = process.stdout.readline()
-        assert "shared simulation, DISARMED: http://127.0.0.1:" in line, line
+        assert "[dual_console] shared_sim, DISARMED: http://127.0.0.1:" in line, line
         process.send_signal(signal.SIGTERM)
         output, _ = process.communicate(timeout=15)
         assert process.returncode == 0, output

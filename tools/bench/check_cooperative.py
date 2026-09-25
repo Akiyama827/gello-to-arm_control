@@ -83,7 +83,7 @@ def main():
         action("plan", expected=400, targets={}, active_arms=["left"])
         action("plan", expected=400, object_target=[0] * 5)
         action("plan", expected=400, object_target=[float("nan")] * 6)
-        for a in app.sim.handles:
+        for a in app.runtime.handles:
             action("arm", arm_id=a)
         wait(lambda s: all(a["ready"] for a in s["arms"].values()))
         action("plan_grasps")
@@ -134,7 +134,7 @@ def main():
             "object_only", "box", (0.02, 0.02, 0.004), (0.45, 0, 0.4), (0, 0, 0)
         )
         scene = replace(scene, obstacles=(obstacle,))
-        held = {name: 0.006 for name in app.sim.finger_names}
+        held = {name: 0.006 for name in app.runtime.finger_names}
         world = MuJoCoCollisionWorld.from_scene(
             scene, scene.state(), scene.actor_names, held_positions=held
         )
@@ -160,10 +160,10 @@ def main():
         # Endpoint IK is not enough: a broken initial rigid relation is refused.
         with app._lock:
             starts = {
-                a: c.last_state.position.copy() for a, c in app.sim.controllers.items()
+                a: c.last_state.position.copy() for a, c in app.runtime.controllers.items()
             }
-            object_start = app.sim.object_pose()
-            fingers = app.sim.finger_positions()
+            object_start = app.runtime.object_pose()
+            fingers = app.runtime.finger_positions()
         starts["left"][0] += 0.04
         try:
             plan_request(

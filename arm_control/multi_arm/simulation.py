@@ -27,7 +27,14 @@ class SharedSimulation:
     hand_busy = False
 
     def cancel_hands(self):
-        self.set_fingers(self.finger_positions())
+        # Hold where the fingers are. MuJoCo joint limits are soft, so a
+        # finger resting at its limit can measure ~2 mm past it; hold the
+        # nearest admissible width rather than refuse the cancel (and, in
+        # stop(), skip the disarm that follows).
+        self.set_fingers({
+            a: float(np.clip(v, *self.finger_limits[a]))
+            for a, v in self.finger_positions().items()
+        })
 
     def stop(self):
         self.cancel_hands()
