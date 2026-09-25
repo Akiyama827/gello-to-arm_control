@@ -8,19 +8,19 @@ version = "0.1.0"
 description = "Reusable robot control, planning, plant backends and Dora adapters"
 requires-python = ">=3.10"
 
-# HARD deps = imported at module top level by code any consumer hits.
-#   numpy    — every module
-#   pyarrow  — contracts/ (wire codecs; messages.py remains an API alias)
-#   pyyaml   — config.py, node_utils.py (top-level)
-#   dora-rs  — the repository ships Dora process adapters.
+# HARD deps = what the minimal SDK imports: arm_control.sdk, .execution and
+# .motion need numpy and nothing else (tools/bench/check_sdk_supervisor.py
+# asserts it). Everything that runs a controller or a Dora process is an extra.
 dependencies = [
     "numpy",
-    "pyarrow",
-    "pyyaml",
-    "dora-rs",
 ]
 
 [project.optional-dependencies]
+# The headless supervisor (arm_control.supervisor): ArmController's wire
+# codecs (contracts/, pyarrow) and robot configs (config.py, pyyaml).
+supervisor = ["pyarrow", "pyyaml"]
+# Dora process adapters (nodes/, dataflows/, arm_control.control.adapter).
+dora = ["pyarrow", "pyyaml", "dora-rs"]
 # --- pip-installable extras -------------------------------------------------
 # simulation/ + planning/mujoco_collision.py import mujoco at MODULE top level,
 # so `pip install arm_control[sim]` is required before importing those.

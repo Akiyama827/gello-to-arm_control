@@ -93,6 +93,47 @@ def authority(state: rtp.State, *, claimed_session: int | None = None,
     return Authority(Lifecycle.OBSERVING, None, 0, state.stop_epoch, holding=False)
 
 
+class AppliedTracker:
+    """The RT APPLIED rule (docs/ARCHITECTURE.md, "RT APPLIED rule") over one
+    session's state stream: which command seq the backend has ACCEPTED in the
+    current ARM generation.
+
+    ``feed`` every newly received state in arrival order; call
+    ``disarm_sent`` when a DISARM leaves this session. A seq is confirmed by an
+    ARMED state carrying it plus a LATER ARMED, non-FAULTED state of the same
+    generation received before any DISARM; a FAULTED or disarmed state closes
+    the generation, and nothing after it confirms. Assumes the client seeds
+    its seqs above the generation's first ``last_cmd_seq`` (``RtBackend``
+    does), so a stale value can only confirm a seq older than ours.
+    """
+
+    def __init__(self) -> None:
+        self.epoch: int | None = None
+        self._candidate: int | None = None
+        self._confirmed: int | None = None
+        self._closed = False
+
+    def feed(self, state: rtp.State) -> None:
+        if state.arm_epoch != self.epoch:
+            self.epoch, self._candidate, self._confirmed = state.arm_epoch, None, None
+            self._closed = False
+        if self._closed:
+            return
+        if not state.flags & rtp.FLAG_ARMED or state.flags & rtp.FLAG_FAULTED:
+            self._closed, self._candidate = True, None
+            return
+        if self._candidate is not None:
+            self._confirmed = self._candidate
+        self._candidate = state.last_cmd_seq
+
+    def disarm_sent(self) -> None:
+        self._closed, self._candidate = True, None
+
+    def confirmed(self, epoch: int) -> int | None:
+        """Highest accepted seq of ``epoch``, or None."""
+        return self._confirmed if epoch == self.epoch else None
+
+
 def _self_check() -> None:
     golden = next(line.split()[1] for line in rtp.golden_lines() if line.startswith("STATE "))
     st = rtp.unpack_state(bytes.fromhex(golden))
@@ -144,9 +185,28 @@ def _self_check() -> None:
     assert other.lifecycle is Lifecycle.CONNECTED
     idle = rtp.State(**{**st.__dict__, "flags": 0, "session_id": 0, "arm_epoch": 0})
     assert authority(idle).lifecycle is Lifecycle.OBSERVING
+    # APPLIED: confirmation needs a later ARMED, non-FAULTED state of the epoch.
+    def pkt(seq, flags=rtp.FLAG_ARMED, epoch=7):
+        return rtp.State(**{**st.__dict__, "last_cmd_seq": seq, "flags": flags,
+                            "arm_epoch": epoch})
+    t = AppliedTracker()
+    t.feed(pkt(5))
+    assert t.confirmed(7) is None  # selected by the servo, not yet confirmed
+    t.feed(pkt(6))
+    assert t.confirmed(7) == 5 and t.confirmed(8) is None
+    t.feed(pkt(7, rtp.FLAG_ARMED | rtp.FLAG_FAULTED))  # the write of 6 was rejected
+    t.feed(pkt(7))  # e.g. a later clean state straddling recovery: never evidence
+    assert t.confirmed(7) == 5
+    t.feed(pkt(9, epoch=8))
+    t.disarm_sent()
+    t.feed(pkt(9, epoch=8))  # state straddling our DISARM
+    assert t.confirmed(8) is None
+    t.feed(pkt(3, 0, epoch=9))
+    t.feed(pkt(3, epoch=9))  # disarmed state in the epoch closes it
+    assert t.confirmed(9) is None
     print("RT observation adapter self-check: PASS (golden state -> valid RobotState, "
           "stale/foreign/missing/non-finite, selected/output only while writing, identity hash, "
-          "ARMED/FAULTED holding vs plant-fault/OBSERVING authority)")
+          "ARMED/FAULTED holding vs plant-fault/OBSERVING authority, APPLIED tracker)")
 
 
 if __name__ == "__main__":

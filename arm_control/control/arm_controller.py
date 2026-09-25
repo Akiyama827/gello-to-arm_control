@@ -397,7 +397,11 @@ class ArmController:
                 self._pause_observation("plant health is faulted or stale")
         self.supports_pose_hold = bool(payload.get("supports_pose_hold", False))
         armed = bool(payload.get("armed", False))
-        if armed and not self.bridge_armed:
+        # Latch the plant's armed edge only while THIS controller wants
+        # authority: health can still read armed for a sample or two after a
+        # DISARM request, and latching that stale edge made the next ARM
+        # fault on its own not-yet-armed sample ("plant reported disarmed").
+        if armed and not self.bridge_armed and self.armed:
             self.bridge_armed = True
         elif not armed and self.bridge_armed and self.armed and not self.stopped:
             self._fault("plant reported disarmed")

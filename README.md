@@ -16,6 +16,8 @@ records; they are not current operating instructions.
 |---|---|
 | `arm_control/motion/` | Shared joint-state, command, and trajectory values |
 | `arm_control/control/` | Execution, controller state, safety, gain validation |
+| `arm_control/execution/` | Transport-independent execution contract and its JSON codec |
+| `arm_control/supervisor/`, `arm_control/sdk.py` | Headless per-robot supervisor process; the minimal application SDK (`ArmClient`) |
 | `arm_control/multi_arm/` | Pair lifecycle, transport handles, shared-world and fixed-grasp object planning, simulation |
 | `arm_control/planning/` | IK, collision checking, planning, retiming, preview builders |
 | `arm_control/contracts/` | Central Dora/Arrow wire contracts |

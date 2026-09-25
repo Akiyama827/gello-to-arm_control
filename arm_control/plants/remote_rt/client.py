@@ -320,6 +320,7 @@ class RtBackend:
         # Clear BEFORE consenting: a CTL_FAULT that lands after the ack is
         # new evidence and must not be erased by this cycle's bookkeeping.
         self._latched_fault = ""
+        self._seed_command_seq()
         status = self._control_roundtrip(rtp.CTL_ARM)
         # FAULTED in the ack is the refusal — ARMED alone is not consent: the
         # server keeps its ARMED flag while fault-HOLDING a latched arm.
@@ -328,6 +329,25 @@ class RtBackend:
         if status.seq == 0:
             raise RtLinkError("arm ack carries no ARM epoch (pre-v5 server?)")
         self._arm_epoch = status.seq
+
+    def _seed_command_seq(self) -> None:
+        """Number this epoch's commands above the server's ``last_cmd_seq``.
+
+        The server keeps that value across ARM generations and client
+        sessions, while a new client restarts at 1. Seeded before ARM (no
+        command of the new epoch exists yet), a stale value can then never
+        pass for one of ours -- the execution contract's APPLIED rule
+        (docs/ARCHITECTURE.md) depends on it.
+        """
+        deadline = time.monotonic() + self.config.ack_timeout_s
+        state, _ = self.latest_state()
+        while state is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+            state, _ = self.latest_state()
+        if state is None:
+            raise RtLinkError("no state from server; refusing to arm without the state stream")
+        if not epoch_reached(self._cmd_seq, state.last_cmd_seq):
+            self._cmd_seq = state.last_cmd_seq
 
     def safe_stop(self) -> bool:
         """Disarm (also clears a server-side fault latch, matching the bench
@@ -396,17 +416,18 @@ class RtBackend:
         self._udp = self._tcp = None
 
     # -- command path ---------------------------------------------------------
-    def apply_command(self, command: dict[str, Any]) -> None:
+    def apply_command(self, command: dict[str, Any]) -> int | None:
         """Stream one joint-servo word (the full bridge contract — the server
-        applies torque clamp + slew; nothing is dropped on this side)."""
+        applies torque clamp + slew; nothing is dropped on this side).
+        Returns the wire seq sent, or None while closed."""
         if command.get("cartesian") is not None:
             raise RtLinkError("RT backend does not support the legacy cartesian command tail")
         pose_hold = command.get("pose_hold")
         if pose_hold is not None and not self.supports_pose_hold:
             raise RtLinkError(f"RT backend does not advertise pose_hold={rtp.POSE_HOLD_VERSION}")
         if self._udp is None:
-            return
-        self._send_command_raw(
+            return None
+        return self._send_command_raw(
             np.asarray(command["position"], dtype=float),
             np.asarray(command.get("velocity", np.zeros(self.n)), dtype=float),
             np.asarray(command.get("torque", np.zeros(self.n)), dtype=float),
@@ -415,8 +436,8 @@ class RtBackend:
             pose_hold=pose_hold,
         )
 
-    def _send_command_raw(self, q, qd, tau, kp, kd, pose_hold=None) -> None:
-        self._cmd_seq += 1
+    def _send_command_raw(self, q, qd, tau, kp, kd, pose_hold=None) -> int:
+        self._cmd_seq = (self._cmd_seq + 1) & 0xFFFFFFFF
         pkt = rtp.pack_command(
             n=self.n,
             seq=self._cmd_seq,
@@ -444,6 +465,7 @@ class RtBackend:
             if now - self._last_send_err > 1.0:
                 self._last_send_err = now
                 print(f"[rt_link] UDP send failed: {exc}", flush=True)
+        return self._cmd_seq
 
     # -- feedback -------------------------------------------------------------
     def latest_state(self) -> tuple[rtp.State | None, float]:
@@ -886,6 +908,10 @@ def _demo() -> None:
         backend.open()
         assert backend.session_id != old_session
         backend.enable_all()
+        # A new client numbers above the server's surviving last_cmd_seq, so
+        # that stale value can never read as acceptance of its commands.
+        prior, _ = backend.latest_state()
+        assert epoch_reached(backend._cmd_seq, prior.last_cmd_seq) and backend._cmd_seq > 0
         time.sleep(0.05)
         before, _ = backend.latest_state()
         ghost = rtp.pack_command(n=3, seq=10**6, t_mono_ns=0, q_des=target,

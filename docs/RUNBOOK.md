@@ -5,13 +5,17 @@ the consuming project's workcell-add or hardware deployment workflow.
 
 ## Environment
 
-The local `pyproject.toml` declares Python >=3.10, core dependencies, and the
-`sim`, `viz`, and `mesh` extras. To install this checkout into your selected
-environment:
+The local `pyproject.toml` declares Python >=3.10 and numpy as the only core
+dependency: that is the minimal SDK (`arm_control.sdk`, `.execution`,
+`.motion`). Running controllers or Dora processes needs the `supervisor` or
+`dora` extra. To install this checkout for the Dora stack and console:
 
 ```bash
-python -m pip install -e ".[sim,viz,mesh]"
+python -m pip install -e ".[dora,sim,viz,mesh]"
 ```
+
+An application that only talks to a supervisor needs `python -m pip install .`
+(numpy only); the supervisor host needs `".[supervisor]"` plus Pinocchio.
 
 Installation can download packages and is separate from the offline checks
 below. Provision Pinocchio/collision/planning and vendor hardware bindings as

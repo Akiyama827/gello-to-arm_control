@@ -486,19 +486,102 @@ terminal phase carries a reason. `ExecutionStatus.apply` enforces this.
 
 ### Gaps the contract exposes
 
-These are to be closed by the supervisor and executor slices (CTRL-022/030/033)
-without an RT wire change:
+The headless supervisor (CTRL-022, below) closes these. It emits every phase
+from `ArmController` events, its snapshots and RT evidence, with no RT wire
+change:
 
-- Selection is not reported, and a wrong-id `execute` is log-only.
-- SENT and APPLIED are not reported.
-- Supersession is silent and implicit, and EXPIRED does not exist.
-- `plan_id` doubles as the request and execution id, with no idempotency.
+- selection, SENT and APPLIED (by the RT APPLIED rule)
+- explicit supersession and EXPIRED
+- separate request and execution ids, with idempotency
+- `RtBackend` now seeds its command seq above `last_cmd_seq` at every ARM
+
+The Dora path (`plan`/`control` topics) still reports only its old events.
+
+Still open:
+
 - RT and PC clocks are not attested: there is no host/boot identity on the
-  wire (`Stamp.domain` is empty), so cross-host timing stays unmapped.
+  wire (`Stamp.domain` is empty for RT), so cross-host timing stays unmapped.
+  The supervisor's own clock is attested by the host boot id.
 - RT fault text arrives only over the control session, not in state.
-- `RtBackend` numbers commands from 1 per client instance; it does not yet
-  seed above the observed `last_cmd_seq`, which the APPLIED rule needs.
 - A failed backend stop at DISARM is visible only in the fault journal.
+
+## Headless supervisor and SDK (CTRL-022, first slice)
+
+`arm_control.supervisor` runs one robot in its own process. `arm_control.sdk`
+is the application side. The chain is:
+
+`ArmClient` → named operations over a local socket → `RobotRuntime` → the
+existing `ArmController` (still the only executor) → `RtBackend` → the RT
+server.
+
+- **Process and threads.**
+  - The runtime steps the controller at the execution policy's 100 Hz, in the
+    supervisor process.
+  - Every controller call and ledger change happens on that loop while it
+    holds one lock. Client threads only enqueue operations and read
+    snapshots.
+  - ARM/DISARM round trips run on their own worker, with
+    `RemoteHardware`'s rules: a DISARM drops queued ARMs, and ARM is refused
+    while a DISARM is unconfirmed.
+  - A stalled client (half-sent frame, GIL-bound thread, silence) does not
+    delay a tick.
+- **Operations.** These names and arguments are the transport-neutral
+  boundary:
+  - `hello`, `now`, `state`, `authority`
+  - `claim`, `unclaim`, `arm`, `disarm`
+  - `submit`, `release`, `cancel`, `status` (optionally a bounded wait),
+    `receipts`
+
+  The transport today is newline-delimited JSON over a Unix socket in an
+  owner-only directory, one connection per client session.
+  `supervisor.service.dispatch` maps names to the runtime, and
+  `execution.codec` maps contract values to JSON.
+- **Ownership.**
+  - One client session owns the robot (`claim`); every mutating operation
+    checks it.
+  - A closed session is refused at once, before its queued work runs.
+  - Losing the owner cancels its live executions and holds, still armed.
+    Nobody reacquires control automatically.
+  - Connecting is observation only.
+  - A supervisor start claims the RT server and never arms.
+- **Authority as reported.**
+  - ARMED/FAULTED come from RT state.
+  - CLAIMED means a client owns the robot through the supervisor's RT claim.
+  - CONNECTED means nobody owns it.
+  - DISCONNECTED means no fresh RT state.
+- **Admission.**
+  - Contract admission (`admission_refusal`, then `supersession_refusal`)
+    runs first.
+  - Then the controller's own admission: execution policy, gains and model
+    token.
+  - Selection is the controller's `_release`, preceded by the contract's
+    expiry and `selection_refusal`.
+- **Completion.** A feedback completion becomes COMPLETED only once APPLIED is
+  reached. It becomes FAULTED if acceptance evidence has not arrived within
+  0.5 s.
+- **Install.**
+  - The minimal SDK needs numpy only (`pip install .`).
+  - The supervisor needs `.[supervisor]` (pyarrow for the controller's
+    codecs, pyyaml) plus Pinocchio.
+  - Dora processes need `.[dora]`.
+  - `tools/bench/check_sdk_supervisor.py` drives all of it device-free,
+    including from a clean numpy-only install.
+- **One writer.** Until the Dora adapters delegate to the supervisor, a robot
+  is driven by either the supervisor or a Dora graph (PC-controlled mode),
+  never both. The RT server admits one control session, so a second commander
+  is refused at CLAIM.
+
+Not in this slice:
+
+- `RobotGroup` and group reservation (CTRL-040)
+- migrating the Dora `arm_controller` node, the consoles and `RemoteHardware`
+  onto the runtime; they still build their own `ArmController`, the same
+  recipe
+- a client lease or heartbeat beyond connection liveness
+- clearing a completion-timeout freeze without DISARM: a FAULTED settle
+  leaves the controller frozen, and later submits are refused until DISARM
+  (which cancels) clears it
+- persisting the ledger (it keeps 512 executions)
 
 ## Known unfinished boundaries
 
