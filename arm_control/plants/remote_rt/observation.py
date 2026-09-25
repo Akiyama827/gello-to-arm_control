@@ -65,14 +65,17 @@ def robot_state(state: rtp.State | None, identity: RobotIdentity, *, received_ns
         return RobotState(iid, Validity.INVALID, str(exc))
 
 
-def authority(state: rtp.State, *, claimed: bool = False,
+def authority(state: rtp.State, *, claimed_session: int | None = None,
               fault_text: str = "") -> Authority:
     """The robot's lifecycle as its state packet shows it. ``session`` is the
     connected control session (hex), whoever holds it; ``holding`` is
     ``FLAG_HOLDING``. State packets never carry ``FLAG_CLAIMED`` (only
     control replies do), so a disarmed CLAIMED robot is known only to the
-    session that claimed it: it passes ``claimed`` from its latest reply.
-    Anyone else sees CONNECTED."""
+    session that claimed it: it passes its own session id as
+    ``claimed_session`` while its latest reply shows the claim. The packet
+    must carry that same session -- the server re-sends its cached state to
+    a newly registered peer, so a packet from the previous session can reach
+    the new one. Anyone else sees CONNECTED."""
     session = f"{state.session_id:016x}" if state.session_id else None
     holding = bool(state.flags & rtp.FLAG_HOLDING)
     if state.flags & rtp.FLAG_FAULTED:
@@ -83,7 +86,7 @@ def authority(state: rtp.State, *, claimed: bool = False,
     if state.flags & rtp.FLAG_ARMED:
         return Authority(Lifecycle.ARMED, session, state.arm_epoch, state.stop_epoch,
                          holding=holding)
-    if claimed and session is not None:
+    if claimed_session is not None and state.session_id == claimed_session:
         return Authority(Lifecycle.CLAIMED, session, 0, state.stop_epoch, holding=False)
     if session is not None:
         return Authority(Lifecycle.CONNECTED, session, 0, state.stop_epoch, holding=False)
@@ -136,7 +139,9 @@ def _self_check() -> None:
     assert p.lifecycle is Lifecycle.FAULTED and p.fault.code == "plant" and p.holding is False
     disarmed = rtp.State(**{**st.__dict__, "flags": 0})
     assert authority(disarmed).lifecycle is Lifecycle.CONNECTED  # observer: claim unknown
-    assert authority(disarmed, claimed=True).lifecycle is Lifecycle.CLAIMED
+    assert authority(disarmed, claimed_session=st.session_id).lifecycle is Lifecycle.CLAIMED
+    other = authority(disarmed, claimed_session=st.session_id + 1)  # cached packet of a prior session
+    assert other.lifecycle is Lifecycle.CONNECTED
     idle = rtp.State(**{**st.__dict__, "flags": 0, "session_id": 0, "arm_epoch": 0})
     assert authority(idle).lifecycle is Lifecycle.OBSERVING
     print("RT observation adapter self-check: PASS (golden state -> valid RobotState, "

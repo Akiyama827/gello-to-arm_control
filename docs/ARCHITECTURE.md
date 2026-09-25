@@ -355,10 +355,15 @@ of these:
 
 - an ARMED state of the same `arm_epoch` whose `last_cmd_seq` is at or past
   the first command seq sent for the execution;
-- a later state of that epoch that is still ARMED and not FAULTED.
+- a later state of that epoch that is still ARMED and not FAULTED, received
+  while the executor's control session is up and before it sends any DISARM
+  in that epoch.
 
 The later state is needed because a cause latched concurrently by another
-thread can surface one tick late. For the FR3 backend, acceptance means
+thread can surface one tick late. The DISARM bound is needed because DISARM
+clears the latch mid-tick: a state straddling it can show ARMED without
+FAULTED after a rejected write. A FAULTED state seen at any point in the epoch
+ends the execution FAULTED, and a later clean state never overrides it. For the FR3 backend, acceptance means
 libfranka's `ActiveControl::writeOnce` returned without an exception. For DM,
 it means every active motor's CAN frame was sent.
 
@@ -440,7 +445,9 @@ terminal phase carries a reason. `ExecutionStatus.apply` enforces this.
   `FAULT_STOP_FAILED` journal record.
 - **CLAIMED** is visible only to the session that claimed. State packets carry
   `session_id` (set at connect) but not `FLAG_CLAIMED`, which appears only in
-  control replies. Everyone else sees a disarmed claimed robot as CONNECTED.
+  control replies. The claiming session reports CLAIMED only for packets
+  carrying its own session id: the server re-sends cached state to a new peer.
+  Everyone else sees a disarmed claimed robot as CONNECTED.
 - **Capability, version and qualification.**
   - An unknown controller profile or contract version is refused before
     actuation.
