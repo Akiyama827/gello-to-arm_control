@@ -19,6 +19,9 @@
 #pragma once
 
 #include <netinet/in.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 
 #include <atomic>
@@ -72,9 +75,13 @@ struct ServerConfig {
   double hold_kp = 50.0;    // hold gains when no command was ever received
   double hold_kd = 5.0;
   uint32_t initial_active_mask = 0xFFFFu;
-  int rt_priority = 80;     // SCHED_FIFO; failure to set is a warning, not fatal
+  int rt_priority = 80;     // SCHED_FIFO for the servo thread
   int rt_cpu = -1;          // pin the SERVO thread here (an isolcpus core);
                             // comms threads float on the housekeeping cores
+  // Process-local RT setup (mlockall, SCHED_FIFO at rt_priority, rt_cpu when
+  // given) gates ARM for real backends. The fake backend runs degraded unless
+  // this asks it to gate too (device-free checks of the refusal path).
+  bool require_rt_setup = false;
   // Bind address for BOTH listeners. Default any: the box is dual-NIC (PC
   // direct link + robot LAN) and INADDR_ANY answers on the robot LAN too —
   // production units should pass --bind <direct-link-ip>.
@@ -306,6 +313,14 @@ struct ServerCtx {
                                      // so systemd's Restart=on-failure retries
                                      // (a port race must not look like success)
   std::atomic<bool> backend_ready{false};
+  // Failed process-local RT prerequisites (RT_SETUP_*) and whether they gate
+  // ARM. Written once by rt_loop before backend_ready; a failure lasts for
+  // the process: fix the limits and restart the service.
+  std::atomic<uint32_t> rt_setup_failed{0};
+  std::atomic<bool> rt_setup_required{false};
+  bool rt_setup_blocks_arm() const {
+    return rt_setup_required.load() && rt_setup_failed.load() != 0;
+  }
   std::atomic<bool> supports_pose_hold{false};
   std::atomic<int> backend_n{0};
   std::atomic<uint32_t> online_mask{0};
@@ -501,7 +516,70 @@ inline int drain_fault_journal(ServerCtx& ctx, FILE* out) {
 // generation, the flow pin is cleared, the peer is scoped to the new
 // generation, the generation is published, and authority is raised last,
 // after the latch word is FREE again. Returns the new generation, 0 = refused.
+// Process-local RT prerequisites this server establishes for its own servo
+// thread. The syscalls are injectable so self-checks need no privileges. Host
+// facts (PREEMPT_RT, IRQ routing, ksoftirqd, isolation, deployed artifacts)
+// belong to the deployment package (install.py --check-host), not here.
+enum : uint32_t {
+  RT_SETUP_MLOCK = 1u << 0,     // mlockall(MCL_CURRENT | MCL_FUTURE)
+  RT_SETUP_SCHED = 1u << 1,     // SCHED_FIFO at the requested priority
+  RT_SETUP_AFFINITY = 1u << 2,  // servo thread on exactly --rt-cpu
+};
+struct RtSetupOps {
+  int (*lock_memory)(int) = ::mlockall;
+  int (*set_sched)(pthread_t, int, const sched_param*) = ::pthread_setschedparam;
+  int (*get_sched)(pthread_t, int*, sched_param*) = ::pthread_getschedparam;
+  int (*set_affinity)(pthread_t, size_t, const cpu_set_t*) = ::pthread_setaffinity_np;
+  int (*get_affinity)(pthread_t, size_t, cpu_set_t*) = ::pthread_getaffinity_np;
+};
+
+// Applies the setup to the calling thread; returns what failed (0 = all
+// established). Scheduling and affinity are read back, not assumed from a
+// zero return. Affinity is a prerequisite only when rt_cpu is requested.
+inline uint32_t establish_rt_setup(int rt_priority, int rt_cpu, const RtSetupOps& ops = {}) {
+  uint32_t failed = 0;
+  if (ops.lock_memory(MCL_CURRENT | MCL_FUTURE) != 0) failed |= RT_SETUP_MLOCK;
+  sched_param want{}, got{};
+  want.sched_priority = rt_priority;
+  int policy = -1;
+  if (ops.set_sched(pthread_self(), SCHED_FIFO, &want) != 0 ||
+      ops.get_sched(pthread_self(), &policy, &got) != 0 || policy != SCHED_FIFO ||
+      got.sched_priority != rt_priority)
+    failed |= RT_SETUP_SCHED;
+  if (rt_cpu >= 0) {
+    cpu_set_t set, have;
+    CPU_ZERO(&set);
+    CPU_ZERO(&have);
+    CPU_SET(rt_cpu, &set);
+    if (ops.set_affinity(pthread_self(), sizeof(set), &set) != 0 ||
+        ops.get_affinity(pthread_self(), sizeof(have), &have) != 0 || !CPU_EQUAL(&set, &have))
+      failed |= RT_SETUP_AFFINITY;
+  }
+  return failed;
+}
+
+// "mlockall+sched_fifo+affinity" for the failed bits; "ok" when none.
+inline void rt_setup_names(uint32_t failed, char* out, size_t cap) {
+  static const char* const names[] = {"mlockall", "sched_fifo", "affinity"};
+  size_t at = 0;
+  out[0] = '\0';
+  for (int b = 0; b < 3; ++b)
+    if (failed & (1u << b) && at < cap)
+      at += size_t(std::snprintf(out + at, cap - at, "%s%s", at ? "+" : "", names[b]));
+  if (!failed) std::snprintf(out, cap, "ok");
+}
+
+// CTL_ARM's refusal text when the process-local setup gates ARM.
+inline void rt_setup_refusal(const ServerCtx& ctx, char* out, size_t cap) {
+  char names[48];
+  rt_setup_names(ctx.rt_setup_failed.load(), names, sizeof(names));
+  std::snprintf(out, cap, "refused: RT process setup failed (%s); fix limits, restart", names);
+}
+
 inline uint64_t begin_arm(ServerCtx& ctx) {
+  // Checked first: a process that could not establish its RT setup prepares
+  // nothing of a new generation.
+  if (ctx.rt_setup_blocks_arm()) return 0;
   uint64_t gen = 0;
   ctx.arm_unlatched([&] {
     gen = ctx.arm_gen.load(std::memory_order_relaxed) + 1;

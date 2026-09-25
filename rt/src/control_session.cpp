@@ -120,14 +120,18 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   // name: the client must be able to refuse a server whose deadman is
   // configured for hand-guiding (--fault-ms 3600000) — a commander graph
   // against that server has no staleness reflex at all (audit 2026-07-29).
-  char hello[96];
+  // rt= reports the process-local RT setup ("ok" or the failed parts); an
+  // extra key=value token, so existing clients ignore it.
+  char hello[sizeof(ControlPacket{}.text)];
   char capability[24] = {};
+  char rt_setup[48];
   if (ctx.supports_pose_hold.load())
     std::snprintf(capability, sizeof(capability), " pose_hold=%u", POSE_HOLD_VERSION);
+  rt_setup_names(ctx.rt_setup_failed.load(), rt_setup, sizeof(rt_setup));
   std::snprintf(hello, sizeof(hello),
-                "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s",
+                "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s rt=%s",
                 ctx.backend_name, ctx.cfg.hold_ms, ctx.cfg.fault_ms,
-                ctx.active_mask.load(), capability);
+                ctx.active_mask.load(), capability, rt_setup);
   send_frame(fd, make(CTL_HELLO, uint32_t(ctx.backend_n.load()), hello));
   {
     ControlPacket idf = make(CTL_IDENTITY, uint32_t(ctx.backend_n.load()), nullptr);
@@ -226,7 +230,12 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           // deliberately retained) — the FAULTED bit is the refusal, and
           // clients must check it, not just ARMED.
           const uint64_t gen = begin_arm(ctx);
-          if (gen != 0) {
+          if (gen == 0 && ctx.rt_setup_blocks_arm()) {
+            char why[sizeof(ControlPacket{}.text)];
+            rt_setup_refusal(ctx, why, sizeof(why));
+            std::fprintf(stderr, "[rt] ARM %s\n", why);
+            send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), why));
+          } else if (gen != 0) {
             // seq = the ARM epoch every command of this authority must carry.
             send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "armed", uint32_t(gen)));
           } else if (ctx.latch_state.load() == ServerCtx::LATCH_SET) {

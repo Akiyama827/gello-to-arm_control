@@ -1,7 +1,8 @@
 // The 1 kHz servo thread. Constructs the backend HERE (libfranka raises the
-// calling thread's scheduling in the Robot constructor), elevates itself
-// (mlockall + SCHED_FIFO — warnings, not failures, so the fake runs on any
-// desktop), then ticks: read plant -> staleness policy -> servo law -> write.
+// calling thread's scheduling in the Robot constructor), establishes its
+// process-local RT setup (mlockall + SCHED_FIFO + --rt-cpu; a failure refuses
+// ARM on real backends, while the fake runs degraded on any desktop), then
+// ticks: read plant -> staleness policy -> servo law -> write.
 //
 // Authority ladder, most-alive first:
 //   armed + fresh command        -> track the command (its kp/kd/tau_ff)
@@ -20,10 +21,6 @@
 // gains (or --hold-kp/--hold-kd if no command ever arrived — the state right
 // after arming, which IS "hold where you are"). tau_ff is dropped in hold;
 // the slew limiter ramps it out instead of stepping it.
-#include <pthread.h>
-#include <sched.h>
-#include <sys/mman.h>
-
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -41,30 +38,6 @@ std::unique_ptr<Backend> make_franka_backend(const std::string& ip, double ee_ma
                                              const double ee_com[3]);
 std::unique_ptr<Backend> make_dm_backend(const std::string& can_if,
                                          uint32_t active_mask, double tau_max);
-
-namespace {
-
-void elevate(const ServerConfig& cfg) {
-  if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
-    std::perror("[rt] mlockall (continuing unpinned)");
-  sched_param sp{};
-  sp.sched_priority = cfg.rt_priority;
-  if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
-    std::perror("[rt] SCHED_FIFO (continuing at normal priority)");
-  if (cfg.rt_cpu >= 0) {
-    // Only THIS thread moves to the isolated core; the comms threads keep the
-    // default mask (the housekeeping cores, once isolcpus removes this one).
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cfg.rt_cpu, &set);
-    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
-      std::perror("[rt] rt-cpu pin (continuing unpinned)");
-    else
-      std::printf("[rt] servo thread pinned to cpu %d\n", cfg.rt_cpu);
-  }
-}
-
-} // namespace
 
 void rt_loop(ServerCtx& ctx) {
   std::unique_ptr<Backend> backend;
@@ -136,8 +109,26 @@ void rt_loop(ServerCtx& ctx) {
   ctx.requested_active_mask.store(backend->active_mask());
   std::snprintf(ctx.backend_name, sizeof(ctx.backend_name), "%s", backend->name());
   ctx.supports_pose_hold.store(backend->supports_pose_hold());
+  // Only THIS thread moves to the isolated core; the comms threads keep the
+  // default mask (the housekeeping cores, once isolcpus removes this one).
+  // Published before backend_ready, so no ARM is admitted ahead of it.
+  const uint32_t rt_failed = establish_rt_setup(ctx.cfg.rt_priority, ctx.cfg.rt_cpu);
+  const bool rt_required = ctx.cfg.backend != "fake" || ctx.cfg.require_rt_setup;
+  ctx.rt_setup_failed.store(rt_failed);
+  ctx.rt_setup_required.store(rt_required);
+  {
+    char names[48];
+    rt_setup_names(rt_failed, names, sizeof(names));
+    if (!rt_failed)
+      std::printf("[rt] process RT setup ok: mlockall, SCHED_FIFO %d%s\n", ctx.cfg.rt_priority,
+                  ctx.cfg.rt_cpu >= 0 ? (", cpu " + std::to_string(ctx.cfg.rt_cpu)).c_str() : "");
+    else
+      std::fprintf(stderr, "[rt] process RT setup FAILED: %s -- %s (check LimitMEMLOCK, "
+                   "LimitRTPRIO/--rt-priority, --rt-cpu)\n", names,
+                   rt_required ? "ARM will be refused; state stays observable"
+                               : "running degraded (fake backend)");
+  }
   ctx.backend_ready.store(true);
-  elevate(ctx.cfg);
   std::printf("[rt] %s backend up: %d joints, tick %.1f ms, slew %.2f N.m/tick\n",
               backend->name(), n, backend->tick_s() * 1e3, slew);
 

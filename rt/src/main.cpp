@@ -61,6 +61,7 @@ void usage(const char* argv0) {
       "          [--ee-mass KG] [--ee-com X,Y,Z] [--tau-max NM]\n"
       "          [--dm-spec IF;ID:TYPE[:MST[:PMAX:VMAX:TMAX]],...] [--rt-priority N]\n"
       "          [--active-mask MASK] [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
+      "          [--require-rt-setup]\n"
       "\n"
       "  --instance-id  provisioned arm instance id ([A-Za-z0-9_.-], <32 chars);\n"
       "             required for franka/dm. Commanders CLAIM it before ARM.\n"
@@ -72,7 +73,9 @@ void usage(const char* argv0) {
       "  --dm-spec DM host MIT maps; optional symmetric PMAX/VMAX/TMAX must\n"
       "             match firmware (rad, rad/s, N.m). Omit for type defaults.\n"
       "  --tau-max  positive operating torque cap per joint (N.m), never above\n"
-      "             backend limits; omitted keeps the backend defaults.\n",
+      "             backend limits; omitted keeps the backend defaults.\n"
+      "  --require-rt-setup  refuse ARM if mlockall, SCHED_FIFO or --rt-cpu fails\n"
+      "             (always on for franka/dm; the fake backend runs degraded).\n",
       argv0);
 }
 
@@ -177,6 +180,7 @@ int main(int argc, char** argv) {
     }
     else if (!std::strcmp(argv[i], "--rt-priority")) cfg.rt_priority = std::atoi(next("--rt-priority"));
     else if (!std::strcmp(argv[i], "--rt-cpu")) cfg.rt_cpu = std::atoi(next("--rt-cpu"));
+    else if (!std::strcmp(argv[i], "--require-rt-setup")) cfg.require_rt_setup = true;
     else {
       usage(argv[0]);
       return 2;

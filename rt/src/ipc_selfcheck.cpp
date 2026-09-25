@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -330,13 +331,123 @@ namespace arm_rt {
 uint64_t mono_ns();  // udp_link.cpp (real clock)
 }
 
+// ---- Process-local RT setup gate -----------------------------------------
+
+// Injected syscalls: each fails on request, and readback reports what a
+// kernel would have stored (or a lie, to prove the readback is checked).
+struct FakeRt {
+  int mlock_rc = 0, set_sched_rc = 0, set_aff_rc = 0;
+  int got_policy = SCHED_FIFO, got_prio = 80, got_cpu = 3;
+  int affinity_calls = 0;
+} fake_rt;
+int fake_mlock(int) { return fake_rt.mlock_rc; }
+int fake_set_sched(pthread_t, int, const sched_param*) { return fake_rt.set_sched_rc; }
+int fake_get_sched(pthread_t, int* policy, sched_param* p) {
+  *policy = fake_rt.got_policy;
+  p->sched_priority = fake_rt.got_prio;
+  return 0;
+}
+int fake_set_aff(pthread_t, size_t, const cpu_set_t*) {
+  ++fake_rt.affinity_calls;
+  return fake_rt.set_aff_rc;
+}
+int fake_get_aff(pthread_t, size_t, cpu_set_t* set) {
+  CPU_ZERO(set);
+  CPU_SET(fake_rt.got_cpu, set);
+  return 0;
+}
+uint32_t setup_with(FakeRt f, int cpu = 3) {
+  fake_rt = f;
+  RtSetupOps ops;
+  ops.lock_memory = fake_mlock;
+  ops.set_sched = fake_set_sched;
+  ops.get_sched = fake_get_sched;
+  ops.set_affinity = fake_set_aff;
+  ops.get_affinity = fake_get_aff;
+  return establish_rt_setup(80, cpu, ops);
+}
+
+void check_rt_setup() {
+  assert(setup_with({}) == 0);  // everything established and read back
+  FakeRt f;
+  f.mlock_rc = -1;
+  assert(setup_with(f) == RT_SETUP_MLOCK);
+  f = {};
+  f.set_sched_rc = EPERM;
+  assert(setup_with(f) == RT_SETUP_SCHED);
+  f = {};
+  f.got_policy = SCHED_OTHER;  // call "succeeded", thread is not FIFO
+  assert(setup_with(f) == RT_SETUP_SCHED);
+  f = {};
+  f.got_prio = 50;  // FIFO, but not the requested priority
+  assert(setup_with(f) == RT_SETUP_SCHED);
+  f = {};
+  f.set_aff_rc = EINVAL;
+  assert(setup_with(f) == RT_SETUP_AFFINITY);
+  f = {};
+  f.got_cpu = 1;  // pinned somewhere else
+  assert(setup_with(f) == RT_SETUP_AFFINITY);
+  f = {};
+  f.set_aff_rc = EINVAL;  // no --rt-cpu: affinity is not requested at all
+  assert(setup_with(f, -1) == 0 && fake_rt.affinity_calls == 0);
+  f = {};
+  f.mlock_rc = -1;
+  f.set_sched_rc = EPERM;
+  f.set_aff_rc = EINVAL;
+  assert(setup_with(f) == (RT_SETUP_MLOCK | RT_SETUP_SCHED | RT_SETUP_AFFINITY));
+  char names[48];
+  rt_setup_names(RT_SETUP_MLOCK | RT_SETUP_AFFINITY, names, sizeof(names));
+  assert(!std::strcmp(names, "mlockall+affinity"));
+  rt_setup_names(0, names, sizeof(names));
+  assert(!std::strcmp(names, "ok"));
+}
+
+void check_rt_setup_gate() {
+  {  // real backend, setup failed: ARM refused, repeatedly, preparing nothing
+    Bench b;
+    b.ctx.rt_setup_failed.store(RT_SETUP_MLOCK | RT_SETUP_SCHED);
+    b.ctx.rt_setup_required.store(true);
+    const uint64_t owner = b.ctx.cmd_owner.load();
+    for (int i = 0; i < 3; ++i) {
+      assert(b.arm() == 0);
+      ArmStart start{};
+      assert(b.ctx.arm_start.read(start) == 0);  // never written
+      assert(b.ctx.arm_gen.load() == 0 && !b.ctx.armed.load());
+      assert(b.ctx.cmd_owner.load() == owner && b.ctx.peer_gen == 0);
+      assert(b.ctx.latch_state.load() == ServerCtx::LATCH_FREE);
+    }
+    char why[sizeof(ControlPacket{}.text)];
+    rt_setup_refusal(b.ctx, why, sizeof(why));
+    assert(std::strstr(why, "refused: RT process setup failed (mlockall+sched_fifo)"));
+    // DISARM / latch reset does not clear it: the failure lasts for the process.
+    assert(b.ctx.clear_latch() && b.arm() == 0 && b.ctx.rt_setup_blocks_arm());
+    // The state path is untouched: the server stays observable.
+    assert(!b.ctx.fault.load());
+  }
+  {  // fake/offline backend: degraded setup is permitted
+    Bench b;
+    b.ctx.rt_setup_failed.store(RT_SETUP_MLOCK | RT_SETUP_SCHED | RT_SETUP_AFFINITY);
+    b.ctx.rt_setup_required.store(false);
+    assert(b.arm() == 1 && b.ctx.armed.load());
+  }
+  {  // real backend, setup established: admitted as before
+    Bench b;
+    b.ctx.rt_setup_failed.store(0);
+    b.ctx.rt_setup_required.store(true);
+    assert(b.arm() == 1 && b.ctx.armed.load());
+  }
+}
+
 int main() {
+  check_rt_setup();
+  check_rt_setup_gate();
   check_mailbox_sequential();
   check_mailbox_concurrent();
   check_admission();
   check_retired_handler();
   check_freshness();
-  std::puts("PASS RT IPC: mailbox latest-wins without tearing, admission before "
-            "side effects (stale-port pin, epochs, observers), retired-handler and session "
-            "scoping, generation-owned deadline");
+  std::puts("PASS RT IPC: process RT setup (mlockall/FIFO/affinity failures read back, "
+            "gate refuses ARM for real backends before any preparation, fake permitted), "
+            "mailbox latest-wins without tearing, admission before side effects (stale-port pin, "
+            "epochs, observers), retired-handler and session scoping, generation-owned deadline");
 }

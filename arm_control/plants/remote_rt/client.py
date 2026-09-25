@@ -273,6 +273,8 @@ class RtBackend:
         )
         self.supports_pose_hold = flags.get("pose_hold") == str(rtp.POSE_HOLD_VERSION)
         self._active_mask = int(flags.get("active", str((1 << self.n) - 1)), 0)
+        # Process-local RT setup: "ok" or the failed parts; older servers omit it.
+        self.rt_setup = flags.get("rt", "unknown")
         fault_ms = float(flags.get("fault_ms", 0) or 0)
         if self.config.max_fault_ms > 0 and fault_ms > self.config.max_fault_ms:
             raise RtLinkError(
