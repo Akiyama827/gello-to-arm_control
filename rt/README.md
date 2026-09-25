@@ -378,6 +378,21 @@ review-caught, all in the stale-authority class):
 4. **Graph integration**: the real motion graph with `plant_interface` →
    `nodes/rt_interface.py`; then the project's task-specific validation.
 
+## Process-local RT setup gates ARM
+
+At startup the servo thread applies `mlockall`, `SCHED_FIFO` at `--rt-priority`
+and, when `--rt-cpu` is given, its CPU pin. It reads back the policy, priority
+and CPU mask. This finishes before the backend is published as ready. For
+`franka` and `dm`, any failed part refuses ARM for the life of the process:
+`refused: RT process setup failed (<parts>); fix limits, restart`. The state
+stream and observers keep working. The fake backend runs degraded unless
+`--require-rt-setup` is given. HELLO reports `rt=ok` or the failed parts.
+
+This checks only what the process sets for itself. The host facts (kernel,
+IRQ routing, `ksoftirqd`, isolation, deployed artifacts) belong to the
+deployment package's `install.py --check-host`. Whether the whole stack meets
+FCI timing is established by hardware qualification.
+
 ## RT host checklist (rung 1 prerequisite)
 
 - PREEMPT_RT kernel (`uname -v` says `PREEMPT_RT`); `/etc/security/limits.d/`
