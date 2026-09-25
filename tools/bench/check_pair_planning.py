@@ -132,6 +132,11 @@ def fr3_sim():
 
 
 if __name__ == "__main__":
+    # Keep this regression reproducible without changing production planner
+    # randomness or its public API.
+    from ompl import util as ou
+
+    ou.RNG.setSeed(42)
     crossing()
     fr3_sim()
     print(
