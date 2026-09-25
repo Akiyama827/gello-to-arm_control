@@ -112,7 +112,7 @@ void rt_loop(ServerCtx& ctx) {
   // Only THIS thread moves to the isolated core; the comms threads keep the
   // default mask (the housekeeping cores, once isolcpus removes this one).
   // Published before backend_ready, so no ARM is admitted ahead of it.
-  const uint32_t rt_failed = establish_rt_setup(ctx.cfg.rt_priority, ctx.cfg.rt_cpu);
+  const uint32_t rt_failed = establish_rt_setup(ctx.cfg.rt_priority, ctx.cfg.rt_cpu, ctx.rt_setup_ops);
   const bool rt_required = ctx.cfg.backend != "fake" || ctx.cfg.require_rt_setup;
   ctx.rt_setup_failed.store(rt_failed);
   ctx.rt_setup_required.store(rt_required);

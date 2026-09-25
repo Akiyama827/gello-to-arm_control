@@ -163,6 +163,43 @@ void check_backend() {
   assert(script.writes == writes);
 }
 
+// A kernel that grants the process-local RT setup and reports back what it
+// was given: these harnesses run the real rt_loop under backend "franka",
+// whose ARM is gated on that setup.
+struct {
+  int policy = SCHED_OTHER, prio = 0;
+  cpu_set_t cpus;
+} granted;
+int grant_mlock(int) { return 0; }
+int grant_set_sched(pthread_t, int policy, const sched_param* p) {
+  granted.policy = policy;
+  granted.prio = p->sched_priority;
+  return 0;
+}
+int grant_get_sched(pthread_t, int* policy, sched_param* p) {
+  *policy = granted.policy;
+  p->sched_priority = granted.prio;
+  return 0;
+}
+int grant_set_aff(pthread_t, size_t, const cpu_set_t* set) {
+  granted.cpus = *set;
+  return 0;
+}
+int grant_get_aff(pthread_t, size_t, cpu_set_t* set) {
+  *set = granted.cpus;
+  return 0;
+}
+int refuse_mlock(int) { return -1; }
+RtSetupOps granting_kernel() {
+  RtSetupOps ops;
+  ops.lock_memory = grant_mlock;
+  ops.set_sched = grant_set_sched;
+  ops.get_sched = grant_get_sched;
+  ops.set_affinity = grant_set_aff;
+  ops.get_affinity = grant_get_aff;
+  return ops;
+}
+
 // The real rt_loop: an armed FR3 read throwing a non-libfranka exception
 // latches FAULT_PLANT with the attributed cause and suppresses every torque
 // write until the next ARM, instead of terminating the process.
@@ -176,6 +213,7 @@ void check_rt_loop() {
   context.cfg.instance_id = "selfcheck";
   for (int j = 0; j < 7; ++j) context.cfg.joint_names.push_back("j" + std::to_string(j));
   context.cfg.rt_priority = 0;
+  context.rt_setup_ops = granting_kernel();
   script = {};
   idle_reads = 0;
   script.hook = [](const char* op) {
@@ -204,6 +242,33 @@ void check_rt_loop() {
   assert(std::strcmp(first.text, context.fault_text) == 0);
 }
 
+// The real rt_loop under a kernel that refuses mlockall: the franka backend is
+// up and keeps reading (observable), ARM is refused, nothing is written.
+void check_rt_setup_refusal() {
+  ServerCtx context;
+  ctx = &context;
+  context.cfg.backend = "franka";
+  context.cfg.instance_id = "selfcheck";
+  for (int j = 0; j < 7; ++j) context.cfg.joint_names.push_back("j" + std::to_string(j));
+  context.cfg.rt_priority = 0;
+  context.rt_setup_ops = granting_kernel();
+  context.rt_setup_ops.lock_memory = refuse_mlock;
+  script = {};
+  idle_reads = 0;
+  script.hook = [](const char* op) {
+    if (!std::strcmp(op, "readOnce")) {
+      ++idle_reads;
+      if (idle_reads <= 3) assert(begin_arm(*ctx) == 0);  // refused, every time
+      if (idle_reads >= 6) ctx->shutdown.store(true);
+    }
+  };
+  rt_loop(context);
+  assert(!context.failed && context.backend_ready && context.rt_setup_blocks_arm());
+  assert(context.rt_setup_failed == RT_SETUP_MLOCK);
+  assert(idle_reads >= 6 && script.writes == 0 && script.sessions == 0);
+  assert(context.arm_gen == 0 && !context.armed && !context.fault);
+}
+
 // DISARM whose controlled stop fails: a separate stop-failed record, no latch.
 void check_stop_failure_journal() {
   ServerCtx context;
@@ -212,6 +277,7 @@ void check_stop_failure_journal() {
   context.cfg.instance_id = "selfcheck";
   for (int j = 0; j < 7; ++j) context.cfg.joint_names.push_back("j" + std::to_string(j));
   context.cfg.rt_priority = 0;
+  context.rt_setup_ops = granting_kernel();
   script = {};
   idle_reads = 0;
   script.hook = [](const char* op) {
@@ -243,6 +309,7 @@ std::string shutdown_export(bool consumer_running) {
   context.cfg.instance_id = "selfcheck";
   for (int j = 0; j < 7; ++j) context.cfg.joint_names.push_back("j" + std::to_string(j));
   context.cfg.rt_priority = 0;
+  context.rt_setup_ops = granting_kernel();
   char* buf = nullptr;
   size_t len = 0;
   context.journal_out = open_memstream(&buf, &len);
@@ -286,9 +353,11 @@ void check_shutdown_export() {
 int main() {
   check_backend();
   check_rt_loop();
+  check_rt_setup_refusal();
   check_stop_failure_journal();
   check_shutdown_export();
   std::puts("PASS FR3 backend: non-libfranka exceptions in open/read/write/stop contained, "
             "cause attributed and journaled, armed read fault latches with writes "
-            "suppressed, failed stop journaled separately and exported once at shutdown");
+            "suppressed, failed stop journaled separately and exported once at shutdown, "
+            "ARM refused under a failed process RT setup while reads continue");
 }

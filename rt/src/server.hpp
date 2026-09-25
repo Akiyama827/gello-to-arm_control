@@ -231,6 +231,23 @@ struct Observer {
   uint64_t expiry_ns = 0;  // 0 = free slot
 };
 
+// Process-local RT prerequisites this server establishes for its own servo
+// thread. The syscalls are injectable so self-checks need no privileges. Host
+// facts (PREEMPT_RT, IRQ routing, ksoftirqd, isolation, deployed artifacts)
+// belong to the deployment package (install.py --check-host), not here.
+enum : uint32_t {
+  RT_SETUP_MLOCK = 1u << 0,     // mlockall(MCL_CURRENT | MCL_FUTURE)
+  RT_SETUP_SCHED = 1u << 1,     // SCHED_FIFO at the requested priority
+  RT_SETUP_AFFINITY = 1u << 2,  // servo thread on exactly --rt-cpu
+};
+struct RtSetupOps {
+  int (*lock_memory)(int) = ::mlockall;
+  int (*set_sched)(pthread_t, int, const sched_param*) = ::pthread_setschedparam;
+  int (*get_sched)(pthread_t, int*, sched_param*) = ::pthread_getschedparam;
+  int (*set_affinity)(pthread_t, size_t, const cpu_set_t*) = ::pthread_setaffinity_np;
+  int (*get_affinity)(pthread_t, size_t, cpu_set_t*) = ::pthread_getaffinity_np;
+};
+
 struct ServerCtx {
   ServerConfig cfg;
 
@@ -318,6 +335,7 @@ struct ServerCtx {
   // the process: fix the limits and restart the service.
   std::atomic<uint32_t> rt_setup_failed{0};
   std::atomic<bool> rt_setup_required{false};
+  RtSetupOps rt_setup_ops;  // the real syscalls; self-checks inject a kernel
   bool rt_setup_blocks_arm() const {
     return rt_setup_required.load() && rt_setup_failed.load() != 0;
   }
@@ -516,23 +534,6 @@ inline int drain_fault_journal(ServerCtx& ctx, FILE* out) {
 // generation, the flow pin is cleared, the peer is scoped to the new
 // generation, the generation is published, and authority is raised last,
 // after the latch word is FREE again. Returns the new generation, 0 = refused.
-// Process-local RT prerequisites this server establishes for its own servo
-// thread. The syscalls are injectable so self-checks need no privileges. Host
-// facts (PREEMPT_RT, IRQ routing, ksoftirqd, isolation, deployed artifacts)
-// belong to the deployment package (install.py --check-host), not here.
-enum : uint32_t {
-  RT_SETUP_MLOCK = 1u << 0,     // mlockall(MCL_CURRENT | MCL_FUTURE)
-  RT_SETUP_SCHED = 1u << 1,     // SCHED_FIFO at the requested priority
-  RT_SETUP_AFFINITY = 1u << 2,  // servo thread on exactly --rt-cpu
-};
-struct RtSetupOps {
-  int (*lock_memory)(int) = ::mlockall;
-  int (*set_sched)(pthread_t, int, const sched_param*) = ::pthread_setschedparam;
-  int (*get_sched)(pthread_t, int*, sched_param*) = ::pthread_getschedparam;
-  int (*set_affinity)(pthread_t, size_t, const cpu_set_t*) = ::pthread_setaffinity_np;
-  int (*get_affinity)(pthread_t, size_t, cpu_set_t*) = ::pthread_getaffinity_np;
-};
-
 // Applies the setup to the calling thread; returns what failed (0 = all
 // established). Scheduling and affinity are read back, not assumed from a
 // zero return. Affinity is a prerequisite only when rt_cpu is requested.
