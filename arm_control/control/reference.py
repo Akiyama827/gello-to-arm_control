@@ -40,9 +40,6 @@ class TrajectoryReference:
         """q, qd, qdd off one polynomial; clamped to the ends outside it."""
         return self.trajectory.sample_at(self.elapsed(t_now))
 
-    def played_out(self, t_now: float) -> bool:
-        return self.elapsed(t_now) >= self.trajectory.duration_sec
-
     @property
     def end(self) -> TrajectoryPoint:
         return self.trajectory.sample_at(self.trajectory.duration_sec)
@@ -73,7 +70,6 @@ def _self_check() -> None:
     assert np.array_equal(ref.sample(9.0).position, [0.0])        # start retained
     assert np.array_equal(ref.sample(99.0).position, [1.0])       # endpoint retained
     assert np.array_equal(ref.sample(99.0).velocity, [0.0])
-    assert not ref.played_out(10.999) and ref.played_out(11.0)
     assert np.array_equal(ref.end.position, [1.0])
     assert ref.cartesian_pose(10.0)[0] == 0 and ref.cartesian_pose(10.6)[0] == 7
     assert ref.cartesian_pose(50.0)[0] == 14 and ref.cartesian_pose(0.0)[0] == 0

@@ -747,11 +747,11 @@ class ArmController:
         one that gets to know which legs those are, or what tolerances their
         physics deserves. Both numbers ride in with the leg.
         """
+        # LegSettling consults this only once the reference has played out
+        # (its leg end is the reference's start + duration).
         ref = self._reference
         if ref is None:
             return True
-        if not ref.played_out(self.exec_time):
-            return False  # the plan has not played out yet
         spec = (self._plan or {}).get("completion")
         if spec is None:
             return self.executor.at_goal(ref.end.position, state)

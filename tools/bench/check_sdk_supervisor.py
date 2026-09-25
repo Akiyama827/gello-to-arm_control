@@ -44,10 +44,18 @@ LINK = """<link name="l{i}"><inertial><origin xyz="0 0 0.1"/><mass value="1"/>
   <limit lower="-2.9" upper="2.9" effort="50" velocity="2"/></joint>"""
 
 
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+def free_port(kind: int) -> int:
+    with socket.socket(socket.AF_INET, kind) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def tcp_listening(port: int) -> bool:
+    """LISTEN on the port, read from /proc/net/tcp: a probe connection would
+    count as a control peer, and the server admits one."""
+    with open("/proc/net/tcp") as f:
+        rows = [line.split() for line in f.readlines()[1:]]
+    return any(r[1].endswith(f":{port:04X}") and r[3] == "0A" for r in rows)
 
 
 def write_config(tmp: Path, udp: int, tcp: int) -> Path:
@@ -133,14 +141,18 @@ def main() -> None:
     import arm_control
     print(f"  SDK from {Path(arm_control.__file__).parent}")
     tmp = Path(tempfile.mkdtemp(prefix="sdk_supervisor_"))
-    udp, tcp = free_port(), free_port()
+    udp, tcp = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
     sock = tmp / "sdk_arm.sock"
     rt = subprocess.Popen(
         [args.server, "--backend", "fake", "--n", "3", "--instance-id", "sdk_arm",
          "--joint-names", ",".join(JOINTS), "--udp-port", str(udp), "--tcp-port", str(tcp),
          "--hold-ms", "100", "--fault-ms", "600"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    time.sleep(0.3)
+    deadline = time.monotonic() + 10
+    while not tcp_listening(tcp):
+        assert rt.poll() is None, rt.stdout.read()
+        assert time.monotonic() < deadline, "arm_rt_server did not listen"
+        time.sleep(0.02)
     env = dict(os.environ)
     if args.supervisor_path:
         env["PYTHONPATH"] = args.supervisor_path

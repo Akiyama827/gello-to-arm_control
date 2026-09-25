@@ -426,7 +426,7 @@ def check_completion_order():
     c.on_motor_state(state(.0005))
     c.tick()
     assert c.executor.steps == stepped, "completed trajectory was stepped again"
-    assert not c._running
+    assert not c._running and c.reference is None, "a finished leg releases its reference"
     assert np.allclose(commands(c)[-1]["position"], 0), "successful joint goal must retain its endpoint"
     assert commands(c)[-1]["cartesian"] is None
     c.on_motor_state(state(.0075))
