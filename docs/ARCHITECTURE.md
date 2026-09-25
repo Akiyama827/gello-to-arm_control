@@ -311,7 +311,7 @@ contract versions.
 | `Capabilities` | HELLO tokens (`hold_ms`, `fault_ms`, `active`, `pose_hold`, `rt`), `IDENTITY` capability bits, `VERSION`/`POSE_HOLD_VERSION`. What the backend advertises only. |
 | qualification (not a contract value) | the deployment registry `qualification` and the evidence records, consulted by the supervisor. Never inferred from what a device advertises. |
 | `Authority.session` | RT `session_id`, one per control connection. Distinct from the controller's `runtime_state.session_id` (a controller instance). |
-| `Lifecycle` | `FLAG_CLAIMED`, `FLAG_ARMED`, `FLAG_FAULTED`; CLAIM, ARM, DISARM |
+| `Lifecycle` | `FLAG_ARMED`, `FLAG_FAULTED` (state and replies); `FLAG_CLAIMED` (control replies only); CLAIM, ARM, DISARM |
 | `Authority.holding` | `FLAG_HOLDING` |
 | `arm_epoch`, `stop_epoch` | ARM ack seq, `StatePacket.arm_epoch`/`stop_epoch`, `CommandPacket.arm_epoch` |
 | `Fault` | `fault_code`, CTL_FAULT text, fault journal FIRST record with its ARM generation, controller `fault` event |
@@ -336,18 +336,26 @@ contract versions.
 | REJECTED | refused at admission or selection; never moved | `plan_staged ok=False`; `leg_result ok=False` for a refused release; a wrong-id `execute` is **log-only** |
 | SUPERSEDED | admitted, unselected, replaced by an admitted request naming it | a new `plan` replaces a staged one **silently and implicitly** |
 | EXPIRED | not selected before `admit_by` | **none** |
-| CANCELLED | cancellation confirmed; executor dropped it and holds | `plan_cleared ok=True` |
+| CANCELLED | cancellation confirmed; the executor dropped it, and holds if it had been selected (an unselected one is only discarded) | `plan_cleared ok=True` |
 | FAULTED | stopped by a fault while it owned the reference | controller `fault`, RT latch, `leg_result ok=False` while running |
 
 **RT APPLIED rule.** The server advances `last_cmd_seq` when it selects a
 fresh command, before `backend->write_command()`. So `last_cmd_seq` alone is
-selection by the servo, not acceptance. A rejected write latches `FAULT_PLANT`,
-and the latch is sticky within the ARM generation. APPLIED therefore requires
-both of these:
+selection by the servo, not acceptance.
 
-- a state of the same `arm_epoch` whose `last_cmd_seq` is at or past the first
-  command seq sent for the execution;
-- a later state of that epoch that is still not FAULTED.
+The server keeps `last_cmd_seq` across ARM generations and client sessions,
+while a new client restarts its sequence. So the RT executor numbers its
+commands strictly above (serial arithmetic) the `last_cmd_seq` in the first
+state it observes of its own `arm_epoch`. That is a client rule, not a wire
+change. With it, a stale value can never pass for a new command.
+
+A rejected write latches `FAULT_PLANT`, and the latch is sticky until DISARM.
+DISARM clears it without changing `arm_epoch`. APPLIED therefore requires both
+of these:
+
+- an ARMED state of the same `arm_epoch` whose `last_cmd_seq` is at or past
+  the first command seq sent for the execution;
+- a later state of that epoch that is still ARMED and not FAULTED.
 
 The later state is needed because a cause latched concurrently by another
 thread can surface one tick late. For the FR3 backend, acceptance means
@@ -356,7 +364,9 @@ it means every active motor's CAN frame was sent.
 
 The chain REQUESTED → ADMITTED → SELECTED → SENT → APPLIED moves forward only.
 A transport that cannot observe a phase may skip it, but no phase is ever
-revisited. A terminal phase is final, and a duplicate receipt is idempotent.
+revisited. A terminal phase is final. A receipt for a phase already reached
+is a redelivery and changes nothing, so receipts may be delivered at least
+once.
 COMPLETED requires APPLIED, so a sent packet is never "executed". Every failed
 terminal phase carries a reason. `ExecutionStatus.apply` enforces this.
 
@@ -409,17 +419,28 @@ terminal phase carries a reason. `ExecutionStatus.apply` enforces this.
 - **Cancellation.**
   - It names one execution and never cancels another.
   - It completes with the CANCELLED receipt: the executor dropped the
-    execution and holds.
+    execution and, if it had been selected, holds. Cancelling an unselected
+    execution only discards it.
   - Cancelling a terminal execution reports its status and changes nothing.
   - Cancel is not DISARM.
 - **Holding and faults.**
   - `Authority.holding` is True while the executor holds a captured pose
     instead of tracking.
-  - A FAULTED robot holds after a command-stream or controller fault.
-  - After a plant fault it writes nothing (`holding=False`), and the robot's
-    own safety owns the arm. FAULTED does not imply holding.
+  - A FAULTED robot holds when the servo can still hold: after a
+    command-stream or controller fault, or a `FAULT_PLANT` with a healthy
+    plant (invalid pose-hold inputs).
+  - After a plant/bus failure writes are suppressed (`holding=False`), and
+    the robot's own safety owns the arm.
+  - FAULTED does not imply holding, and the fault code does not say which:
+    read `holding`.
 - **DISARM** completes when `stop_epoch` reaches the DISARM generation, not
-  when the request is acknowledged.
+  when the request is acknowledged. That means the servo stopped commanding
+  and ran the backend stop. It is not a claim about the plant's brakes: a
+  failed backend stop still advances `stop_epoch`, and is reported as a
+  `FAULT_STOP_FAILED` journal record.
+- **CLAIMED** is visible only to the session that claimed. State packets carry
+  `session_id` (set at connect) but not `FLAG_CLAIMED`, which appears only in
+  control replies. Everyone else sees a disarmed claimed robot as CONNECTED.
 - **Capability, version and qualification.**
   - An unknown controller profile or contract version is refused before
     actuation.
@@ -468,6 +489,9 @@ without an RT wire change:
 - RT and PC clocks are not attested: there is no host/boot identity on the
   wire (`Stamp.domain` is empty), so cross-host timing stays unmapped.
 - RT fault text arrives only over the control session, not in state.
+- `RtBackend` numbers commands from 1 per client instance; it does not yet
+  seed above the observed `last_cmd_seq`, which the APPLIED rule needs.
+- A failed backend stop at DISARM is visible only in the fault journal.
 
 ## Known unfinished boundaries
 

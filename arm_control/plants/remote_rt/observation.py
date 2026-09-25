@@ -26,8 +26,9 @@ def identity_hash(identity: RobotIdentity) -> int:
 
 def _writing(state: rtp.State) -> bool:
     """Whether the servo selected a reference and wrote the plant that tick.
-    Disarmed: nothing. Armed and FAULTED without HOLDING: a plant fault, no
-    writes -- the robot's own safety has the arm. ponytail: a cause latched by
+    Disarmed: nothing. Armed and FAULTED without HOLDING: writes suppressed
+    after a plant/bus failure -- the robot's own safety has the arm. (A
+    FAULT_PLANT that can still hold, e.g. invalid pose-hold inputs, HOLDs.) ponytail: a cause latched by
     another thread in the same tick can show FAULTED on a tick that still
     wrote; reported as not writing (conservative, one tick)."""
     armed = bool(state.flags & rtp.FLAG_ARMED)
@@ -64,10 +65,14 @@ def robot_state(state: rtp.State | None, identity: RobotIdentity, *, received_ns
         return RobotState(iid, Validity.INVALID, str(exc))
 
 
-def authority(state: rtp.State, *, fault_text: str = "") -> Authority:
+def authority(state: rtp.State, *, claimed: bool = False,
+              fault_text: str = "") -> Authority:
     """The robot's lifecycle as its state packet shows it. ``session`` is the
-    owning control session (hex), whoever owns it; ``holding`` is
-    ``FLAG_HOLDING`` (False after a plant fault: nothing is written)."""
+    connected control session (hex), whoever holds it; ``holding`` is
+    ``FLAG_HOLDING``. State packets never carry ``FLAG_CLAIMED`` (only
+    control replies do), so a disarmed CLAIMED robot is known only to the
+    session that claimed it: it passes ``claimed`` from its latest reply.
+    Anyone else sees CONNECTED."""
     session = f"{state.session_id:016x}" if state.session_id else None
     holding = bool(state.flags & rtp.FLAG_HOLDING)
     if state.flags & rtp.FLAG_FAULTED:
@@ -78,7 +83,7 @@ def authority(state: rtp.State, *, fault_text: str = "") -> Authority:
     if state.flags & rtp.FLAG_ARMED:
         return Authority(Lifecycle.ARMED, session, state.arm_epoch, state.stop_epoch,
                          holding=holding)
-    if state.flags & rtp.FLAG_CLAIMED:
+    if claimed and session is not None:
         return Authority(Lifecycle.CLAIMED, session, 0, state.stop_epoch, holding=False)
     if session is not None:
         return Authority(Lifecycle.CONNECTED, session, 0, state.stop_epoch, holding=False)
@@ -129,6 +134,9 @@ def _self_check() -> None:
                          "fault_code": rtp.FAULT_PLANT})
     p = authority(plant)
     assert p.lifecycle is Lifecycle.FAULTED and p.fault.code == "plant" and p.holding is False
+    disarmed = rtp.State(**{**st.__dict__, "flags": 0})
+    assert authority(disarmed).lifecycle is Lifecycle.CONNECTED  # observer: claim unknown
+    assert authority(disarmed, claimed=True).lifecycle is Lifecycle.CLAIMED
     idle = rtp.State(**{**st.__dict__, "flags": 0, "session_id": 0, "arm_epoch": 0})
     assert authority(idle).lifecycle is Lifecycle.OBSERVING
     print("RT observation adapter self-check: PASS (golden state -> valid RobotState, "

@@ -205,7 +205,8 @@ class RobotState:
       encoded frames produce, not the bytes sent.
 
     Selected and output are ``None`` while nothing is selected or written
-    (disarmed, or a plant fault handed the arm to the robot's own safety).
+    (disarmed, or writes suppressed after a plant/bus failure, when the
+    robot's own safety owns the arm).
     Arrays are ``None`` unless ``validity`` is VALID; wrench also needs the
     plant to report it valid. ``source`` is the sample's RT-host (or plant)
     time, ``received`` the time it became available to the reader.
@@ -274,15 +275,18 @@ class Authority:
     """Ownership and lifecycle of one robot as its owner sees it.
 
     ``arm_epoch`` is the RT ARM generation commands must carry (0 = none).
-    DISARM completes when ``stop_epoch`` reaches the DISARM's generation --
-    the servo stopped the plant -- not when the request was acknowledged.
+    DISARM completes when ``stop_epoch`` reaches the DISARM's generation: the
+    servo stopped commanding and ran the backend stop -- not when the request
+    was acknowledged. It is not a claim about the plant's brakes: a failed
+    backend stop still advances it and is reported as a fault-journal record.
 
     ``holding`` is True while the executor holds a captured pose instead of
-    tracking commands (stale stream, or latched on a command/controller
-    fault). It is False while tracking and while writing nothing: disarmed,
-    or FAULTED by the plant itself, when the robot's own safety owns the arm.
-    A FAULTED robot is therefore NOT necessarily holding. ``None``: the
-    transport does not report it.
+    tracking commands (stale stream, or latched on a fault it can still hold
+    through). It is False while tracking and while writing nothing: disarmed,
+    or FAULTED with writes suppressed (plant/bus failure), when the robot's
+    own safety owns the arm. A FAULTED robot is therefore NOT necessarily
+    holding, and the fault code does not say which: read ``holding``.
+    ``None``: the transport does not report it.
     """
 
     lifecycle: Lifecycle
@@ -388,7 +392,8 @@ class TrajectoryRequest:
         n = self.trajectory.num_joints
         if len(self.joint_names) != n:
             raise ValueError("joint_names must name every trajectory column")
-        for arr in (self.trajectory.positions, self.trajectory.velocities):
+        for arr in (self.trajectory.times, self.trajectory.positions,
+                    self.trajectory.velocities):
             if arr is not None and not np.isfinite(arr).all():
                 raise ValueError("trajectory must be finite")
         if self.gains is not None and self.gains.kp.size != n:
@@ -456,18 +461,17 @@ class Phase(str, Enum):
     SELECTED   the executor is sampling it as the active reference
     SENT       a command derived from it left the executor for the plant
                transport (RT: the UDP command was sent)
-    APPLIED    the downstream plant/backend ACCEPTED such a command. RT: a
-               state of the same arm_epoch with last_command_seq at or past
-               the first sent seq, confirmed by a later state of that epoch
-               that is still not FAULTED (the server advances last_cmd_seq
-               when it selects a command, BEFORE backend->write_command();
-               a rejected write latches a plant fault). Acceptance evidence
-               only -- NOT evidence of physical motion.
+    APPLIED    the downstream plant/backend ACCEPTED such a command.
+               Acceptance evidence only -- NOT evidence of physical motion.
+               The RT rule is in docs/ARCHITECTURE.md: last_cmd_seq alone is
+               only the servo's selection, advanced BEFORE the backend write.
     COMPLETED  its completion rule held on OBSERVED feedback
     REJECTED   refused at admission or at selection; it never moved
     SUPERSEDED admitted, unselected, and replaced by a request naming it
     EXPIRED    not selected before ``admit_by``
-    CANCELLED  cancellation confirmed: the executor dropped it and holds
+    CANCELLED  cancellation confirmed: the executor dropped it. If it had
+               been selected, the executor holds; an unselected one is only
+               discarded (nothing moves or holds on its account)
     FAULTED    stopped by a fault while it owned the reference
     """
 
@@ -539,7 +543,9 @@ class Receipt:
 class ExecutionStatus:
     """The fold of an execution's receipts. ``reached`` keeps the stamp of
     every phase actually reported; a phase the transport cannot observe may be
-    skipped forward, but never back, and a terminal phase is final."""
+    skipped forward, but never back, and a terminal phase is final. A receipt
+    for a phase already reached is a redelivery and changes nothing, so
+    receipts may be delivered at least once."""
 
     execution_id: str
     request_id: str
@@ -569,8 +575,8 @@ class ExecutionStatus:
         if (receipt.execution_id, receipt.request_id, receipt.instance_id) != (
                 self.execution_id, self.request_id, self.instance_id):
             raise IllegalTransition("receipt belongs to another execution")
-        if receipt.phase is self.phase:
-            return self  # duplicate delivery: idempotent
+        if receipt.phase in self.reached:
+            return self  # redelivery: idempotent, keeps the first stamp
         if self.terminal:
             raise IllegalTransition(f"{self.execution_id} is already {self.phase.value}")
         if receipt.phase in _ENDS:
@@ -611,10 +617,10 @@ def supersession_refusal(request: TrajectoryRequest,
 
 @dataclass(frozen=True)
 class CancelRequest:
-    """Cancel one execution. Completion is the CANCELLED receipt (the executor
-    dropped it and holds); cancelling a terminal execution is a no-op that
-    reports its terminal status. A cancel never disarms and never cancels a
-    different execution than the one named."""
+    """Cancel one execution. Completion is the CANCELLED receipt: the executor
+    dropped it and, if it had been selected, holds. Cancelling a terminal
+    execution is a no-op that reports its terminal status. A cancel never
+    disarms and never cancels a different execution than the one named."""
 
     execution_id: str
     reason: str = "cancelled"
@@ -686,6 +692,7 @@ def _self_check() -> None:
 
     for bad in (dict(request_id="has space"), dict(joint_names=fr3.joint_names[:6]),
                 dict(supersedes="has space"), dict(start="on_commit"),
+                dict(trajectory=JointTrajectory([0.0, float("nan")], np.zeros((2, 7)))),
                 dict(completion=Completion(0.01, np.zeros(6), 0.01))):
         refused(lambda bad=bad: replace(req, **bad), f"request {bad}")
     for bad in (dict(vel_tol=0.0), dict(vel_tol=0.01, goal_q=np.zeros(7)),
@@ -713,7 +720,7 @@ def _self_check() -> None:
     for phase in (Phase.ADMITTED, Phase.SELECTED, Phase.APPLIED):  # SENT unobserved
         status = status.apply(receipt(phase))
     assert status.apply(receipt(Phase.APPLIED)) is status  # duplicate is idempotent
-    for illegal in (Phase.SENT, Phase.SELECTED, Phase.EXPIRED, Phase.SUPERSEDED):
+    for illegal in (Phase.SENT, Phase.EXPIRED, Phase.SUPERSEDED):  # SENT was skipped
         try:
             status.apply(receipt(illegal, "x"))
             raise AssertionError(f"{illegal} accepted after applied")
@@ -722,7 +729,9 @@ def _self_check() -> None:
     done = status.apply(receipt(Phase.COMPLETED))
     assert done.terminal and done.ok and set(done.reached) == {
         Phase.REQUESTED, Phase.ADMITTED, Phase.SELECTED, Phase.APPLIED, Phase.COMPLETED}
-    for late in (receipt(Phase.CANCELLED, "late"), receipt(Phase.SENT), receipt(Phase.ADMITTED)):
+    assert done.apply(receipt(Phase.ADMITTED)) is done  # redelivered: no change
+    assert status.apply(receipt(Phase.SELECTED)) is status
+    for late in (receipt(Phase.CANCELLED, "late"), receipt(Phase.SENT)):
         try:
             done.apply(late)
             raise AssertionError(f"terminal execution changed by {late.phase.value}")
