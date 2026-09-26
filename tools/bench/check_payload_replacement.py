@@ -14,6 +14,7 @@ import numpy as np
 from arm_control.config import CONTROL_ROOT, arm_joints, ee_frame, load_config_tree
 from arm_control.control.doubles import FakeNode
 from arm_control.control.factory import arm_urdf, build_arm_controller, build_executor
+from arm_control.control.trajectory_executor import JointTrajectoryExecutor
 from arm_control.dynamics import PinocchioDynamics
 from arm_control.motion import JointState, TrajectoryPoint
 from arm_control.messages import pack_control_update
@@ -76,6 +77,45 @@ def transitions(cfg):
     return "controller decoding, replace, clear, regrasp, zero-offset, copied CoM, fixed frame: PASS"
 
 
+def declarations(cfg):
+    executor = build_executor(cfg)
+    state = JointState(np.array([0., -.785, 0., -2.356, 0., 1.571, .785]), np.zeros(7))
+    executor.set_payload(.5, com_offset=[.02, -.03, .12])
+    previous = executor._payload
+    command = executor.hold_command(state).tau_ff
+    invalid = [(mass, None) for mass in (np.nan, np.inf, -np.inf)]
+    invalid += [(.5, com) for com in ([1, 2], [1, 2, 3, 4], [[1, 2, 3]],
+                                    [np.nan, 0, 0], [0, np.inf, 0], [0, 0, -np.inf])]
+    for mass, com in invalid:
+        try:
+            executor.set_payload(mass, com_offset=com)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid payload accepted: {mass}, {com}")
+        assert executor._payload is previous, "refusal replaced previous payload"
+        assert np.array_equal(executor.hold_command(state).tau_ff, command)
+    for mass in (0., -1.):
+        for ignored in ([1, 2], [np.nan, np.inf, 0], object()):
+            executor.set_payload(.5, com_offset=[.02, -.03, .12])
+            executor.set_payload(mass, com_offset=ignored)
+            assert executor._payload == (0., None), "clear inspected ignored CoM"
+
+    dynamics = PinocchioDynamics(arm_urdf(cfg), arm_joints(cfg))
+    direct = JointTrajectoryExecutor("payloadless", arm_joints(cfg), dynamics,
+                                     np.zeros(7), np.ones(7), dynamics.effort_limits)
+    direct.hold_command(state)  # Payloadless construction remains supported.
+    for com in (None, [.02, -.03, .12]):
+        try:
+            direct.set_payload(.5, com_offset=com)
+        except ValueError as exc:
+            assert "payload_frame" in str(exc)
+        else:
+            raise AssertionError("positive payload accepted without a frame")
+        assert direct._payload == (0., None)
+    return "finite mass, exact finite CoM, atomic refusal, ignored clear CoM, required frame: PASS"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=CONTROL_ROOT / "examples/configs/sim_arm.yaml")
@@ -94,7 +134,7 @@ def main():
         return
     if args.baseline:
         assert parity == json.loads(args.baseline.read_text()), "explicit-payload command parity changed"
-    print(json.dumps(dict(parity=parity, transitions=transitions(cfg),
+    print(json.dumps(dict(parity=parity, transitions=transitions(cfg), declarations=declarations(cfg),
                           baseline_parity="PASS" if args.baseline else "not requested"), indent=2))
 
 

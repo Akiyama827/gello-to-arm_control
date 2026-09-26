@@ -178,9 +178,18 @@ class JointTrajectoryExecutor:
         Zero mass clears both mass and CoM. Copy the value so callers cannot
         change the active payload by mutating their array after declaration.
         """
-        mass = max(0.0, float(mass_kg))
-        com = (None if mass == 0.0 or com_offset is None
-               else np.array(com_offset, dtype=float, copy=True).ravel())
+        mass = float(mass_kg)
+        if not np.isfinite(mass):
+            raise ValueError("payload mass must be finite")
+        mass = max(0.0, mass)
+        com = None
+        if mass > 0.0:
+            if not self._payload_frame:
+                raise ValueError("positive payload requires a construction-owned payload_frame")
+            if com_offset is not None:
+                com = np.array(com_offset, dtype=float, copy=True)
+                if com.shape != (3,) or not np.all(np.isfinite(com)):
+                    raise ValueError("payload CoM must have shape (3,) and be finite")
         self._payload = (mass, com)
 
     # ponytail: fixed integration window; make it configurable if a plant needs
@@ -213,7 +222,7 @@ class JointTrajectoryExecutor:
 
     def _payload_tau(self, q: np.ndarray) -> np.ndarray:
         mass, com = self._payload
-        if mass <= 0.0 or not self._payload_frame:
+        if mass <= 0.0:
             return np.zeros(len(self._joints))
         return self._dyn.payload_gravity(
             q, mass, self._payload_frame, com
