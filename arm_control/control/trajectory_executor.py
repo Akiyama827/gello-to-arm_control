@@ -65,6 +65,8 @@ class JointTrajectoryExecutor:
         ki: np.ndarray | None = None,
         i_limit: np.ndarray | None = None,
         clock: Callable[[], float] = time.monotonic,
+        *,
+        payload_frame: str = "",
     ) -> None:
         n = len(list(joint_names))
         for arr, name in ((kp_default, "kp_default"), (kd_default, "kd_default")):
@@ -87,9 +89,8 @@ class JointTrajectoryExecutor:
         # Held-payload feedforward: RNEA knows only the bare arm, so a grasped
         # module's weight otherwise lands on the PD as steady-state sag (the
         # softened contact-phase gains make it centimeters at the EE).
-        self._payload_mass = 0.0
-        self._payload_frame = ""
-        self._payload_com: np.ndarray | None = None
+        self._payload_frame = str(payload_frame)  # model/config owns this frame
+        self._payload: tuple[float, np.ndarray | None] = (0.0, None)
         # Plant compensates gravity itself (FR3 control box): ship RNEA MINUS
         # gravity. The subtraction happens HERE, before the torque clamp — a
         # post-clamp subtraction downstream let |tau| reach clamp+|g| and made
@@ -168,19 +169,19 @@ class JointTrajectoryExecutor:
     def set_payload(
         self,
         mass_kg: float,
-        frame_name: str = "",
+        *,
         com_offset: Sequence[float] | None = None,
     ) -> None:
-        """Enable (mass > 0, with the EE frame) or clear (mass 0) payload FF.
+        """Replace the complete payload in the construction-owned EE frame.
 
-        ``com_offset``: payload CoM in the frame's LOCAL coordinates — the
-        carried module's weight acts ~12 cm out of the flange, not at it.
+        CoM is local to that frame; None means zero offset, never previous CoM.
+        Zero mass clears both mass and CoM. Copy the value so callers cannot
+        change the active payload by mutating their array after declaration.
         """
-        self._payload_mass = max(0.0, float(mass_kg))
-        if frame_name:
-            self._payload_frame = str(frame_name)
-        if com_offset is not None:
-            self._payload_com = np.asarray(com_offset, dtype=float).ravel()
+        mass = max(0.0, float(mass_kg))
+        com = (None if mass == 0.0 or com_offset is None
+               else np.array(com_offset, dtype=float, copy=True).ravel())
+        self._payload = (mass, com)
 
     # ponytail: fixed integration window; make it configurable if a plant needs
     # a different transient/settle boundary.
@@ -211,10 +212,11 @@ class JointTrajectoryExecutor:
         return self._i_tau.copy()
 
     def _payload_tau(self, q: np.ndarray) -> np.ndarray:
-        if self._payload_mass <= 0.0 or not self._payload_frame:
+        mass, com = self._payload
+        if mass <= 0.0 or not self._payload_frame:
             return np.zeros(len(self._joints))
         return self._dyn.payload_gravity(
-            q, self._payload_mass, self._payload_frame, self._payload_com
+            q, mass, self._payload_frame, com
         )
 
     def set_gains(self, kp: np.ndarray | None = None, kd: np.ndarray | None = None) -> None:

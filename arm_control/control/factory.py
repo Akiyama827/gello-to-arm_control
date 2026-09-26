@@ -149,12 +149,9 @@ def build_executor(
         gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
         ki=None if gains is None else gains.get("ki"),
         i_limit=None if gains is None else gains.get("i_limit"),
+        payload_frame=ee_frame(cfg),
         **tolerances,
     )
-    # Payload feedforward frame (mass toggles on grasp/release results): RNEA
-    # knows only the bare arm; a held module otherwise sags on the soft contact-
-    # phase gains (centimeters at the EE — measured in the twin).
-    executor.set_payload(0.0, ee_frame(cfg))
     return executor
 
 

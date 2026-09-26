@@ -55,8 +55,8 @@ class _FakeExecutor:
         if kd is not None:
             self.kd = np.asarray(kd, dtype=float)
 
-    def set_payload(self, mass_kg, frame_name="", com_offset=None) -> None:
-        self.payload = (float(mass_kg), com_offset)
+    def set_payload(self, mass_kg, *, com_offset=None) -> None:
+        self.payload = (float(mass_kg), None if mass_kg == 0 else com_offset)
 
     def step(self, point, state) -> JointServoCommand:
         self.steps += 1

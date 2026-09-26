@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import mujoco
 
-from arm_control.config import gripper_joints, ee_frame
+from arm_control.config import gripper_joints
 from arm_control import frames
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.factory import build_executor, gripper_command_cfg
@@ -213,7 +213,6 @@ class SharedSimulation:
             tcp_com = np.linalg.inv(obj.grasps.object_T_tcp[a]) @ object_com
             c.executor.set_payload(
                 mass / 2 if enabled else 0.0,
-                ee_frame(self.config.robots[a]),
                 com_offset=tcp_com[:3],
             )
         self.mode = mode

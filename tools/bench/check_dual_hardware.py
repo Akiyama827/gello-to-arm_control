@@ -173,7 +173,7 @@ def check_virtual(app, action, wait, refinement):
     assert app.snapshot()["mode"] == "shared" and app.snapshot()["preview_id"] is None
     assert hands == {a: (h.width, h.moves) for a, h in app.runtime.hands.items()}
     assert all(h.width == .08 for h in app.runtime.hands.values())
-    assert all(c.executor._payload_mass == 0 for c in app.runtime.controllers.values())
+    assert all(c.executor._payload == (0.0, None) for c in app.runtime.controllers.values())
     refused("stage", pair_id=approach, reviewed=True)
     refused("gripper", arm_id=next(iter(hands)), width_mm=10)
     print("Opposite-edge preparation -> explicit empty-Hand coupling, no weld/payload/Hand command: PASS", flush=True)

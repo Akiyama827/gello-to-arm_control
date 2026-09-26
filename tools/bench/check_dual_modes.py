@@ -128,7 +128,7 @@ def check(path, refinement="none"):
             app.runtime.backend.constraint_active(n)
             for n in app.config.shared_object.grasp_welds
         )
-        assert all(c.executor._payload_mass == 0 for c in app.runtime.controllers.values())
+        assert all(c.executor._payload == (0.0, None) for c in app.runtime.controllers.values())
         action("stage", pair_id=shared_id, reviewed=True, refused=True)
         action("plan", object_target=goal, refused=True)
         # The support anchors the CURRENT object pose after a lift/rotation.
