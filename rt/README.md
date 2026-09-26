@@ -427,11 +427,11 @@ paths (packet loss, session death, latched re-arm). It stays dumb by rule: a
 damped integrator, never a second simulator — closed-loop realism is the
 MuJoCo twin's job on the PC.
 
-## Native reference extension (v7; implementation in progress)
+## Native reference extension (v7; software-only qualification)
 
 The base protocol remains **v5**. Its command/state/control bytes and v6 pose
 hold are unchanged. `CAP_REFERENCE_HORIZON = 1 << 3` is a separate capability;
-B1 defines the schema but the server does **not advertise or execute it yet**.
+The server advertises support; each client must explicitly negotiate it.
 A client without it stays on streamed commands. A new server with an old client
 stays on v5 state. Passive observer leases continue to receive v5 state.
 
@@ -463,7 +463,15 @@ be finite, nonnegative and strictly increasing; initial release begins at zero.
 Replacement keeps the existing clock anchor and every protected whole segment
 byte-for-byte, including the cut knot q/qd; it promises C1 only. COMMIT carries
 the exact protected cut and latest acceptable phase (exclusive). Initial
-COMMIT uses both zero. ABORT names an upload; CANCEL names an execution reference
+COMMIT uses both zero. At body offset 56, `selection_budget_ns` is a u64
+initial-selection duration (zero means absent); bytes 64..103 remain reserved.
+Replacement COMMITs require a zero selection budget. The TCP owner timestamps
+the first successful SEAL, never its retries. After the SEAL ACK, the PC computes
+its remaining `admit_by` duration; RT requires elapsed time since that SEAL to be
+strictly less than the budget. Both queue and network delay consume this
+conservative bound; PC/RT absolute clock values are never compared. A failed
+budget returns REF_LATE without changing selection. Packet sizes stay unchanged.
+ABORT names an upload; CANCEL names an execution reference
 and retires active/pending revisions without granting delayed frames authority.
 
 The v7 UDP dynamics envelope is 448 bytes. Its 32-byte common header retains
@@ -530,7 +538,7 @@ PYTHONPATH=. python tools/bench/rt/reference_numerics.py build/reference_probe.s
 PYTHONPATH=. python tools/bench/rt/reference_upload.py build/reference_session_selfcheck
 ```
 
-### B3 / B4 RT-side checkpoint (capability still gated)
+### RT selection and PC provider
 
 `ReferenceSelection` now owns the selected native curve and its RT clock
 anchor. The TCP thread publishes one immutable `ReferenceCommit` via the
@@ -546,7 +554,7 @@ through staging. A running reference requires same-id prefix-preserving revision
 or explicit cancellation. Linear references can be initially selected; the C1
 replacement promise requires Hermite velocity knots.
 
-The largest commit is 34,032 bytes, its three-slot mailbox 102,136. Every copy
+The largest commit is 34,040 bytes, its three-slot mailbox 102,160. Every copy
 has a static capacity; prefix validation scans at most 128 knots with at most
 16 q/qd values per knot. No RT allocation, hash, socket call or retry loop is
 introduced. The selection check disables C++ allocation during initial and
@@ -560,17 +568,33 @@ captures measured q once and holds with captured gains/zero feedforward without
 immediate CMD_LOST. The independent deadline can subsequently latch if valid
 command traffic ceases. END retains planned q with zero qd/qdd; it is not a
 completion receipt. Native state is sent only to the negotiated commander;
-passive observers retain v5. The ordinary server still advertises no horizon
-capability: the dedicated fake-only runtime check enables it for validation.
+passive observers retain v5. Ordinary clients that do not opt in continue to
+use existing command/state packets, regardless of the advertised capability.
 
 ```sh
 build/reference_selection_selfcheck
 PYTHONPATH=. python tools/bench/rt/native_reference.py build/reference_runtime_selfcheck
 ```
 
-The remaining B4/B5 work is the supervisor/controller reference-provider
-handoff, PC dynamics at the exact reported sample, execution receipts and full
-lifecycle regressions. The high-level native path is not integrated yet. In
-particular, migrate existing planned-endpoint and measured/custom-settling holds
-without changing the executor's gravity/payload/integral law or silently treating
-RT transport holds as equivalent to compensated PC holds.
+The model-bound supervisor binds `TrajectoryReference` to selected feedback:
+no PC reference clock/interpolation runs for that execution. The existing PC
+executor still computes all dynamics and integral terms. `ReferenceHorizon`
+copies exact windows from the admitted plan and refills near half-window; a
+missed window never predicts/extrapolates. It has one worker/candidate and retains
+session/epoch/socket scope across queued operations. Cancelling an unselected
+upload ABORTs it; a selected cancellation retires the reference. The existing
+controller's new compensated hold target requires an explicit constant terminal
+admission; underflow never triggers that automatic recovery.
+
+```sh
+PYTHONPATH=. python tools/bench/rt/reference_horizon.py build/reference_runtime_selfcheck
+PYTHONPATH=. python tools/bench/rt/reference_supervisor.py build/reference_runtime_selfcheck
+PYTHONPATH=. python tools/bench/check_sdk_supervisor.py --native --server build/arm_rt_server
+```
+
+Checks cover command parity at the same RT sample, receipt ordering, deadline
+races, unselected upload cancellation, underflow/new-admission recovery, terminal
+hold, stale envelopes, old epochs, owner loss, restart, upload flood and stalled
+peers. v5 base/v6 pose bytes remain unchanged. The pre-integration v7 checkpoint
+binaries are not a deployment interface: use a matched final source/binary pair.
+No hardware deployment or worst-case RT timing qualification is implied.

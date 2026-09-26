@@ -54,6 +54,9 @@ int main(int argc,char**) {
   cm.reference_id=3; cm.arm_epoch=4; cm.expected_revision=5; cm.revision=6;
   cm.protected_until=1.25; cm.latest_phase=1;
   control("COMMIT",CTL_REFERENCE_COMMIT,cm);
+  cm.reference_id=4; cm.expected_revision=0; cm.revision=1;
+  cm.protected_until=cm.latest_phase=0; cm.selection_budget_ns=123456789;
+  control("DEADLINE",CTL_REFERENCE_COMMIT,cm);
   ReferenceRetirePayload re{}; re.session_id=123; re.id=2; re.arm_epoch=4;
   control("ABORT",CTL_REFERENCE_ABORT,re);
   re.id=3; re.revision=6; control("CANCEL",CTL_CANCEL_REFERENCE,re);

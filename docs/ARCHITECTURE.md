@@ -33,19 +33,54 @@ Use `planning.stack.build_planner` and `build_preview` for planner-side
 construction, and `control.factory.build_executor` for the streaming side.
 The planner builder does not instantiate an executor just to obtain gains.
 
-On the streaming side, the controller owns the released reference as one
-`control.reference.TrajectoryReference` (CTRL-030): the trajectory, its start
-on the controller's clock, and its sampling (`JointTrajectory.sample_at`, the
-only reference evaluator). Sampling is pure, so any order or repetition gives
-the same point, and it clamps to the endpoints. The executor
-(`JointTrajectoryExecutor`) receives that sampled point and turns it into a
-servo command: feedforward, payload, integral and gains. It stores no
-trajectory and no trajectory time. Completion is the reference having played
-out plus, by default, `executor.at_goal` on the reference end; a plan's
-`completion` rule replaces the goal test. The RT server holds the last
-command and does not interpolate, so there is no native sampler to keep in
-parity yet. Native evaluation and bounded horizons are later CTRL-030 slices
-and change the wire.
+The controller owns its released `control.reference.TrajectoryReference`.
+Legacy streamed execution uses its PC start time and pure
+`JointTrajectory.sample_at`. Negotiated native execution has **no PC start
+time or active PC interpolation**: this same provider delegates to one
+RT-selected feedback sample per controller tick. The planned trajectory stays
+available for endpoint and Cartesian knot association. `JointTrajectoryExecutor`
+receives that sample and retains RNEA, payload, integral, gains and torque bounds;
+it still stores no trajectory or trajectory time.
+
+For a model-bound supervisor and a capable RT server, v5 session negotiation
+opts into v7. `plants.remote_rt.reference.ReferenceHorizon` uploads unchanged
+windows of the admitted curve, one candidate/worker at a time. It owns transport
+progress and feedback binding, not a sampler or a control law. `ReferenceSelection`
+owns the RT anchor/revision and pure native Hermite evaluation. Whole retained
+segments are byte-identical; replacement is C1, not necessarily C2. The bounded
+RT limit is 128 knots × 16 joints; longer PC plans advance through bounded windows.
+
+PC dynamics use measured state and the exact selected q/qd/qdd from the same
+feedback tick. UDP envelopes identify session, ARM epoch, reference/revision and
+phase; the supervisor initially requests 50 ms wall-age and phase-age bounds,
+further capped by the RT hold deadline. No cross-host timestamp subtraction is
+used. Too-old PC samples send no envelope; normal freshness fallback applies.
+Terminal END retains planned q and zero qd/qdd. Settling starts on observed END;
+COMPLETED still requires settling and APPLIED. UNDERFLOW faults that execution,
+leaves the RT measured hold with zero PC feedforward and captured gains, and
+requires a new admission. The independent session/command fault clocks remain.
+
+The supervisor retains admission and receipts. An initial COMMIT in flight cannot
+be superseded as unselected. `admit_by` is preserved with a conservative duration:
+RT records the first successful SEAL; after its ACK the PC computes remaining
+selection time and puts that budget in COMMIT. RT checks elapsed time from SEAL
+again at selection. Network/queue delay consumes the budget; retries cannot reset
+it. This can refuse early, never grant an extension, and needs no synchronized
+clocks. PC waits for selection/refusal evidence rather than calling a delayed
+selection receipt EXPIRED.
+
+An unselected cancellation ABORTs only the candidate. A selected cancellation
+retires active/pending generations. The controller's existing compensated
+measured/contact hold is then admitted as a constant terminal reference; its
+anchor/compensation still come from the existing controller/executor. It is not
+confused with RT's zero-feedforward transport/underflow hold. Ordinary completion
+keeps the planned endpoint throughout. No automatic hold admission heals UNDERFLOW.
+
+v5 streaming remains for old/non-negotiated peers and unbound configurations.
+Dora, RemoteHardware and SharedSimulation retain their existing construction and
+execution paths; application/group migration is CTRL-040/052/053. They do not run
+a second sampler for a negotiated supervisor execution. Native software checks
+are not matched deployment or physical/RT timing qualification (CTRL-060/013).
 Neutral values live in `motion/types.py`; retiming algorithms remain under
 `planning/retiming.py`. Execution does not depend on a planning-owned value type.
 

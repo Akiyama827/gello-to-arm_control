@@ -55,9 +55,9 @@ class LegSettling:
         self._settled_since: float | None = None
         self._report_at: float | None = None
 
-    def begin(self, leg_end: float) -> None:
+    def begin(self, leg_end: float | None) -> None:
         """Arm the clocks for a leg whose reference ends at ``leg_end``."""
-        self._leg_end = float(leg_end)
+        self._leg_end = None if leg_end is None else float(leg_end)
         self._settled_since = self._report_at = None
 
     @property
@@ -65,13 +65,17 @@ class LegSettling:
         """True once a settle has been reported on -- the first-message latch."""
         return self._report_at is not None
 
-    def poll(self, *, now: float, fresh: bool, done) -> SettleVerdict | None:
+    def poll(self, *, now: float, fresh: bool, done, reference_ended=False) -> SettleVerdict | None:
         """None before the reference ends; otherwise the leg's state.
 
         ``done`` is a CALLABLE and is consulted only on a fresh sample, because
         asking an executor whether it is finished is not always free and,
         more importantly, its answer about a stale sample means nothing.
         """
+        if self._leg_end is None:
+            if not reference_ended:
+                return None
+            self._leg_end = now  # observed native END; no PC reference clock
         if now < self._leg_end:
             return None
         if fresh:
@@ -164,6 +168,10 @@ def _self_check() -> None:
     s = settling()
     assert s.due_to_report(10.0) and not s.due_to_report(10.1)
     assert s.due_to_report(10.3) and s.started
+    s.begin(None)
+    assert s.poll(now=1e6, fresh=True, done=lambda: True) is None
+    assert s.poll(now=1e6, fresh=True, done=lambda: True, reference_ended=True).state == SETTLING
+    assert s.poll(now=1e6+.3, fresh=True, done=lambda: True).state == SETTLED
     print("leg_settling: dwell needs fresh samples, timeout does not")
 
 

@@ -91,6 +91,13 @@ int main() {
   s.reset(124,4); assert(!s.active());
   assert(s.commit(fresh,5000000000,1)==REF_IDENTITY);
   s.reset(123,5); assert(s.commit(fresh,5000000000,1)==REF_IDENTITY);
+  // Selection deadline uses only RT elapsed time from immutable SEAL.
+  s.reset(123,4); auto timed=initial(30);
+  timed.admitted.sealed_at_ns=1000000000; timed.request.selection_budget_ns=50000000;
+  assert(s.commit(timed,1050000000,0)==REF_LATE && !s.active());
+  assert(s.commit(timed,1049999999,0)==REF_OK);
+  s.retire(); timed=initial(31); timed.request.selection_budget_ns=50000000;
+  assert(s.commit(timed,1049999999,0)==REF_LATE); // missing server anchor
   // Largest immutable publication, validation and copy: fixed capacities,
   // one read and one write, no retry loop or allocation on selection.
   auto start=std::chrono::steady_clock::now();

@@ -48,7 +48,8 @@ int main() {
     c.data[0]^=1; assert(u.chunk(c)==REF_INTEGRITY); c.data[0]^=1;
   }
   auto wrong=seal; wrong.sha256[0]^=1; assert(u.seal(wrong)==REF_INTEGRITY);
-  assert(u.seal(seal)==REF_OK && u.seal(seal)==REF_OK && u.admitted());
+  assert(u.seal(seal,100)==REF_OK && u.seal(seal,200)==REF_OK && u.admitted());
+  assert(u.admitted()->sealed_at_ns==100); // exact retry cannot extend a selection deadline
   assert(u.admitted()->curve.k==128 && u.admitted()->curve.n==16);
   double out[49]; assert(sample(u.admitted()->curve,.555,out));
   assert(std::abs(out[1]-.0555)<1e-14 && std::abs(out[17]-.1)<1e-14);

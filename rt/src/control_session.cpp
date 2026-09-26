@@ -232,7 +232,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
         }
         case CTL_REFERENCE_SEAL: {
           ReferenceSealPayload s; std::memcpy(&s,rx.text,sizeof(s));
-          reply.upload_id=s.upload_id; result=upload->seal(s); break;
+          reply.upload_id=s.upload_id; result=upload->seal(s,mono_ns()); break;
         }
         case CTL_REFERENCE_ABORT: {
           ReferenceRetirePayload a; std::memcpy(&a,rx.text,sizeof(a));

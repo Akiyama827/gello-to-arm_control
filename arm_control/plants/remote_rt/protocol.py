@@ -318,7 +318,7 @@ _REFERENCE_LAYOUTS = {
     CTL_REFERENCE_SEAL: ('upload_id sha256', '<Q32s', 64),
     CTL_REFERENCE_COMMIT: (
         'session_id upload_id reference_id arm_epoch expected_revision revision '
-        'reserved0 protected_until latest_phase', '<QQQIIIIdd', 48),
+        'reserved0 protected_until latest_phase selection_budget_ns', '<QQQIIIIddQ', 40),
     CTL_REFERENCE_ABORT: ('session_id id arm_epoch revision', '<QQII', 80),
     CTL_CANCEL_REFERENCE: ('session_id id arm_epoch revision', '<QQII', 80),
     CTL_REFERENCE_STATUS: (
@@ -361,7 +361,8 @@ def _validate_reference_body(op: int, p: dict) -> None:
         require(not p['reserved0'])
         cut, latest = p['protected_until'], p['latest_phase']
         require(math.isfinite(cut) and math.isfinite(latest) and cut >= 0 and latest >= 0)
-        require(0 < latest <= cut if p['expected_revision'] else latest == cut == 0)
+        require(0 < latest <= cut and not p['selection_budget_ns']
+                if p['expected_revision'] else latest == cut == 0)
     elif op in (CTL_REFERENCE_ABORT, CTL_CANCEL_REFERENCE):
         require(p['session_id'] and p['id'] and p['arm_epoch'])
         require(p['revision'] == 0 if op == CTL_REFERENCE_ABORT else p['revision'] > 0)
@@ -379,7 +380,7 @@ def pack_reference_control(*, ctl_type: int, seq: int, t_mono_ns: int = 0,
         raise ValueError('reference capability has not been negotiated')
     names, fmt, padding = _REFERENCE_LAYOUTS[ctl_type]
     fields = dict(fields)
-    for name in ('reserved', 'reserved0'):
+    for name in ('reserved', 'reserved0', 'selection_budget_ns'):
         if name in names.split():
             fields.setdefault(name, 0)
     if set(fields) != set(names.split()):

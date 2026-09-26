@@ -59,9 +59,10 @@ class JointTrajectory:
         consistent; the retimer and execution policy separately bound its
         extrema. Legal waypoint velocities alone do not bound a cubic.
 
-        This is the ONLY reference evaluator in the stack -- sim and hardware
-        both come through here, and the RT server holds the last command
-        rather than interpolating -- so there is nothing to keep in sync.
+        This is the Python evaluator for simulation and legacy streamed
+        execution. Negotiated native references delegate evaluation to the
+        byte-parity-checked RT implementation; the PC consumes its selected
+        sample and does not run this evaluator for that execution.
         """
         t = float(time_sec)
         if t <= self.times[0]:

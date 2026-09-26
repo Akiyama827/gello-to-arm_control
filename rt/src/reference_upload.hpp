@@ -50,7 +50,7 @@ class ReferenceUpload {
     std::memcpy(bytes_.data()+received_,c.data,c.length); received_=end;
     return REF_OK;
   }
-  ReferenceResult seal(const ReferenceSealPayload& s) {
+  ReferenceResult seal(const ReferenceSealPayload& s, uint64_t now=0) {
     if(!valid_reference_body(CTL_REFERENCE_SEAL,&s)) return REF_MALFORMED;
     if(!present_ || s.upload_id!=candidate_.identity.upload_id) return REF_RETIRED;
     if(received_!=candidate_.identity.byte_count) return REF_NOT_ADMITTED;
@@ -69,6 +69,7 @@ class ReferenceUpload {
     }
     if(r.times[0]<0 || (!b.expected_revision && r.times[0]!=0) || !valid_reference(r))
       return REF_MALFORMED;
+    candidate_.sealed_at_ns=now;
     sealed_=true;
     return REF_OK;
   }

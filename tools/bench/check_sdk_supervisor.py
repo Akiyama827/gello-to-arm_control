@@ -14,6 +14,8 @@ full environment with ``--supervisor-python``/``--supervisor-path``.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import signal
 import socket
@@ -33,6 +35,8 @@ from arm_control.motion import JointTrajectory
 from arm_control.sdk import ArmClient, Refused, SupervisorError
 
 JOINTS = ("j1", "j2", "j3")
+MODEL_TOKEN = None
+EXPECT_NATIVE = False
 URDF = """<robot name="three">
   <link name="base"/>
   {links}
@@ -103,7 +107,7 @@ def move(rid: str, q0, q1, duration: float, **kw) -> TrajectoryRequest:
     traj = JointTrajectory([0.0, duration / 2, duration],
                            np.stack([q0, (q0 + q1) / 2, q1]),
                            np.stack([0 * q0, mid_v, 0 * q0]))
-    return TrajectoryRequest(rid, "sdk_arm", JOINTS, traj, **kw)
+    return TrajectoryRequest(rid, "sdk_arm", JOINTS, traj, model_token=MODEL_TOKEN, **kw)
 
 
 def phases(arm: ArmClient, eid: str) -> list[str]:
@@ -132,6 +136,8 @@ def expect_refused(fn, why: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--legacy-server", action="store_true", help="expect v5 fallback despite a bound model")
+    parser.add_argument("--native", action="store_true", help="bind the analytical model and negotiate v7")
     parser.add_argument("--server", required=True, help="locally built arm_rt_server")
     parser.add_argument("--supervisor-python", default=sys.executable,
                         help="interpreter with the supervisor extra (default: this one)")
@@ -156,9 +162,24 @@ def main() -> None:
     env = dict(os.environ)
     if args.supervisor_path:
         env["PYTHONPATH"] = args.supervisor_path
+    config_path = write_config(tmp, udp, tcp)
+    if args.native:
+        # Analytical fixture binding, not a physical model/accuracy claim.
+        gravity = dict(instance_id="sdk_arm", revision=1, vector=[0., 0., -9.81],
+            units="m/s^2", frame="base", source=dict(type="nominal_assumption", evidence="analytical fixture"),
+            reviewed_against=dict(bundle_id="fixture", revision=1, installation_epoch="fixture",
+                model_sha256=hashlib.sha256((tmp / "three.urdf").read_bytes()).hexdigest(),
+                base_sha256=hashlib.sha256(b"identity base fixture").hexdigest()))
+        digest = hashlib.sha256(json.dumps(gravity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        global MODEL_TOKEN, EXPECT_NATIVE
+        EXPECT_NATIVE = not args.legacy_server
+        MODEL_TOKEN = "analytical-fixture:g" + digest
+        model = dict(token=MODEL_TOKEN, bundle_id="fixture", revision=1, gravity=gravity)
+        with config_path.open("a") as f:
+            f.write("model: " + json.dumps(model) + "\n")
     sup = subprocess.Popen(
         [args.supervisor_python, "-m", "arm_control.supervisor.service",
-         "--config", str(write_config(tmp, udp, tcp)), "--socket", str(sock)],
+         "--config", str(config_path), "--socket", str(sock)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     try:
         deadline = time.monotonic() + 30
@@ -223,6 +244,9 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     assert [r.phase.value for r in got] == [
         "requested", "admitted", "selected", "sent", "applied", "completed"], got
     completed_chain(arm, staged.execution_id)
+    if EXPECT_NATIVE:
+        selected = next(r for r in got if r.phase is Phase.SELECTED)
+        assert selected.evidence["reference_id"] > 0 and selected.evidence["reference_revision"] == 1
     assert got[3].evidence["arm_epoch"] == auth.arm_epoch
     q = arm.state().q
     assert np.max(np.abs(q - target)) < 0.03, q
@@ -260,7 +284,7 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
 
     # Cancel mid-run completes with CANCELLED; the robot holds, still armed.
     long = arm.execute(move("r8", zero, target, 3.0))
-    assert long.phase is Phase.SELECTED, long
+    assert long.phase in (Phase.ADMITTED, Phase.SELECTED), long
     wait_phase(arm, long.execution_id, Phase.APPLIED)
     # SELECTED or later is never replaced.
     x = arm.execute(move("r9", zero, target, 1.0, supersedes=long.execution_id))
@@ -325,7 +349,7 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
 
     # An owner PROCESS that dies inside a long wait is noticed within ~1 s.
     other.unclaim()
-    owner = subprocess.Popen([sys.executable, "-c", OWNER_SCRIPT, str(sock)],
+    owner = subprocess.Popen([sys.executable, "-c", OWNER_SCRIPT, str(sock), MODEL_TOKEN or ""],
                              stdout=subprocess.PIPE, text=True)
     eid = owner.stdout.readline().strip()
     wait_phase(other, eid, Phase.APPLIED)
@@ -374,7 +398,8 @@ q0 = arm.state().q
 q1 = np.array([0.3, -0.2, 0.25])
 traj = JointTrajectory([0.0, 1.5, 3.0], np.stack([q0, (q0 + q1) / 2, q1]),
                        np.stack([0 * q0, (q1 - q0) / 2, 0 * q0]))
-status = arm.execute(TrajectoryRequest("owner-proc", "sdk_arm", ("j1", "j2", "j3"), traj))
+status = arm.execute(TrajectoryRequest("owner-proc", "sdk_arm", ("j1", "j2", "j3"), traj,
+    model_token=sys.argv[2] or None))
 print(status.execution_id, flush=True)
 arm.wait(status.execution_id, 30)
 """

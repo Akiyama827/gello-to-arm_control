@@ -8,6 +8,7 @@ namespace arm_rt {
 struct AdmittedReference {
   ReferenceBeginPayload identity{};
   NativeReference curve{};
+  uint64_t sealed_at_ns=0;  // server clock, immutable across exact retries
 };
 struct ReferenceCommit {
   AdmittedReference admitted{};
@@ -44,6 +45,8 @@ class ReferenceSelection {
        p.revision!=b.revision || p.expected_revision!=b.expected_revision)
       return REF_IDENTITY;
     if(c.cancel_generation!=cancel_generation) return REF_RETIRED;
+    if(p.selection_budget_ns && (!c.admitted.sealed_at_ns || now<c.admitted.sealed_at_ns ||
+       now-c.admitted.sealed_at_ns>=p.selection_budget_ns)) return REF_LATE;
     if(!p.expected_revision) {
       // IDs come from a monotonically increasing per-epoch PC counter. One
       // high-water mark rejects replay without an unbounded retired-id cache.

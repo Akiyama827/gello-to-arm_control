@@ -29,6 +29,9 @@ def golden() -> dict[str, bytes]:
     ctl('SEAL', p.CTL_REFERENCE_SEAL, upload_id=2, sha256=bytes(range(32, 0, -1)))
     ctl('COMMIT', p.CTL_REFERENCE_COMMIT, session_id=123, upload_id=2, reference_id=3,
         arm_epoch=4, expected_revision=5, revision=6, protected_until=1.25, latest_phase=1.)
+    ctl('DEADLINE', p.CTL_REFERENCE_COMMIT, session_id=123, upload_id=2, reference_id=4,
+        arm_epoch=4, expected_revision=0, revision=1, protected_until=0., latest_phase=0.,
+        selection_budget_ns=123456789)
     ctl('ABORT', p.CTL_REFERENCE_ABORT, session_id=123, id=2, arm_epoch=4, revision=0)
     ctl('CANCEL', p.CTL_CANCEL_REFERENCE, session_id=123, id=3, arm_epoch=4, revision=6)
     ctl('REPLY', p.CTL_REFERENCE_STATUS, upload_id=2, reference_id=3, revision=6,
@@ -87,7 +90,7 @@ def main(binary: str):
     # Every reserved byte, including CHUNK padding, independently rejected.
     for name, (start, end) in {
         'MODE': (76,128), 'BEGIN': (112,128), 'CHUNK': (43,128),
-        'SEAL': (64,128), 'COMMIT': (80,128), 'ABORT': (48,128),
+        'SEAL': (64,128), 'COMMIT': (88,128), 'ABORT': (48,128),
         'CANCEL': (48,128), 'REPLY': (56,128), 'STATE': (872,888),
     }.items():
         for offset in range(start, end):

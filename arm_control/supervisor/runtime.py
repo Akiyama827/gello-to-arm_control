@@ -27,6 +27,9 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
+import numpy as np
+
+from arm_control.motion import JointTrajectory
 from arm_control.config import arm_joints
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.factory import build_arm_controller
@@ -43,6 +46,7 @@ from arm_control.messages import (
 from arm_control.control.inprocess import QueueControllerNode
 from arm_control.plants.remote_rt import protocol as rtp
 from arm_control.plants.remote_rt.client import RtBackend, epoch_reached
+from arm_control.plants.remote_rt.reference import ReferenceHorizon
 from arm_control.plants.remote_rt.observation import AppliedTracker, authority, robot_state
 
 #: Executions kept for status queries and request_id idempotency.
@@ -100,6 +104,10 @@ class RobotRuntime:
         # evidence is the next state packet, which the link's own freshness
         # bound already promises; past it the link is stale anyway.
         self.applied_grace_s = float(self.link.config.state_timeout_s)
+        self._native = None
+        self._native_pending = None
+        self._native_epoch = 0
+        self._native_failed = False
         self.controller = self._build_controller()
         self.period = self.controller.execution_policy.period
         self._profile_gains = (self.controller.executor.kp.copy(),
@@ -131,12 +139,17 @@ class RobotRuntime:
     def _build_controller(self) -> ArmController:
         return build_arm_controller(
             self.cfg, _Node(self), arm_id=self.instance_id, require_policy=True,
-            clock=time.monotonic, plant_reports_health=True)
+            clock=time.monotonic, plant_reports_health=True,
+            reference_source=(None if self._native is None else lambda: self._native.point))
 
     # -- lifecycle ---------------------------------------------------------------
     def start(self) -> None:
         """Claim the RT server (never ARM) and start the 100 Hz loop."""
         self.link.open()
+        if (self.controller.model_token and (self.cfg.get("rt") or {}).get("native_reference", True)
+                and self.link.negotiate_reference(self.controller.model_token)):
+            self._native = ReferenceHorizon(self.link)
+            self.controller.bind_reference_source(lambda: self._native.point)
         ident = self.link.identity
         self.identity = RobotIdentity(self.instance_id, tuple(self.joints),
                                       f"rt:{self.link.backend_name}", ident.model_id)
@@ -153,6 +166,8 @@ class RobotRuntime:
         if self._thread is not None:
             self._thread.join(timeout=timeout_s)
         self._tracker.disarm_sent()
+        if self._native is not None:
+            self._native.close()
         for fut, _, _ in self._pending:
             fut.cancel()  # queued ARM/DISARM work; link.close() disarms itself
         closing = self._rpc.submit(self.link.close)
@@ -323,6 +338,10 @@ class RobotRuntime:
             admission_refusal(request, self.identity, self.capabilities, self._authority,
                               now=self.now(), model_token=self.controller.model_token)
             or supersession_refusal(request, current)
+            or ("reference selection is in flight; cancel before a new admission"
+                if request.supersedes and self._native is not None
+                and self._native.key == request.supersedes
+                and self._native.selection_requested else "")
             or ("the joint_impedance profile needs waypoint velocities"
                 if request.trajectory.velocities is None else ""))
         if refusal:
@@ -371,6 +390,16 @@ class RobotRuntime:
             self._receipt(ex, Phase.REJECTED, refusal)
             self._drop_staged(ex, refusal)
             return
+        if self._native is not None:
+            if self._native_pending == ex.status.execution_id:
+                return
+            refusal = self.controller.release_error(ex.status.execution_id)
+            if refusal:
+                self._receipt(ex, Phase.REJECTED, refusal)
+                self._drop_staged(ex, refusal)
+                return
+            self._native_pending = ex.status.execution_id
+            return  # upload and selection are observed asynchronously on ticks
         self.controller.on_control(pack_control_update(execute=ex.status.execution_id))
         self._pump_controller()
 
@@ -383,12 +412,14 @@ class RobotRuntime:
 
     def _cancel_execution(self, ex: _Execution, reason: str) -> None:
         ex.cancel_reason = reason
+        self._retire_native(ex.status.execution_id)
         if self.controller.current_plan_id == ex.status.execution_id:
             self.controller.on_control(pack_control_update(
                 cancel=True, reason=reason, cancel_plan_id=ex.status.execution_id))
         self._pump_controller()
 
     def _drop_staged(self, ex: _Execution, reason: str) -> None:
+        self._retire_native(ex.status.execution_id)
         if self.controller.current_plan_id == ex.status.execution_id:
             self.controller.on_control(pack_control_update(
                 cancel=True, reason=reason, cancel_plan_id=ex.status.execution_id))
@@ -422,7 +453,7 @@ class RobotRuntime:
         sent, events = [], []
         for topic, value in c.node.sent:
             if topic == "motor_command":
-                seq = self.link.apply_command(unpack_motor_command(value, c.n_arm))
+                seq = self._send_command(unpack_motor_command(value, c.n_arm))
                 if seq is not None:
                     sent.append(seq)
             elif topic == "controller_event":
@@ -433,7 +464,7 @@ class RobotRuntime:
         rs = c.runtime_state
         if rs["executing"]:
             ex = self._executions.get(rs["plan_id"])
-            if ex is not None and ex.status.phase is Phase.ADMITTED:
+            if ex is not None and ex.status.phase is Phase.ADMITTED and self._native is None:
                 self._receipt(ex, Phase.SELECTED, arm_epoch=self._authority.arm_epoch)
         if sent_for is not None and sent:
             ex = self._executions.get(sent_for)
@@ -455,6 +486,7 @@ class RobotRuntime:
             self._receipt(ex, Phase.ADMITTED)
             old = ex.request.supersedes and self._executions.get(ex.request.supersedes)
             if old and not old.status.terminal:
+                self._retire_native(old.status.execution_id)
                 self._receipt(old, Phase.SUPERSEDED, f"superseded by {ex.status.execution_id}",
                               superseded_by=ex.status.execution_id)
         elif kind == "leg_result":
@@ -494,17 +526,144 @@ class RobotRuntime:
                 self._receipt(ex, Phase.FAULTED, "the controller dropped the running execution")
 
     def _expire(self, ex: _Execution) -> bool:
-        if ex.status.phase is Phase.ADMITTED and ex.request.expired(self.now()):
+        # COMMIT carries a conservative RT-local deadline budget. Once sent,
+        # wait for its selection/refusal evidence; PC receipt time is not the
+        # selection time and cannot honestly prove EXPIRED.
+        committing = (self._native is not None and self._native.key == ex.status.execution_id
+                      and self._native.selection_requested)
+        if ex.status.phase is Phase.ADMITTED and not committing and ex.request.expired(self.now()):
             self._receipt(ex, Phase.EXPIRED, "admit_by passed before selection")
             self._drop_staged(ex, "expired")
             return True
         return False
+
+    # -- negotiated RT reference -------------------------------------------------
+    def _retire_native(self, execution_id: str) -> None:
+        if self._native_pending == execution_id:
+            self._native_pending = None
+        if self._native is not None and self._native.key == execution_id:
+            self._native.cancel()
+
+    def _native_step(self, sample) -> None:
+        h, c = self._native, self.controller
+        state, rx = sample
+        h.poll(state, rx)
+        if state is None or not state.armed:
+            return
+        if state.arm_epoch != self._native_epoch:
+            self._native_epoch = state.arm_epoch
+            self._native_failed = False
+        ex = self._executions.get(h.key)
+        if (h.error and ex is not None and not ex.status.terminal
+                and (not h.selected or h.error == 'REFERENCE_UNDERFLOW')):
+            # Reference failure is distinct from a transport/plant fault. In
+            # particular, never heal UNDERFLOW with an implicit hold admission.
+            self._native_failed = True
+            if ex.status.phase is Phase.ADMITTED and h.error == 'REFERENCE_UNDERFLOW':
+                self._receipt(ex, Phase.SELECTED, reference_id=h.id,
+                              reference_revision=h.revision, arm_epoch=h.arm_epoch)
+            failure = Phase.FAULTED
+            if ex.status.phase is Phase.ADMITTED:
+                failure = Phase.EXPIRED if ex.request.expired(self.now()) else Phase.REJECTED
+            self._receipt(ex, failure, h.error,
+                          reference_id=h.id, reference_revision=h.revision)
+            self._drop_staged(ex, h.error)
+        if h.key is None and h.error:
+            self._native_failed = True
+        if h.key is None and h.ready and self._native_pending is None and not self._native_failed:
+            h.approve()
+        eid = self._native_pending
+        ex = self._executions.get(eid)
+        if ex is None or ex.status.terminal or c.current_plan_id != eid:
+            if eid is not None:
+                self._retire_native(eid)
+            return
+        if h.key != eid:
+            # Cancellation/hold upload finishes before another candidate may
+            # enter this same bounded session slot.
+            if h.busy:
+                if h.key is None:
+                    h.cancel()
+                return
+            observed = h.observed
+            if observed and observed['status'] == rtp.REFERENCE_RUNNING:
+                h.cancel()
+                return
+            try:
+                deadline = ex.request.admit_by
+                h.stage(eid, c.staged_trajectory(eid),
+                        selection_deadline_ns=None if deadline is None else deadline.ns)
+                self._native_failed = False  # a new, explicit admission
+            except (ValueError, RuntimeError) as exc:
+                self._receipt(ex, Phase.REJECTED, str(exc))
+                self._drop_staged(ex, str(exc))
+            return
+        if h.selected:
+            if ex.status.phase is Phase.ADMITTED:
+                self._receipt(ex, Phase.SELECTED, reference_id=h.id, reference_revision=h.revision,
+                              reference_phase=h.point.time, arm_epoch=h.arm_epoch)
+            c.on_control(pack_control_update(execute=eid))
+            self._native_pending = None
+            if not c.runtime_state['executing']:
+                h.cancel()
+            self._pump_controller()
+        elif h.ready:
+            refusal = selection_refusal(self._authority) or c.release_error(eid)
+            if refusal:
+                self._receipt(ex, Phase.REJECTED, refusal)
+                self._drop_staged(ex, refusal)
+            else:
+                h.approve()
+
+    def _send_command(self, command):
+        h = self._native
+        if h is None:
+            return self.link.apply_command(command)
+        state, _ = self.link.latest_state()
+        if state is None or not state.armed:
+            return None
+        ref, point = h.observed, h.observed_point
+        if (state.session_id, state.arm_epoch) != (h.session_id, h.arm_epoch):
+            ref = point = None
+        # Before this ARM generation has ever selected a reference, the
+        # existing compensated idle hold remains the v5 command path.
+        if state.reference is None or not state.reference['reference_id']:
+            return self.link.apply_command(command)
+        if ref is not None and point is not None:
+            matches = (np.array_equal(command['position'], point.position)
+                       and np.array_equal(command['velocity'], point.velocity))
+            if matches:
+                return self.link.apply_reference_envelope(
+                    command, reference_id=ref['reference_id'], revision=ref['revision'],
+                    phase=point.time, sample_received_at=h.received_at,
+                    valid_for_s=.05, phase_window_s=.05,
+                    session_id=h.session_id, arm_epoch=h.arm_epoch)
+        # The controller's existing cancel/contact/relatch path owns the hold
+        # target and its compensation. Admit that fixed target explicitly;
+        # never mislabel its dynamics as an envelope for the old moving curve.
+        if (self._native_failed or self._native_pending is not None
+                or self.controller.runtime_state['executing'] or h.busy):
+            return None
+        if ref and ref['status'] == rtp.REFERENCE_UNDERFLOW:
+            self._native_failed = True
+            return None
+        if ref and ref['status'] == rtp.REFERENCE_RUNNING:
+            h.cancel()
+            return None
+        if not h.busy:
+            q = command['position']
+            hold = JointTrajectory([0., self.period], np.stack([q, q]), np.zeros((2, len(q))))
+            h.stage(None, hold)
+        return None
 
     # -- authority RPCs ------------------------------------------------------------
     def _request_authority(self, armed: bool) -> None:
         """From the controller's ``arm`` output. One worker, bounded by the
         link's ACK timeouts; a DISARM drops queued ARMs (RemoteHardware's rule)."""
         if not armed:
+            self._native_pending = None
+            if self._native is not None:
+                self._native.cancel()
             self._tracker.disarm_sent()
             if any(not want and not fut.done() for fut, want, _ in self._pending):
                 return  # one DISARM in flight covers this one
@@ -588,6 +747,8 @@ class RobotRuntime:
         self._publish()
         for ex in list(self._executions.values()):
             self._expire(ex)
+        if self._native is not None:
+            self._native_step(history[-1] if history else (None, 0.))
         c.tick()
         rs = c.runtime_state
         self._pump_controller(sent_for=rs["plan_id"] if rs["executing"] else None)

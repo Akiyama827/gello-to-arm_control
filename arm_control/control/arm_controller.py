@@ -80,6 +80,7 @@ class ArmController:
         settle_dwell_s: float = 0.2,
         model_token: str | None = None,
         pose_provenance: str = "unbound",
+        reference_source=None,
     ) -> None:
         self.node = node
         # Model binding (arm_control.model_bundle). None = unbound graph (sims,
@@ -133,6 +134,7 @@ class ArmController:
         if reference_clock is not None and self._state_period is not None:
             raise ValueError("reference_clock cannot be combined with motor_state_period_s")
         self._reference_clock = reference_clock or self._clock
+        self._reference_source = reference_source
         self.execution_policy = execution_policy
         if execution_policy is not None:
             if execution_policy.torque_limits.shape != (self.n_arm,):
@@ -552,6 +554,30 @@ class ArmController:
         """
         return self._plant_t if self._state_period is not None else self._reference_clock()
 
+    def bind_reference_source(self, source) -> None:
+        """Disarmed construction binding for a negotiated plant reference."""
+        if self.armed or self._plan is not None:
+            raise ValueError("bind reference source before ARM or plan admission")
+        self._reference_source = source
+
+    def staged_trajectory(self, plan_id: str) -> JointTrajectory:
+        """Snapshot the trajectory admitted by this controller, for plant upload."""
+        if self.current_plan_id != plan_id or self._pending_traj is None or self._running:
+            raise ValueError("the named trajectory is not staged and unselected")
+        traj = self._pending_traj
+        return JointTrajectory(traj.times, traj.positions, traj.velocities)
+
+    def release_error(self, plan_id: str) -> str:
+        """The existing selection checks, shared with asynchronous RT admission."""
+        if self._plan is None or self._plan["plan_id"] != plan_id:
+            return "the named plan is no longer staged"
+        if not self.armed or not self.ready_sent:
+            return "not armed"
+        if self.execution_policy is not None:
+            return self._observation_error() or self.execution_policy.plan_error(
+                self._plan, self.last_state.position, self.n_arm)
+        return ""
+
     def _release(self, plan_id: str) -> None:
         """Start a named plan. Anchors t_start NOW, never at plan time.
 
@@ -582,16 +608,17 @@ class ArmController:
         if self._running:
             return
         if self.execution_policy is not None:
-            reason = self._observation_error() or self.execution_policy.plan_error(
-                self._plan, self.last_state.position, self.n_arm)
+            reason = self.release_error(plan_id)
             if reason:
                 self._finish_leg(ok=False, reason=reason)
                 self._pending_traj = None
                 return
         start = self.exec_time
+        source = self._reference_source
         self._reference = TrajectoryReference(
-            self._pending_traj, start, self._plan.get("cartesian_poses"))
-        self._settling.begin(start + self._reference.duration_sec)
+            self._pending_traj, None if source else start,
+            self._plan.get("cartesian_poses"), source)
+        self._settling.begin(None if source else start + self._reference.duration_sec)
         self._completion_sample_at = None
         self._running = True
         print(
@@ -776,7 +803,10 @@ class ArmController:
         if fresh:
             self._completion_sample_at = self._last_state_at
         verdict = self._settling.poll(
-            now=now, fresh=fresh, done=lambda: self._leg_done(state)
+            now=now, fresh=fresh, done=lambda: self._leg_done(state),
+            reference_ended=(self._reference is not None
+                             and self._reference.sample_source is not None
+                             and self._reference.elapsed(now) >= self._reference.duration_sec),
         )
         if verdict is None:
             return False

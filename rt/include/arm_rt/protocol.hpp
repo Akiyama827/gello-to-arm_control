@@ -244,7 +244,8 @@ struct ReferenceCommitPayload {
   uint32_t reserved0;               // 36
   double protected_until;           // 40: exact shared cut knot, reference seconds
   double latest_phase;              // 48: refuse if RT phase reaches this cut
-  uint8_t reserved[48];             // 56
+  uint64_t selection_budget_ns;     // 56: initial selection, since first successful SEAL; 0=none
+  uint8_t reserved[40];             // 64
 };
 struct ReferenceRetirePayload {
   uint64_t session_id;              // 0
@@ -358,7 +359,7 @@ inline bool valid_reference_body(uint16_t type, const void* body) {
         p.revision && p.revision==p.expected_revision+1 && !p.reserved0 &&
         std::isfinite(p.protected_until) && std::isfinite(p.latest_phase) &&
         p.protected_until>=0 && p.latest_phase>=0 &&
-        (p.expected_revision ? p.latest_phase<=p.protected_until && p.latest_phase>0
+        (p.expected_revision ? !p.selection_budget_ns && p.latest_phase<=p.protected_until && p.latest_phase>0
                              : p.latest_phase==0 && p.protected_until==0) &&
         zero_bytes(p.reserved,sizeof(p.reserved));
     }
