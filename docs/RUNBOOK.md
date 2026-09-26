@@ -397,7 +397,11 @@ PYTHONPATH=. python tools/bench/check_pose_hold_sim.py /path/to/arm_rt_servo.so 
 
 The simulation regression identifies `legacy-fr3-soft-20260907` by source URDF
 SHA256 `94bd52bf6d1b5a87312a5edbf61f3ea91c8a34a1236e0e4cc1785611a5d4957d`.
-Its meshes must resolve relative to that file. With no `--fixture`, it checks
+The check also fingerprints the URDF plus the bytes of its 12 distinct
+referenced collision meshes: `7b8060b5c078bc95dfd6ed7cd39fd662e8086cbfeca08fce98f84a3091b607a1`.
+Meshes must resolve relative to that file; a replaced/missing collision mesh
+refuses the regression. Visual-only meshes are excluded from this physics fixture.
+With no `--fixture`, it checks
 the standalone library-root URDF; a missing or different asset exits 2 with
 `fixture/provenance mismatch` before loading the controller. It does not run
 the historical numerical limits against generic FR3 or approved MUKCa models.

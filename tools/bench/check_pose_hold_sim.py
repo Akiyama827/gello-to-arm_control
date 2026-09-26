@@ -9,11 +9,25 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
 FIXTURE_ID = "legacy-fr3-soft-20260907"
 FIXTURE_SHA256 = "94bd52bf6d1b5a87312a5edbf61f3ea91c8a34a1236e0e4cc1785611a5d4957d"
+# Historical evidence: URDF plus its 12 distinct referenced collision meshes.
+# Hash compact JSON [("urdf", source_sha), (sorted mesh URI, content_sha), ...].
+# URI labels, not resolved paths, keep an explicit --fixture copy relocatable.
+FIXTURE_FINGERPRINT = "7b8060b5c078bc95dfd6ed7cd39fd662e8086cbfeca08fce98f84a3091b607a1"
+
+
+def fixture_fingerprint(fixture: Path, source: bytes) -> str:
+    records = [("urdf", hashlib.sha256(source).hexdigest())]
+    names = sorted({m.attrib["filename"] for m in
+                    ET.fromstring(source).findall("./link/collision/geometry/mesh")})
+    for name in names:
+        records.append((name, hashlib.sha256((fixture.parent / name).read_bytes()).hexdigest()))
+    return hashlib.sha256(json.dumps(records, separators=(",", ":")).encode()).hexdigest()
 
 
 def main():
@@ -27,14 +41,23 @@ def main():
     if not fixture.is_file():
         parser.error(f"fixture/provenance mismatch: missing URDF {fixture}; "
                      "controller regression NOT RUN")
-    digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+    source = fixture.read_bytes()
+    digest = hashlib.sha256(source).hexdigest()
     if digest != FIXTURE_SHA256:
         parser.error(f"fixture/provenance mismatch for {FIXTURE_ID}: {fixture} "
                      f"has SHA256 {digest}, expected {FIXTURE_SHA256}; "
                      "controller regression NOT RUN. Supply --fixture with the "
                      "historical URDF; these thresholds do not qualify another model.")
+    try:
+        fingerprint = fixture_fingerprint(fixture, source)
+    except OSError as exc:
+        parser.error(f"fixture/provenance mismatch; controller regression NOT RUN: {exc}")
+    if fingerprint != FIXTURE_FINGERPRINT:
+        parser.error("fixture/provenance mismatch; controller regression NOT RUN: "
+                     f"URDF/collision fingerprint {fingerprint}, expected {FIXTURE_FINGERPRINT}")
     print(json.dumps(dict(fixture_id=FIXTURE_ID, fixture_path=str(fixture),
-                          fixture_sha256=digest, fixture_identity="verified")), flush=True)
+                          fixture_sha256=digest, fixture_fingerprint=fingerprint,
+                          fixture_identity="verified")), flush=True)
     if args.servo_binding:
         spec = importlib.util.spec_from_file_location("arm_rt_servo", args.servo_binding)
         module = importlib.util.module_from_spec(spec)
