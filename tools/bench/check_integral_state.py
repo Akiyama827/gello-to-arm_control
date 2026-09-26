@@ -97,7 +97,7 @@ def check_update_order():
         ki=np.full(2, 200.), i_limit=np.ones(2), clock=lambda: now[0])
     policy = ExecutionPolicy(100., .1, .1, .01, .05, .1, np.full(2, 50.))
     controller = ArmController(QueueControllerNode(), ex,
-        gripper={'n_motors': 2, 'open_finger_m': 0., 'gains': (0., 0.), 'mimic': None}, execution_policy=policy, clock=lambda: now[0])
+        gripper={'n_motors': 2, 'open_finger_m': 0., 'gains': (0., 0.), 'mimic': None}, execution_policy=policy, clock=lambda: now[0], plant_reports_health=False)
     state = controller.last_state
     ex.hold_command(state)
     # One joint exceeds tracking admission; another is in the integral window.
@@ -125,6 +125,93 @@ def check_update_order():
     second = ex.hold_command(state, q_des=target).tau_ff.copy()
     assert np.allclose(second-first, .0001)
     print('second construction 100 us later adds integral', (second-first).tolist())
+
+    # Trace real tick paths, including construction that never becomes output.
+    from arm_control.control.reference import TrajectoryReference
+    from arm_control.messages import pack_motor_state
+    from arm_control.motion import JointTrajectory
+
+    calls = []
+    integrate = ex._integral
+
+    def trace(q_des, q):
+        result = integrate(q_des, q)
+        calls.append((np.asarray(q_des)-q).tolist())
+        return result
+
+    ex._integral = trace  # fixture instrumentation, not a second state owner
+    ex.reset_integral()
+    controller._set_arm(True)
+    controller.last_command = controller._hold_anchor = None
+    now[0] = 1.
+    controller._last_state_at = now[0]
+    controller.tick()
+    assert len(calls) == 2 and calls == [[0., 0.], [0., 0.]]
+    print('initial measured hold: 2 integral calls for 1 tick')
+    # Keep one still-fresh observation across two controller cycles.
+    controller._hold_anchor.q_des[:] = .005
+    calls.clear()
+    now[0] = 1.01
+    controller.tick()
+    first = ex._i_tau.copy()
+    now[0] = 1.02
+    controller.tick()
+    assert len(calls) == 2 and np.allclose(ex._i_tau-first, .01)
+    assert controller._last_state_at == 1.
+    print('two cycles reuse one fresh observation: 1 update per tick, bias grows')
+    calls.clear()
+    saved = ex._i_tau.copy()
+    controller.tick()  # identical clock: law invoked again, zero dt
+    assert len(calls) == 1 and np.array_equal(ex._i_tau, saved)
+    print('duplicate tick at identical time: integral called, zero dt')
+    calls.clear()
+    now[0] = 1.2
+    controller.tick()
+    assert not calls and np.array_equal(ex._i_tau, saved)
+    zeros = np.zeros(2)
+    controller.on_motor_state(pack_motor_state(np.full(2, np.nan), *[zeros]*7))
+    assert not calls and np.array_equal(ex._i_tau, saved)
+    print('stale/nonfinite observation: no update; ordinary pause retains bias')
+    controller._set_arm(False)
+    assert np.array_equal(ex._i_tau, zeros) and ex._i_t is None
+    print('DISARM: bias and integral time reset')
+
+    # Exercise the complete tick -> jog command -> tracking fallback chain too.
+    controller._set_arm(True)
+    controller._last_state_at = now[0] = 2.
+    controller.tick()
+    calls.clear()
+    controller._jog.set(np.array([.1, .005]), now[0])
+    now[0] = 2.01
+    controller.tick()
+    assert calls == [[.1, .005], [0., 0.]]
+    assert np.allclose(controller.last_command.tau_ff, [0., .01])
+    print('tracking-abort tick: rejected target update then measured hold update')
+
+    # Successful settling constructs an endpoint hold and then rebuilds it.
+    calls.clear()
+    controller._last_state_at = now[0] = 2.02
+    goal = np.full(2, .0005)
+    trajectory = JointTrajectory([0., .1], np.stack([goal, goal]), np.zeros((2, 2)))
+    controller._reference = TrajectoryReference(trajectory, 1.)
+    controller._plan = dict(plan_id='settled', phase='settled', positions=trajectory.positions)
+    controller._running = True
+    controller._settling.begin(1.1)
+    controller._settling._settled_since = 1.1
+    controller.tick()
+    assert calls == [goal.tolist(), goal.tolist()] and not controller._running
+    print('ordinary completion tick: 2 endpoint integral calls, same desired q')
+
+    # The event-driven compatibility path caches hold commands between states.
+    controller.execution_policy = None
+    controller.last_command = controller._hold_anchor = None
+    calls.clear()
+    controller.on_motor_state(pack_motor_state(*[zeros]*8))
+    assert len(calls) == 1
+    now[0] += .01
+    controller.on_motor_state(pack_motor_state(*[zeros]*8))
+    assert len(calls) == 1
+    print('event-driven cached hold: only first state constructs/integrates hold')
 
 
 if __name__ == '__main__':
