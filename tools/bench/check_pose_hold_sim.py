@@ -1,7 +1,10 @@
 """Headless FR3 Soft disturbance check; pass the freshly built servo .so.
 
-No hardware connection. Uses the standalone example model and control profile.
+No hardware connection. Numerical limits belong to the identified historical
+fixture, not to arbitrary nominal or calibrated FR3 descriptions.
 """
+import argparse
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -9,23 +12,43 @@ import sys
 
 import numpy as np
 
-if len(sys.argv) > 1:
-    spec = importlib.util.spec_from_file_location("arm_rt_servo", sys.argv[1])
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    sys.modules["arm_rt_servo"] = module
-
-from arm_control.config import load_config_tree
-from arm_control.plants.mujoco.backend import MuJoCoBackend
+FIXTURE_ID = "legacy-fr3-soft-20260907"
+FIXTURE_SHA256 = "94bd52bf6d1b5a87312a5edbf61f3ea91c8a34a1236e0e4cc1785611a5d4957d"
 
 
 def main():
     root = Path(__file__).resolve().parents[2]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("servo_binding", nargs="?", help="freshly built arm_rt_servo .so")
+    parser.add_argument("--fixture", type=Path, default=root / "franka/urdf/fr3.urdf",
+                        help=f"source URDF for {FIXTURE_ID}; meshes must resolve beside it")
+    args = parser.parse_args()
+    fixture = args.fixture.resolve()
+    if not fixture.is_file():
+        parser.error(f"fixture/provenance mismatch: missing URDF {fixture}; "
+                     "controller regression NOT RUN")
+    digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+    if digest != FIXTURE_SHA256:
+        parser.error(f"fixture/provenance mismatch for {FIXTURE_ID}: {fixture} "
+                     f"has SHA256 {digest}, expected {FIXTURE_SHA256}; "
+                     "controller regression NOT RUN. Supply --fixture with the "
+                     "historical URDF; these thresholds do not qualify another model.")
+    print(json.dumps(dict(fixture_id=FIXTURE_ID, fixture_path=str(fixture),
+                          fixture_sha256=digest, fixture_identity="verified")), flush=True)
+    if args.servo_binding:
+        spec = importlib.util.spec_from_file_location("arm_rt_servo", args.servo_binding)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules["arm_rt_servo"] = module
+
+    from arm_control.config import load_config_tree
+    from arm_control.plants.mujoco.backend import MuJoCoBackend
+
     cfg = load_config_tree(root / "examples/configs/sim_arm.yaml")
     mode = load_config_tree(root / "examples/profiles/motion_franka.yaml")
     soft = mode["gain_presets"]["soft"]["pose_hold"] | {"id": 1}
     plant = MuJoCoBackend(
-        joint_names=cfg["arm"]["joints"], single_model_path=root / cfg["sim_model_path"],
+        joint_names=cfg["arm"]["joints"], single_model_path=fixture,
         timestep=.001, control_period=.01, ee_body=cfg["arm"]["ee_frame"],
         enable_self_collision=True, default_joint_positions=cfg["sim_default_joint_positions"],
         gravcomp_prefixes=("",), gripper_joints=tuple(cfg["arm"]["gripper_joints"]),

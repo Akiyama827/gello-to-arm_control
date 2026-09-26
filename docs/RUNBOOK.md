@@ -392,8 +392,16 @@ python -m pip install --no-deps -e rt/bindings
 PYTHONPATH=. python rt/bindings/pose_hold_check.py
 PYTHONPATH=. python tools/bench/check_pose_hold_contract.py
 PYTHONPATH=. python tools/bench/check_pose_hold_controller.py
-PYTHONPATH=. python tools/bench/check_pose_hold_sim.py
+PYTHONPATH=. python tools/bench/check_pose_hold_sim.py /path/to/arm_rt_servo.so --fixture /path/to/historical/fr3.urdf
 ```
+
+The simulation regression identifies `legacy-fr3-soft-20260907` by source URDF
+SHA256 `94bd52bf6d1b5a87312a5edbf61f3ea91c8a34a1236e0e4cc1785611a5d4957d`.
+Its meshes must resolve relative to that file. With no `--fixture`, it checks
+the standalone library-root URDF; a missing or different asset exits 2 with
+`fixture/provenance mismatch` before loading the controller. It does not run
+the historical numerical limits against generic FR3 or approved MUKCa models.
+This is a historical simulation regression, not FR3 #1 calibration validation.
 
 The single-model simulator advertises support only with an explicit EE body and
 the updated binding. Composed workcells do not advertise Soft. Remote Franka
