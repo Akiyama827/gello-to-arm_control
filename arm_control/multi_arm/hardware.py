@@ -10,7 +10,6 @@ import time
 
 import numpy as np
 
-from arm_control import frames
 from arm_control.config import arm_joints, gripper_joints
 from arm_control.control.factory import build_arm_controller
 from arm_control.end_effectors.franka_adapter import BridgeClient
@@ -106,7 +105,6 @@ class RemoteHardware:
                 # Model binding is enforced for remote_rt by load_pair_config.
                 c = build_arm_controller(
                     cfg, _HardwareNode(self, a), arm_id=a, require_policy=True,
-                    gravity=frames.world_T_arm(cfg)[:3, :3].T @ np.array([0., 0., -9.81]),
                     clock=time.monotonic, reference_clock=self.reference_clock,
                     plant_reports_health=True,
                 )

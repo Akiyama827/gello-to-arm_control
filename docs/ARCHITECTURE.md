@@ -245,6 +245,17 @@ objective and the evaluators; `mukca_casadi.py` is its OFFLINE solver and is
 imported only by offline tools -- no CasADi, IPOPT or GUI import exists on any
 control or RT path.
 
+Installation gravity is separate from kinematic registration. Project staging
+binds a registry declaration to the approved bundle/model, root frame and
+installation epoch with `bind_gravity`; a canonical digest extends the existing
+opaque model token. `build_executor` consumes that staged value through
+`execution_gravity` and the existing `PinocchioDynamics(gravity=...)`. Bound
+hardware refuses missing/stale facts. Neither RemoteHardware nor a supervisor
+rotates gravity through the fitted workcell mount. Simulation explicitly uses
+its own physics gravity/actor placement via `simulation_gravity`; unbound
+analytical examples retain the dynamics default. No generic module reads the
+project registry. Nominal installation assumptions are not measurements.
+
 ## Configuration and assets
 
 `examples/configs/` contains minimal reusable examples, not measured deployment

@@ -104,7 +104,7 @@ class SharedSimulation:
                 build_executor(
                     cfg,
                     arm_id=a,
-                    gravity=frames.world_T_arm(cfg)[:3, :3].T
+                    simulation_gravity=frames.world_T_arm(cfg)[:3, :3].T
                     @ self.backend.model.opt.gravity,
                 ),
                 arm_id=a,

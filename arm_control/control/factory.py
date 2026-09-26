@@ -26,7 +26,7 @@ from arm_control.dynamics import PinocchioDynamics
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.execution_policy import build_execution_policy
 from arm_control.control.trajectory_executor import JointTrajectoryExecutor
-from arm_control.model_bundle import model_token, pose_provenance
+from arm_control.model_bundle import execution_gravity, model_token, pose_provenance
 from arm_control.node_utils import resolve_gains
 
 __all__ = [
@@ -103,9 +103,13 @@ def gripper_command_cfg(cfg) -> dict:
 
 
 def build_executor(
-    cfg, *, arm_id: str = "arm", gains: dict | None = None, gravity=None
+    cfg, *, arm_id: str = "arm", gains: dict | None = None, simulation_gravity=None
 ) -> JointTrajectoryExecutor:
     """The EXECUTION half of an arm's stack, with no planning half at all.
+
+    Bound hardware consumes staged model gravity. Only simulation may supply
+    ``simulation_gravity`` from its own physics/actor placement; analytical
+    callers can construct PinocchioDynamics directly.
 
     Split out of build_planning_stack so ``arm_controller`` can have a servo
     without an IK, an OMPL instance, a collision world or a scene -- the whole
@@ -122,6 +126,7 @@ def build_executor(
     resolves across both and passes the answer in; absent, the arm table is
     still the source, so every existing caller is unchanged.
     """
+    # Simulation supplies its own physics vector; hardware consumes staged facts.
     joints = arm_joints(cfg)
     n = len(joints)
     # done() tolerances are per-arm feedback facts (DM quantization, payload
@@ -138,7 +143,11 @@ def build_executor(
     executor = JointTrajectoryExecutor(
         arm_id=arm_id,
         joint_names=joints,
-        dynamics=PinocchioDynamics(arm_urdf(cfg), joints, gravity=gravity),
+        dynamics=PinocchioDynamics(
+            arm_urdf(cfg), joints,
+            gravity=(execution_gravity(cfg, arm_urdf(cfg)) if simulation_gravity is None
+                     else simulation_gravity),
+        ),
         kp_default=_gain("kp", "kp"),
         kd_default=_gain("kd", "kd"),
         max_torque=_gain("torque_limits", "max_tau"),
@@ -156,7 +165,7 @@ def build_executor(
 
 
 def build_arm_controller(
-    cfg, node, *, arm_id: str, mode_cfg: dict | None = None, gravity=None,
+    cfg, node, *, arm_id: str, mode_cfg: dict | None = None,
     require_policy: bool = False, **options,
 ) -> ArmController:
     """The one recipe for an arm's ``ArmController`` from its config.
@@ -173,7 +182,7 @@ def build_arm_controller(
     if mode_cfg is None:
         mode_cfg = cfg.get("control_mode") or {}
     gains = resolve_gains(cfg, mode_cfg, names, n)
-    executor = build_executor(cfg, arm_id=arm_id, gains=gains, gravity=gravity)
+    executor = build_executor(cfg, arm_id=arm_id, gains=gains)
     policy_cfg = cfg.get("execution_policy")
     if policy_cfg is not None and gains is None:
         raise ValueError("execution_policy requires resolved per-joint torque limits")

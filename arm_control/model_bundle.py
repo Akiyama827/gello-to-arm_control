@@ -239,6 +239,100 @@ def base_to_base(world_T_base_a, world_T_base_b) -> np.ndarray:
     return np.linalg.inv(np.asarray(world_T_base_a, float)) @ np.asarray(world_T_base_b, float)
 
 
+def gravity_digest(binding: dict) -> str:
+    """Canonical identity of a staged installation gravity declaration."""
+    import json
+
+    if not isinstance(binding, dict):
+        raise ValueError("missing model-bound gravity declaration")
+    try:
+        vector = np.asarray(binding["vector"], dtype=float)
+        reviewed = binding["reviewed_against"]
+        if (vector.shape != (3,) or not np.isfinite(vector).all()
+                or binding["units"] != "m/s^2"
+                or type(binding["revision"]) is not int or binding["revision"] < 1
+                or binding["source"]["type"] not in {"nominal_assumption", "measured"}
+                or not binding["source"]["evidence"]
+                or not binding["instance_id"] or not binding["frame"]
+                or not reviewed["installation_epoch"]
+                or not reviewed["bundle_id"]
+                or type(reviewed["revision"]) is not int or reviewed["revision"] < 1
+                or any(len(reviewed[key]) != 64 for key in ("model_sha256", "base_sha256"))):
+            raise ValueError("invalid model-bound gravity declaration")
+        canonical = dict(binding, vector=vector.tolist())
+        return hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":"),
+                                         allow_nan=False).encode()).hexdigest()
+    except (KeyError, TypeError, OverflowError) as exc:
+        raise ValueError("incomplete model-bound gravity declaration") from exc
+
+
+def _base_digest(bundle: ModelBundle) -> str:
+    import json
+
+    return hashlib.sha256(json.dumps(bundle.base, sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def bind_gravity(bundle: ModelBundle, declaration: dict, *, installation_epoch: str) -> dict:
+    """Qualify an installation declaration against the selected approved facts.
+
+    Project staging supplies the authority; runtime never reads its registry.
+    Repeated model/mount facts in reviewed_against are deliberate review guards.
+    """
+    from copy import deepcopy
+
+    if not isinstance(declaration, dict):
+        raise ValueError("missing installation gravity declaration")
+    binding = dict(deepcopy(declaration), instance_id=bundle.instance_id)
+    gravity_digest(binding)
+    expected = dict(bundle_id=bundle.bundle_id, revision=bundle.revision,
+                    model_sha256=bundle.model_sha256, base_sha256=_base_digest(bundle),
+                    installation_epoch=installation_epoch)
+    for key, value in expected.items():
+        if binding["reviewed_against"].get(key) != value:
+            raise ValueError(f"gravity reviewed_against.{key} does not match selected model/installation")
+    if bundle.base.get("mount_epoch", installation_epoch) != installation_epoch:
+        raise ValueError("gravity installation epoch differs from bundle mount_epoch")
+    _check_gravity_model(binding, bundle.model_urdf)
+    binding["vector"] = np.asarray(binding["vector"], dtype=float).tolist()
+    return binding
+
+
+def _check_gravity_model(binding: dict, urdf: Path | str) -> None:
+    import xml.etree.ElementTree as ET
+
+    if sha256_file(urdf) != binding["reviewed_against"]["model_sha256"]:
+        raise ValueError("gravity binding model SHA differs from runtime URDF")
+    robot = ET.parse(urdf).getroot()
+    roots = ({link.get("name") for link in robot.findall("link")}
+             - {joint.find("child").get("link") for joint in robot.findall("joint")})
+    if roots != {binding["frame"]}:
+        raise ValueError("gravity frame must be the runtime URDF root/base frame")
+
+
+def execution_gravity(cfg, urdf: Path | str) -> np.ndarray | None:
+    """Consume a bound gravity value, refusing stale or incomplete model facts.
+
+    Unbound analytical/example configs retain the low-level nominal default.
+    Bound hardware never infers gravity from a kinematic workcell transform.
+    """
+    model = cfg.get("model") or {}
+    if not model:
+        return None
+    binding = model.get("gravity")
+    digest = gravity_digest(binding)
+    if not str(model.get("token", "")).endswith(":g" + digest):
+        raise ValueError("gravity binding does not match execution/model token; re-stage")
+    for instance in (cfg.get("deployment_instance"), (cfg.get("rt") or {}).get("instance_id")):
+        if instance is not None and instance != binding["instance_id"]:
+            raise ValueError("gravity binding instance differs from runtime instance")
+    for key in ("bundle_id", "revision"):
+        if model.get(key) != binding["reviewed_against"][key]:
+            raise ValueError(f"gravity binding {key} differs from staged model")
+    _check_gravity_model(binding, urdf)
+    return np.array(binding["vector"], dtype=float)
+
+
 def model_token(cfg) -> str | None:
     """The staged config's model binding token, or None when unbound."""
     raw = getattr(cfg, "raw", cfg)

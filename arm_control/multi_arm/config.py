@@ -13,7 +13,7 @@ from scipy.spatial.transform import Rotation
 
 from arm_control.config import RobotConfig, arm_joints, ee_frame, load_config_tree
 from arm_control import frames
-from arm_control.model_bundle import model_token
+from arm_control.model_bundle import execution_gravity, model_token
 from arm_control.control.factory import arm_urdf
 from arm_control.dynamics import PinocchioDynamics
 from arm_control.scene import ActorSpec, ObjectSpec, SceneSpec, WeldSpec, load_scene
@@ -162,6 +162,8 @@ def load_pair_config(path) -> PairConfig:
             or not cfg.get("execution_policy")
         ):
             raise ValueError(f"{name}: hardware needs model binding, RT identity and execution policy")
+        if raw["backend"] == "remote_rt":
+            execution_gravity(cfg, urdf)
     if scene is None:
         scene = SceneSpec(tuple(actors), (), ())
     if set(scene.actor_names) != set(robots):
