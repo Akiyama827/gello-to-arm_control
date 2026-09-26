@@ -594,6 +594,40 @@ class RtBackend:
         finally:
             self._upload_lock.release()
 
+    def commit_reference(self, upload_id: int, *, reference_id: int, revision: int = 1,
+                         expected_revision: int = 0, protected_until: float = 0.,
+                         latest_phase: float = 0.) -> dict:
+        with self._upload_lock:
+            self._upload_cancel.clear()
+            return self._reference_exchange(
+                rtp.CTL_REFERENCE_COMMIT, session_id=self.session_id, upload_id=upload_id,
+                reference_id=reference_id, arm_epoch=self._arm_epoch, revision=revision,
+                expected_revision=expected_revision, protected_until=protected_until,
+                latest_phase=latest_phase)
+
+    def cancel_reference(self, reference_id: int, revision: int) -> None:
+        self._upload_cancel.set()
+        with self._upload_lock:
+            self._upload_cancel.clear()
+            self._reference_exchange(rtp.CTL_CANCEL_REFERENCE, session_id=self.session_id,
+                                     id=reference_id, arm_epoch=self._arm_epoch, revision=revision)
+
+    def apply_reference_envelope(self, command: dict, *, reference_id: int, revision: int,
+                                 phase: float, sample_received_at: float,
+                                 valid_for_s: float, phase_window_s: float) -> int:
+        """PC dynamics evaluated at the feedback reference sample, never a second clock."""
+        self._cmd_seq = (self._cmd_seq + 1) & 0xFFFFFFFF
+        age_us = max(0, int((time.monotonic() - sample_received_at)*1e6))
+        packet = rtp.pack_reference_command(
+            n=self.n, seq=self._cmd_seq, arm_epoch=self._arm_epoch,
+            t_mono_ns=time.monotonic_ns(), session_id=self.session_id,
+            reference_id=reference_id, revision=revision, phase=phase, age_us=age_us,
+            valid_for_us=int(valid_for_s*1e6), phase_window_us=int(phase_window_s*1e6),
+            tau_ff=command['torque'], kp=command['kp'], kd=command['kd'],
+            negotiated=self._reference_mode)
+        self._udp.send(packet)
+        return self._cmd_seq
+
     def abort_reference_upload(self, upload_id: int) -> None:
         self._upload_cancel.set()
         with self._upload_lock:
@@ -682,13 +716,17 @@ class RtBackend:
     def _rx_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                data = self._udp.recv(rtp.STATE_SIZE)
+                data = self._udp.recv(rtp.REFERENCE_STATE_SIZE + 1)
             except socket.timeout:
                 continue
             except OSError:
                 return
             try:
-                state = rtp.unpack_state(data)
+                if self._reference_mode and len(data) == rtp.REFERENCE_STATE_SIZE:
+                    state, state_reference = rtp.unpack_reference_state(data, negotiated=True)
+                    state.reference = state_reference
+                else:
+                    state = rtp.unpack_state(data)
             except ValueError:
                 continue
             if state.identity_hash != self._expected_identity or state.n != self.n:

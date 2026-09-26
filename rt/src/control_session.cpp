@@ -160,9 +160,25 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
 
   std::optional<ReferenceUpload> upload;
   ReferenceModePayload bound{};
+  ReferenceSelectionInfo selection{};
+  ReferenceCommit pending{};
+  ControlPacket commit_frame{};
+  ReferenceReplyPayload commit_reply{};
+  ReferenceRetirePayload last_cancel{};
+  bool commit_waiting=false, have_commit_reply=false;
   ControlPacket rx;
   size_t have = 0;
   while (!ctx.shutdown.load()) {
+    ctx.reference_feedback.read(selection);
+    if(commit_waiting && ctx.reference_done.load(std::memory_order_acquire)==pending.ticket) {
+      commit_reply.result=ctx.reference_result.load(std::memory_order_relaxed);
+      ControlPacket answer=make(CTL_REFERENCE_STATUS,0,nullptr,commit_frame.seq);
+      answer.version=REFERENCE_VERSION;
+      std::memcpy(answer.text,&commit_reply,sizeof(commit_reply));
+      if(!send_frame(fd,answer)) break;
+      commit_waiting=false; have_commit_reply=true;
+      if(commit_reply.result==REF_OK && upload) upload->discard();
+    }
     ServerCtx::FaultNotice notice;
     if (ctx.pending_fault_notice(notice)) {
       // Acknowledge only a DELIVERED frame, and only its own serial: a failed
@@ -190,6 +206,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
     have = 0;
     if (rx.magic != MAGIC_CTL) continue;
     if (rx.version==REFERENCE_VERSION) {
+      ctx.reference_feedback.read(selection); // refresh after a possibly blocking poll
       // One frame per iteration: deadline/fault processing is never skipped by
       // a producer flood. There is no batch drain or unbounded upload queue.
       ControlPacket checked{};
@@ -201,7 +218,13 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
         case CTL_REFERENCE_BEGIN: {
           ReferenceBeginPayload b; std::memcpy(&b,rx.text,sizeof(b));
           reply.upload_id=b.upload_id; reply.reference_id=b.reference_id; reply.revision=b.revision;
-          result=upload->begin(b); break;
+          const bool active=selection.session_id==session && selection.arm_epoch==ctx.arm_gen.load() &&
+            (selection.status==REFERENCE_RUNNING || selection.status==REFERENCE_END);
+          const bool new_after_end=active && selection.status==REFERENCE_END &&
+            b.reference_id>selection.reference_id && b.expected_revision==0;
+          result=commit_waiting?REF_BUSY:upload->begin(b,selection.reference_id,
+                                                      active&&!new_after_end?selection.revision:0);
+          break;
         }
         case CTL_REFERENCE_CHUNK: {
           ReferenceChunkPayload c; std::memcpy(&c,rx.text,sizeof(c));
@@ -215,10 +238,64 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           ReferenceRetirePayload a; std::memcpy(&a,rx.text,sizeof(a));
           reply.upload_id=a.id;
           result=a.session_id==session && a.arm_epoch==ctx.arm_gen.load() && ctx.armed.load()
-              ? upload->abort(a.id) : REF_IDENTITY;
+              ? (commit_waiting?REF_BUSY:upload->abort(a.id)) : REF_IDENTITY;
           break;
         }
-        default: break; // B3 owns commit/cancel; no selection in the upload owner.
+        case CTL_REFERENCE_COMMIT: {
+          ReferenceCommitPayload c; std::memcpy(&c,rx.text,sizeof(c));
+          reply.upload_id=c.upload_id; reply.reference_id=c.reference_id; reply.revision=c.revision;
+          if(c.session_id!=session || c.arm_epoch!=ctx.arm_gen.load() || !ctx.armed.load()) {
+            result=REF_IDENTITY; break;
+          }
+          if(commit_waiting) {
+            if(!std::memcmp(commit_frame.text,rx.text,sizeof(rx.text))) {
+              commit_frame.seq=rx.seq; continue; // same operation, latest correlation
+            }
+            result=REF_BUSY; break;
+          }
+          if(have_commit_reply && !std::memcmp(commit_frame.text,rx.text,sizeof(rx.text))) {
+            reply=commit_reply;
+            result=pending.cancel_generation==ctx.reference_cancel_generation.load()
+              ? ReferenceResult(reply.result):REF_RETIRED;
+            break;
+          }
+          const auto* admitted=upload->admitted();
+          if(!admitted || admitted->identity.upload_id!=c.upload_id) break;
+          pending={}; pending.admitted=*admitted; pending.request=c;
+          pending.ticket=ctx.reference_published.load()+1;
+          pending.cancel_generation=ctx.reference_cancel_generation.load();
+          commit_frame=rx; commit_reply=reply; commit_waiting=true; have_commit_reply=false;
+          ctx.reference_in.write(pending);
+          ctx.reference_published.store(pending.ticket,std::memory_order_release);
+          continue; // RT acknowledgement is delivered without blocking this thread
+        }
+        case CTL_CANCEL_REFERENCE: {
+          ReferenceRetirePayload c; std::memcpy(&c,rx.text,sizeof(c));
+          reply.reference_id=c.id; reply.revision=c.revision;
+          const auto* candidate=upload->candidate_identity();
+          const bool selected=selection.session_id==session && selection.arm_epoch==c.arm_epoch &&
+                              c.id==selection.reference_id && c.revision==selection.revision;
+          const bool staged=candidate && c.id==candidate->reference_id &&
+                            c.revision==candidate->revision;
+          const bool waiting=commit_waiting && c.id==pending.request.reference_id &&
+                             c.revision==pending.request.revision;
+          if(c.session_id!=session || c.arm_epoch!=ctx.arm_gen.load() || !ctx.armed.load())
+            result=REF_IDENTITY;
+          else if(!std::memcmp(&c,&last_cancel,sizeof(c))) result=REF_OK;
+          else if(!selected && !staged && !waiting) result=REF_REVISION;
+          else {
+            uint64_t retire_id=c.id;
+            if(candidate) retire_id=std::max(retire_id,candidate->reference_id);
+            if(commit_waiting) retire_id=std::max(retire_id,pending.request.reference_id);
+            const uint64_t generation=ctx.reference_cancel_generation.load()+1;
+            ctx.reference_cancel.write(ReferenceCancel{session,retire_id,generation,
+                                                        c.arm_epoch,c.revision});
+            ctx.reference_cancel_generation.store(generation,std::memory_order_release);
+            upload->discard(); last_cancel=c; result=REF_OK;
+          }
+          break;
+        }
+        default: break;
       }
       reply.result=result;
       ControlPacket answer=make(CTL_REFERENCE_STATUS,0,nullptr,rx.seq);

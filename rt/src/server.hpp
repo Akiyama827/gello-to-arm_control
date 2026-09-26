@@ -36,6 +36,7 @@
 #include "arm_rt/backend.hpp"
 #include "arm_rt/protocol.hpp"
 #include "arm_rt/mailbox.hpp"
+#include "arm_rt/reference_selection.hpp"
 
 namespace arm_rt {
 
@@ -159,12 +160,20 @@ uint64_t mono_ns();
 // made it authority: its own receive time and the ARM generation it was
 // validated against. The RT loop never pairs a payload with another packet's
 // timestamp or epoch (they used to be published separately).
+struct ReferenceEnvelopeBinding {
+  uint64_t reference_id=0;
+  uint32_t revision=0, age_us=0;
+  double phase=0;
+  uint32_t valid_for_us=0, phase_window_us=0;
+};
+
 struct CommandEnvelope {
   PoseHoldCommandPacket packet;
   uint64_t rx_ns;       // server clock at INGRESS (recvfrom return), never
                         // re-dated by a handler that was delayed afterwards
   uint64_t arm_gen;     // generation this packet's arm_epoch was checked against
   uint64_t session_id;  // control session it was admitted under
+  ReferenceEnvelopeBinding reference{};
 };
 
 // When an ARM generation began: the no-first-command deadline's baseline.
@@ -180,6 +189,18 @@ inline double clamped_age_ns(uint64_t now, uint64_t then) {
   // tick, so `then` can be nanoseconds in the future.
   const int64_t age = int64_t(now) - int64_t(then);
   return double(age < 0 ? 0 : age);
+}
+
+// One envelope validity rule for admission and continued use. Wall age uses
+// local elapsed intervals only; phase is the shared semantic coordinate.
+inline bool reference_envelope_fresh(const ReferenceEnvelopeBinding& b,
+                                    const ReferenceSelectionInfo& r,
+                                    uint64_t now,uint64_t ingress,double hold_ns) {
+  const double lag=r.phase-b.phase;
+  return r.reference_id==b.reference_id && r.revision==b.revision && lag>=0 &&
+    lag*1e6<=b.phase_window_us && lag*1e9<=hold_ns &&
+    clamped_age_ns(now,ingress)+double(b.age_us)*1000<=
+      std::min(hold_ns,double(b.valid_for_us)*1000);
 }
 
 // The RT loop's own view of command authority, updated once per tick from
@@ -224,6 +245,11 @@ struct CommandAuthority {
            current.packet.command.n == uint16_t(n) &&
            clamped_age_ns(now, current.rx_ns) <= hold_ns;
   }
+};
+
+struct ReferenceCancel {
+  uint64_t session_id=0, reference_id=0, generation=0;
+  uint32_t arm_epoch=0, revision=0;
 };
 
 struct Observer {
@@ -274,6 +300,13 @@ struct ServerCtx {
 
   Mailbox<CommandEnvelope> cmd_in;
   Mailbox<StatePacket> state_out;
+  Mailbox<ReferenceStatePacket> reference_state_out; // RT -> state_tx, negotiated peers only
+  Mailbox<ReferenceCommit> reference_in;       // control -> RT, one pending
+  Mailbox<ReferenceCancel> reference_cancel;   // control -> RT, latest retirement
+  Mailbox<ReferenceSelectionInfo> reference_feedback; // RT -> control
+  std::atomic<uint64_t> reference_published{0}, reference_done{0};
+  std::atomic<uint32_t> reference_result{REF_NOT_ADMITTED};
+  std::atomic<uint64_t> reference_cancel_generation{0};
   // control thread (CTL_ARM) -> rt_loop. The staleness clock starts AT ARM;
   // the RT loop owns the deadline (CommandAuthority), not a shared stamp.
   Mailbox<ArmStart> arm_start;

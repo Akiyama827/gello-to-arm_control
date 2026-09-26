@@ -163,6 +163,7 @@ class State:
     q_cmd: list[float] = field(default_factory=list)
     qd_cmd: list[float] = field(default_factory=list)
     wrench: list[float] = field(default_factory=list)
+    reference: dict | None = None
 
     @property
     def armed(self) -> bool:

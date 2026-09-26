@@ -4,14 +4,9 @@
 #include <openssl/sha.h>
 #include <array>
 #include <cstring>
-#include "arm_rt/reference.hpp"
+#include "arm_rt/reference_selection.hpp"
 
 namespace arm_rt {
-struct AdmittedReference {
-  ReferenceBeginPayload identity{};
-  NativeReference curve{};
-};
-
 class ReferenceUpload {
  public:
   ReferenceUpload(uint64_t session, uint64_t joint_hash, uint16_t n,
@@ -85,6 +80,7 @@ class ReferenceUpload {
   }
   void discard() { present_=sealed_=false; }
   const AdmittedReference* admitted() const { return present_&&sealed_?&candidate_:nullptr; }
+  const ReferenceBeginPayload* candidate_identity() const { return present_?&candidate_.identity:nullptr; }
   bool busy() const { return present_; }
   uint64_t upload_id() const { return present_?candidate_.identity.upload_id:0; }
  private:

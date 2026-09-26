@@ -16,7 +16,13 @@ struct NativeReference {
   std::array<double,NK*NJ> q{}, v{};
 };
 // No cursor, allocation, clock or mutation. Each call selects its own interval.
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("fp-contract=off")))
+#endif
 inline bool sample(const NativeReference& r, double t, double* out) {
+#ifdef __clang__
+#pragma clang fp contract(off)
+#endif
   if(std::isnan(t)) return false;
   int endpoint=-1;
   if(t<=r.times[0]) endpoint=0;

@@ -144,6 +144,11 @@ void rt_loop(ServerCtx& ctx) {
   PoseHold pose_hold;
   double pose_tau[MAX_JOINTS]{};
   StatePacket out = {};
+  ReferenceSelection reference;
+  ReferenceCommit reference_commit{};
+  ReferenceCancel reference_cancel{};
+  uint64_t reference_seen=0, cancel_seen=0;
+  double reference_point[1+3*MAX_JOINTS]{};
   bool prev_armed = false;
   bool holding = false;
   bool have_cmd_gains = false;
@@ -250,7 +255,45 @@ void rt_loop(ServerCtx& ctx) {
     const uint64_t gen = ctx.arm_gen.load(std::memory_order_acquire);
     ctx.arm_start.read(arm_start);
     const uint64_t cmd_v = ctx.cmd_in.read(envelope);
-    authority.observe(gen, arm_start, cmd_v, envelope);
+    const uint64_t session=ctx.session_id.load(std::memory_order_acquire);
+    reference.reset(session,uint32_t(gen));
+    const uint64_t published=ctx.reference_published.load(std::memory_order_acquire);
+    if(published!=reference_seen) ctx.reference_in.read(reference_commit);
+    const uint64_t cancelled=ctx.reference_cancel_generation.load(std::memory_order_acquire);
+    if(cancelled!=cancel_seen) {
+      ctx.reference_cancel.read(reference_cancel);
+      if(reference_cancel.generation==cancelled) {
+        if(reference_cancel.session_id==session && reference_cancel.arm_epoch==gen) {
+          reference.retire(reference_cancel.reference_id);
+          holding=false; // capture measured position once at this event
+        }
+        cancel_seen=cancelled;
+      }
+    }
+    if(!armed || faulted) reference.retire();
+    // Exhaustion is classified before considering a new admission.
+    const uint32_t previous_reference_status=reference.info().status;
+    reference.evaluate(now,reference_point);
+    if(published!=reference_seen && reference_commit.ticket==published) {
+      ReferenceResult result=REF_IDENTITY;
+      if(armed && !faulted && ctx.reference_session.load()==session)
+        result=reference.commit(reference_commit,now,cancelled);
+      ctx.reference_result.store(result,std::memory_order_relaxed);
+      reference_seen=published;
+      ctx.reference_done.store(published,std::memory_order_release);
+    }
+    reference.evaluate(now,reference_point);
+    if(reference.info().status==REFERENCE_UNDERFLOW && previous_reference_status!=REFERENCE_UNDERFLOW)
+      holding=false; // underflow captures measured q once, independently of prior staleness hold
+    ctx.reference_feedback.write(reference.info());
+    // Wrong reference identity/phase never refreshes the command deadline.
+    // A retired revision can report a live transport, but cannot regain selection.
+    bool admit_envelope=true;
+    if(envelope.packet.command.version==REFERENCE_VERSION) {
+      admit_envelope=reference_envelope_fresh(envelope.reference,reference.info(),
+                                               now,envelope.rx_ns,hold_ns);
+    } else if(reference.info().reference_id) admit_envelope=false;
+    authority.observe(gen, arm_start, admit_envelope?cmd_v:0, envelope);
     const uint64_t rx_ns = authority.deadman_base();
     // Deadman age (CMD_LOST), from this generation only. SIGNED, clamped age:
     // stamps are taken in parallel with this tick: a packet stamped between our `now` sample
@@ -266,8 +309,14 @@ void rt_loop(ServerCtx& ctx) {
     // hold by their OWN ingress stamp, are authority: a newer packet's stamp
     // can no longer freshen an older payload, and a retired handler's late
     // publish is neither tracked nor able to move this generation's deadline.
-    const bool fresh = authority.fresh(ctx.session_id.load(std::memory_order_acquire),
-                                       n, now, hold_ns);
+    bool fresh = authority.fresh(ctx.session_id.load(std::memory_order_acquire),
+                                n, now, hold_ns);
+
+    const bool native_command=cmd.version==REFERENCE_VERSION;
+    if(native_command) {
+      fresh=fresh && reference.active() && reference_envelope_fresh(
+        authority.current.reference,reference.info(),now,authority.current.rx_ns,hold_ns);
+    } else if(reference.info().reference_id) fresh=false;
 
     const double* q_des = zeros;
     const double* qd_des = zeros;
@@ -309,8 +358,8 @@ void rt_loop(ServerCtx& ctx) {
         last_cmd_seq = cmd.seq;
         std::memcpy(cmd_kp, cmd.kp, sizeof(cmd_kp));  // accepted -> snapshot
         std::memcpy(cmd_kd, cmd.kd, sizeof(cmd_kd));
-        q_des = cmd.q_des;
-        qd_des = cmd.qd_des;
+        q_des = native_command?reference_point+1:cmd.q_des;
+        qd_des = native_command?reference_point+1+n:cmd.qd_des;
         tau_ff = cmd.tau_ff;
         kp = cmd_kp;
         kd = cmd_kd;
@@ -406,6 +455,26 @@ void rt_loop(ServerCtx& ctx) {
     // flag still reads zeros rather than stale numbers.
     std::memcpy(out.wrench, ps.wrench, sizeof(out.wrench));
     ctx.state_out.write(out);
+    if(session && ctx.reference_session.load()==session) {
+      ReferenceStatePacket extended{};
+      extended.state=out; extended.state.version=REFERENCE_VERSION;
+      const auto& r=reference.info();
+      extended.reference_id=r.reference_id; extended.revision=r.revision;
+      extended.status=r.status; extended.phase=r.phase;
+      extended.envelope_age_us=UINT32_MAX;
+      if(authority.have && native_command) {
+        extended.envelope_phase=authority.current.reference.phase;
+        extended.envelope_seq=cmd.seq;
+        extended.envelope_age_us=uint32_t(std::min(double(UINT32_MAX),
+          clamped_age_ns(now,authority.current.rx_ns)/1000+authority.current.reference.age_us));
+      }
+      if(reference.active()) {
+        std::copy_n(reference_point+1,n,extended.q_ref);
+        std::copy_n(reference_point+1+n,n,extended.qd_ref);
+        std::copy_n(reference_point+1+2*n,n,extended.qdd_ref);
+      }
+      ctx.reference_state_out.write(extended);
+    }
     const uint64_t t_pub = mono_ns();
     if (t_w0 == 0) t_w0 = t_w1 = t_pub;  // no write this tick (disarmed/plant down)
     prev_compute = t_w0 - t_read;

@@ -135,3 +135,12 @@ target_compile_options(reference_upload_selfcheck PRIVATE -UNDEBUG -ffp-contract
 add_executable(reference_session_selfcheck src/reference_session_selfcheck.cpp)
 target_include_directories(reference_session_selfcheck PRIVATE include)
 target_link_libraries(reference_session_selfcheck PRIVATE OpenSSL::Crypto Threads::Threads)
+
+add_executable(reference_selection_selfcheck src/reference_selection_selfcheck.cpp)
+target_include_directories(reference_selection_selfcheck PRIVATE include)
+target_compile_options(reference_selection_selfcheck PRIVATE -UNDEBUG -ffp-contract=off)
+
+add_executable(reference_runtime_selfcheck src/reference_runtime_selfcheck.cpp
+  src/rt_loop.cpp src/udp_link.cpp src/control_session.cpp src/backend_fake.cpp)
+target_include_directories(reference_runtime_selfcheck PRIVATE include)
+target_link_libraries(reference_runtime_selfcheck PRIVATE OpenSSL::Crypto Threads::Threads Eigen3::Eigen)

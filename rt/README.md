@@ -529,3 +529,48 @@ build/reference_upload_selfcheck
 PYTHONPATH=. python tools/bench/rt/reference_numerics.py build/reference_probe.so
 PYTHONPATH=. python tools/bench/rt/reference_upload.py build/reference_session_selfcheck
 ```
+
+### B3 / B4 RT-side checkpoint (capability still gated)
+
+`ReferenceSelection` now owns the selected native curve and its RT clock
+anchor. The TCP thread publishes one immutable `ReferenceCommit` via the
+existing Mailbox and permits no second pending commit until RT acknowledges
+its ticket. RT repeats session/epoch/generation/revision/lateness checks and
+compares every retained protected knot byte; malformed/stale replacement
+cannot change active selection. ABORT refuses a pending commit; CANCEL retires
+both selected and pending generations. Exact COMMIT/CANCEL retries do not
+reselect or recapture a hold. Internal reference ids increase monotonically
+per ARM epoch, allowing a bounded retired-id high-water mark. A new admitted
+id can replace a terminal endpoint at COMMIT; the old endpoint remains selected
+through staging. A running reference requires same-id prefix-preserving revision
+or explicit cancellation. Linear references can be initially selected; the C1
+replacement promise requires Hermite velocity knots.
+
+The largest commit is 34,032 bytes, its three-slot mailbox 102,136. Every copy
+has a static capacity; prefix validation scans at most 128 knots with at most
+16 q/qd values per knot. No RT allocation, hash, socket call or retry loop is
+introduced. The selection check disables C++ allocation during initial and
+replacement publication/read/selection. Host mean timings are diagnostic,
+not RT-box worst-case timing qualification.
+
+The RT dynamic-envelope check is shared by acceptance and continued use.
+Wrong identity/revision, stale phase or expired age does not refresh command
+authority. Selection and applied output remain distinct. Nonterminal exhaustion
+captures measured q once and holds with captured gains/zero feedforward without
+immediate CMD_LOST. The independent deadline can subsequently latch if valid
+command traffic ceases. END retains planned q with zero qd/qdd; it is not a
+completion receipt. Native state is sent only to the negotiated commander;
+passive observers retain v5. The ordinary server still advertises no horizon
+capability: the dedicated fake-only runtime check enables it for validation.
+
+```sh
+build/reference_selection_selfcheck
+PYTHONPATH=. python tools/bench/rt/native_reference.py build/reference_runtime_selfcheck
+```
+
+The remaining B4/B5 work is the supervisor/controller reference-provider
+handoff, PC dynamics at the exact reported sample, execution receipts and full
+lifecycle regressions. The high-level native path is not integrated yet. In
+particular, migrate existing planned-endpoint and measured/custom-settling holds
+without changing the executor's gravity/payload/integral law or silently treating
+RT transport holds as equivalent to compensated PC holds.

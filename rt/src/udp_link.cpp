@@ -46,7 +46,19 @@ bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_
     return false;
   }
   PoseHoldCommandPacket decoded{};
-  if (got < 0 || !decode_command(data, size_t(got), ctx.supports_pose_hold.load(), decoded))
+  ReferenceEnvelopeBinding binding{};
+  if(got==ssize_t(sizeof(ReferenceCommandPacket))) {
+    ReferenceCommandPacket r{};
+    const uint64_t session=ctx.session_id.load(std::memory_order_acquire);
+    if(!decode_reference_command(data,size_t(got),
+          session && ctx.reference_session.load()==session,r)) return false;
+    auto& c=decoded.command;
+    c.magic=r.magic; c.version=r.version; c.n=r.n; c.seq=r.seq; c.arm_epoch=r.arm_epoch;
+    c.t_mono_ns=r.t_mono_ns; c.session_id=r.session_id;
+    std::memcpy(c.tau_ff,r.tau_ff,sizeof(c.tau_ff));
+    std::memcpy(c.kp,r.kp,sizeof(c.kp)); std::memcpy(c.kd,r.kd,sizeof(c.kd));
+    binding={r.reference_id,r.revision,r.age_us,r.phase,r.valid_for_us,r.phase_window_us};
+  } else if (got < 0 || !decode_command(data, size_t(got), ctx.supports_pose_hold.load(), decoded))
     return false;
   const auto& pkt = decoded.command;
   // Wrong joint count is dropped HERE, before anything is published: the
@@ -172,7 +184,7 @@ bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_
   // ingress stamp. If an ARM or session change landed after the checks, the
   // RT loop's CommandAuthority neither tracks it nor lets it move the new
   // generation's deadline: there is no shared deadman stamp left to refresh.
-  ctx.cmd_in.write(CommandEnvelope{decoded, ingress_ns, gen, session});
+  ctx.cmd_in.write(CommandEnvelope{decoded, ingress_ns, gen, session, binding});
   return true;
 }
 
@@ -273,9 +285,16 @@ void state_tx_thread(ServerCtx& ctx) {
       have_peer = ctx.have_peer;
       peer = ctx.peer;
     }
-    if (have_peer)
-      sendto(ufd, &pkt, sizeof(pkt), MSG_DONTWAIT,
-             reinterpret_cast<sockaddr*>(&peer), sizeof(peer));
+    if (have_peer) {
+      ReferenceStatePacket extended{};
+      if(ctx.reference_session.load()==pkt.session_id && pkt.session_id &&
+         ctx.reference_state_out.read(extended) && extended.state.session_id==pkt.session_id)
+        sendto(ufd,&extended,sizeof(extended),MSG_DONTWAIT,
+               reinterpret_cast<sockaddr*>(&peer),sizeof(peer));
+      else
+        sendto(ufd, &pkt, sizeof(pkt), MSG_DONTWAIT,
+               reinterpret_cast<sockaddr*>(&peer), sizeof(peer));
+    }
     Observer copy[MAX_OBSERVERS];
     {
       std::lock_guard<std::mutex> lock(ctx.obs_mu);
