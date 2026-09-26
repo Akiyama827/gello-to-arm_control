@@ -169,6 +169,7 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | N
     import numpy as np
 
     from arm_control.config import _arm_block
+    from arm_control.control.gains import validate_integral_vector
 
     if not names:
         # No motor-name vector at the top level of this config. That is a
@@ -206,9 +207,9 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | N
     # = zero = off. No arm-table fallback -- it is a tuning of one plant's
     # servo, not a fact about the arm.
     for key in ("ki", "i_limit"):
-        out[key] = expand_named_values(
-            controller_cfg.get(key), names=names, default=0.0, clamp_min=0.0
-        )
+        out[key] = validate_integral_vector(expand_named_values(
+            controller_cfg.get(key), names=names, default=0.0
+        ), len(names), where=f"controller.{key}")
 
     if not float(np.max(np.abs(out["kp"][:n_arm]))) > 0.0:
         # All-zero arm stiffness is never intentional -- it is a limp arm that
@@ -301,7 +302,20 @@ def _check_resolve_gains() -> None:
         assert "all zeros" in str(exc), exc
     else:
         raise AssertionError("all-zero kp resolved silently")
-    print("node_utils: resolve_gains OK")
+    for key in ("ki", "i_limit"):
+        for bad in (-1., float("nan"), float("inf"), [1.], [1., 2., 3.],
+                    [[1., 2.]], {"j1": -1.}, {"j2": float("nan")}):
+            try:
+                resolve_gains(cfg, {"controller": {key: bad}}, names, 2)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"resolved invalid {key}={bad!r}")
+        vector = [2., 3.]
+        out = resolve_gains(cfg, {"controller": {key: vector}}, names, 2)
+        vector[:] = [99., 99.]
+        assert np.array_equal(out[key], [2., 3.]) and not out[key].flags.writeable
+    print("node_utils: resolve_gains and integral admission OK")
 
 
 if __name__ == "__main__":

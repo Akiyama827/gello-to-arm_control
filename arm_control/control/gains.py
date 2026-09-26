@@ -67,6 +67,15 @@ def validate_torque_limits(
     return values
 
 
+def validate_integral_vector(values, n: int, *, where: str) -> np.ndarray:
+    """Exact finite nonnegative admitted values, copied and read-only."""
+    result = np.zeros(n) if values is None else np.array(values, dtype=float, copy=True)
+    if result.shape != (n,) or not np.isfinite(result).all() or np.any(result < 0):
+        raise ValueError(f"{where} must have shape ({n},) and be finite and nonnegative")
+    result.setflags(write=False)
+    return result
+
+
 def _self_check() -> None:
     """The NaN/negative limits that used to slip past the clamp must now raise."""
     ok = validate_torque_limits([9.0, 3.0], 2)

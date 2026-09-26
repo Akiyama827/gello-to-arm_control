@@ -26,6 +26,7 @@ from arm_control.dynamics import PinocchioDynamics
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.execution_policy import build_execution_policy
 from arm_control.control.trajectory_executor import JointTrajectoryExecutor
+from arm_control.control.gains import validate_integral_vector
 from arm_control.model_bundle import execution_gravity, model_token, pose_provenance
 from arm_control.node_utils import resolve_gains
 
@@ -140,6 +141,15 @@ def build_executor(
             return gain_vector(cfg, arm_key, n)
         return np.asarray(gains[key], dtype=float).ravel()[:n]
 
+    def _integral_gain(key):
+        if gains is None:
+            return None
+        names = cfg.get("joint_names") or cfg.get("motor_names") or joints
+        values = validate_integral_vector(gains.get(key), len(names), where=key)
+        # Motor-to-arm projection belongs to composition, never to the
+        # executor's public value boundary. Validate trailing motor slots too.
+        return values[:n]
+
     executor = JointTrajectoryExecutor(
         arm_id=arm_id,
         joint_names=joints,
@@ -156,8 +166,8 @@ def build_executor(
         # twice. The legacy standalone executor already honoured this flag; this
         # path silently ignored it.
         gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
-        ki=None if gains is None else gains.get("ki"),
-        i_limit=None if gains is None else gains.get("i_limit"),
+        ki=_integral_gain("ki"),
+        i_limit=_integral_gain("i_limit"),
         payload_frame=ee_frame(cfg),
         **tolerances,
     )

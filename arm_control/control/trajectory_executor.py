@@ -6,7 +6,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 
-from arm_control.control.gains import validate_torque_limits
+from arm_control.control.gains import validate_integral_vector, validate_torque_limits
 from arm_control.dynamics import PinocchioDynamics
 from arm_control.motion import JointServoCommand, JointState, TrajectoryPoint
 
@@ -108,13 +108,8 @@ class JointTrajectoryExecutor:
         # joint, 2-3 mm at a shared object (2026-09-24). Zero ki = off, which
         # every plant except the real FR3 keeps. The term is stored as a torque
         # so the clamp is a torque bound and gain changes cannot make it jump.
-        self._ki = np.zeros(n) if ki is None else np.asarray(ki, dtype=float).ravel()[:n]
-        self._i_limit = (np.zeros(n) if i_limit is None
-                         else np.asarray(i_limit, dtype=float).ravel()[:n])
-        if self._ki.shape != (n,) or self._i_limit.shape != (n,):
-            raise ValueError(f"ki and i_limit must have shape ({n},)")
-        if np.any(self._ki < 0) or np.any(self._i_limit < 0):
-            raise ValueError("ki and i_limit must be nonnegative")
+        self._ki = validate_integral_vector(ki, n, where="ki")
+        self._i_limit = validate_integral_vector(i_limit, n, where="i_limit")
         self._clock = clock
         self._i_tau = np.zeros(n)
         self._i_t: float | None = None
@@ -204,9 +199,9 @@ class JointTrajectoryExecutor:
     def _integral(self, q_des: np.ndarray, q: np.ndarray) -> np.ndarray:
         """Advance and return the clamped integral torque.
 
-        dt comes from the executor's own clock, so building several commands in
-        one tick (hold anchor + hold) integrates once, not once per call. Only
-        errors inside I_WINDOW_RAD integrate: a larger error is a transient the
+        Each command construction reads the executor's clock and updates state.
+        A repeated call has zero dt only if that clock returns the same value.
+        Only errors inside I_WINDOW_RAD integrate: a larger error is a transient the
         PD is already fighting, and winding up on it overshoots at the end.
         A joint with no spring (kp == 0: Float, pose hold) carries none.
         """
@@ -327,7 +322,25 @@ def _check_integral() -> None:
     off.hold_command(state_1 := JointState(np.zeros(1), np.zeros(1)), q_des=np.array([0.01]))
     t[0] += 1.0
     assert off.hold_command(state_1, q_des=np.array([0.01])).tau_ff[0] == 0.0  # default off
-    print("trajectory_executor: integral OK")
+    def make(**kw):
+        return JointTrajectoryExecutor(
+            "arm", ["j1", "j2"], _NoDynamics(), np.ones(2), np.ones(2), np.ones(2), **kw)
+
+    for name in ("ki", "i_limit"):
+        for bad in (0., [1.], [1., 2., 3.], [[1., 2.]], [-1., 0.],
+                    [np.nan, 0.], [np.inf, 0.], [-np.inf, 0.]):
+            try:
+                make(**{name: bad})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted {name}={bad!r}")
+        supplied = np.array([2., 3.])
+        admitted = make(**{name: supplied})
+        supplied[:] = 99.
+        stored = getattr(admitted, "_" + name)
+        assert np.array_equal(stored, [2., 3.]) and not stored.flags.writeable
+    print("trajectory_executor: integral law and atomic input boundary OK")
 
 
 if __name__ == "__main__":
