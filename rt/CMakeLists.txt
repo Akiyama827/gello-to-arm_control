@@ -114,3 +114,7 @@ target_compile_options(dm_backend_selfcheck PRIVATE -UNDEBUG)
 foreach(call socket setsockopt ioctl bind close write recv ppoll)
   target_link_options(dm_backend_selfcheck PRIVATE "-Wl,--wrap=${call}")
 endforeach()
+
+add_executable(reference_protocol_selfcheck src/reference_protocol_selfcheck.cpp)
+target_include_directories(reference_protocol_selfcheck PRIVATE include)
+target_compile_options(reference_protocol_selfcheck PRIVATE -UNDEBUG)

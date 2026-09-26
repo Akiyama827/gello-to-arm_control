@@ -426,3 +426,74 @@ machine in seconds. It is also the only safe place to rehearse the failure
 paths (packet loss, session death, latched re-arm). It stays dumb by rule: a
 damped integrator, never a second simulator — closed-loop realism is the
 MuJoCo twin's job on the PC.
+
+## Native reference extension (v7; implementation in progress)
+
+The base protocol remains **v5**. Its command/state/control bytes and v6 pose
+hold are unchanged. `CAP_REFERENCE_HORIZON = 1 << 3` is a separate capability;
+B1 defines the schema but the server does **not advertise or execute it yet**.
+A client without it stays on streamed commands. A new server with an old client
+stays on v5 state. Passive observer leases continue to receive v5 state.
+
+After v5 HELLO/IDENTITY/CLAIM, a capable client explicitly requests v5
+`REFERENCE_MODE` (opcode 11) while disarmed, binding the session to SHA-256 of
+its existing opaque execution model token and the existing joint-order hash.
+The server must acknowledge in v5 STATUS before either peer uses v7. The
+binding lasts until disconnect; a repeated identical request is idempotent,
+changing it requires reconnect. This is a PC model binding, not RT verification
+of calibration or equality with the vendor task model. No reserved legacy bytes
+acquire a new meaning. No v7 command is also a pose-hold command.
+
+All new control frames retain the 24-byte little-endian header and 104-byte
+body (128 bytes total), with `arg=0`. v7 operations are BEGIN=32, CHUNK=33,
+SEAL=34, COMMIT=35, ABORT=36, CANCEL_REFERENCE=37 and STATUS=38. STATUS echoes
+request `seq` and operation and reports a typed result; receipt/admission is
+not selection or backend application. Each packed C++ payload declares byte
+offsets in `protocol.hpp`; `_REFERENCE_LAYOUTS` is the checked Python mirror.
+Reserved bytes, unknown flags/opcodes and wrong versions refuse. Counts do not
+change packet sizes. Upload ids are positive monotonically increasing u64
+within a session; revisions are positive u32, exactly previous+1, no wrapping.
+
+The upload body is **knot-major little-endian float64**: for each knot, time
+(seconds relative to release), N joint positions (rad), then N velocities
+(rad/s) for Hermite. Linear references omit velocities. K is 2..128, N is
+1..16. The maximum is 33,792 bytes. CHUNK has upload id, byte offset, length
+1..88 and zero-padded data. SEAL hashes exactly `byte_count` bytes. Times must
+be finite, nonnegative and strictly increasing; initial release begins at zero.
+Replacement keeps the existing clock anchor and every protected whole segment
+byte-for-byte, including the cut knot q/qd; it promises C1 only. COMMIT carries
+the exact protected cut and latest acceptable phase (exclusive). Initial
+COMMIT uses both zero. ABORT names an upload; CANCEL names an execution reference
+and retires active/pending revisions without granting delayed frames authority.
+
+The v7 UDP dynamics envelope is 448 bytes. Its 32-byte common header retains
+session, ARM epoch and command sequence; the 32-byte binding carries reference
+id/revision, phase in seconds, PC elapsed compute/queue age in microseconds,
+wall validity and phase window in microseconds. Three 16-double arrays contain
+PC tau_ff, kp, kd. No q/qd are transmitted in this mode. RT must require both
+`PC age + time since ingress <= validity` and
+`0 <= selected phase - envelope phase <= phase window`, additionally bounded
+by the existing command freshness policy. No PC/RT clock subtraction is valid.
+Neither buffered reference nor upload traffic refreshes dynamic freshness.
+
+The v7 state is 1,312 bytes: existing 888-byte state (version 7), 40 bytes of
+reference/envelope identity and timing, and selected q/qd/qdd arrays (16 each).
+Existing q_cmd/qd_cmd/tau_cmd and last_cmd_seq retain output/backend-acceptance
+meaning. Selected reference is separate. Static assertions include IPv6+UDP
+headers within a 1,500-byte MTU. Unused reference-array slots are zero.
+
+Reference status is NONE=0, RUNNING=1, END=2, UNDERFLOW=3, CANCELLED=4. END is
+neither UNDERFLOW nor COMPLETED: terminal selection holds endpoint with zero
+velocity/acceleration while a matching fresh dynamics envelope remains valid.
+UNDERFLOW retires the nonterminal revision, captures measured position once,
+zeros velocity/feedforward, holds with captured gains and stays armed. It does
+not immediately latch CMD_LOST; existing independent command/session deadlines
+remain in force. No late upload heals retirement. These execution semantics
+are approved requirements, **not implemented by the B1 codecs**.
+
+Offline schema check (no server/device):
+
+```sh
+cmake --build build --target reference_protocol_selfcheck
+PYTHONPATH=. python tools/bench/rt/reference_protocol.py build/reference_protocol_selfcheck
+```

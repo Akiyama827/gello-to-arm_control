@@ -3,7 +3,7 @@
 Hand-mirrored, byte-exact, enforced: ``python -m arm_control.plants.remote_rt.protocol
 --hex`` prints the canonical golden packets and the C++ ``protocol_selfcheck``
 prints the same lines — ``rt_backend``'s ``_demo`` diffs them automatically.
-Any field change edits BOTH files in one commit and bumps ``VERSION``.
+Any field change edits BOTH files in one commit and versions its packet variant.
 
 This module is a peer of ``messages.py``, not part of it: ``messages`` is the
 Dora-graph Arrow contract, this is the PC<->RT-machine UDP/TCP contract.
@@ -280,6 +280,198 @@ def unpack_control(data: bytes) -> Control:
         raise ValueError(f"bad control packet (magic {magic:#x}, version {version})")
     return Control(ctl_type, seq, arg, t,
                    text.split(b"\x00", 1)[0].decode(errors="replace"), text)
+
+
+# Negotiated native reference extension. Base HELLO/IDENTITY/CLAIM stay v5;
+# merely seeing the capability is not consent to receive v7 packets.
+REFERENCE_VERSION = 7
+CAP_REFERENCE_HORIZON = 1 << 3
+MAX_REFERENCE_KNOTS = 128
+REFERENCE_CHUNK_BYTES = 88
+MAX_REFERENCE_BYTES = 33792
+CTL_REFERENCE_MODE = 11
+CTL_REFERENCE_BEGIN = 32
+CTL_REFERENCE_CHUNK = 33
+CTL_REFERENCE_SEAL = 34
+CTL_REFERENCE_COMMIT = 35
+CTL_REFERENCE_ABORT = 36
+CTL_CANCEL_REFERENCE = 37
+CTL_REFERENCE_STATUS = 38
+REFERENCE_HERMITE = 1
+REFERENCE_TERMINAL = 2
+REFERENCE_NONE, REFERENCE_RUNNING, REFERENCE_END = 0, 1, 2
+REFERENCE_UNDERFLOW, REFERENCE_CANCELLED = 3, 4
+REF_OK, REF_MALFORMED, REF_IDENTITY, REF_BUSY, REF_REVISION = range(5)
+REF_INTEGRITY, REF_PREFIX, REF_LATE, REF_RETIRED, REF_NOT_ADMITTED = range(5, 10)
+
+# Names, exact little-endian field layout, trailing reserved bytes. No padding
+# is implicit; decoders check it rather than treating it as future extension.
+_REFERENCE_LAYOUTS = {
+    CTL_REFERENCE_MODE: (
+        'session_id joint_order_hash model_digest enable', '<QQ32sI', 52),
+    CTL_REFERENCE_BEGIN: (
+        'session_id upload_id reference_id joint_order_hash model_digest '
+        'arm_epoch expected_revision revision byte_count knots n flags',
+        '<QQQQ32sIIIIHHI', 16),
+    CTL_REFERENCE_CHUNK: ('upload_id offset length reserved data', '<QIHH88s', 0),
+    CTL_REFERENCE_SEAL: ('upload_id sha256', '<Q32s', 64),
+    CTL_REFERENCE_COMMIT: (
+        'session_id upload_id reference_id arm_epoch expected_revision revision '
+        'reserved0 protected_until latest_phase', '<QQQIIIIdd', 48),
+    CTL_REFERENCE_ABORT: ('session_id id arm_epoch revision', '<QQII', 80),
+    CTL_CANCEL_REFERENCE: ('session_id id arm_epoch revision', '<QQII', 80),
+    CTL_REFERENCE_STATUS: (
+        'upload_id reference_id revision result operation reserved0', '<QQIIII', 72),
+}
+_REFERENCE_CMD_FMT = '<IHHIIQQQIIdII48d'
+_REFERENCE_STATE_TAIL_FMT = '<QIIddII48d'
+REFERENCE_CMD_SIZE = struct.calcsize(_REFERENCE_CMD_FMT)
+REFERENCE_STATE_SIZE = STATE_SIZE + struct.calcsize(_REFERENCE_STATE_TAIL_FMT)
+assert (REFERENCE_CMD_SIZE, REFERENCE_STATE_SIZE) == (448, 1312)
+assert REFERENCE_STATE_SIZE + 8 + 40 <= 1500  # UDP + IPv6, no fragmentation
+assert all(struct.calcsize(fmt) + pad == 104
+           for _, fmt, pad in _REFERENCE_LAYOUTS.values())
+
+
+def _validate_reference_body(op: int, p: dict) -> None:
+    def require(condition):
+        if not condition:
+            raise ValueError('malformed reference control body')
+
+    if op == CTL_REFERENCE_MODE:
+        require(p['session_id'] and p['enable'] == 1 and any(p['model_digest']))
+    elif op == CTL_REFERENCE_BEGIN:
+        require(all(p[k] for k in ('session_id', 'upload_id', 'reference_id', 'arm_epoch')))
+        require(0 < p['revision'] == p['expected_revision'] + 1 <= 0xFFFFFFFF)
+        require(2 <= p['knots'] <= MAX_REFERENCE_KNOTS and 1 <= p['n'] <= MAX_JOINTS)
+        require(not p['flags'] & ~(REFERENCE_HERMITE | REFERENCE_TERMINAL))
+        require(p['byte_count'] == p['knots'] * (
+            8 + 8 * p['n'] * (2 if p['flags'] & REFERENCE_HERMITE else 1)))
+        require(any(p['model_digest']))
+    elif op == CTL_REFERENCE_CHUNK:
+        require(p['upload_id'] and not p['reserved'] and 1 <= p['length'] <= 88)
+        require(p['offset'] <= MAX_REFERENCE_BYTES - p['length'])
+        require(not any(p['data'][p['length']:]))
+    elif op == CTL_REFERENCE_SEAL:
+        require(p['upload_id'])
+    elif op == CTL_REFERENCE_COMMIT:
+        require(all(p[k] for k in ('session_id', 'upload_id', 'reference_id', 'arm_epoch')))
+        require(0 < p['revision'] == p['expected_revision'] + 1 <= 0xFFFFFFFF)
+        require(not p['reserved0'])
+        cut, latest = p['protected_until'], p['latest_phase']
+        require(math.isfinite(cut) and math.isfinite(latest) and cut >= 0 and latest >= 0)
+        require(0 < latest <= cut if p['expected_revision'] else latest == cut == 0)
+    elif op in (CTL_REFERENCE_ABORT, CTL_CANCEL_REFERENCE):
+        require(p['session_id'] and p['id'] and p['arm_epoch'])
+        require(p['revision'] == 0 if op == CTL_REFERENCE_ABORT else p['revision'] > 0)
+    elif op == CTL_REFERENCE_STATUS:
+        require(REF_OK <= p['result'] <= REF_NOT_ADMITTED and not p['reserved0'])
+        require(CTL_REFERENCE_BEGIN <= p['operation'] <= CTL_CANCEL_REFERENCE)
+
+
+def pack_reference_control(*, ctl_type: int, seq: int, t_mono_ns: int = 0,
+                           negotiated: bool = False, **fields) -> bytes:
+    """One fixed 128-byte frame. Only MODE may be sent before negotiation."""
+    if ctl_type not in _REFERENCE_LAYOUTS:
+        raise ValueError('unknown reference opcode')
+    if ctl_type != CTL_REFERENCE_MODE and not negotiated:
+        raise ValueError('reference capability has not been negotiated')
+    names, fmt, padding = _REFERENCE_LAYOUTS[ctl_type]
+    fields = dict(fields)
+    for name in ('reserved', 'reserved0'):
+        if name in names.split():
+            fields.setdefault(name, 0)
+    if set(fields) != set(names.split()):
+        raise ValueError('reference control fields do not match opcode')
+    for name in ('model_digest', 'sha256'):
+        if name in fields and len(fields[name]) != 32:
+            raise ValueError('digest must contain exactly 32 bytes')
+    if ctl_type == CTL_REFERENCE_CHUNK:
+        if len(fields['data']) != fields['length']:
+            raise ValueError('chunk length does not match data')
+        fields['data'] = fields['data'].ljust(88, b'\0')
+    _validate_reference_body(ctl_type, fields)
+    body = struct.pack(fmt, *(fields[k] for k in names.split())) + b'\0' * padding
+    version = VERSION if ctl_type == CTL_REFERENCE_MODE else REFERENCE_VERSION
+    return struct.pack(_CTL_FMT, MAGIC_CTL, version, ctl_type, seq, 0, t_mono_ns, body)
+
+
+def unpack_reference_control(data: bytes, *, negotiated: bool = False) -> tuple[int, int, dict]:
+    if len(data) != CTL_SIZE:
+        raise ValueError('reference control must contain 128 bytes')
+    magic, version, op, seq, arg, _, body = struct.unpack(_CTL_FMT, data)
+    expected = VERSION if op == CTL_REFERENCE_MODE else REFERENCE_VERSION
+    if (magic != MAGIC_CTL or version != expected or arg or op not in _REFERENCE_LAYOUTS
+            or (op != CTL_REFERENCE_MODE and not negotiated)):
+        raise ValueError('unnegotiated or malformed reference control header')
+    names, fmt, padding = _REFERENCE_LAYOUTS[op]
+    if padding and any(body[-padding:]):
+        raise ValueError('reference reserved bytes must be zero')
+    p = dict(zip(names.split(), struct.unpack_from(fmt, body)))
+    _validate_reference_body(op, p)
+    if op == CTL_REFERENCE_CHUNK:
+        p['data'] = p['data'][:p['length']]
+    return op, seq, p
+
+
+def pack_reference_command(*, n: int, seq: int, arm_epoch: int, t_mono_ns: int,
+                           session_id: int, reference_id: int, revision: int,
+                           age_us: int, phase: float, valid_for_us: int,
+                           phase_window_us: int, tau_ff, kp, kd,
+                           negotiated: bool = False) -> bytes:
+    arrays = [list(a) for a in (tau_ff, kp, kd)]
+    if any(len(a) != n for a in arrays):
+        raise ValueError('reference command arrays must have length n')
+    data = struct.pack(_REFERENCE_CMD_FMT, MAGIC_CMD, REFERENCE_VERSION, n, seq,
+                       arm_epoch, t_mono_ns, session_id, reference_id, revision,
+                       age_us, phase, valid_for_us, phase_window_us,
+                       *(v for a in arrays for v in _padded(a)))
+    unpack_reference_command(data, negotiated=negotiated)
+    return data
+
+
+def unpack_reference_command(data: bytes, *, negotiated: bool = False) -> dict:
+    if not negotiated or len(data) != REFERENCE_CMD_SIZE:
+        raise ValueError('unnegotiated or wrong-size reference command')
+    v = struct.unpack(_REFERENCE_CMD_FMT, data)
+    magic, version, n = v[:3]
+    if (magic != MAGIC_CMD or version != REFERENCE_VERSION or not 1 <= n <= MAX_JOINTS
+            or not all(v[i] for i in (4, 6, 7, 8, 11, 12))
+            or not math.isfinite(v[10]) or v[10] < 0 or v[9] > v[11]):
+        raise ValueError('invalid reference command binding/freshness')
+    arrays = [v[13 + j*16:13 + (j+1)*16] for j in range(3)]
+    if (any(not math.isfinite(x) for a in arrays for x in a)
+            or any(x < 0 for a in arrays[1:] for x in a)
+            or any(x != 0 for a in arrays for x in a[n:])):
+        raise ValueError('invalid reference command arrays/padding')
+    p = dict(zip('n seq arm_epoch t_mono_ns session_id reference_id revision age_us '
+                 'phase valid_for_us phase_window_us'.split(), v[2:13]))
+    p.update(zip(('tau_ff', 'kp', 'kd'), (list(a[:n]) for a in arrays)))
+    return p
+
+
+def unpack_reference_state(data: bytes, *, negotiated: bool = False) -> tuple[State, dict]:
+    """Retains backend output/acceptance independently of pure selected reference."""
+    if not negotiated or len(data) != REFERENCE_STATE_SIZE:
+        raise ValueError('unnegotiated or wrong-size reference state')
+    base = bytearray(data[:STATE_SIZE])
+    if struct.unpack_from('<H', base, 4)[0] != REFERENCE_VERSION:
+        raise ValueError('wrong reference state version')
+    struct.pack_into('<H', base, 4, VERSION)
+    if any(base[-16:]):
+        raise ValueError('reference state reserved bytes must be zero')
+    state = unpack_state(base)
+    v = struct.unpack_from(_REFERENCE_STATE_TAIL_FMT, data, STATE_SIZE)
+    if v[2] > REFERENCE_CANCELLED or any(not math.isfinite(x) or x < 0 for x in v[3:5]):
+        raise ValueError('invalid reference state status/phase')
+    arrays = [v[7 + j*16:7 + (j+1)*16] for j in range(3)]
+    if (any(not math.isfinite(x) for a in arrays for x in a)
+            or any(x != 0 for a in arrays for x in a[state.n:])):
+        raise ValueError('invalid reference state values/padding')
+    p = dict(zip('reference_id revision status phase envelope_phase envelope_age_us '
+                 'envelope_seq'.split(), v[:7]))
+    p.update(zip(('q_ref', 'qd_ref', 'qdd_ref'), (list(a[:state.n]) for a in arrays)))
+    return state, p
 
 
 # --------------------------------------------------------------------------- #

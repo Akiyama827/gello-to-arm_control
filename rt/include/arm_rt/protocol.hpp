@@ -4,7 +4,7 @@
 // must byte-match. Parity is enforced, not hoped for: `protocol_selfcheck`
 // prints canonical golden packets as hex and
 // `python -m arm_control.plants.remote_rt.protocol --hex` prints the same;
-// rt_backend's _demo diffs them automatically. Any field change bumps VERSION
+// rt_backend's _demo diffs them automatically. Any field change versions its packet variant
 // and edits both files in one commit.
 //
 // Layout rules that make the mirror trivial:
@@ -38,11 +38,16 @@ constexpr uint32_t MAGIC_OBS = 0x53424F41;   // bytes "AOBS"
 // peers are rejected: their commands carry no session and cannot be admitted.
 constexpr uint16_t VERSION = 5;
 constexpr uint16_t POSE_HOLD_VERSION = 6;
+constexpr uint16_t REFERENCE_VERSION = 7;
+constexpr uint16_t MAX_REFERENCE_KNOTS = 128;
+constexpr uint32_t REFERENCE_CHUNK_BYTES = 88;
+constexpr uint32_t MAX_REFERENCE_BYTES = 128 * (8 + 16 * 16);
 constexpr int MAX_JOINTS = 16;
 constexpr int ID_CHARS = 32;  // instance/model id fields, NUL-padded
 
 // IDENTITY.capabilities bits
 constexpr uint32_t CAP_POSE_HOLD = 1u << 0;     // v6 Cartesian pose hold
+constexpr uint32_t CAP_REFERENCE_HORIZON = 1u << 3; // negotiated v7, not implicit
 constexpr uint32_t CAP_OBSERVER = 1u << 1;      // UDP observer lease
 // Task-space feedback uses a kinematic model the deployment has approved for
 // THIS instance. No backend sets it today: libfranka's own model is not a
@@ -77,12 +82,33 @@ enum CtlType : uint16_t {
   CTL_FAULT = 7,  // server -> client event: arg = fault code, text = reason
   CTL_SET_ACTIVE = 8, // client -> server: arg = desired fixed-slot mask
   CTL_IDENTITY = 9,   // server -> client after HELLO: text = IdentityPayload
+  CTL_REFERENCE_MODE = 11, // v5 opt-in after CLAIM, disarmed only
   CTL_CLAIM = 10,     // client -> server: text = expected IdentityPayload;
                       // STATUS answers with FLAG_CLAIMED set or a refusal
 };
 // ACK correlation (ControlPacket.seq of the STATUS reply):
 //   ARM    -> the ARM generation every command of this epoch must carry
 //   DISARM -> the DISARM generation StatePacket.stop_epoch must reach
+
+// v7 control operations. Only a successful v5 REFERENCE_MODE exchange may
+// enable these. Old clients/observers continue receiving v5 state.
+enum ReferenceCtl : uint16_t {
+  CTL_REFERENCE_BEGIN = 32, CTL_REFERENCE_CHUNK = 33,
+  CTL_REFERENCE_SEAL = 34, CTL_REFERENCE_COMMIT = 35,
+  CTL_REFERENCE_ABORT = 36, CTL_CANCEL_REFERENCE = 37,
+  CTL_REFERENCE_STATUS = 38,
+};
+enum ReferenceStatus : uint32_t {
+  REFERENCE_NONE = 0, REFERENCE_RUNNING = 1, REFERENCE_END = 2,
+  REFERENCE_UNDERFLOW = 3, REFERENCE_CANCELLED = 4,
+};
+enum ReferenceResult : uint32_t {
+  REF_OK = 0, REF_MALFORMED = 1, REF_IDENTITY = 2, REF_BUSY = 3,
+  REF_REVISION = 4, REF_INTEGRITY = 5, REF_PREFIX = 6, REF_LATE = 7,
+  REF_RETIRED = 8, REF_NOT_ADMITTED = 9,
+};
+constexpr uint32_t REFERENCE_HERMITE = 1u << 0;
+constexpr uint32_t REFERENCE_TERMINAL = 1u << 1;
 
 #pragma pack(push, 1)
 
@@ -170,6 +196,102 @@ struct ObserveRequest {
   uint32_t reserved2;
 };
 
+// All control bodies occupy exactly ControlPacket.text (104 bytes).
+// Reserved bytes and unused array slots MUST be zero; receivers reject them.
+// The model digest is SHA256 of the existing opaque execution model token,
+// not a vendor model or a new calibration identity. Binding is per session.
+struct ReferenceModePayload {
+  uint64_t session_id;              // 0
+  uint64_t joint_order_hash;        // 8
+  uint8_t model_digest[32];         // 16
+  uint32_t enable;                  // 48: exactly 1; reconnect to leave mode
+  uint8_t reserved[52];             // 52
+};
+struct ReferenceBeginPayload {
+  uint64_t session_id;              // 0
+  uint64_t upload_id;               // 8: nonzero, monotonically increasing
+  uint64_t reference_id;            // 16: nonzero execution identity
+  uint64_t joint_order_hash;        // 24
+  uint8_t model_digest[32];         // 32
+  uint32_t arm_epoch;               // 64
+  uint32_t expected_revision;       // 68: 0 for initial release
+  uint32_t revision;                // 72: expected + 1, no wrapping
+  uint32_t byte_count;              // 76: K * (8 + 8*N*(Hermite ? 2 : 1))
+  uint16_t knots;                   // 80: 2..128
+  uint16_t n;                       // 82: 1..16
+  uint32_t flags;                   // 84: HERMITE / TERMINAL only
+  uint8_t reserved[16];             // 88
+};
+struct ReferenceChunkPayload {
+  uint64_t upload_id;               // 0 (session implicit on TCP)
+  uint32_t offset;                  // 8: contiguous bytes or exact retry
+  uint16_t length;                  // 12: 1..88
+  uint16_t reserved;                // 14
+  uint8_t data[REFERENCE_CHUNK_BYTES]; // 16; zero beyond length
+};
+struct ReferenceSealPayload {
+  uint64_t upload_id;               // 0
+  uint8_t sha256[32];               // 8: complete serialized knot body
+  uint8_t reserved[64];             // 40
+};
+struct ReferenceCommitPayload {
+  uint64_t session_id;              // 0
+  uint64_t upload_id;               // 8
+  uint64_t reference_id;            // 16
+  uint32_t arm_epoch;               // 24
+  uint32_t expected_revision;       // 28
+  uint32_t revision;                // 32
+  uint32_t reserved0;               // 36
+  double protected_until;           // 40: exact shared cut knot, reference seconds
+  double latest_phase;              // 48: refuse if RT phase reaches this cut
+  uint8_t reserved[48];             // 56
+};
+struct ReferenceRetirePayload {
+  uint64_t session_id;              // 0
+  uint64_t id;                      // 8: upload_id (ABORT), reference_id (CANCEL)
+  uint32_t arm_epoch;               // 16
+  uint32_t revision;                // 20: 0 for ABORT; selected/pending for CANCEL
+  uint8_t reserved[80];             // 24
+};
+struct ReferenceReplyPayload {
+  uint64_t upload_id;               // 0
+  uint64_t reference_id;            // 8
+  uint32_t revision;                // 16
+  uint32_t result;                  // 20: ReferenceResult
+  uint32_t operation;               // 24: request opcode; header seq echoes request
+  uint32_t reserved0;               // 28
+  uint8_t reserved[72];             // 32
+};
+
+// v7 replaces the streamed q/qd fields with a reference-bound PC dynamics
+// envelope. Sender clock is diagnostic only. Age is PC elapsed compute/queue
+// age at send; RT adds elapsed time since ingress. Network phase lag is bounded
+// independently against RT's selected phase, never inferred by clock subtraction.
+struct ReferenceCommandPacket {
+  uint32_t magic; uint16_t version; uint16_t n; // 0
+  uint32_t seq; uint32_t arm_epoch;            // 8
+  uint64_t t_mono_ns; uint64_t session_id;     // 16
+  uint64_t reference_id;                      // 32
+  uint32_t revision; uint32_t age_us;          // 40
+  double phase;                              // 48
+  uint32_t valid_for_us; uint32_t phase_window_us; // 56, both >0
+  double tau_ff[MAX_JOINTS];                  // 64
+  double kp[MAX_JOINTS];                      // 192
+  double kd[MAX_JOINTS];                      // 320
+};
+struct ReferenceStatePacket {
+  StatePacket state;               // 0: version=7, existing output/acceptance intact
+  uint64_t reference_id;            // 888
+  uint32_t revision; uint32_t status; // 896
+  double phase;                    // 904: RT selected phase, seconds from release
+  double envelope_phase;           // 912: last accepted PC envelope's sample phase
+  uint32_t envelope_age_us;         // 920: saturating; UINT32_MAX if absent
+  uint32_t envelope_seq;            // 924: accepted envelope; not backend APPLIED
+  double q_ref[MAX_JOINTS];         // 928: selected reference, distinct from q_cmd
+  double qd_ref[MAX_JOINTS];        // 1056
+  double qdd_ref[MAX_JOINTS];       // 1184
+};
+
 #pragma pack(pop)
 
 static_assert(sizeof(CommandPacket) == 32 + 5 * 8 * MAX_JOINTS, "cmd layout");
@@ -179,6 +301,124 @@ static_assert(sizeof(StatePacket) == 888, "state size");
 static_assert(sizeof(ControlPacket) == 128, "ctl size");
 static_assert(sizeof(IdentityPayload) == 104, "identity size");
 static_assert(sizeof(ObserveRequest) == 16, "observe size");
+
+static_assert(sizeof(ReferenceModePayload) == 104, "reference mode layout");
+static_assert(sizeof(ReferenceBeginPayload) == 104, "reference begin layout");
+static_assert(sizeof(ReferenceChunkPayload) == 104, "reference chunk layout");
+static_assert(sizeof(ReferenceSealPayload) == 104, "reference seal layout");
+static_assert(sizeof(ReferenceCommitPayload) == 104, "reference commit layout");
+static_assert(sizeof(ReferenceRetirePayload) == 104, "reference retire layout");
+static_assert(sizeof(ReferenceReplyPayload) == 104, "reference reply layout");
+static_assert(sizeof(ReferenceCommandPacket) == 448, "reference command layout");
+static_assert(sizeof(ReferenceStatePacket) == 1312, "reference state layout");
+static_assert(sizeof(ReferenceStatePacket) + 8 + 40 <= 1500, "IPv6 UDP MTU");
+static_assert(offsetof(ReferenceBeginPayload, arm_epoch) == 64, "begin offset");
+static_assert(offsetof(ReferenceCommitPayload, protected_until) == 40, "commit offset");
+static_assert(offsetof(ReferenceCommandPacket, tau_ff) == 64, "envelope offset");
+static_assert(offsetof(ReferenceStatePacket, q_ref) == 928, "reference state offset");
+
+inline bool zero_bytes(const void* data, size_t size) {
+  const auto* b = static_cast<const uint8_t*>(data);
+  for (size_t i=0; i<size; ++i) if (b[i]) return false;
+  return true;
+}
+inline bool reference_opcode(uint16_t type) {
+  return type >= CTL_REFERENCE_BEGIN && type <= CTL_REFERENCE_STATUS;
+}
+inline bool valid_reference_body(uint16_t type, const void* body) {
+  // Copy packed payloads before inspecting them: no aliasing/lifetime assumptions.
+  switch (type) {
+    case CTL_REFERENCE_MODE: {
+      ReferenceModePayload p; std::memcpy(&p,body,sizeof(p));
+      return p.session_id && p.enable==1 && !zero_bytes(p.model_digest,32) &&
+             zero_bytes(p.reserved,sizeof(p.reserved));
+    }
+    case CTL_REFERENCE_BEGIN: {
+      ReferenceBeginPayload p; std::memcpy(&p,body,sizeof(p));
+      return p.session_id && p.upload_id && p.reference_id && p.arm_epoch &&
+        p.revision && p.revision==p.expected_revision+1 &&
+        p.knots>=2 && p.knots<=MAX_REFERENCE_KNOTS && p.n>=1 && p.n<=MAX_JOINTS &&
+        !(p.flags & ~(REFERENCE_HERMITE|REFERENCE_TERMINAL)) &&
+        p.byte_count==uint32_t(p.knots)*(8+8*p.n*((p.flags & REFERENCE_HERMITE)?2:1)) &&
+        !zero_bytes(p.model_digest,32) && zero_bytes(p.reserved,sizeof(p.reserved));
+    }
+    case CTL_REFERENCE_CHUNK: {
+      ReferenceChunkPayload p; std::memcpy(&p,body,sizeof(p));
+      return p.upload_id && !p.reserved && p.length && p.length<=REFERENCE_CHUNK_BYTES &&
+        p.offset<=MAX_REFERENCE_BYTES-p.length &&
+        zero_bytes(p.data+p.length,REFERENCE_CHUNK_BYTES-p.length);
+    }
+    case CTL_REFERENCE_SEAL: {
+      ReferenceSealPayload p; std::memcpy(&p,body,sizeof(p));
+      return p.upload_id && zero_bytes(p.reserved,sizeof(p.reserved));
+    }
+    case CTL_REFERENCE_COMMIT: {
+      ReferenceCommitPayload p; std::memcpy(&p,body,sizeof(p));
+      return p.session_id && p.upload_id && p.reference_id && p.arm_epoch &&
+        p.revision && p.revision==p.expected_revision+1 && !p.reserved0 &&
+        std::isfinite(p.protected_until) && std::isfinite(p.latest_phase) &&
+        p.protected_until>=0 && p.latest_phase>=0 &&
+        (p.expected_revision ? p.latest_phase<=p.protected_until && p.latest_phase>0
+                             : p.latest_phase==0 && p.protected_until==0) &&
+        zero_bytes(p.reserved,sizeof(p.reserved));
+    }
+    case CTL_REFERENCE_ABORT: case CTL_CANCEL_REFERENCE: {
+      ReferenceRetirePayload p; std::memcpy(&p,body,sizeof(p));
+      return p.session_id && p.id && p.arm_epoch &&
+        (type==CTL_REFERENCE_ABORT ? p.revision==0 : p.revision>0) &&
+        zero_bytes(p.reserved,sizeof(p.reserved));
+    }
+    case CTL_REFERENCE_STATUS: {
+      ReferenceReplyPayload p; std::memcpy(&p,body,sizeof(p));
+      return p.result<=REF_NOT_ADMITTED && p.operation>=CTL_REFERENCE_BEGIN &&
+        p.operation<=CTL_CANCEL_REFERENCE && !p.reserved0 &&
+        zero_bytes(p.reserved,sizeof(p.reserved));
+    }
+    default: return false;
+  }
+}
+inline bool decode_reference_control(const void* bytes, size_t size, bool negotiated,
+                                     ControlPacket& out) {
+  if (size!=sizeof(out)) return false;
+  ControlPacket p; std::memcpy(&p,bytes,sizeof(p));
+  if (p.magic!=MAGIC_CTL || p.arg ||
+      (p.type==CTL_REFERENCE_MODE ? p.version!=VERSION
+        : !negotiated || p.version!=REFERENCE_VERSION || !reference_opcode(p.type)) ||
+      !valid_reference_body(p.type,p.text)) return false;
+  out=p; return true;
+}
+inline bool decode_reference_command(const void* bytes, size_t size, bool negotiated,
+                                     ReferenceCommandPacket& out) {
+  if (!negotiated || size!=sizeof(out)) return false;
+  ReferenceCommandPacket p; std::memcpy(&p,bytes,sizeof(p));
+  if (p.magic!=MAGIC_CMD || p.version!=REFERENCE_VERSION || p.n<1 ||
+      p.n>MAX_JOINTS || !p.session_id || !p.arm_epoch || !p.reference_id || !p.revision ||
+      !std::isfinite(p.phase) || p.phase<0 || !p.valid_for_us || !p.phase_window_us ||
+      p.age_us>p.valid_for_us) return false;
+  for (int j=0; j<MAX_JOINTS; ++j) {
+    if (!std::isfinite(p.tau_ff[j]) || !std::isfinite(p.kp[j]) ||
+        !std::isfinite(p.kd[j]) || p.kp[j]<0 || p.kd[j]<0) return false;
+    if (j>=p.n && (p.tau_ff[j]!=0 || p.kp[j]!=0 || p.kd[j]!=0)) return false;
+  }
+  out=p; return true;
+}
+
+inline bool decode_reference_state(const void* bytes, size_t size, bool negotiated,
+                                   ReferenceStatePacket& out) {
+  if (!negotiated || size!=sizeof(out)) return false;
+  ReferenceStatePacket p; std::memcpy(&p,bytes,sizeof(p));
+  if (p.state.magic!=MAGIC_STATE || p.state.version!=REFERENCE_VERSION ||
+      p.state.n<1 || p.state.n>MAX_JOINTS || p.status>REFERENCE_CANCELLED ||
+      !std::isfinite(p.phase) || p.phase<0 || !std::isfinite(p.envelope_phase) ||
+      p.envelope_phase<0 || !zero_bytes(p.state.reserved,sizeof(p.state.reserved)))
+    return false;
+  for (int j=0; j<MAX_JOINTS; ++j) {
+    if (!std::isfinite(p.q_ref[j]) || !std::isfinite(p.qd_ref[j]) ||
+        !std::isfinite(p.qdd_ref[j])) return false;
+    if (j>=p.state.n && (p.q_ref[j]!=0 || p.qd_ref[j]!=0 || p.qdd_ref[j]!=0)) return false;
+  }
+  out=p; return true;
+}
 
 constexpr uint64_t FNV_OFFSET = 0xcbf29ce484222325ull;
 constexpr uint64_t FNV_PRIME = 0x100000001b3ull;
