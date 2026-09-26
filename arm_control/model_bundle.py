@@ -192,8 +192,13 @@ def _urdf_problems(urdf: Path, joints, frames: dict, fitted) -> list[str]:
 
 def compatibility_error(bundle: ModelBundle, *, instance_id: str, joints,
                         urdf: Path | str | None = None,
-                        tool_root_link: str | None = None) -> str | None:
-    """Why this bundle must not serve this instance/config, or None."""
+                        tool_root_link: str | None = None,
+                        tcp_frame: str | None = None) -> str | None:
+    """Why this bundle must not serve this instance/config, or None.
+
+    A caller selecting an EE frame supplies it as ``tcp_frame``. Tool root,
+    flange and TCP are distinct frames; matching the root does not bind the TCP.
+    """
     if bundle.instance_id != instance_id:
         return f"bundle is for {bundle.instance_id!r}, not {instance_id!r}"
     if tuple(joints) != bundle.joints:
@@ -203,6 +208,8 @@ def compatibility_error(bundle: ModelBundle, *, instance_id: str, joints,
     if tool_root_link is not None and bundle.tool.get("root_link") not in (None, tool_root_link):
         return (f"tool root link {tool_root_link!r} != bundle tool "
                 f"{bundle.tool.get('root_link')!r}")
+    if tcp_frame is not None and tcp_frame != bundle.frames.get("tcp"):
+        return f"selected TCP/EE frame {tcp_frame!r} != bundle TCP {bundle.frames.get('tcp')!r}"
     return None
 
 
@@ -281,6 +288,12 @@ def _self_check() -> None:
                                                     joints=joints[::-1])
         assert "tool root" in compatibility_error(b, instance_id="fr3_1", joints=joints,
                                                   tool_root_link="fr3_hand")
+        assert compatibility_error(b, instance_id="fr3_1", joints=joints,
+                                   tcp_frame="fr3_hand_tcp") is None
+        assert "selected TCP/EE" in compatibility_error(b, instance_id="fr3_1", joints=joints,
+                                                        tcp_frame="fr3_link8")
+        assert "runtime URDF" in compatibility_error(b, instance_id="fr3_1", joints=joints,
+                                                     urdf=Path(tmp) / "other.urdf")
         assert activation_error(b) is None
         for bad, why in (({"nominal": {"urdf": str(urdf), "sha256": "0" * 64}}, "sha256"),
                          ({"joints": joints[:6] + ["nope"]}, "no joint"),
