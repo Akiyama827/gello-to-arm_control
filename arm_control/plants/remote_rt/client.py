@@ -35,6 +35,7 @@ nothing that can arm, disarm, command or steal the commander's stream.
 from __future__ import annotations
 
 import queue
+import hashlib
 import socket
 import threading
 import time
@@ -196,6 +197,15 @@ class RtBackend:
         self._arm_epoch = 0
         self._expected_identity = 0
         self._stream_fault = ""
+        self._reference_mode = False
+        self._reference_model = b""
+        self._reference_seq = 0
+        self._upload_id = 0
+        self._upload_lock = threading.Lock()
+        self._upload_cancel = threading.Event()
+        self._reference_cv = threading.Condition()
+        self._reference_wait_seq = None
+        self._reference_reply = None
 
     @classmethod
     def from_config(cls, cfg) -> "RtBackend":
@@ -209,6 +219,10 @@ class RtBackend:
 
     # -- lifecycle ------------------------------------------------------------
     def open(self) -> None:
+        self._reference_mode = False
+        self._reference_model = b""
+        self._reference_seq = self._upload_id = 0
+        self._upload_cancel.set()
         cfg = self.config
         try:
             self._tcp = socket.create_connection(
@@ -468,6 +482,125 @@ class RtBackend:
             return None
         return self._cmd_seq
 
+    def negotiate_reference(self, model_token: str) -> bool:
+        """Disarmed opt-in; an old server remains usable in streamed mode."""
+        if self.identity is None or not self.identity.capabilities & rtp.CAP_REFERENCE_HORIZON:
+            return False
+        if not model_token:
+            raise ValueError("native reference requires the bound execution model token")
+        digest = hashlib.sha256(model_token.encode()).digest()
+        if self._reference_mode:
+            if digest != self._reference_model:
+                raise RtLinkError("reconnect to change reference model binding")
+            return True
+        packet = rtp.pack_reference_control(
+            ctl_type=rtp.CTL_REFERENCE_MODE, seq=0, session_id=self.session_id,
+            joint_order_hash=self.identity.joint_order_hash, model_digest=digest, enable=1)
+        while not self._status_q.empty():
+            self._status_q.get_nowait()
+        self._send_frame(packet)
+        try:
+            status = self._status_q.get(timeout=self.config.ack_timeout_s)
+        except queue.Empty as exc:
+            raise RtLinkError("no reference mode acknowledgement") from exc
+        if status.text != "reference mode accepted":
+            raise RtLinkError(status.text)
+        self._reference_model = digest
+        self._reference_mode = True
+        return True
+
+    def _reference_exchange(self, operation: int, **fields) -> dict:
+        # One frame in flight, and no send lock held while awaiting a reply.
+        # Lifecycle traffic/PONG can interleave even with a stalled upload peer.
+        self._reference_seq += 1
+        if self._reference_seq > 0xFFFFFFFF:
+            raise RtLinkError("reference request sequence exhausted; reconnect")
+        seq = self._reference_seq
+        packet = rtp.pack_reference_control(
+            ctl_type=operation, seq=seq, t_mono_ns=time.monotonic_ns(),
+            negotiated=self._reference_mode, **fields)
+        with self._reference_cv:
+            self._reference_wait_seq, self._reference_reply = seq, None
+        try:
+            for attempt in range(2):  # one exact retry; never a bulk enqueue
+                if self._upload_cancel.is_set() or self._stop.is_set():
+                    raise RtLinkError("reference upload interrupted by lifecycle")
+                self._send_frame(packet)
+                deadline = time.monotonic() + self.config.ack_timeout_s
+                with self._reference_cv:
+                    while self._reference_reply is None:
+                        if self._upload_cancel.is_set() or self._stop.is_set():
+                            raise RtLinkError("reference upload interrupted by lifecycle")
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self._reference_cv.wait(min(.02, remaining))
+                    reply = self._reference_reply
+                if reply is not None:
+                    if reply['operation'] != operation or reply['result'] != rtp.REF_OK:
+                        raise RtLinkError(f"reference operation {operation} refused: {reply['result']}")
+                    return reply
+            raise RtLinkError("no reference acknowledgement after exact retry")
+        finally:
+            with self._reference_cv:
+                self._reference_wait_seq, self._reference_reply = None, None
+
+    def upload_reference(self, trajectory, *, reference_id: int, revision: int = 1,
+                         expected_revision: int = 0, terminal: bool = True) -> int:
+        """Upload/admit an already PC-admitted trajectory; never select it.
+
+        At most one caller and one in-flight 128-byte frame. No background
+        frame queue exists; each CHUNK acknowledgement yields the socket to
+        lifecycle/control traffic before the next CHUNK is produced.
+        """
+        if not self._reference_mode or not self._arm_epoch:
+            raise RtLinkError("native reference needs negotiated mode and an ARM epoch")
+        if not self._upload_lock.acquire(blocking=False):
+            raise RtLinkError("one reference upload is already in progress")
+        try:
+            self._upload_cancel.clear()
+            times = np.asarray(trajectory.times, dtype=float)
+            q = np.asarray(trajectory.positions, dtype=float)
+            velocity = trajectory.velocities
+            k = len(times)
+            if not 2 <= k <= rtp.MAX_REFERENCE_KNOTS or q.shape != (k, self.n):
+                raise ValueError("reference requires 2..128 knots and the configured joint count")
+            arrays = [times[:, None], q]
+            if velocity is not None:
+                velocity = np.asarray(velocity, dtype=float)
+                if velocity.shape != q.shape:
+                    raise ValueError("reference velocity shape mismatch")
+                arrays.append(velocity)
+            rows = np.concatenate(arrays, axis=1)
+            if not np.isfinite(rows).all() or times[0] < 0 or not (np.diff(times) > 0).all():
+                raise ValueError("reference needs finite values and increasing nonnegative times")
+            body = rows.astype('<f8', copy=False).tobytes()
+            self._upload_id += 1
+            upload_id = self._upload_id
+            self._reference_exchange(
+                rtp.CTL_REFERENCE_BEGIN, session_id=self.session_id, upload_id=upload_id,
+                reference_id=reference_id, joint_order_hash=self.identity.joint_order_hash,
+                model_digest=self._reference_model, arm_epoch=self._arm_epoch,
+                expected_revision=expected_revision, revision=revision, byte_count=len(body),
+                knots=k, n=self.n, flags=(rtp.REFERENCE_HERMITE if velocity is not None else 0)
+                | (rtp.REFERENCE_TERMINAL if terminal else 0))
+            for offset in range(0, len(body), rtp.REFERENCE_CHUNK_BYTES):
+                chunk = body[offset:offset + rtp.REFERENCE_CHUNK_BYTES]
+                self._reference_exchange(rtp.CTL_REFERENCE_CHUNK, upload_id=upload_id,
+                                         offset=offset, length=len(chunk), data=chunk)
+            self._reference_exchange(rtp.CTL_REFERENCE_SEAL, upload_id=upload_id,
+                                     sha256=hashlib.sha256(body).digest())
+            return upload_id
+        finally:
+            self._upload_lock.release()
+
+    def abort_reference_upload(self, upload_id: int) -> None:
+        self._upload_cancel.set()
+        with self._upload_lock:
+            self._upload_cancel.clear()
+            self._reference_exchange(rtp.CTL_REFERENCE_ABORT, session_id=self.session_id,
+                                     id=upload_id, arm_epoch=self._arm_epoch, revision=0)
+
     # -- feedback -------------------------------------------------------------
     def latest_state(self) -> tuple[rtp.State | None, float]:
         with self._state_lock:
@@ -593,6 +726,18 @@ class RtBackend:
             if len(buf) < rtp.CTL_SIZE:
                 continue
             frame, buf = buf[: rtp.CTL_SIZE], b""
+            if self._reference_mode:
+                try:
+                    op, seq, reply = rtp.unpack_reference_control(frame, negotiated=True)
+                except ValueError:
+                    pass
+                else:
+                    if op == rtp.CTL_REFERENCE_STATUS:
+                        with self._reference_cv:
+                            if seq == self._reference_wait_seq:
+                                self._reference_reply = reply
+                                self._reference_cv.notify_all()
+                    continue
             try:
                 msg = rtp.unpack_control(frame)
             except ValueError:
@@ -614,6 +759,8 @@ class RtBackend:
                     return
 
     def _send_control(self, ctl_type: int, text: str | bytes = "", arg: int = 0) -> None:
+        if ctl_type in (rtp.CTL_DISARM, rtp.CTL_ARM):
+            self._upload_cancel.set()
         pkt = rtp.pack_control(
             ctl_type=ctl_type,
             seq=0,
@@ -621,8 +768,11 @@ class RtBackend:
             t_mono_ns=time.monotonic_ns(),
             text=text,
         )
+        self._send_frame(pkt)
+
+    def _send_frame(self, pkt: bytes) -> None:
         try:
-            # Two writers share this socket (node thread + the PONG reply in
+            # Writers share this socket (node thread + the PONG reply in
             # _ctl_loop); interleaved partial sends would corrupt the framing.
             with self._send_lock:
                 self._tcp.sendall(pkt)

@@ -497,3 +497,35 @@ Offline schema check (no server/device):
 cmake --build build --target reference_protocol_selfcheck
 PYTHONPATH=. python tools/bench/rt/reference_protocol.py build/reference_protocol_selfcheck
 ```
+
+
+### B2 upload implementation
+
+The TCP thread now owns one bounded `ReferenceUpload` value (67,792 bytes on
+the checked x86-64 build). A session binds the execution-token digest once;
+BEGIN checks identity, epoch, revision and capacity before reserving it. CHUNK
+uses aligned 88-byte pieces (only the final piece may be shorter); exact
+retries are idempotent and altered/reordered/overlapping data refuses. SEAL
+requires complete bytes and SHA-256, then validates finite increasing knots
+and conservatively rejects overflowing interpolation arithmetic. Hashing,
+parsing and validation are non-RT. libcrypto is the SHA-256 dependency; matched
+binary/dependency packaging remains CTRL-060. No vendor model is loaded here.
+
+The client has one upload caller and **one frame awaiting acknowledgement**;
+there is no bulk frame queue. It releases the send lock before waiting. ARM,
+DISARM and abort interrupt an in-progress sender; PING/PONG continues on the
+existing control thread. Upload frames do not refresh either deadman. A local
+socketpair check pauses the peer and floods 32 callers: exactly one upload
+frame precedes the DISARM frame. This tests bounded queueing, not a guaranteed
+servo-stop latency. A send remains bounded by the socket timeout.
+
+`reference.hpp` owns the extracted pure native polynomial. The C ABI parity
+wrapper delegates to it; no polynomial remains in that wrapper. Publication
+and execution are B3/B4 work, so capability remains unadvertised in the server.
+The test session executable alone enables it without a plant/servo thread.
+
+```sh
+build/reference_upload_selfcheck
+PYTHONPATH=. python tools/bench/rt/reference_numerics.py build/reference_probe.so
+PYTHONPATH=. python tools/bench/rt/reference_upload.py build/reference_session_selfcheck
+```

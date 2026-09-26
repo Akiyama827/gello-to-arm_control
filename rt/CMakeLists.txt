@@ -118,3 +118,20 @@ endforeach()
 add_executable(reference_protocol_selfcheck src/reference_protocol_selfcheck.cpp)
 target_include_directories(reference_protocol_selfcheck PRIVATE include)
 target_compile_options(reference_protocol_selfcheck PRIVATE -UNDEBUG)
+
+# Numerical parity wrapper delegates to the same pure evaluator as RT.
+add_library(reference_probe SHARED src/reference_probe.cpp)
+set_target_properties(reference_probe PROPERTIES PREFIX "")
+target_include_directories(reference_probe PRIVATE include)
+target_compile_options(reference_probe PRIVATE -ffp-contract=off)
+
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+target_link_libraries(arm_rt_server PRIVATE OpenSSL::Crypto)
+add_executable(reference_upload_selfcheck src/reference_upload_selfcheck.cpp)
+target_include_directories(reference_upload_selfcheck PRIVATE include)
+target_link_libraries(reference_upload_selfcheck PRIVATE OpenSSL::Crypto)
+target_compile_options(reference_upload_selfcheck PRIVATE -UNDEBUG -ffp-contract=off)
+
+add_executable(reference_session_selfcheck src/reference_session_selfcheck.cpp)
+target_include_directories(reference_session_selfcheck PRIVATE include)
+target_link_libraries(reference_session_selfcheck PRIVATE OpenSSL::Crypto Threads::Threads)

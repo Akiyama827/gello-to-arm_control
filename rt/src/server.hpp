@@ -261,6 +261,9 @@ struct ServerCtx {
   // TCP connection. Commands must carry it, and it must have passed CLAIM.
   std::atomic<uint64_t> session_id{0};
   std::atomic<bool> claim_ok{false};
+  // Capability stays off until the complete native selection path is available.
+  std::atomic<bool> supports_reference{false};
+  std::atomic<uint64_t> reference_session{0};
   // DISARM generation: bumped AFTER `armed` is cleared, so a servo tick that
   // reads this value first and `armed` second can only report a stop epoch
   // that covers the request (see rt_loop).

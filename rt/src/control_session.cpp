@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <optional>
+#include "reference_upload.hpp"
 
 #include "server.hpp"
 
@@ -58,7 +60,8 @@ uint32_t flags_snapshot(const ServerCtx& ctx) {
 uint32_t capabilities(const ServerCtx& ctx) {
   // CAP_CALIBRATED_TASK_SPACE is never advertised: no backend evaluates a
   // deployment-approved model in the servo (see protocol.hpp).
-  return CAP_OBSERVER | (ctx.supports_pose_hold.load() ? CAP_POSE_HOLD : 0u);
+  return CAP_OBSERVER | (ctx.supports_pose_hold.load() ? CAP_POSE_HOLD : 0u) |
+    (ctx.supports_reference.load() ? CAP_REFERENCE_HORIZON : 0u);
 }
 
 IdentityPayload identity(const ServerCtx& ctx, uint64_t session) {
@@ -155,6 +158,8 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   uint64_t last_alive_ns = mono_ns();
   uint64_t last_ping_ns = 0;
 
+  std::optional<ReferenceUpload> upload;
+  ReferenceModePayload bound{};
   ControlPacket rx;
   size_t have = 0;
   while (!ctx.shutdown.load()) {
@@ -183,10 +188,70 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
     have += size_t(got);
     if (have < sizeof(rx)) continue;
     have = 0;
-    if (rx.magic != MAGIC_CTL || rx.version != VERSION) continue;
+    if (rx.magic != MAGIC_CTL) continue;
+    if (rx.version==REFERENCE_VERSION) {
+      // One frame per iteration: deadline/fault processing is never skipped by
+      // a producer flood. There is no batch drain or unbounded upload queue.
+      ControlPacket checked{};
+      if(!upload || !decode_reference_control(&rx,sizeof(rx),true,checked)) continue;
+      upload->observe_epoch(ctx.armed.load()?uint32_t(ctx.arm_gen.load()):0);
+      ReferenceResult result=REF_NOT_ADMITTED;
+      ReferenceReplyPayload reply{}; reply.operation=rx.type;
+      switch(rx.type) {
+        case CTL_REFERENCE_BEGIN: {
+          ReferenceBeginPayload b; std::memcpy(&b,rx.text,sizeof(b));
+          reply.upload_id=b.upload_id; reply.reference_id=b.reference_id; reply.revision=b.revision;
+          result=upload->begin(b); break;
+        }
+        case CTL_REFERENCE_CHUNK: {
+          ReferenceChunkPayload c; std::memcpy(&c,rx.text,sizeof(c));
+          reply.upload_id=c.upload_id; result=upload->chunk(c); break;
+        }
+        case CTL_REFERENCE_SEAL: {
+          ReferenceSealPayload s; std::memcpy(&s,rx.text,sizeof(s));
+          reply.upload_id=s.upload_id; result=upload->seal(s); break;
+        }
+        case CTL_REFERENCE_ABORT: {
+          ReferenceRetirePayload a; std::memcpy(&a,rx.text,sizeof(a));
+          reply.upload_id=a.id;
+          result=a.session_id==session && a.arm_epoch==ctx.arm_gen.load() && ctx.armed.load()
+              ? upload->abort(a.id) : REF_IDENTITY;
+          break;
+        }
+        default: break; // B3 owns commit/cancel; no selection in the upload owner.
+      }
+      reply.result=result;
+      ControlPacket answer=make(CTL_REFERENCE_STATUS,0,nullptr,rx.seq);
+      answer.version=REFERENCE_VERSION; std::memcpy(answer.text,&reply,sizeof(reply));
+      if(!send_frame(fd,answer)) break;
+      // Upload traffic does not renew session or command deadmen. The client
+      // must still service the ordinary PING/PONG and fresh dynamic envelopes.
+      continue;
+    }
+    if (rx.version != VERSION) continue;
     last_alive_ns = mono_ns();  // any valid frame (PONGs included) is life
 
     switch (rx.type) {
+      case CTL_REFERENCE_MODE: {
+        ControlPacket checked{};
+        const bool valid=decode_reference_control(&rx,sizeof(rx),false,checked);
+        ReferenceModePayload want{}; std::memcpy(&want,rx.text,sizeof(want));
+        const char* why=nullptr;
+        if(!ctx.supports_reference.load()) why="reference refused: capability unavailable";
+        else if(!valid || !ctx.claim_ok.load() || want.session_id!=session ||
+                want.joint_order_hash!=ctx.joint_order_hash)
+          why="reference refused: identity/malformed mode";
+        else if(ctx.armed.load()) why="reference refused: negotiate while disarmed";
+        else if(upload && std::memcmp(&want,&bound,sizeof(want)))
+          why="reference refused: reconnect to change model binding";
+        if(!why && !upload) {
+          bound=want;
+          upload.emplace(session,ctx.joint_order_hash,uint16_t(ctx.backend_n.load()),want.model_digest);
+          ctx.reference_session.store(session);
+        }
+        send_frame(fd,make(CTL_STATUS,flags_snapshot(ctx),why?why:"reference mode accepted",rx.seq));
+        break;
+      }
       case CTL_STATUS:
         // Read-only inspection; never changes authority or clears a fault.
         send_frame(fd, make(CTL_STATUS, flags_snapshot(ctx), "status"));
@@ -259,6 +324,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
         break;
       case CTL_DISARM: {
         ctx.armed.store(false);
+        if(upload) upload->observe_epoch(0);
         // The latch is reset only when no writer holds it (server.hpp). A
         // latch racing this clear is not taken and re-fires on a later tick
         // if the cause persists. The journal keeps every first cause.
@@ -314,6 +380,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   // The session is over: its commands are no longer admissible and the state
   // stream stops going to its address. Observers keep their own leases.
   ctx.claim_ok.store(false);
+  ctx.reference_session.store(0);
   ctx.session_id.store(0);
   {
     std::lock_guard<std::mutex> lock(ctx.peer_mu);
