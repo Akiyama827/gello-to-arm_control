@@ -354,7 +354,17 @@ class RemoteHardware:
                 for a, link in self.links.items()}
 
     def diagnostic_sample(self):
-        """Copy the exact packets consumed by the controllers on this PC tick."""
+        """Copy the exact packets consumed by the controllers on this PC tick.
+
+        The CTRL-010 controller fields are labeled by origin: `*_pc` are the
+        PC's own accepted command and its algebraic PD+FF against the
+        measurement that command's cycle consumed; `*_rt` come from the same
+        RT state packet (the servo's post-clamp post-slew output and measured
+        torque). Vendor-acknowledged torque (franka tau_J_d) is not on the
+        wire and stays explicitly absent, never zero-filled; the authoritative
+        limiter activity is the RT-side loop-gap diagnostic, never a PC-side
+        cross-tick comparison.
+        """
         now = time.monotonic()
         arms = {}
         for a, c in self.controllers.items():
@@ -379,6 +389,14 @@ class RemoteHardware:
                 dq_cmd_rt=None if motor is None else motor["velocity_cmd"].tolist(),
                 q_cmd_pc=None if command is None else command.q_des.tolist(),
                 dq_cmd_pc=None if command is None else command.qd_des.tolist(),
+                tau_ff_pc=None if command is None else command.tau_ff.tolist(),
+                integral_bias_pc=c.integral.bias.tolist(),
+                raw_pc=(None if command is None else
+                        (command.kp * (command.q_des - c.last_state.position)
+                         + command.kd * (command.qd_des - c.last_state.velocity)
+                         + command.tau_ff).tolist()),
+                tau_cmd_rt=None if motor is None else motor["torque_cmd"].tolist(),
+                tau_meas_rt=None if motor is None else motor["torque"].tolist(),
                 plan_id=c.current_plan_id,
                 trajectory_elapsed_s=(c.reference.elapsed(self._reference_time)
                                       if c.reference is not None and self._reference_time is not None else None),

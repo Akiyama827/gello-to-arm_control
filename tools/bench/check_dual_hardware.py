@@ -560,6 +560,30 @@ def main(pair_path, binary, refinement="none"):
             action("stage", pair_id=pair, reviewed=True)
             wait(lambda s: s["pair"]["lifecycle"] == "ready")
             action("execute", pair_id=pair)
+            # CTRL-010 bounded controller diagnostics flow through the
+            # existing observation history: the PC integral term is
+            # separated from the model feedforward, the raw algebraic PD+FF
+            # is the command's own sum against the measurement its cycle
+            # consumed, and the RT's limited output and measured torque
+            # arrive from the same state packet. Read under the console lock
+            # so the sample and the controller state are one consistent tick.
+            with app._lock:
+                sample = app.runtime.diagnostic_sample()["arms"][a]
+                ctrl = app.runtime.controllers[a]
+                command, measured, bias = ctrl.last_command, ctrl.last_state, ctrl.integral.bias
+            if command is not None:
+                assert (np.asarray(sample["tau_ff_pc"]).tobytes()
+                        == np.asarray(command.tau_ff).tobytes())
+                assert (np.asarray(sample["integral_bias_pc"]).tobytes()
+                        == np.asarray(bias).tobytes())
+                expected = (command.kp * (command.q_des - measured.position)
+                            + command.kd * (command.qd_des - measured.velocity)
+                            + command.tau_ff)
+                assert np.asarray(sample["raw_pc"]).tobytes() == expected.tobytes()
+            assert sample["tau_cmd_rt"] is not None
+            assert np.isfinite(np.asarray(sample["tau_cmd_rt"])).all()
+            assert sample["tau_meas_rt"] is not None
+            assert np.isfinite(np.asarray(sample["tau_meas_rt"])).all()
             state = wait(lambda s: s["pair"]["lifecycle"] in {"complete", "faulted", "cancelled"})
             assert state["pair"]["lifecycle"] == "complete", state
             assert all(np.max(np.abs(np.array(s["q_deg"]) - targets[a]["values"])) < .7
