@@ -49,6 +49,14 @@ ticks may reuse still-fresh observations; stale/nonfinite observations cannot
 advance state. Event-driven cached holds update only when constructed, retaining
 their historical cadence. No PC/RT clock or state owner is duplicated.
 
+`build_execution_policy` admits the deployment's position envelope against
+the robot description: explicit bounds may narrow it, never widen it. Missing
+bounds inherit finite description limits; a partial declaration is refused.
+Continuous joints retain the existing unset-default behavior. This admission
+does not certify workspace/collision clearance or physical contact forces.
+Invalid jog targets reach the existing controller fault path before any
+integral update; the integral owner never accepts a nonfinite target.
+
 For a model-bound supervisor and a capable RT server, v5 session negotiation
 opts into v7. `plants.remote_rt.reference.ReferenceHorizon` uploads unchanged
 windows of the admitted curve, one candidate/worker at a time. It owns transport

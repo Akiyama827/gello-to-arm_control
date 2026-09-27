@@ -167,8 +167,8 @@ def build_execution_policy(policy_config, *, torque_limits, joint_limits=None):
     One constructor for every caller, because the interesting part is not the
     dataclass but WHICH numbers are allowed to come from YAML. The position
     envelope is a factory limit: the URDF owns it and a deployment reads it.
-    A deployment may still declare both bounds to NARROW the machine
-    deliberately -- an operating choice -- and that declaration wins here.
+    A deployment may declare both bounds to NARROW the machine deliberately,
+    but may never expand the description's position envelope.
 
     ``joint_limits`` is the description's ``(lower, upper)``; non-finite
     bounds (a continuous joint) are left unset rather than fabricated.
@@ -177,8 +177,14 @@ def build_execution_policy(policy_config, *, torque_limits, joint_limits=None):
     if policy_config is None:
         return None
     config = dict(policy_config)
-    if config.get("position_lower") is None and joint_limits is not None:
+    if (config.get("position_lower") is None and config.get("position_upper") is None
+            and joint_limits is not None):
         lower, upper = (np.asarray(v, dtype=float) for v in joint_limits)
         if np.isfinite(lower).all() and np.isfinite(upper).all():
             config["position_lower"], config["position_upper"] = lower, upper
-    return ExecutionPolicy(**config, torque_limits=torque_limits)
+    policy = ExecutionPolicy(**config, torque_limits=torque_limits)
+    if joint_limits is not None and policy.position_lower is not None:
+        lower, upper = joint_limits
+        if np.any(policy.position_lower < lower) or np.any(policy.position_upper > upper):
+            raise ValueError("execution_policy position bounds may only narrow the robot description")
+    return policy

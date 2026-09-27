@@ -268,8 +268,7 @@ def check_factory_envelope():
     with its own way of going stale -- real-add carried a hand-derived inner
     envelope ([-2.3093, ...]) narrower than the FR3's factory bounds and
     justified only by a comment. build_execution_policy fills it from the
-    URDF, and an explicit declaration still wins so a deployment can NARROW
-    the machine deliberately.
+    URDF, and an explicit declaration can only NARROW the machine deliberately.
     """
     from arm_control.control.execution_policy import build_execution_policy
 
@@ -288,12 +287,46 @@ def check_factory_envelope():
         torque_limits=tau, joint_limits=described)
     assert np.allclose(narrowed.position_lower, [-1.0, -1.0])
 
+    # Neither side may expand the description. A half-declaration must be
+    # refused rather than silently overwritten by the inherited bounds.
+    for lo, hi in (([-3.0, -1.0], [1.0, 1.0]),
+                   ([-1.0, -1.0], [3.0, 1.0]),
+                   (None, [1.0, 1.0]), ([-1.0, -1.0], None)):
+        try:
+            build_execution_policy(dict(base, position_lower=lo, position_upper=hi),
+                                   torque_limits=tau, joint_limits=described)
+        except ValueError as exc:
+            expected = "both position bounds" if lo is None or hi is None else "only narrow"
+            assert expected in str(exc), exc
+        else:
+            raise AssertionError((lo, hi))
+
+    equal = build_execution_policy(
+        dict(base, position_lower=described[0], position_upper=described[1]),
+        torque_limits=tau, joint_limits=described)
+    for name in ("position_lower", "position_upper", "torque_limits"):
+        assert getattr(equal, name).tobytes() == getattr(filled, name).tobytes()
+        assert not getattr(equal, name).flags.writeable
+
     # A continuous joint reports infinite bounds; leave them unset rather
     # than fabricate a number the machine never stated.
     infinite = build_execution_policy(
         base, torque_limits=tau,
         joint_limits=(np.array([-np.inf, -1.0]), np.array([np.inf, 1.0])))
     assert infinite.position_lower is None
+
+    # Explicit bounds on a continuous joint are permitted, while the other
+    # joint's finite factory bound remains authoritative.
+    mixed = (np.array([-np.inf, -1.0]), np.array([np.inf, 1.0]))
+    build_execution_policy(dict(base, position_lower=[-10., -.5], position_upper=[10., .5]),
+                           torque_limits=tau, joint_limits=mixed)
+    try:
+        build_execution_policy(dict(base, position_lower=[-10., -.5], position_upper=[10., 1.1]),
+                               torque_limits=tau, joint_limits=mixed)
+    except ValueError as exc:
+        assert "only narrow" in str(exc)
+    else:
+        raise AssertionError("continuous joint concealed another joint's factory bound")
 
     assert build_execution_policy(None, torque_limits=tau) is None
     print("factory envelope: read from the description, narrowing honoured OK")
@@ -321,9 +354,9 @@ def check_modes_and_validation():
     seen = []
     hold = c.executor.hold_command
 
-    def measured_hold(state, q_des=None):
+    def measured_hold(state, q_des=None, *, integral_bias=0.0):
         seen.append(state.position.copy())
-        return hold(state, q_des)
+        return hold(state, q_des, integral_bias=integral_bias)
 
     c.executor.hold_command = measured_hold
     c.tick()
@@ -342,10 +375,17 @@ def check_modes_and_validation():
     c.on_motor_state(state(.01))
     c.tick()
     assert not c._jog.active and np.allclose(commands(c)[-1]["position"], .01)
-    c.on_jog(pack_jog(q=[float("nan")]*7))
-    count = len(commands(c))
-    c.tick()
-    assert c.stopped and len(commands(c)) == count
+    for invalid in (float("nan"), float("inf"), -float("inf")):
+        c, clock = setup()
+        c.on_jog(pack_jog(q=[invalid]*7))
+        count = len(commands(c))
+        def no_update(*args):
+            raise AssertionError("invalid jog reached integral update")
+        c.integral.update = no_update
+        c.tick()
+        assert c.stopped and not c.armed and len(commands(c)) == count
+        events = [unpack_json_message(v) for t, v in c.node.sent if t == "controller_event"]
+        assert events[-1]["reason"] == "non-finite or invalid servo command"
 
     c, clock = setup()
     spec = dict(id=1, kc=[300]*3+[30]*3, dc=[35]*3+[8]*3,

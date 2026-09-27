@@ -541,6 +541,12 @@ class ArmController:
             return
         jog, expired = self._jog_target()
         if jog is not None:
+            # Invalid streamed targets used to reach _send's fault path.
+            # Refuse before the atomic integral boundary without changing
+            # that lifecycle response or allowing a partial state advance.
+            if self.execution_policy is not None and not np.isfinite(jog).all():
+                self._fault("non-finite or invalid servo command")
+                return
             bias = self.integral.update(*cycle, jog, arm.position, self.executor.kp)
             command = self.executor.hold_command(arm, q_des=jog, integral_bias=bias)
             self._hold_anchor = None   # a jog moves: the next hold re-anchors
