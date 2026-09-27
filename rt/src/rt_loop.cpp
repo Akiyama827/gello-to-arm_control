@@ -28,7 +28,7 @@
 #include <vector>
 
 #include "arm_rt/servo_law.hpp"
-#include "arm_rt/pose_hold.hpp"
+#include "arm_rt/controller.hpp"
 #include "server.hpp"
 
 namespace arm_rt {
@@ -141,8 +141,7 @@ void rt_loop(ServerCtx& ctx) {
   CommandAuthority authority;     // RT-owned; tracking + deadline derive here
   const PoseHoldCommandPacket& incoming = authority.current.packet;
   const CommandPacket& cmd=incoming.command;
-  PoseHold pose_hold;
-  double pose_tau[MAX_JOINTS]{};
+  Controller controller;
   StatePacket out = {};
   ReferenceSelection reference;
   ReferenceCommit reference_commit{};
@@ -320,9 +319,6 @@ void rt_loop(ServerCtx& ctx) {
 
     const double* q_des = zeros;
     const double* qd_des = zeros;
-    const double* tau_ff = zeros;
-    const double* kp = hold_kp;
-    const double* kd = hold_kd;
 
     // The ARM edge is a GENERATION, not a level: a DISARM->ARM pair that
     // completes between two 1 kHz samples still changes arm_gen, so the
@@ -336,7 +332,7 @@ void rt_loop(ServerCtx& ctx) {
       plant_ok = true;         // ARM = explicit plant retry
       have_cmd_gains = false;  // fresh epoch: hold gains until the task speaks
       holding = false;         // re-capture the hold pose in this epoch
-      pose_hold.reset();
+      controller.reset();
     }
     if(armed) {
       for(int j=0;j<n;++j) {
@@ -348,7 +344,7 @@ void rt_loop(ServerCtx& ctx) {
       }
     }
     if (armed && !plant_ok) {
-      pose_hold.reset();
+      controller.reset();
       holding = false;  // nothing is held — the robot's own safety has it
       std::memset(tau_out, 0, sizeof(tau_out));
     } else if (armed) {
@@ -358,24 +354,19 @@ void rt_loop(ServerCtx& ctx) {
         last_cmd_seq = cmd.seq;
         std::memcpy(cmd_kp, cmd.kp, sizeof(cmd_kp));  // accepted -> snapshot
         std::memcpy(cmd_kd, cmd.kd, sizeof(cmd_kd));
-        q_des = native_command?reference_point+1:cmd.q_des;
-        qd_des = native_command?reference_point+1+n:cmd.qd_des;
-        tau_ff = cmd.tau_ff;
-        kp = cmd_kp;
-        kd = cmd_kd;
         if(cmd.version==POSE_HOLD_VERSION) {
-          if(!backend->supports_pose_hold() || !ps.pose_valid || !ps.jacobian_valid ||
-             !pose_hold.torque(n,ps.q,ps.dq,ps.jacobian,ps.pose,ps.coriolis,
-                               incoming.pose_hold,backend->tick_s(),pose_tau)) {
+          if(!controller.pose(n, ps, incoming.pose_hold, backend->tick_s(),
+                              backend->supports_pose_hold())) {
             ctx.latch(FAULT_PLANT, "pose hold requires valid measured pose/J/model state", seen_gen);
             faulted=true;
-          } else {
-            q_des=ps.q; qd_des=zeros; tau_ff=pose_tau; kp=zeros; kd=zeros;
           }
-        } else pose_hold.reset();
+        } else {
+          controller.joint(n, native_command?reference_point+1:cmd.q_des,
+                           native_command?reference_point+1+n:cmd.qd_des,
+                           cmd.tau_ff, cmd_kp, cmd_kd);
+        }
       }
       if(faulted || !fresh) {
-        pose_hold.reset();
         if (!holding) {
           holding = true;
           std::memcpy(q_hold, ps.q, sizeof(double) * size_t(n));
@@ -384,24 +375,15 @@ void rt_loop(ServerCtx& ctx) {
           ctx.latch(FAULT_CMD_LOST, "command stream lost (staleness > fault-ms)", seen_gen);
           faulted = true;
         }
-        q_des = q_hold;
-        qd_des=zeros; tau_ff=zeros; kp=hold_kp; kd=hold_kd;
-        if (have_cmd_gains) {  // hold with the authority the task last chose
-          kp = cmd_kp;         // the SNAPSHOT — never the live buffer
-          kd = cmd_kd;
-        }
+        // Retain the accepted gain snapshot, never the live ingress buffer.
+        controller.joint(n, q_hold, zeros, zeros,
+                         have_cmd_gains?cmd_kp:hold_kp, have_cmd_gains?cmd_kd:hold_kd);
       }
-      servo_torque(n, ps.q, ps.dq, q_des, qd_des, tau_ff, kp, kd, ps.tau_ref,
-                   tau_limits, slew, tau_out);
-      // Preserve the authority-selected fields for native MIT. In particular,
-      // tau_out contains PD already; it must NOT become an extra MIT tau_ff.
-      CommandPacket selected{};
-      selected.n = uint16_t(n);
-      std::copy_n(q_des, n, selected.q_des);
-      std::copy_n(qd_des, n, selected.qd_des);
-      std::copy_n(tau_ff, n, selected.tau_ff);
-      std::copy_n(kp, n, selected.kp);
-      std::copy_n(kd, n, selected.kd);
+      const auto& selected = controller.command();
+      q_des = selected.q_des;
+      qd_des = selected.qd_des;
+      servo_torque(n, ps.q, ps.dq, selected.q_des, selected.qd_des, selected.tau_ff,
+                   selected.kp, selected.kd, ps.tau_ref, tau_limits, slew, tau_out);
       t_w0 = mono_ns();
       const bool wrote = backend->write_command(selected, slew, tau_out);
       t_w1 = mono_ns();
@@ -412,7 +394,7 @@ void rt_loop(ServerCtx& ctx) {
         std::fill_n(tau_out, n, 0.0);  // rejected output is not commanded torque
       }
     } else {
-      pose_hold.reset();
+      controller.reset();
       if (prev_armed && !backend->stop())
         ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str(), seen_gen);
       holding = false;

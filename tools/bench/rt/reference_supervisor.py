@@ -64,7 +64,7 @@ def main(binary):
         step = runtime.controller.executor.step
         parity_samples = []
 
-        def checked_step(point, measured):
+        def checked_step(point, measured, *, integral_bias):
             reference = runtime.controller.reference
             assert reference.t_start is None
             expected = reference.trajectory.sample_at(point.time)
@@ -72,8 +72,8 @@ def main(binary):
                 expected = TrajectoryPoint(
                     point.time, expected.position, np.zeros(3), np.zeros(3)
                 )
-            actual = step(point, measured)
-            oracle = oracle_executor.step(expected, measured)
+            actual = step(point, measured, integral_bias=integral_bias)
+            oracle = oracle_executor.step(expected, measured, integral_bias=integral_bias)
             for field in ("q_des", "qd_des", "tau_ff", "kp", "kd"):
                 assert (
                     getattr(actual, field).tobytes() == getattr(oracle, field).tobytes()

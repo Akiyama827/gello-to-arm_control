@@ -76,8 +76,8 @@ def check_reference_phase():
             executor = c.executor
             original = executor.step
 
-            def sample(point, state, original=original):
-                command = original(point, state)
+            def sample(point, state, original=original, *, integral_bias=0.0):
+                command = original(point, state, integral_bias=integral_bias)
                 return replace(command, q_des=point.position, qd_des=point.velocity)
 
             executor.step = sample

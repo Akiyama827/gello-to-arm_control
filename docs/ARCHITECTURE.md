@@ -346,6 +346,17 @@ units, CAN-link setup, and task-specific device bridges belong to the consumer.
 See [the RT reference](../rt/README.md) for core protocol and safety details;
 its historical bench observations do not certify another machine.
 
+`rt/include/arm_rt/controller.hpp` owns the RT joint/pose mode mapping and the
+existing `PoseHold` capture state. It produces the selected five-field command;
+`rt_loop` owns lifecycle/freshness/fallback selection, calls the unchanged limiter,
+and dispatches to the plant. Native MIT receives the original fields, not a
+second PD contribution folded into feedforward. Joint RNEA/integral remain PC
+owned. Pose hold continues using the named vendor model and its existing
+Coriolis input; no new dynamics provider or PC-to-RT state migration is implied.
+The MuJoCo adapter still supplies its own measured simulation state to the same
+compiled `PoseHold`/`servo_torque` primitives; it does not consume an RT wire
+packet or pretend its model is the vendor model.
+
 Simulation and hardware share control contracts without pretending their
 lifecycle or physics are identical. Scene revisions and stale-command
 rejection, live-state transfer across MuJoCo recompilation, contacts, and

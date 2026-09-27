@@ -144,3 +144,8 @@ add_executable(reference_runtime_selfcheck src/reference_runtime_selfcheck.cpp
   src/rt_loop.cpp src/udp_link.cpp src/control_session.cpp src/backend_fake.cpp)
 target_include_directories(reference_runtime_selfcheck PRIVATE include)
 target_link_libraries(reference_runtime_selfcheck PRIVATE OpenSSL::Crypto Threads::Threads Eigen3::Eigen)
+
+add_executable(controller_selfcheck src/controller_selfcheck.cpp)
+target_include_directories(controller_selfcheck PRIVATE include)
+target_link_libraries(controller_selfcheck PRIVATE Eigen3::Eigen)
+target_compile_options(controller_selfcheck PRIVATE -UNDEBUG)
