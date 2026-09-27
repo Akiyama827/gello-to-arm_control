@@ -34,6 +34,8 @@ class TrajectoryReference:
     # a PC clock and PC interpolation cannot also own this released reference.
     sample_source: Callable[[], TrajectoryPoint] | None = None
 
+    terminal: bool = True
+
     def __post_init__(self) -> None:
         if (self.t_start is None) == (self.sample_source is None):
             raise ValueError("reference needs exactly one local clock or selected sample source")
@@ -55,8 +57,12 @@ class TrajectoryReference:
         return self.trajectory.sample_at(self.elapsed(t_now))
 
     @property
+    def end_phase(self) -> float:
+        return float(self.trajectory.times[-1])
+
+    @property
     def end(self) -> TrajectoryPoint:
-        return self.trajectory.sample_at(self.trajectory.duration_sec)
+        return self.trajectory.sample_at(self.end_phase)
 
     def cartesian_pose(self, t_now: float):
         """The precomputed pose of the knot segment being commanded, or None."""

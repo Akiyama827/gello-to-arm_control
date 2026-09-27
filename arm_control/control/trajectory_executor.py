@@ -148,6 +148,11 @@ class JointTrajectoryExecutor:
             kd=self._kd.copy(),
         )
 
+    @property
+    def payload_mass_kg(self) -> float:
+        """Current transient PC compensation mass, for admission evidence."""
+        return self._payload[0]
+
     def set_payload(
         self,
         mass_kg: float,

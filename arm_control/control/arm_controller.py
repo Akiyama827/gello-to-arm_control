@@ -520,7 +520,7 @@ class ArmController:
             # Re-latching measured q here baked the allowed settle residual into
             # a new target and added another static tracking error at each stop.
             # Task-specific/contact completion keeps its measured hold contract.
-            goal = (np.asarray(self._plan["positions"][-1], dtype=float).copy()
+            goal = (self._reference.end.position.copy()
                     if self._plan.get("completion") is None else None)
             if self._check_completion(arm):
                 if not self.frozen:
@@ -569,6 +569,13 @@ class ArmController:
         absolute value -- only differences.
         """
         return self._plant_t if self._state_period is not None else self._reference_clock()
+
+    def select_reference_window(self, plan_id, trajectory, *, terminal):
+        """Selected native stream revision; the reference owns endpoint/termination."""
+        from dataclasses import replace
+        if self.current_plan_id != plan_id or self._reference is None or self._reference.sample_source is None:
+            raise ValueError('selected native reference required')
+        self._reference = replace(self._reference, trajectory=trajectory, terminal=terminal)
 
     def bind_reference_source(self, source) -> None:
         """Disarmed construction binding for a negotiated plant reference."""
@@ -814,6 +821,8 @@ class ArmController:
         measurement the operator needs to see, which needs the plan and the
         executor's tolerances that this class owns and that one does not.
         """
+        if self._reference is not None and not self._reference.terminal:
+            return False
         now = self.exec_time
         fresh = self._completion_sample_at != self._last_state_at
         if fresh:
@@ -822,7 +831,7 @@ class ArmController:
             now=now, fresh=fresh, done=lambda: self._leg_done(state),
             reference_ended=(self._reference is not None
                              and self._reference.sample_source is not None
-                             and self._reference.elapsed(now) >= self._reference.duration_sec),
+                             and self._reference.elapsed(now) >= self._reference.end_phase),
         )
         if verdict is None:
             return False
@@ -831,7 +840,7 @@ class ArmController:
             return True
         spec = self._plan.get('completion')
         pos_tol, vel_tol = self.executor.completion_tolerances
-        goal = self._plan['positions'][-1]
+        goal = self._reference.end.position
         if spec is not None:
             vel_tol = spec['vel_tol']
             goal, pos_tol = spec.get('goal_q'), spec.get('residual_max')

@@ -85,6 +85,40 @@ def receipt_from(d) -> Receipt:
                    stamp_from(d["at"]), d["reason"], dict(d["evidence"]))
 
 
+def stream_open_from(d):
+    from .stream import StreamOpen
+    t = d['initial']
+    return StreamOpen(d['request_id'], d['open_seq'], d['instance_id'],
+                      tuple(d['joint_names']), d['model_token'], d['scene_token'],
+                      d['stream_policy_id'], JointTrajectory(**t), Start(d['start']),
+                      stamp_from(d['admit_by']))
+
+
+def stream_revision_from(d):
+    from .stream import StreamRevision
+    return StreamRevision(**{**d, 'suffix': JointTrajectory(**d['suffix']),
+                             'admit_by': stamp_from(d['admit_by'])})
+
+
+def anchor_from(d):
+    from .stream import SpliceAnchor
+    return None if d is None else SpliceAnchor(
+        **{**d, 'issued_at': stamp_from(d['issued_at']), 'expires_at': stamp_from(d['expires_at'])})
+
+
+def revision_status_from(d):
+    from .stream import RevisionStatus, SelectionState
+    return RevisionStatus(**{**d, 'phase': Phase(d['phase']),
+                             'selection_state': SelectionState(d['selection_state']),
+                             'at': stamp_from(d['at'])})
+
+
+def stream_view_from(d):
+    from .stream import StreamView
+    return StreamView(**{**d, 'execution': status_from(d['execution']),
+                         'splice': anchor_from(d['splice'])})
+
+
 def _self_check() -> None:
     import json
 

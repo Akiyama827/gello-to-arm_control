@@ -10,8 +10,8 @@ messages and in-process controllers ADAPT to these values.
 
 Every concept below already existed somewhere; the mapping from the old names
 is in docs/ARCHITECTURE.md ("Execution contract"). Contract v1 is one robot
-executing one planned joint trajectory; groups (CTRL-040), Cartesian and
-streaming requests (CTRL-030) are later versions.
+executing one planned joint trajectory. Streaming requests use the separately negotiated ``execution.stream`` extension;
+group and Cartesian public operations remain separate work.
 
 Conventions (normative):
 

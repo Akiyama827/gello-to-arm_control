@@ -700,3 +700,26 @@ Not in this slice:
   behavior, body-name contact exclusions, and tuned gripper/object parameters.
   Moving that core preserved physics; extracting these policies would require
   separate behavior validation. It is not yet a fully domain-free backend.
+
+### Optional stream/1 implementation checkpoint (CTRL-033)
+
+`execution.stream` adds negotiated values alongside execution v1. `ArmClient`
+refuses all six stream operations unless HELLO advertises stream/1. RobotRuntime
+owns async admission, service-session high-water marks, the bounded attempt
+ledger and explicit selection uncertainty. The neutral `StreamAdmission` seam
+requires trusted scene/model/policy/load facts; configuring no provider leaves
+the extension unavailable. Project provider and console migration are pending.
+
+ReferenceHorizon remains the single upload/selection owner: admitted suffixes
+copy whole selected prefix knots, with no second sampler or RT wire change.
+TrajectoryReference now owns the selected endpoint/end phase/terminal flag;
+controller completion delegates to it rather than the original plan endpoint.
+`planning.stream_target.TargetStopGrid` is the named target-generation strategy,
+separate from stream policy. It does not execute or renew references.
+
+Raw jog remains compatibility-only because the current Dora console also owns
+gain/Soft/payload message ingress. Moving only jog to a separate supervisor
+would introduce competing control owners. Retirement requires migrating that
+console and its graph peers to one supervisor owner without dropping those
+controls. This checkpoint is not a completed console migration or hardware
+qualification.

@@ -18,6 +18,10 @@ from . import protocol as p
 from .client import RtLinkError, ReferenceRefused
 
 
+class _NotDispatched(RtLinkError):
+    """Local proof that COMMIT never entered the transport."""
+
+
 class ReferenceHorizon:
     def __init__(self, link):
         self.link = link
@@ -43,6 +47,15 @@ class ReferenceHorizon:
         self.received_at = 0.
         self._session = 0
         self._epoch = 0
+        self.stream = False
+        self.terminal = True
+        self.protected_until = 0.
+        self.candidate_selection = 'not_requested'
+        self.candidate_error = ''
+        self.candidate_result = None
+        self._candidate_curve = None
+        self._candidate_terminal = True
+        self._latest_phase = 0.
 
     @property
     def session_id(self):
@@ -58,6 +71,9 @@ class ReferenceHorizon:
 
     @property
     def busy(self):
+        if self.stream:
+            return (self._job is not None or self._cancel_job is not None or self._stage_ready
+                    or self.candidate_selection == 'pending')
         return (self._job is not None or self._cancel_job is not None or self._stage_ready
                 or (self.selection_requested and not self.feedback
                     and not self._interrupt.is_set() and not self.error))
@@ -71,12 +87,19 @@ class ReferenceHorizon:
     def revision(self):
         return self.feedback['revision'] if self.feedback is not None else 0
 
-    def stage(self, key, trajectory: JointTrajectory, *, selection_deadline_ns=None):
+    def stage(self, key, trajectory: JointTrajectory, *, selection_deadline_ns=None,
+              stream=False, terminal=True):
         if self.busy:
             raise RtLinkError('reference transfer already pending')
         if trajectory.times[0] != 0 or trajectory.velocities is None:
             raise ValueError('native execution requires zero-origin Hermite knots')
         self._next_id += 1
+        self.stream, self.terminal = bool(stream), bool(terminal)
+        self.protected_until = 0.
+        self.candidate_selection, self.candidate_error = 'not_requested', ''
+        self.candidate_result = None
+        self._candidate_curve = None
+        self._latest_phase = 0.
         # A transport caller cannot mutate future windows after admission.
         self.id, self.key = self._next_id, key
         self.trajectory = JointTrajectory(trajectory.times, trajectory.positions, trajectory.velocities)
@@ -109,12 +132,69 @@ class ReferenceHorizon:
                 raise RtLinkError('reference transfer cancelled')
             return self.link.upload_reference(
                 window, reference_id=identity, revision=revision,
-                expected_revision=revision-1, terminal=end == len(traj.times),
+                expected_revision=revision-1, terminal=self.terminal and end == len(traj.times),
                 session_id=session, arm_epoch=epoch)
 
         self._window, self._revision, self._cut = (first, end), revision, cut
         self._stage_ready = False
         self._job = ('stage', self._worker.submit(upload))
+
+    def splice(self, suffix, *, cut, expected_revision):
+        """Copy the selected whole prefix, retaining the segment covering phase.
+
+        Pure bounded composition; the trusted admission worker checks this exact
+        result before stage_suffix. No sampler or coefficient reconstruction.
+        """
+        if not self.stream or not self.selected or expected_revision != self.revision:
+            raise ValueError('splice requires the selected stream revision')
+        old = self.trajectory
+        indices = np.flatnonzero(old.times == cut)
+        if len(indices) != 1 or cut < self.protected_until:
+            raise ValueError('cut is not an eligible selected knot')
+        last = int(indices[0])
+        if (suffix.times[0] != cut or not np.array_equal(suffix.positions[0], old.positions[last])
+                or not np.array_equal(suffix.velocities[0], old.velocities[last])):
+            raise ValueError('suffix must preserve exact cut time/q/qd')
+        first = max(0, int(np.searchsorted(old.times, self.point.time, side='right')) - 1)
+        if first >= last:
+            raise ValueError('splice missed its whole-segment prefix')
+        curve = JointTrajectory(np.r_[old.times[first:last+1], suffix.times[1:]],
+                                np.vstack([old.positions[first:last+1], suffix.positions[1:]]),
+                                np.vstack([old.velocities[first:last+1], suffix.velocities[1:]]))
+        if len(curve.times) > p.MAX_REFERENCE_KNOTS:
+            raise ValueError('combined reference exceeds 128 knots')
+        for arr in (curve.times, curve.positions, curve.velocities):
+            arr.setflags(write=False)
+        return curve
+
+    def stage_suffix(self, curve, *, cut, expected_revision, terminal,
+                     latest_phase, selection_deadline_ns):
+        """Upload the already admitted bounded splice through this same worker."""
+        if self.busy or not self.stream or not self.selected or self.terminal:
+            raise RtLinkError('stream candidate slot is unavailable')
+        if expected_revision != self.revision:
+            raise ValueError('selected revision changed before upload')
+        self._candidate_curve, self._candidate_terminal = curve, terminal
+        self._revision, self._cut = expected_revision+1, cut
+        self._latest_phase, self._selection_deadline_ns = latest_phase, selection_deadline_ns
+        self.candidate_selection, self.candidate_error = 'not_requested', ''
+        self.candidate_result = None
+        identity, revision, session, epoch = self.id, self._revision, self._session, self._epoch
+        self._job = ('stage', self._worker.submit(
+            self.link.upload_reference, curve, reference_id=identity, revision=revision,
+            expected_revision=expected_revision, terminal=terminal,
+            session_id=session, arm_epoch=epoch))
+
+    def abort_candidate(self):
+        """Only an unselected attempt; never retire the selected stream."""
+        if self.candidate_selection == 'pending':
+            raise RtLinkError('selection pending; reconcile RT feedback before abort')
+        self.link.interrupt_reference_upload()
+        # The single worker serializes ABORT after any outstanding upload.
+        self._job = ('abort', self._worker.submit(
+            self.link.abort_reference_upload, session_id=self._session, arm_epoch=self._epoch))
+        self._stage_ready = False
+        self._candidate_curve = None
 
     def approve(self):
         """Initial caller admission, or continuation of its immutable admitted plan."""
@@ -123,24 +203,38 @@ class ReferenceHorizon:
         cancelled = self._interrupt
         identity, revision, upload, cut = self.id, self._revision, self._upload, self._cut
         session, epoch = self._session, self._epoch
-        deadline = self._selection_deadline_ns if revision == 1 else None
+        deadline = self._selection_deadline_ns if revision == 1 or self.stream else None
+        latest = self._latest_phase if self.stream else cut
+        observed_phase = None if self.point is None else self.point.time
 
         def commit():
             if cancelled.is_set():
                 raise RtLinkError('reference selection cancelled')
             budget = 0 if deadline is None else deadline-time.monotonic_ns()
             if deadline is not None and budget <= 0:
-                raise RtLinkError('selection deadline expired before COMMIT')
+                raise _NotDispatched('selection deadline expired before COMMIT')
+            phase_deadline = latest
+            if revision > 1 and deadline is not None:
+                # v7 reserves selection_budget_ns for initial selection. For a
+                # revision its existing latest_phase is the deadline. Add only
+                # the remaining PC duration to the captured RT phase: ignoring
+                # feedback/worker age makes this earlier, never later. No host
+                # timestamp subtraction or predicted motion sample is involved.
+                if observed_phase is None:
+                    raise _NotDispatched('no selected phase for revision deadline')
+                phase_deadline = min(latest, observed_phase + budget / 1e9)
+                budget = 0
             # RT anchors the duration at SEAL, which precedes receipt of its
             # ACK and this PC budget calculation. This can refuse early but
             # cannot grant extra network/queue time or compare host clocks.
             return self.link.commit_reference(
                 upload, reference_id=identity, revision=revision,
-                expected_revision=revision-1, protected_until=cut, latest_phase=cut,
+                expected_revision=revision-1, protected_until=cut, latest_phase=phase_deadline,
                 session_id=session, arm_epoch=epoch, selection_budget_ns=budget)
 
         self._stage_ready = False
         self.selection_requested = True
+        self.candidate_selection = 'pending'
         self._job = ('commit', self._worker.submit(commit))
 
     def poll(self, state, received_at):
@@ -151,9 +245,18 @@ class ReferenceHorizon:
             try:
                 result = job.result()
             except Exception as exc:
+                if self.stream:
+                    self.candidate_error = str(exc)
+                    if kind == 'commit' and isinstance(exc, (ReferenceRefused, _NotDispatched)):
+                        self.candidate_selection = 'refused'
+                        self.candidate_result = exc.result if isinstance(exc, ReferenceRefused) else p.REF_LATE
+                    # A timeout after COMMIT never proves nonselection. Continue
+                    # observing the old selected reference, without freeing slot.
+                    if kind != 'commit' and kind != 'abort':
+                        self.candidate_selection = 'not_requested'
                 if kind == 'commit' and isinstance(exc, ReferenceRefused) and self._revision == 1:
                     self.selection_requested = False  # RT proved it did not select
-                if not self._interrupt.is_set():
+                if not self._interrupt.is_set() and not self.stream:
                     self.error = str(exc)
             else:
                 if kind == 'stage' and not self._interrupt.is_set():
@@ -178,9 +281,17 @@ class ReferenceHorizon:
         self.feedback = dict(ref) if valid else None
         self.point = self.observed_point if valid else None
         self.received_at = received_at
+        if (self.stream and valid and ref['revision'] == self._revision
+                and ref['status'] in (p.REFERENCE_RUNNING, p.REFERENCE_END, p.REFERENCE_UNDERFLOW)):
+            self.candidate_selection = 'selected'
+            if self._candidate_curve is not None:
+                self.trajectory = self._candidate_curve
+                self._candidate_curve = None
+                self.terminal = self._candidate_terminal
+                self.protected_until = self._cut
         if valid and ref['status'] == p.REFERENCE_UNDERFLOW:
             self.error = 'REFERENCE_UNDERFLOW'
-        if self._interrupt.is_set() or self.error or not self.selected:
+        if self.stream or self._interrupt.is_set() or self.error or not self.selected:
             return
         # Replacements were already admitted as part of the full PC plan. No
         # new scene policy or coefficient reconstruction runs here.

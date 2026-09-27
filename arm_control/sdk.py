@@ -127,6 +127,7 @@ class ArmClient:
                                   f"not {instance_id!r}")
         self.capabilities = codec.capabilities_from(hello["capabilities"])
         self.session: str = hello["session"]
+        self.extensions = dict(hello.get("extensions") or {})
 
     # -- observation and time --------------------------------------------------
     def now(self) -> Stamp:
@@ -206,6 +207,34 @@ class ArmClient:
     def receipts(self, execution_id: str) -> tuple[Receipt, ...]:
         return tuple(codec.receipt_from(r) for r in
                      self._channel.call("receipts", execution_id=execution_id))
+
+    # -- negotiated stream/1 ----------------------------------------------------
+    def _stream_call(self, op, **args):
+        if self.extensions.get('stream') != 1:
+            raise Refused('supervisor does not advertise stream/1; no raw-jog fallback')
+        return self._channel.call(op, **args)
+
+    def open_stream(self, request):
+        """Returns REQUESTED; trusted admission continues asynchronously."""
+        return codec.stream_view_from(self._stream_call('stream_open', request=codec.encode(request)))
+
+    def stream_state(self, execution_id):
+        """Pure observation; never acquires a splice challenge."""
+        return codec.stream_view_from(self._stream_call('stream_state', execution_id=execution_id))
+
+    def stream_anchor(self, execution_id):
+        return codec.anchor_from(self._stream_call('stream_anchor', execution_id=execution_id))
+
+    def revise_stream(self, request):
+        return codec.revision_status_from(self._stream_call('stream_revise', request=codec.encode(request)))
+
+    def stream_revision(self, execution_id, request_id):
+        return codec.revision_status_from(self._stream_call(
+            'stream_revision', execution_id=execution_id, request_id=request_id))
+
+    def abort_stream_revision(self, execution_id, request_id):
+        return codec.revision_status_from(self._stream_call(
+            'stream_abort', execution_id=execution_id, request_id=request_id))
 
     # -- lifetime ----------------------------------------------------------------
     def close(self) -> None:

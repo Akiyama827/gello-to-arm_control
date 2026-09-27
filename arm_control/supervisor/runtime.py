@@ -34,6 +34,9 @@ from arm_control.config import arm_joints
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.factory import build_arm_controller
 from arm_control.execution import codec
+from arm_control.execution.stream import (StreamOpen, StreamRevision, StreamView,
+                                          SpliceAnchor, RevisionStatus, SelectionState)
+from arm_control.supervisor.admission import StreamAdmission, StreamFacts
 from arm_control.execution.contract import (
     CONTRACT_VERSION, Authority, Capabilities, Clock, ExecutionStatus, Lifecycle, Phase,
     Receipt, RobotIdentity, RobotState, Stamp, Start, TrajectoryRequest, Validity,
@@ -84,6 +87,7 @@ class _Node(QueueControllerNode):
 @dataclass
 class _Execution:
     request: TrajectoryRequest
+    stream: _Stream | None = field(default=None, kw_only=True)
     status: ExecutionStatus
     receipts: list[Receipt] = field(default_factory=list)
     first_seq: int | None = None
@@ -92,8 +96,34 @@ class _Execution:
     completed_at: float | None = None  # feedback completion awaiting APPLIED
 
 
+@dataclass
+class _Attempt:
+    request: StreamOpen | StreamRevision
+    status: RevisionStatus
+    curve: JointTrajectory
+    facts: StreamFacts
+    deadline_ns: int
+    cut: float = 0.
+    terminal: bool = False
+    sent_seq: int | None = None
+    upload_started: bool = False
+
+
+@dataclass
+class _Stream:
+    owner: str
+    opened: StreamOpen
+    facts: StreamFacts
+    epoch: tuple
+    gains: tuple
+    anchor: SpliceAnchor | None = None
+    pending: str | None = None
+    selected: str | None = None
+
+
+
 class RobotRuntime:
-    def __init__(self, cfg, *, link=None) -> None:
+    def __init__(self, cfg, *, link=None, stream_admission: StreamAdmission | None = None) -> None:
         self.cfg = cfg
         self.joints = arm_joints(cfg)
         self.instance_id = str((cfg.get("rt") or {}).get("instance_id", ""))
@@ -104,6 +134,11 @@ class RobotRuntime:
         # evidence is the next state packet, which the link's own freshness
         # bound already promises; past it the link is stale anyway.
         self.applied_grace_s = float(self.link.config.state_timeout_s)
+        self._stream_admission = stream_admission
+        self._stream_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='stream-admission')
+        self._stream_job = None
+        self._stream_marks = {}  # live service-session marks, independent of claim
+        self._stream_attempts = {}  # (service session, request id) -> bounded record
         self._native = None
         self._native_pending = None
         self._native_epoch = 0
@@ -135,6 +170,370 @@ class RobotRuntime:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+    @property
+    def extensions(self):
+        return {'stream': 1} if self._native is not None and self._stream_admission is not None else {}
+
+    # -- stream/1: same execution ledger, reference owner and control loop -------
+    def open_stream(self, session, request):
+        return self._call(self._open_stream, session, request)
+
+    def revise_stream(self, session, request):
+        return self._call(self._revise_stream, session, request)
+
+    def stream_anchor(self, session, execution_id):
+        return self._call(self._stream_anchor, session, execution_id)
+
+    def abort_stream_revision(self, session, execution_id, request_id):
+        return self._call(self._stream_abort, session, execution_id, request_id)
+
+    def _stream_get(self, session, execution_id):
+        ex = self._get(execution_id)
+        if ex.stream is None or ex.stream.owner != session:
+            raise Refused('stream is not owned by this service session')
+        return ex
+
+    def stream_state(self, session, execution_id):
+        with self._cv:
+            return self._stream_view(self._stream_get(session, execution_id))
+
+    def stream_revision(self, session, execution_id, request_id):
+        with self._cv:
+            self._stream_get(session, execution_id)
+            attempt = self._stream_attempts.get((session, request_id))
+            if attempt is None or attempt.status.execution_id != execution_id:
+                raise Refused('revision history unavailable')
+            return attempt.status
+
+    def _stream_view(self, ex):
+        s, h = ex.stream, self._native
+        selected = h is not None and h.key == ex.status.execution_id and s.selected is not None
+        ref = h.feedback if selected else None
+        pending = self._stream_attempts.get((s.owner, s.pending))
+        return StreamView(ex.status, s.opened.model_token, s.opened.scene_token,
+                          s.opened.stream_policy_id,
+                          h.id if ref else None, ref['revision'] if ref else None,
+                          ref['phase'] if ref else None,
+                          h.protected_until if ref else None,
+                          float(h.trajectory.times[-1]) if ref else None,
+                          h.terminal if ref else None, s.pending,
+                          pending.status.revision if pending else None, s.anchor)
+
+    def _stream_retry(self, session, request):
+        self._owns(session)
+        if not self.extensions:
+            raise Refused('stream/1 requires native reference and trusted admission')
+        old = self._stream_attempts.get((session, request.request_id))
+        if old is not None and codec.encode(old.request) != codec.encode(request):
+            raise Refused('request_id already used with different content')
+        return old
+
+    def _stream_slot(self, session, sequence, kind):
+        marks = self._stream_marks.setdefault(session, [0, 0])
+        if sequence <= marks[kind]:
+            raise Refused('stale sequence or evicted history')
+        if self._stream_job is not None:
+            raise Refused('admission worker busy; no queued intents')
+        return marks
+
+    def _stream_facts_error(self, ex, facts):
+        s = ex.stream
+        if self.controller.mode_law != 'joint':
+            return 'stream requires joint-impedance mode'
+        if self.controller.executor.payload_mass_kg != 0.:
+            return 'transient PC compensation payload must be zero for stream/1'
+        if facts != s.facts or not facts.empty_load:
+            return 'model/scene/policy/load snapshot changed or transient load is not known zero'
+        if facts.model_token != self.controller.model_token or facts.model_token != s.opened.model_token:
+            return 'stream model differs from bound execution model'
+        if facts.scene_token != s.opened.scene_token or facts.policy.stream_policy_id != s.opened.stream_policy_id:
+            return 'stream scene/policy differs from trusted composition'
+        if s.epoch != (self._owner, self.link.session_id, self._authority.arm_epoch):
+            return 'stream owner/session/ARM epoch changed'
+        kp, kd = s.gains
+        if (not np.array_equal(kp, self.controller.executor.kp)
+                or not np.array_equal(kd, self.controller.executor.kd)):
+            return 'stream gains changed'
+        return ''
+
+    def _open_stream(self, session, request):
+        request = codec.stream_open_from(codec.encode(request))
+        old = self._stream_retry(session, request)
+        if old is not None:
+            return self._stream_view(self._get(old.status.execution_id))
+        marks = self._stream_slot(session, request.open_seq, 0)
+        if self._current() is not None:
+            raise Refused('execution busy; cancel explicitly before opening another stream')
+        facts = self._stream_admission.snapshot()
+        eid = f'{self.instance_id}.{next(self._ids)}.{uuid.uuid4().hex[:8]}'
+        at = self.now()
+        receipt = Receipt(eid, request.request_id, self.instance_id, Phase.REQUESTED, at)
+        stream = _Stream(session, request, facts,
+                         (session, self.link.session_id, self._authority.arm_epoch),
+                         tuple(x.copy() for x in self._profile_gains), pending=request.request_id)
+        ex = _Execution(request.as_request(), ExecutionStatus.start(receipt), [receipt], stream=stream)
+        attempt = self._new_attempt(ex, request, request.initial, at)
+        self._executions[eid] = ex
+        self._stream_attempts[session, request.request_id] = attempt
+        marks[0] = request.open_seq
+        self._queue_stream_check(ex, attempt)
+        return self._stream_view(ex)  # worker results only applied on a later loop tick
+
+    def _new_attempt(self, ex, request, curve, at, *, cut=0., terminal=False):
+        deadline = at.ns + int(ex.stream.facts.policy.max_candidate_age_s * 1e9)
+        if request.admit_by is not None:
+            deadline = min(deadline, request.admit_by.ns)
+        expected = request.expected_revision if isinstance(request, StreamRevision) else None
+        status = RevisionStatus(ex.status.execution_id, request.request_id, expected,
+                                1 if expected is None else expected+1, Phase.REQUESTED,
+                                SelectionState.NOT_REQUESTED, at)
+        return _Attempt(request, status, curve, ex.stream.facts, deadline, cut, terminal)
+
+    def _stream_anchor(self, session, execution_id):
+        self._owns(session)
+        ex = self._stream_get(session, execution_id)
+        s, h, now = ex.stream, self._native, self.now()
+        if ex.status.terminal or s.pending is not None or h.busy or h.key != execution_id:
+            raise Refused('stream candidate slot unavailable')
+        if not h.selected or h.terminal or self._state.validity is not Validity.VALID:
+            raise Refused('stream is stale, unselected or terminal')
+        if s.anchor is not None and s.anchor.expires_at.ns > now.ns:
+            return s.anchor
+        policy, curve = s.facts.policy, h.trajectory
+        minimum = h.point.time + policy.min_commit_lead_s + policy.max_candidate_age_s
+        eligible = np.flatnonzero((curve.times >= h.protected_until) & (curve.times > minimum))
+        if not len(eligible):
+            raise Refused('no eligible whole-segment cut in selected reference')
+        i = int(eligible[0])
+        s.anchor = SpliceAnchor(uuid.uuid4().hex, h.revision, float(curve.times[i]),
+                                tuple(curve.positions[i]), tuple(curve.velocities[i]), now,
+                                Stamp(now.ns + int(policy.max_candidate_age_s*1e9), Clock.PC, self.domain))
+        return s.anchor
+
+    def _revise_stream(self, session, request):
+        request = codec.stream_revision_from(codec.encode(request))
+        old = self._stream_retry(session, request)
+        if old is not None:
+            return old.status
+        ex = self._stream_get(session, request.execution_id)
+        marks = self._stream_slot(session, request.proposal_seq, 1)
+        s, h, at = ex.stream, self._native, self.now()
+        if ex.status.terminal or s.pending is not None or h.busy or h.key != request.execution_id:
+            raise Refused('stream candidate slot unavailable')
+        anchor = s.anchor
+        if (anchor is None or anchor.anchor_id != request.anchor_id or anchor.expires_at.ns <= at.ns
+                or request.expected_revision != anchor.expected_revision or h.revision != request.expected_revision):
+            raise Refused('anchor is missing, consumed, expired or belongs to another revision')
+        # Curve validity is admission work: accepted intent consumes its challenge
+        # and sequence even when splice/scene/limit checks subsequently refuse it.
+        attempt = self._new_attempt(ex, request, request.suffix, at,
+                                    cut=anchor.cut_phase, terminal=request.terminal)
+        attempt.deadline_ns = min(attempt.deadline_ns, anchor.expires_at.ns)
+        self._stream_attempts[session, request.request_id] = attempt
+        s.anchor, s.pending = None, request.request_id
+        marks[1] = request.proposal_seq
+        try:
+            attempt.curve = h.splice(request.suffix, cut=anchor.cut_phase,
+                                     expected_revision=request.expected_revision)
+        except ValueError as exc:
+            self._stream_fail(ex, attempt, str(exc))
+        else:
+            self._queue_stream_check(ex, attempt)
+        return attempt.status
+
+    def _queue_stream_check(self, ex, attempt):
+        request, state = attempt.request, self._state
+        reason = self._stream_facts_error(ex, self._stream_admission.snapshot())
+        reason = reason or admission_refusal(replace(ex.request, admit_by=request.admit_by), self.identity, self.capabilities,
+                                             self._authority, now=self.now(),
+                                             model_token=self.controller.model_token)
+        if isinstance(request, StreamRevision) and request.scene_token != ex.stream.facts.scene_token:
+            reason = reason or 'revision scene differs from stream'
+        if request.admit_by is not None and request.admit_by.domain != self.domain:
+            reason = reason or 'deadline belongs to another PC clock'
+        if state.validity is not Validity.VALID or state.q is None or state.dq is None:
+            reason = reason or 'fresh finite position/velocity required'
+        curve, policy = attempt.curve, attempt.facts.policy
+        bounds = self.controller.execution_policy
+        if any(getattr(bounds, name) is None for name in
+               ('position_lower', 'position_upper', 'velocity_limits', 'acceleration_limits')):
+            reason = reason or 'stream requires explicit complete motion limits'
+        phase = 0. if isinstance(request, StreamOpen) else self._native.point.time
+        if curve.times[-1] - phase > policy.max_future_s:
+            reason = reason or 'candidate exceeds stream future budget'
+        if not reason:
+            kp, kd = ex.stream.gains
+            plan = dict(times=curve.times, positions=curve.positions, velocities=curve.velocities, kp=kp, kd=kd)
+            start = state.q if isinstance(request, StreamOpen) else curve.positions[0]
+            reason = self.controller.execution_policy.plan_error(plan, start, len(self.joints))
+            if isinstance(request, StreamOpen):
+                tolerance = np.asarray(policy.start_velocity_tolerance_rad_s)
+                if tolerance.shape != state.dq.shape or np.any(np.abs(state.dq-curve.velocities[0]) > tolerance):
+                    reason = reason or 'stream start velocity mismatch'
+        # Even immediate admission refusal is completed asynchronously so the
+        # bounded open reply always represents REQUESTED allocation.
+        def check():
+            return reason or self._stream_admission.check(curve, attempt.facts)
+        self._stream_job = (ex.status.execution_id, request.request_id,
+                            self._stream_worker.submit(check))
+
+    def _stream_fail(self, ex, attempt, reason, *, refused=False, expired=False):
+        phase = Phase.EXPIRED if expired and attempt.status.phase is Phase.ADMITTED else Phase.REJECTED
+        if attempt.upload_started and ex.stream.selected is not None:
+            # A refused COMMIT can leave the sealed upload in the non-RT slot.
+            # Clear that unselected candidate before allowing another revision.
+            self._native.abort_candidate()
+        attempt.status = replace(attempt.status, phase=phase, reason=reason, at=self.now(),
+                                 selection_state=SelectionState.REFUSED if refused else attempt.status.selection_state)
+        ex.stream.pending = None
+        self._native_pending = None
+        if ex.stream.selected is None and not ex.status.terminal:
+            self._receipt(ex, phase, reason)
+            if self.controller.current_plan_id == ex.status.execution_id:
+                self._drop_staged(ex, reason)
+
+    def _stream_abort(self, session, execution_id, request_id):
+        self._owns(session)
+        ex = self._stream_get(session, execution_id)
+        attempt = self._stream_attempts.get((session, request_id))
+        if attempt is None or attempt.status.execution_id != execution_id:
+            raise Refused('revision history unavailable')
+        if attempt.status.selection_state is not SelectionState.NOT_REQUESTED:
+            return attempt.status  # PENDING remains structurally uncertain; no mutation
+        if ex.stream.pending != request_id:
+            return attempt.status
+        if attempt.upload_started:
+            self._native.abort_candidate()
+        phase = Phase.REJECTED if attempt.status.phase is Phase.REQUESTED else Phase.CANCELLED
+        attempt.status = replace(attempt.status, phase=phase, at=self.now(), reason='candidate aborted')
+        ex.stream.pending = None
+        if ex.stream.selected is None and not ex.status.terminal:
+            self._receipt(ex, phase, 'candidate aborted')
+            self._drop_staged(ex, 'candidate aborted')
+        return attempt.status
+
+    def _stream_select(self, ex):
+        # No COMMIT here: upload and final snapshot recheck progress on ticks.
+        self._native_pending = ex.status.execution_id
+
+    def _stream_step(self):
+        h = self._native
+        if self._stream_job is not None and self._stream_job[2].done():
+            eid, rid, job = self._stream_job
+            self._stream_job = None
+            ex = self._executions.get(eid)
+            if ex is not None and not ex.status.terminal and ex.stream.pending == rid:
+                attempt = self._stream_attempts[ex.stream.owner, rid]
+                try:
+                    reason = job.result() or self._stream_facts_error(ex, self._stream_admission.snapshot())
+                except Exception as exc:
+                    reason = f'trusted admission failed: {exc}'
+                if reason or self.now().ns >= attempt.deadline_ns:
+                    self._stream_fail(ex, attempt, reason or 'admission deadline expired')
+                else:
+                    if isinstance(attempt.request, StreamOpen):
+                        q = attempt.curve
+                        kp, kd = ex.stream.gains
+                        self.controller.on_plan(pack_plan(
+                            plan_id=eid, phase=rid, gated=True, times=q.times, positions=q.positions,
+                            velocities=q.velocities, kp=kp, kd=kd, model_token=ex.request.model_token))
+                        self._pump_controller()
+                        if ex.status.phase is not Phase.ADMITTED:
+                            self._stream_fail(ex, attempt, ex.status.reason or 'controller refused')
+                            return True
+                    attempt.status = replace(attempt.status, phase=Phase.ADMITTED, at=self.now())
+                    if isinstance(attempt.request, StreamRevision) or ex.request.start is Start.ON_ADMIT:
+                        self._stream_select(ex)
+        current = self._current()
+        ex = self._executions.get(current.execution_id) if current else None
+        if ex is None or ex.stream is None:
+            return False
+        s, eid = ex.stream, ex.status.execution_id
+        if s.anchor is not None and s.anchor.expires_at.ns <= self.now().ns:
+            s.anchor = None  # lifecycle maintenance, never the state read
+        reason = self._stream_facts_error(ex, self._stream_admission.snapshot())
+        if reason:
+            self._cancel_execution(ex, reason)
+            return True
+        if h.key == eid and h.error == 'REFERENCE_UNDERFLOW':
+            if ex.status.phase is Phase.ADMITTED:
+                self._receipt(ex, Phase.SELECTED, reference_id=h.id, reference_revision=h.revision)
+            self._receipt(ex, Phase.FAULTED, 'REFERENCE_UNDERFLOW')
+            for rid in (s.selected, s.pending):
+                failed = self._stream_attempts.get((s.owner, rid))
+                if failed is not None:
+                    selected = failed.status.revision == h.revision
+                    failed.status = replace(failed.status,
+                        phase=Phase.FAULTED if selected else Phase.EXPIRED,
+                        selection_state=SelectionState.SELECTED if selected else SelectionState.REFUSED,
+                        at=self.now(), reason='REFERENCE_UNDERFLOW')
+            self._native_failed = True
+            self._drop_staged(ex, 'REFERENCE_UNDERFLOW')
+            s.pending = s.anchor = None
+            return True
+        attempt = self._stream_attempts.get((s.owner, s.pending))
+        if attempt is not None:
+            pending = attempt.status.selection_state is SelectionState.PENDING
+            if not pending and self.now().ns >= attempt.deadline_ns:
+                self._stream_fail(ex, attempt, 'candidate deadline expired', expired=True)
+                return True
+            if attempt.status.phase is Phase.ADMITTED and self._native_pending == eid:
+                if not attempt.upload_started:
+                    if h.busy:
+                        if h.key != eid:
+                            h.cancel()
+                        return True
+                    try:
+                        if s.selected is None:
+                            h.stage(eid, attempt.curve, stream=True, terminal=False,
+                                    selection_deadline_ns=attempt.deadline_ns)
+                        else:
+                            h.stage_suffix(attempt.curve, cut=attempt.cut,
+                                           expected_revision=attempt.status.expected_revision,
+                                           terminal=attempt.terminal,
+                                           latest_phase=attempt.cut-s.facts.policy.min_commit_lead_s,
+                                           selection_deadline_ns=attempt.deadline_ns)
+                        attempt.upload_started = True
+                        self._native_failed = False
+                    except (ValueError, RuntimeError) as exc:
+                        self._stream_fail(ex, attempt, str(exc))
+                elif h.candidate_selection == 'refused':
+                    self._stream_fail(ex, attempt, h.candidate_error, refused=True,
+                                      expired=h.candidate_result == rtp.REF_LATE)
+                elif h.candidate_error and h.candidate_selection == 'not_requested':
+                    self._stream_fail(ex, attempt, h.candidate_error)
+                elif h.ready:
+                    reason = selection_refusal(self._authority) or self._stream_facts_error(ex, self._stream_admission.snapshot())
+                    if self._state.validity is not Validity.VALID:
+                        reason = reason or 'observation became stale before selection'
+                    if s.selected is None:
+                        reason = reason or self.controller.release_error(eid)
+                        if self._state.dq is None or np.any(np.abs(self._state.dq-attempt.curve.velocities[0]) > np.asarray(s.facts.policy.start_velocity_tolerance_rad_s)):
+                            reason = reason or 'start velocity changed before selection'
+                    if reason:
+                        self._stream_fail(ex, attempt, reason)
+                    else:
+                        attempt.status = replace(attempt.status, selection_state=SelectionState.PENDING, at=self.now())
+                        h.approve()
+                elif (h.candidate_selection == 'selected' and h.key == eid
+                      and h.revision == attempt.status.revision):
+                    attempt.status = replace(attempt.status, phase=Phase.SELECTED,
+                                             selection_state=SelectionState.SELECTED, at=self.now())
+                    s.selected, s.pending = attempt.request.request_id, None
+                    self._native_pending = None
+                    if ex.status.phase is Phase.ADMITTED:
+                        self._receipt(ex, Phase.SELECTED, reference_id=h.id, reference_revision=h.revision)
+                        self.controller.on_control(pack_control_update(execute=eid))
+                        self._pump_controller()
+                    self.controller.select_reference_window(eid, h.trajectory, terminal=h.terminal)
+        selected = self._stream_attempts.get((s.owner, s.selected))
+        if selected is not None and selected.status.phase is Phase.SENT:
+            confirmed = self._tracker.confirmed(h.arm_epoch)
+            if confirmed is not None and epoch_reached(confirmed, selected.sent_seq):
+                selected.status = replace(selected.status, phase=Phase.APPLIED, at=self.now())
+        return True
+
+
     # -- construction ----------------------------------------------------------
     def _build_controller(self) -> ArmController:
         return build_arm_controller(
@@ -165,6 +564,7 @@ class RobotRuntime:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout_s)
+        self._stream_worker.shutdown(wait=False, cancel_futures=True)
         self._tracker.disarm_sent()
         if self._native is not None:
             self._native.close()
@@ -290,6 +690,7 @@ class RobotRuntime:
         # Every op this session queued ran before this one (FIFO), and its
         # connection has ended: nothing can name it again.
         self._closed_sessions.discard(session)
+        self._stream_marks.pop(session, None)
 
     def _abandon(self, reason: str) -> None:
         """Cancel the owner's live executions and hold; stay armed."""
@@ -310,7 +711,9 @@ class RobotRuntime:
 
     def _disarm(self, session: str) -> int:
         self._owns(session)
-        for ex in self._executions.values():
+        for ex in list(self._executions.values()):
+            if ex.stream is not None and not ex.status.terminal:
+                self._cancel_execution(ex, "disarmed")
             if not ex.status.terminal and ex.completed_at is None:
                 ex.cancel_reason = ex.cancel_reason or "disarmed"
         # The controller's own stop path: cancel the leg, then drop authority.
@@ -374,6 +777,13 @@ class RobotRuntime:
     def _release(self, session: str, execution_id: str) -> ExecutionStatus:
         self._owns(session)
         ex = self._get(execution_id)
+        if ex.stream is not None:
+            if ex.status.phase is not Phase.ADMITTED:
+                raise Refused('stream release requires ADMITTED')
+            if ex.request.start is not Start.ON_RELEASE:
+                raise Refused('stream starts on admission')
+            self._stream_select(ex)
+            return ex.status
         if ex.status.phase is not Phase.ADMITTED:
             return ex.status  # already selected or ended: release is idempotent
         if ex.request.start is not Start.ON_RELEASE:
@@ -412,6 +822,17 @@ class RobotRuntime:
 
     def _cancel_execution(self, ex: _Execution, reason: str) -> None:
         ex.cancel_reason = reason
+        if ex.stream is not None:
+            ex.stream.anchor = None
+            if ex.status.phase is Phase.REQUESTED:
+                self._receipt(ex, Phase.REJECTED, reason)
+            elif not ex.status.terminal:
+                self._receipt(ex, Phase.CANCELLED, reason)
+            for (owner, _), attempt in self._stream_attempts.items():
+                if owner == ex.stream.owner and attempt.status.execution_id == ex.status.execution_id:
+                    phase = Phase.REJECTED if attempt.status.phase is Phase.REQUESTED else Phase.CANCELLED
+                    attempt.status = replace(attempt.status, phase=phase, at=self.now(), reason=reason)
+            ex.stream.pending = None
         self._retire_native(ex.status.execution_id)
         if self.controller.current_plan_id == ex.status.execution_id:
             self.controller.on_control(pack_control_update(
@@ -439,11 +860,22 @@ class RobotRuntime:
         self._cv.notify_all()
 
     def _prune(self) -> None:
-        """Forget the oldest terminal executions beyond RETAINED."""
-        excess = len(self._executions) - RETAINED
-        if excess > 0:
-            for eid in [e for e, x in self._executions.items() if x.status.terminal][:excess]:
-                self._by_request.pop(self._executions.pop(eid).request.request_id, None)
+        """One bounded history budget across executions and stream attempts."""
+        def excess():
+            return len(self._executions) + len(self._stream_attempts) > RETAINED
+        protected = {(ex.stream.owner, rid) for ex in self._executions.values()
+                     if ex.stream is not None and not ex.status.terminal
+                     for rid in (ex.stream.pending, ex.stream.selected, ex.request.request_id)}
+        for key, attempt in list(self._stream_attempts.items()):
+            if excess() and key not in protected and attempt.status.phase is not Phase.REQUESTED:
+                self._stream_attempts.pop(key)
+        for eid, ex in list(self._executions.items()):
+            if excess() and ex.status.terminal:
+                self._executions.pop(eid)
+                self._by_request.pop(ex.request.request_id, None)
+                for key, attempt in list(self._stream_attempts.items()):
+                    if attempt.status.execution_id == eid:
+                        self._stream_attempts.pop(key)
 
     def _pump_controller(self, *, sent_for: str | None = None, reconcile: bool = True) -> None:
         """Forward the controller's commands to the plant and turn its events
@@ -471,6 +903,13 @@ class RobotRuntime:
             if ex is not None and ex.status.phase is Phase.SELECTED and ex.first_seq is None:
                 ex.first_seq, ex.epoch = sent[0], int(self.link.motor_health()["arm_epoch"])
                 self._receipt(ex, Phase.SENT, command_seq=sent[0], arm_epoch=ex.epoch)
+        if sent_for is not None and sent:
+            ex = self._executions.get(sent_for)
+            if ex is not None and ex.stream is not None and ex.stream.selected:
+                attempt = self._stream_attempts.get((ex.stream.owner, ex.stream.selected))
+                if attempt is not None and attempt.status.phase is Phase.SELECTED:
+                    attempt.sent_seq = sent[0]
+                    attempt.status = replace(attempt.status, phase=Phase.SENT, at=self.now())
         if reconcile:
             self._reconcile()
 
@@ -484,6 +923,8 @@ class RobotRuntime:
                 self._receipt(ex, Phase.REJECTED, event.get("reason") or "controller refused")
                 return
             self._receipt(ex, Phase.ADMITTED)
+            if ex.stream is not None:
+                return  # asynchronous stream admission owns release
             old = ex.request.supersedes and self._executions.get(ex.request.supersedes)
             if old and not old.status.terminal:
                 self._retire_native(old.status.execution_id)
@@ -509,7 +950,11 @@ class RobotRuntime:
             if ex.status.terminal:
                 continue
             if ex.completed_at is not None:
-                if phase is Phase.APPLIED:
+                applied = phase is Phase.APPLIED
+                if ex.stream is not None:
+                    attempt = self._stream_attempts.get((ex.stream.owner, ex.stream.selected))
+                    applied = applied and attempt is not None and attempt.terminal and attempt.status.phase is Phase.APPLIED
+                if applied:
                     self._receipt(ex, Phase.COMPLETED)
                 elif now - ex.completed_at > self.applied_grace_s:
                     self._receipt(ex, Phase.FAULTED, "completed on feedback without plant "
@@ -529,6 +974,8 @@ class RobotRuntime:
         # COMMIT carries a conservative RT-local deadline budget. Once sent,
         # wait for its selection/refusal evidence; PC receipt time is not the
         # selection time and cannot honestly prove EXPIRED.
+        if ex.stream is not None:
+            return False  # stream attempt deadlines and uncertainty are reconciled together
         committing = (self._native is not None and self._native.key == ex.status.execution_id
                       and self._native.selection_requested)
         if ex.status.phase is Phase.ADMITTED and not committing and ex.request.expired(self.now()):
@@ -548,6 +995,8 @@ class RobotRuntime:
         h, c = self._native, self.controller
         state, rx = sample
         h.poll(state, rx)
+        if self._stream_step():
+            return
         if state is None or not state.armed:
             return
         if state.arm_epoch != self._native_epoch:

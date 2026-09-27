@@ -37,7 +37,19 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
     if op == "hello":
         return dict(session=session, contract_version=CONTRACT_VERSION,
                     identity=enc(runtime.identity), capabilities=enc(runtime.capabilities),
-                    now=enc(runtime.now()))
+                    now=enc(runtime.now()), extensions=runtime.extensions)
+    if op.startswith('stream_'):
+        if runtime.extensions.get('stream') != 1:
+            raise Refused('stream/1 is unavailable')
+        if op == 'stream_open':
+            return enc(runtime.open_stream(session, codec.stream_open_from(args['request'])))
+        if op == 'stream_revise':
+            return enc(runtime.revise_stream(session, codec.stream_revision_from(args['request'])))
+        methods = {'stream_state': 'stream_state', 'stream_anchor': 'stream_anchor',
+                   'stream_revision': 'stream_revision', 'stream_abort': 'abort_stream_revision'}
+        if op in methods:
+            extra = [str(args['request_id'])] if op in ('stream_revision', 'stream_abort') else []
+            return enc(getattr(runtime, methods[op])(session, str(args['execution_id']), *extra))
     if op == "now":
         return enc(runtime.now())
     if op == "state":
