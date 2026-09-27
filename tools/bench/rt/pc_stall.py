@@ -1,15 +1,14 @@
-"""Offline counterpart of the CTRL-034 PC-stall injection (fake backend only).
+"""CTRL-034 offline counterpart: PC-stall injection and the retire-on-expiry policy.
 
-Pre-registers what the hardware trial must show: with valid_for/phase_window at
-the 50 ms ceiling, a 30 ms PC send-pause never expires the reference envelope, a
-60/150 ms pause expires it at ~50 ms and the arm holds its measured position
-with zero feedforward until a fresh envelope arrives, and none of them latches
-CMD_LOST because fault_ms is 1000 ms.
+Decision (a): once a native reference's dynamics envelope expires, that
+reference is FINISHED. The arm holds its measured position with the captured
+gains and zero feedforward; the running reference is RETIRED
+(REFERENCE_CANCELLED) with a distinct journal cause; envelopes for it are never
+re-admitted; and motion resumes only through a NEW reference the PC plans from
+the measured position. The PC recovery budget is `fault_ms - expiry`.
 
-Runs one fake `arm_rt_server` with --enable-reference, --hold-ms 100 and
---fault-ms 1000 (the deployed defaults; the unit passes neither flag) and
---state-hz 1000 so the hold duration is measurable to ~1 ms. No hardware, no
-deployment, no service action.
+Fake backend only, one `arm_rt_server --enable-reference --hold-ms 100
+--fault-ms 1000 --state-hz 1000`. No hardware, no deployment, no service action.
 """
 from __future__ import annotations
 
@@ -26,15 +25,18 @@ import numpy as np
 
 from arm_control.motion import JointTrajectory
 from arm_control.plants.remote_rt import protocol as p
-from arm_control.plants.remote_rt.client import RtBackend, RtConfig
+from arm_control.plants.remote_rt.reference import ReferenceHorizon
+from arm_control.plants.remote_rt.client import RtBackend, RtConfig, RtLinkError
 
-STALLS_MS = (30, 60, 150)
 FRESHNESS_MS = 50      # min(hold_ms, valid_for_us); valid_for/phase_window = 50 ms
 HOLD_MS, FAULT_MS = 100, 1000
+SPEED = 0.4            # planner speed cap, rad/s
 POLL_S = 0.001
-# Expected hold duration is stall - FRESHNESS_MS; allow for one pump period and
-# one state frame at each edge rather than pretending to sub-ms precision.
 SLACK_MS = 25
+# The arm holds the captured measured position; the retired reference would
+# have advanced by SPEED * elapsed. A resume jump is therefore ~SPEED * elapsed,
+# and the resume assertion below bounds the observed step at half of that.
+STEP_LIMIT = 0.05
 
 
 def unused_port(kind):
@@ -49,12 +51,19 @@ def wait_for(pred, timeout=5.0):
         out = pred()
         if out:
             return out
-        time.sleep(0.005)
+        time.sleep(0.002)
     raise AssertionError('timed out')
 
 
+def ramp(q0, duration, speed=SPEED):
+    q0 = np.asarray(q0, float)
+    q = np.stack([q0, q0 + speed * duration])
+    v = np.full((2, 3), speed)
+    return JointTrajectory(np.array([0.0, duration]), q, v)
+
+
 class Pump:
-    """Native v7 envelopes only; `pause` is the injected PC stall."""
+    """Native v7 envelopes for whatever reference RT reports; `pause` is the stall."""
 
     def __init__(self, rt):
         self.rt, self.stop = rt, threading.Event()
@@ -76,14 +85,47 @@ class Pump:
                             revision=state.reference['revision'],
                             phase=state.reference['phase'], sample_received_at=rx,
                             valid_for_s=.05, phase_window_s=.05)
-                except (ValueError, OSError) as exc:
+                except (ValueError, OSError, RtLinkError) as exc:
                     self.errors.append(str(exc))
-            self.stop.wait(.005)
+            self.stop.wait(.002)
 
     def close(self):
         self.stop.set()
         self.thread.join(2)
         assert not self.errors, self.errors
+
+
+class Recorder:
+    """1 ms samples of what the servo selected, for edge analysis."""
+
+    def __init__(self, rt):
+        self.rt, self.stop = rt, threading.Event()
+        self.rows = []
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while not self.stop.is_set():
+            state = self.rt.latest_state()[0]
+            if state is not None:
+                ref = state.reference or {}
+                self.rows.append({
+                    't': time.monotonic(), 'q_cmd': tuple(state.q_cmd),
+                    'qd_cmd': tuple(state.qd_cmd), 'holding': bool(state.holding),
+                    'status': ref.get('status'), 'age_us': ref.get('envelope_age_us'),
+                    'faulted': bool(state.faulted), 'fault_code': state.fault_code,
+                })
+            self.stop.wait(POLL_S)
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(2)
+
+    def mark(self):
+        return len(self.rows)
+
+    def since(self, mark):
+        return self.rows[mark:]
 
 
 @contextmanager
@@ -93,100 +135,215 @@ def server(binary):
             '--joint-names', 'j0,j1,j2', '--udp-port', str(udp), '--tcp-port', str(tcp),
             '--bind', '127.0.0.1', '--hold-ms', str(HOLD_MS), '--fault-ms', str(FAULT_MS),
             '--state-hz', '1000', '--enable-reference']
-    with tempfile.TemporaryFile(mode='w+') as log:
-        proc = subprocess.Popen(argv, stdout=log, stderr=log)
-        rt = RtBackend(RtConfig(host='127.0.0.1', udp_port=udp, tcp_port=tcp,
-                                instance_id='fake'), ['j0', 'j1', 'j2'])
-        try:
-            time.sleep(.2)
-            rt.open()
-            assert rt.negotiate_reference('pc-stall-fixture-model')
-            rt.enable_all()
-            yield rt
-        except BaseException:
-            log.seek(0)
-            print(log.read())
-            raise
-        finally:
-            rt.close()
-            proc.terminate()
-            proc.wait(3)
+    log = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.log')
+    proc = subprocess.Popen(argv, stdout=log, stderr=log)
+    rt = RtBackend(RtConfig(host='127.0.0.1', udp_port=udp, tcp_port=tcp,
+                            instance_id='fake'), ['j0', 'j1', 'j2'])
+    try:
+        time.sleep(.2)
+        rt.open()
+        assert rt.negotiate_reference('pc-stall-fixture-model')
+        rt.enable_all()
+        yield rt, log.name
+    except BaseException:
+        log.flush()
+        print(Path(log.name).read_text()[-4000:])
+        raise
+    finally:
+        rt.close()
+        proc.terminate()
+        proc.wait(3)
+        log.close()
 
 
-def commit_running(rt, reference_id):
-    load = rt.upload_reference(
-        JointTrajectory([0, 3.0], np.array([[0] * 3, [.1] * 3]), np.zeros((2, 3))),
-        reference_id=reference_id, terminal=False)
+def commit(rt, reference_id, q0, *, duration=3.0):
+    # Terminal so a reference can reach END, which is the state a new reference
+    # may replace without a cancel (used by the COMMIT->gap negative case).
+    load = rt.upload_reference(ramp(q0, duration), reference_id=reference_id,
+                               terminal=True)
     rt.commit_reference(load, reference_id=reference_id)
     return wait_for(lambda: (rt.latest_state()[0] or None)
                     if (rt.latest_state()[0] and rt.latest_state()[0].reference
+                        and rt.latest_state()[0].reference['reference_id'] == reference_id
                         and rt.latest_state()[0].reference['status'] == p.REFERENCE_RUNNING)
                     else None)
 
 
-def inject(rt, pump, stall_ms):
-    """Pause the PC stream for `stall_ms` and measure the hold it causes."""
+def hold_edge(rows, t0):
+    """(first holding sample, ms after t0) or (None, None)."""
+    for row in rows:
+        if row['holding']:
+            return row, (row['t'] - t0) * 1000.0
+    return None, None
+
+
+def inject(rt, pump, recorder, stall_ms, *, resume):
+    """Pause the PC stream, optionally resume, and return (t0, rows)."""
     assert not rt.latest_state()[0].holding, 'already holding before the stall'
+    mark, t0 = recorder.mark(), time.monotonic()
     pump.pause = True
-    t0 = time.monotonic()
-    released = False
-    first = last = None
-    faulted = False
-    while True:
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        if not released and elapsed_ms >= stall_ms:
-            pump.pause = False
-            released = True
-        state = rt.latest_state()[0]
-        if state is not None:
-            faulted = faulted or state.faulted
-            if state.holding:
-                if first is None:
-                    first = elapsed_ms
-                last = elapsed_ms
-        if released and elapsed_ms >= stall_ms + 4 * SLACK_MS:
-            break
-        time.sleep(POLL_S)
-    return first, last, faulted
+    if resume:
+        time.sleep(stall_ms / 1000.0)
+        pump.pause = False
+        time.sleep(0.25)
+    return t0, recorder.since(mark)
+
+
+def horizon_expiry_report(binary):
+    """Item 2: the supervisor-facing horizon reports an RT expiry retire as a
+    failed segment (REFERENCE_EXPIRED) and never plans a continuation; a LOCAL
+    cancel is not misreported as an expiry."""
+    command = dict(position=np.zeros(3), velocity=np.zeros(3),
+                   torque=np.zeros(3), kp=np.ones(3) * 2, kd=np.ones(3) * .1)
+
+    def run_to_selection(rt, h):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (h.selected and not h.error):
+            state, received = rt.latest_state()
+            h.poll(state, received)
+            if h.ready and not h.selected:
+                h.approve()
+            if h.selected:
+                rt.apply_reference_envelope(
+                    command, reference_id=h.id, revision=h.feedback['revision'],
+                    phase=h.point.time, sample_received_at=received,
+                    valid_for_s=.05, phase_window_s=.05)
+            time.sleep(0.005)
+        assert h.selected and not h.error, h.error
+
+    with server(binary) as (rt, _log):
+        h = ReferenceHorizon(rt)
+        try:
+            h.stage("expiry", ramp(np.zeros(3), 2.0), stream=True)
+            run_to_selection(rt, h)
+            # Stop feeding: RT retires the reference when the envelope expires.
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not h.error:
+                h.poll(*rt.latest_state()[:2])
+                time.sleep(0.005)
+            assert h.error == 'REFERENCE_EXPIRED', h.error
+            assert not h.selected
+            print('  report  unsolicited RT retire -> horizon.error=REFERENCE_EXPIRED')
+        finally:
+            h.close()
+    with server(binary) as (rt, _log):
+        h = ReferenceHorizon(rt)
+        try:
+            h.stage("local-cancel", ramp(np.zeros(3), 2.0), stream=True)
+            run_to_selection(rt, h)
+            h.cancel()                     # OUR cancel, not an expiry
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and h.selected:
+                h.poll(*rt.latest_state()[:2])
+                time.sleep(0.005)
+            assert not h.selected and h.error != 'REFERENCE_EXPIRED', h.error
+            print('  report  local cancel -> not reported as an expiry')
+        finally:
+            h.close()
 
 
 def main(binary):
-    expected = {30: (False, 0.0), 60: (True, 60.0 - FRESHNESS_MS),
-                150: (True, 150.0 - FRESHNESS_MS)}
-    with server(binary) as rt:
+    with server(binary) as (rt, logpath):
+        recorder = Recorder(rt)
         pump = Pump(rt)
         try:
-            commit_running(rt, 1)
+            # ---- S1: 30 ms never expires, never retires --------------------
+            wait_for(lambda: commit(rt, 1, np.zeros(3)))
             wait_for(lambda: not rt.latest_state()[0].holding)
-            rows = []
-            for stall in STALLS_MS:
-                first, last, faulted = inject(rt, pump, stall)
-                want_hold, want_ms = expected[stall]
-                state = rt.latest_state()[0]
-                assert state.reference['status'] == p.REFERENCE_RUNNING, state.reference
-                assert not faulted, f'{stall} ms stall latched CMD_LOST (fault_ms={FAULT_MS})'
-                if want_hold:
-                    assert first is not None, f'{stall} ms stall produced no hold'
-                    held_ms = last - first
-                    assert abs(first - FRESHNESS_MS) <= SLACK_MS, \
-                        f'hold began at {first:.1f} ms, expected ~{FRESHNESS_MS}'
-                    assert abs(held_ms - want_ms) <= 2 * SLACK_MS, \
-                        f'{stall} ms stall held {held_ms:.1f} ms, expected ~{want_ms}'
-                    rows.append((stall, f'hold {first:.0f}..{last:.0f} ms'))
-                else:
-                    assert first is None, \
-                        f'{stall} ms stall (< {FRESHNESS_MS} ms ceiling) caused a hold'
-                    rows.append((stall, 'no hold'))
-                # Tracking must resume before the next stall.
-                wait_for(lambda: not rt.latest_state()[0].holding)
+            t0, rows = inject(rt, pump, recorder, 30, resume=True)
+            edge, at_ms = hold_edge(rows, t0)
+            assert edge is None, f'30 ms stall caused a hold at {at_ms:.0f} ms'
+            state = rt.latest_state()[0]
+            assert state.reference['status'] == p.REFERENCE_RUNNING, state.reference
+            assert not state.faulted
+            print('  S1   30 ms -> no hold, reference still RUNNING')
+
+            # ---- S2/S3: expire at ~50 ms, RETIRE, no resume, no jump -------
+            for stall_ms, ref_id, tag in ((60, 2, 'S2'), (150, 3, 'S3')):
+                t0, rows = inject(rt, pump, recorder, stall_ms, resume=True)
+                edge, at_ms = hold_edge(rows, t0)
+                assert edge is not None, f'{stall_ms} ms stall produced no hold'
+                assert abs(at_ms - FRESHNESS_MS) <= SLACK_MS, \
+                    f'hold began at {at_ms:.0f} ms, expected ~{FRESHNESS_MS}'
+                # The wire status is the existing REFERENCE_CANCELLED; the
+                # journal (checked below) is what names the expiry cause.
+                wait_for(lambda: rt.latest_state()[0].reference['status']
+                         == p.REFERENCE_CANCELLED, timeout=2)
+                q_held = np.array(edge['q_cmd'])
+                after = rt.latest_state()[0]
+                assert after.holding and not after.faulted, after.flags
+                assert np.allclose(after.q_cmd, q_held, atol=STEP_LIMIT), (
+                    'q_cmd moved after the retire: the old reference resumed')
+                # A NEW reference from the MEASURED position resumes without a
+                # setpoint step.
+                mark = recorder.mark()
+                commit(rt, ref_id, np.array(rt.latest_state()[0].q), duration=2.0)
+                wait_for(lambda: not rt.latest_state()[0].holding, timeout=3)
+                running = [r for r in recorder.since(mark)
+                           if r['status'] == p.REFERENCE_RUNNING]
+                steps = [abs(b['q_cmd'][0] - a['q_cmd'][0])
+                         for a, b in zip(running, running[1:])]
+                # If the RETIRED reference had resumed, q_cmd would jump by
+                # SPEED x elapsed (~0.12-0.16 rad here). What remains is the
+                # measured-position drift of the soft hold between the capture
+                # and the new commit, so bound the step at half of that jump.
+                jump_if_resumed = SPEED * (stall_ms + 250) / 1000.0
+                assert steps and max(steps) <= 0.5 * jump_if_resumed, \
+                    f'{tag} {stall_ms} ms: resume step {max(steps, default=0):.4f} rad '\
+                    f'(old-reference resume would be ~{jump_if_resumed:.3f})'
+                assert not rt.latest_state()[0].faulted
+                print(f'  {tag}  {stall_ms:>3} ms -> hold at {at_ms:.0f} ms, '
+                      f'CANCELLED, resumes only from a new measured-state commit')
+
+            # ---- Negative: the COMMIT -> first-envelope gap never retires --
+            # A new reference may replace one that has reached its terminal END.
+            # It then has NO accepted envelope yet, so the guard
+            # `held_for_active` is false and a stale-free gap is not an expiry.
+            # Without that guard every new reference would be retired between
+            # COMMIT and its first envelope.
+            wait_for(lambda: rt.latest_state()[0].reference['status']
+                     == p.REFERENCE_END, timeout=5)
+            gap_id = rt.latest_state()[0].reference['reference_id'] + 1
+            pump.pause = True                       # no envelope for the new reference
+            commit(rt, gap_id, np.array(rt.latest_state()[0].q), duration=2.0)
+            time.sleep(0.2)                         # well past the 50 ms ceiling
+            gap_state = rt.latest_state()[0]
+            assert gap_state.reference['status'] == p.REFERENCE_RUNNING, gap_state.reference
+            assert not gap_state.faulted
+            pump.pause = False
+            wait_for(lambda: not rt.latest_state()[0].holding, timeout=3)
+            print('  gap  COMMIT->first envelope -> RUNNING (not retired); '
+                  'revision switch covered by reference_horizon.py')
+
+            # ---- S4: no new commit -> CMD_LOST at the recovery budget ------
+            wait_for(lambda: not rt.latest_state()[0].holding)
             assert rt.latest_state()[0].reference['status'] == p.REFERENCE_RUNNING
-            assert not rt.latest_state()[0].faulted
-            for stall, what in rows:
-                print(f'  {stall:>3} ms -> {what}')
+            mark, t0 = recorder.mark(), time.monotonic()
+            pump.pause = True                       # never resumed
+            wait_for(lambda: rt.latest_state()[0].faulted, timeout=4)
+            # Let the 1 ms recorder capture the fault row before slicing.
+            wait_for(lambda: any(r['faulted'] for r in recorder.since(mark)), timeout=1)
+            rows = recorder.since(mark)
+            hold_row, _ = hold_edge(rows, t0)
+            faulted_row = next((r for r in rows if r['faulted']), None)
+            assert hold_row is not None and faulted_row is not None
+            assert faulted_row['fault_code'] == p.FAULT_CMD_LOST, faulted_row
+            budget_ms = (faulted_row['t'] - hold_row['t']) * 1000.0
+            assert abs(budget_ms - (FAULT_MS - FRESHNESS_MS)) <= 2 * SLACK_MS, \
+                f'CMD_LOST {budget_ms:.0f} ms after expiry, expected ~{FAULT_MS - FRESHNESS_MS}'
+            print(f'  S4  no commit -> CMD_LOST {budget_ms:.0f} ms after the '
+                  f'{FRESHNESS_MS} ms expiry (budget {FAULT_MS - FRESHNESS_MS} ms)')
+
+            # The retire is distinguishable in the evidence by its cause.
+            journal = Path(logpath).read_text()
+            assert 'reference envelope expired' in journal, journal[-2000:]
+            print('  journal names "reference envelope expired" as the cause')
         finally:
+            recorder.close()
             pump.close()
-    print(f'pc stall: {len(STALLS_MS)} injections PASS '
-          f'(ceiling {FRESHNESS_MS} ms, hold_ms {HOLD_MS}, fault_ms {FAULT_MS})')
+    horizon_expiry_report(binary)
+    print(f'pc stall: S1-S4 PASS (ceiling {FRESHNESS_MS} ms, hold {HOLD_MS}, '
+          f'fault {FAULT_MS}, speed {SPEED} rad/s)')
 
 
 if __name__ == '__main__':

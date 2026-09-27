@@ -155,7 +155,9 @@ def main(binary):
                 wait_state(rt, lambda s: s.reference['phase']>.15 and not s.holding)
                 setattr(pump, invalid, True)
                 held = wait_state(rt, lambda s: s.holding)
-                assert not held.faulted and held.reference['status']==p.REFERENCE_RUNNING
+                # CTRL-034 decision (a): an expired envelope RETIRES the
+                # reference; the arm holds and only a new reference resumes it.
+                assert not held.faulted and held.reference['status']==p.REFERENCE_CANCELLED
                 fault = wait_state(rt, lambda s: s.faulted)
                 assert fault.fault_code==p.FAULT_CMD_LOST
             finally:

@@ -547,10 +547,10 @@ class RobotRuntime:
         if reason:
             self._cancel_execution(ex, reason)
             return True
-        if h.key == eid and h.error == 'REFERENCE_UNDERFLOW':
+        if h.key == eid and h.error in ('REFERENCE_UNDERFLOW', 'REFERENCE_EXPIRED'):
             if ex.status.phase is Phase.ADMITTED:
                 self._receipt(ex, Phase.SELECTED, reference_id=h.id, reference_revision=h.revision)
-            self._receipt(ex, Phase.FAULTED, 'REFERENCE_UNDERFLOW')
+            self._receipt(ex, Phase.FAULTED, h.error)
             for rid in (s.selected, s.pending):
                 failed = self._stream_attempts.get((s.owner, rid))
                 if failed is not None:
@@ -558,9 +558,9 @@ class RobotRuntime:
                     failed.status = replace(failed.status,
                         phase=Phase.FAULTED if selected else Phase.EXPIRED,
                         selection_state=SelectionState.SELECTED if selected else SelectionState.REFUSED,
-                        at=self.now(), reason='REFERENCE_UNDERFLOW')
+                        at=self.now(), reason=h.error)
             self._native_failed = True
-            self._drop_staged(ex, 'REFERENCE_UNDERFLOW')
+            self._drop_staged(ex, h.error)
             s.pending = s.anchor = None
             return True
         attempt = self._stream_attempts.get((s.owner, s.pending))
@@ -1106,11 +1106,13 @@ class RobotRuntime:
             self._native_failed = False
         ex = self._executions.get(h.key)
         if (h.error and ex is not None and not ex.status.terminal
-                and (not h.selected or h.error == 'REFERENCE_UNDERFLOW')):
+                and (not h.selected
+                     or h.error in ('REFERENCE_UNDERFLOW', 'REFERENCE_EXPIRED'))):
             # Reference failure is distinct from a transport/plant fault. In
             # particular, never heal UNDERFLOW with an implicit hold admission.
             self._native_failed = True
-            if ex.status.phase is Phase.ADMITTED and h.error == 'REFERENCE_UNDERFLOW':
+            if (ex.status.phase is Phase.ADMITTED
+                    and h.error in ('REFERENCE_UNDERFLOW', 'REFERENCE_EXPIRED')):
                 self._receipt(ex, Phase.SELECTED, reference_id=h.id,
                               reference_revision=h.revision, arm_epoch=h.arm_epoch)
             failure = Phase.FAULTED

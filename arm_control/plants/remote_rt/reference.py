@@ -291,6 +291,14 @@ class ReferenceHorizon:
                 self.protected_until = self._cut
         if valid and ref['status'] == p.REFERENCE_UNDERFLOW:
             self.error = 'REFERENCE_UNDERFLOW'
+        if (valid and ref['status'] == p.REFERENCE_CANCELLED
+                and not self._interrupt.is_set() and not self.error):
+            # CTRL-034 decision (a): RT RETIRED this reference because its
+            # dynamics envelope expired (the wire status is the ordinary
+            # CANCELLED; the cause is in the RT fault journal). Report the
+            # segment as failed — a local cancel sets _interrupt and never
+            # reaches here — and do NOT plan a continuation implicitly.
+            self.error = 'REFERENCE_EXPIRED'
         if self.stream or self._interrupt.is_set() or self.error or not self.selected:
             return
         # Replacements were already admitted as part of the full PC plan. No

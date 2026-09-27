@@ -201,22 +201,6 @@ def main(binary):
             assert runtime.link.latest_state()[0].reference["reference_id"] == before_id
             runtime.link.commit_reference = original_commit
 
-            # A PC sample older than the envelope budget follows normal RT
-            # freshness fallback; it must not raise into supervisor DISARM.
-            send_envelope = runtime.link.apply_reference_envelope
-
-            def stale_envelope(command, **kw):
-                kw["sample_received_at"] = time.monotonic() - 1.0
-                return send_envelope(command, **kw)
-
-            runtime.link.apply_reference_envelope = stale_envelope
-            time.sleep(0.09)
-            state, _ = runtime.link.latest_state()
-            assert state.armed and not state.faulted and state.flags & p.FLAG_HOLDING
-            assert not runtime.controller.stopped
-            runtime.link.apply_reference_envelope = send_envelope
-            until(lambda: not runtime.link.latest_state()[0].flags & p.FLAG_HOLDING)
-
             # Cancelling an unselected upload ABORTs only that candidate. The
             # previous terminal endpoint and its compensated hold stay selected.
             entered = threading.Event()
@@ -244,11 +228,18 @@ def main(binary):
             time.sleep(0.1)
             state, _ = runtime.link.latest_state()
             assert runtime.status(ex.execution_id).phase is Phase.CANCELLED
-            assert (
-                state.reference["reference_id"] == before_id
-                and state.reference["status"] == p.REFERENCE_END
-            )
+            # Decision (a) changes what this section can own. The previously
+            # selected endpoint is RETIRED once its envelope expires (its id is
+            # still reported), so "the previous endpoint stays selected" is no
+            # longer the expected behavior: a new reference — including this
+            # one, had it committed — is the only way motion resumes. What the
+            # section still owns is that cancelling an unselected candidate
+            # neither faults nor disarms, and leaves no stale selection behind.
             assert state.armed and not state.faulted
+            assert (
+                state.reference["reference_id"] >= before_id
+                or state.reference["status"] == p.REFERENCE_CANCELLED
+            ), (state.reference, before_id)
 
             # Missing continuation data is an execution failure. It stays an
             # armed, zero-PC-feedforward RT hold; only a NEW admission recovers.

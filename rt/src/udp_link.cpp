@@ -267,7 +267,8 @@ void state_tx_thread(ServerCtx& ctx) {
                      "robot_dt=%lldms cmd_success=%.3f dropped=%u "
                      "session=%016llx arm_epoch=%u last_cmd_seq=%u "
                      "q_err=%.6f qd_err=%.6f tau_ff=%.3f tau_raw=%.3f tau_out=%.3f "
-                     "tau_ref=%.3f tau_meas=%.3f limiter_joint=%d clamp=%d slew=%d\n",
+                     "tau_ref=%.3f tau_meas=%.3f limiter_joint=%d clamp=%d slew=%d "
+                     "ref_retire=%u\n",
                      g.t_read_ns / 1e9, g.state_seq, int(g.armed), g.period_ns / 1e6,
                      g.read_ns / 1e6, g.compute_ns / 1e6, g.write_ns / 1e6,
                      g.publish_ns / 1e6, (long long)g.robot_dt_ms, g.cmd_success_rate,
@@ -276,7 +277,8 @@ void state_tx_thread(ServerCtx& ctx) {
                      g.diag.q_err_max, g.diag.qd_err_max, g.diag.tau_ff_max,
                      g.diag.tau_raw_max, g.diag.tau_out_max, g.diag.tau_ref_max,
                      g.diag.tau_meas_max, g.diag.limiter_joint,
-                     int(g.diag.clamp_active), int(g.diag.slew_active));
+                     int(g.diag.clamp_active), int(g.diag.slew_active),
+                     g.diag.reference_retire_cause);
       } else {
         std::fprintf(stderr,
                      "[rt] loop gap t=%.6f seq=%u armed=%d period=%.3fms read=%.3fms "

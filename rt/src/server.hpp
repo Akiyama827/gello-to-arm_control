@@ -47,6 +47,11 @@ namespace arm_rt {
 constexpr uint32_t FAULT_CMD_LOST = 1;  // command stream stale past --fault-ms
 constexpr uint32_t FAULT_CTL_LOST = 2;  // TCP control session dropped while armed
 constexpr uint32_t FAULT_PLANT = 3;     // backend read/write failed
+// Journal-only cause (CTRL-034 decision (a)): a native reference was retired
+// because its accepted dynamics envelope expired. It is NEVER latched, so it
+// never reaches StatePacket.fault_code or CTL_FAULT; it exists so the journal
+// names the expiry as the origin of a later CMD_LOST latch.
+constexpr uint32_t FAULT_REFERENCE_EXPIRED = 4;
 
 struct ServerConfig {
   std::string backend = "fake";
@@ -134,6 +139,10 @@ struct CtrlDiag {
   int limiter_joint = -1;   // first joint whose output the limiter changed
   bool clamp_active = false;  // torque clamp engaged on that joint
   bool slew_active = false;   // slew limiter engaged on that joint
+  // CTRL-034: journal code of a reference retired THIS cycle because its
+  // envelope expired (0 = none). Carried into the next loop-gap record so the
+  // bounded diagnostics name the same cause the journal does.
+  uint32_t reference_retire_cause = 0;
 };
 
 // Captures the context of one finished servo computation. `changed` uses the
@@ -200,7 +209,8 @@ constexpr uint32_t LOOP_GAP_RING = 64;
 // client disconnect clear the wire latch, never these records, so a closed
 // GUI no longer means an unrecorded fault. Truncation is flagged, not silent.
 constexpr int FAULT_RECORD_TEXT = 240;
-enum FaultKind : uint8_t { FAULT_FIRST = 0, FAULT_SECONDARY = 1, FAULT_STOP_FAILED = 2 };
+enum FaultKind : uint8_t { FAULT_FIRST = 0, FAULT_SECONDARY = 1, FAULT_STOP_FAILED = 2,
+                            FAULT_EVENT = 3 };  // non-latching origin of a later latch
 struct FaultRecord {
   uint64_t t_ns;        // server clock (StatePacket stamp domain)
   uint64_t session_id;
@@ -283,7 +293,11 @@ inline bool reference_envelope_fresh(const ReferenceEnvelopeBinding& b,
                                     const ReferenceSelectionInfo& r,
                                     uint64_t now,uint64_t ingress,double hold_ns) {
   const double lag=r.phase-b.phase;
-  return r.reference_id==b.reference_id && r.revision==b.revision && lag>=0 &&
+  // A RETIRED selection never regains freshness: reusing its id/revision would
+  // otherwise let the retired reference keep the deadman alive. UNDERFLOW and
+  // END are still fresh (a nonterminal run-off is not a retirement).
+  return r.status!=REFERENCE_CANCELLED &&
+    r.reference_id==b.reference_id && r.revision==b.revision && lag>=0 &&
     lag*1e6<=b.phase_window_us && lag*1e9<=hold_ns &&
     clamped_age_ns(now,ingress)+double(b.age_us)*1000<=
       std::min(hold_ns,double(b.valid_for_us)*1000);
@@ -643,7 +657,7 @@ struct ServerCtx {
 // Non-RT only (state_tx): formatting and stdio stay off the servo thread.
 inline int drain_fault_journal(ServerCtx& ctx, FILE* out) {
   static const char* const kinds[] = {"first cause", "secondary cause",
-                                      "stop failed"};
+                                      "stop failed", "event"};
   int written = 0;
   for (uint32_t tail = ctx.fault_tail.load(std::memory_order_relaxed);
        ctx.fault_ring[tail % FAULT_RING].ready.load(std::memory_order_acquire) ==
@@ -654,7 +668,7 @@ inline int drain_fault_journal(ServerCtx& ctx, FILE* out) {
     std::fprintf(out,
                  "[rt] fault journal: %s code=%u t=%.6f arm_epoch=%u armed=%d "
                  "session=%016llx dropped=%u contended=%u text=\"%s\"%s\n",
-                 kinds[r.kind < 3 ? r.kind : 1], r.code, r.t_ns / 1e9, r.arm_epoch,
+                 kinds[r.kind < 4 ? r.kind : 1], r.code, r.t_ns / 1e9, r.arm_epoch,
                  int(r.armed), (unsigned long long)r.session_id,
                  ctx.fault_dropped.load(std::memory_order_relaxed),
                  ctx.fault_contended.load(std::memory_order_relaxed), r.text,

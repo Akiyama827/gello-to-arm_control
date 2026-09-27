@@ -188,6 +188,7 @@ void rt_loop(ServerCtx& ctx) {
   uint64_t prev_robot_ms = 0;
   while (!ctx.shutdown.load()) {
     const uint64_t t_top = mono_ns();
+    uint32_t retire_cause = 0;  // CTRL-034: set when a reference is retired this tick
     if (!backend->read(ps)) {
       prev_t_read = 0;  // a failed read is logged by the fault path already
       // Latch only while ARMED: a transient read hiccup on a DISARMED idle
@@ -391,6 +392,42 @@ void rt_loop(ServerCtx& ctx) {
       admit_envelope=false;
     }
     authority.observe(gen, arm_start, admit_envelope?cmd_v:0, envelope);
+    // --- retire on expiry (CTRL-034 decision (a)) --------------------------
+    // In MODE_REFERENCE a run reference whose accepted envelope has expired is
+    // FINISHED, not merely held: the arm holds its measured position with the
+    // captured gains and zero feedforward, and motion resumes only through a
+    // NEW reference the PC plans from the measured position. The guard is
+    // `held_for_active`: an envelope for the CURRENT (reference_id, revision)
+    // must already have been accepted, which is exactly what keeps the
+    // COMMIT->first-envelope gap and a normal revision switch from retiring a
+    // healthy reference. MODE_STREAMED never retires here.
+    if (mode.mode == MODE_REFERENCE && reference.active()) {
+      const ReferenceSelectionInfo& info = reference.info();
+      const bool incoming_for_active = incoming_native &&
+          envelope.reference.reference_id == info.reference_id &&
+          envelope.reference.revision == info.revision;
+      const bool held_for_active = authority.have &&
+          authority.current.arm_gen == gen &&
+          authority.current.packet.command.version == REFERENCE_VERSION &&
+          authority.current.reference.reference_id == info.reference_id &&
+          authority.current.reference.revision == info.revision;
+      bool expired = false;
+      if (incoming_for_active) {
+        expired = !reference_envelope_fresh(envelope.reference, info, now,
+                                            envelope.rx_ns, hold_ns);
+      } else if (held_for_active) {
+        expired = !reference_envelope_fresh(authority.current.reference, info, now,
+                                            authority.current.rx_ns, hold_ns);
+      }
+      if (expired) {
+        reference.retire();
+        retire_cause = FAULT_REFERENCE_EXPIRED;
+        holding = false;  // capture the measured position once, at this event
+        ctx.journal(FAULT_EVENT, FAULT_REFERENCE_EXPIRED,
+                    "reference envelope expired; reference retired (held; PC recovery "
+                    "budget = fault_ms - expiry)", gen);
+      }
+    }
     const uint64_t rx_ns = authority.deadman_base();
     // Deadman age (CMD_LOST), from this generation only. SIGNED, clamped age:
     // stamps are taken in parallel with this tick: a packet stamped between our `now` sample
@@ -497,6 +534,7 @@ void rt_loop(ServerCtx& ctx) {
       diag = capture_ctrl_diag(n, ps.q, ps.dq, selected.q_des, selected.qd_des,
                                selected.tau_ff, tau_raw, tau_out, ps.tau_ref,
                                ps.tau, tau_limits, slew);
+      diag.reference_retire_cause = retire_cause;
       diag_valid = true;
       if (!wrote) {
         ctx.latch(FAULT_PLANT, backend->fault_text().c_str(), seen_gen);
