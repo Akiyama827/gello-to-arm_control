@@ -375,17 +375,21 @@ void rt_loop(ServerCtx& ctx) {
     ctx.reference_feedback.write(reference.info());
     // Wrong reference identity/phase never refreshes the command deadline.
     // A retired revision can report a live transport, but cannot regain selection.
-    // Family validity — EXACTLY the baseline predicate, unaffected by the
-    // mode. Wrong reference identity/phase never refreshes the command
-    // deadline, and a retired revision cannot regain it, whatever law the mode
-    // currently authorizes. The mode gates ACTUATION below, not liveness.
+    // Family validity — the baseline predicate with ONE mode-aware exception.
+    // A reference id is RETAINED after retire(), so in the streamed law it must
+    // not discard the new law's own envelopes: dropping them would starve the
+    // deadman and latch CMD_LOST on a healthy, streaming PC (found by the
+    // native->Soft transition case). Wrong reference identity/phase still never
+    // refreshes the deadline, and a bare server never has an id to retain.
     const bool incoming_native =
         envelope.packet.command.version==REFERENCE_VERSION;
     bool admit_envelope=true;
     if(incoming_native) {
       admit_envelope=reference_envelope_fresh(envelope.reference,reference.info(),
                                                now,envelope.rx_ns,hold_ns);
-    } else if(reference.info().reference_id) admit_envelope=false;
+    } else if(reference.info().reference_id && mode.mode!=MODE_STREAMED) {
+      admit_envelope=false;
+    }
     authority.observe(gen, arm_start, admit_envelope?cmd_v:0, envelope);
     const uint64_t rx_ns = authority.deadman_base();
     // Deadman age (CMD_LOST), from this generation only. SIGNED, clamped age:

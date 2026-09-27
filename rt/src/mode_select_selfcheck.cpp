@@ -154,11 +154,9 @@ int main() {
   assert(!m.admits(false, 1, S + 1, uint32_t(G)));  // other session
   assert(!m.admits(false, 1, S, uint32_t(G + 1)));  // other epoch
 
-  // Fence during PENDING: neither family actuates, so the arm holds.
-  m.pending = true;
-  assert(!m.admits(false, 100, S, uint32_t(G)));
-  assert(!m.admits(true, 100, S, uint32_t(G)));
-  m.pending = false;
+  // Another session/epoch never actuates, whatever the mode.
+  assert(!m.admits(false, 1, S + 2, uint32_t(G)));
+  assert(!m.admits(true, 1, S, uint32_t(G + 2)));
 
   // Confirmation moves the floor: the envelope already in the Mailbox is out.
   ModeSelectPayload to_ref = sel;
@@ -188,7 +186,7 @@ int main() {
 
   // A new ARM epoch discards everything.
   m.arm(S, uint32_t(G + 1), MODE_STREAMED);
-  assert(m.generation == 0 && m.floor_ns == 0 && !m.pending);
+  assert(m.generation == 0 && m.floor_ns == 0);
   m.disarm();
   assert(m.mode == MODE_UNSELECTED && !m.confirmed());
   assert(!m.admits(false, 5000, S, uint32_t(G + 1)));

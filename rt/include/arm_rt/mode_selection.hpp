@@ -33,7 +33,6 @@ struct ArmMode {
   uint16_t mode = MODE_UNSELECTED;
   uint64_t generation = 0;
   uint64_t floor_ns = 0;
-  bool pending = false;
 
   // ARM edge. `seed` is MODE_REFERENCE when this session's disarmed
   // CTL_REFERENCE_MODE opt-in was accepted, else MODE_STREAMED. A new epoch is
@@ -44,7 +43,6 @@ struct ArmMode {
     mode = seed;
     generation = 0;
     floor_ns = 0;
-    pending = false;
   }
   void disarm() {
     session_id = 0;
@@ -52,15 +50,18 @@ struct ArmMode {
     mode = MODE_UNSELECTED;
     generation = 0;
     floor_ns = 0;
-    pending = false;
   }
   bool belongs(uint64_t session, uint32_t gen) const {
     return session_id != 0 && session_id == session && epoch == gen;
   }
-  // Confirmed generation, or 0 when this epoch has none yet.
-  bool confirmed() const { return mode != MODE_UNSELECTED && !pending; }
-  // Command gate, evaluated BEFORE authority.observe():
-  //  * a pending/absent selection authorizes neither family: the arm holds;
+  // An effective mode exists for this epoch.
+  bool confirmed() const { return mode != MODE_UNSELECTED; }
+  // Actuation gate, evaluated BEFORE the law runs. There is NO separate
+  // "unconfirmed" flag here: the fence is the cancel published at ACCEPTANCE
+  // (which retires the outgoing law through its owner), and RT confirms within
+  // one tick — confirmation is what moves the floor. Until a floor exists for
+  // MODE_STREAMED the previous law's envelopes still actuate for at most that
+  // one tick; after it, they cannot.
   //  * MODE_REFERENCE admits only native (v7) envelopes; their phase/age
   //    freshness remains a separate upstream check;
   //  * MODE_STREAMED admits only non-native envelopes with ingress ABOVE the
@@ -68,7 +69,7 @@ struct ArmMode {
   //    was raised never actuates;
   //  * MODE_UNSELECTED is never effective while armed.
   bool admits(bool native, uint64_t rx_ns, uint64_t session, uint32_t gen) const {
-    if (!belongs(session, gen) || pending) return false;
+    if (!belongs(session, gen)) return false;
     if (mode == MODE_REFERENCE) return native;
     if (mode == MODE_STREAMED) return !native && rx_ns > floor_ns;
     return false;
@@ -77,7 +78,6 @@ struct ArmMode {
     mode = p.desired_mode;
     generation = p.generation;
     floor_ns = now;
-    pending = false;
   }
 };
 

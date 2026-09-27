@@ -431,10 +431,33 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           send_frame(fd,mode_reply(CTL_MODE_STATUS,r,rx.seq));
           break;
         }
-        // Fence at ACCEPTANCE: the outgoing law's execution authority is
-        // retired through its existing owner (upload candidate discarded, a
-        // cancel generation published) and the arm holds its measured position
-        // until RT confirms. No state changes if RT later reports ORDER.
+        // Ordering is decided against the RT-CONFIRMED generation, BEFORE
+        // anything is published. Only the exact next generation is a new
+        // request; an identical retry of the confirmed generation is an
+        // idempotent OK. Both leave the running reference untouched — a
+        // repeated or mis-ordered request must never retire a live trajectory.
+        // RT re-checks ordering (defence in depth), but by then a published
+        // cancel would already have retired the reference.
+        const uint64_t confirmed_gen=ctx.mode_generation.load(std::memory_order_acquire);
+        const uint16_t confirmed_mode=ctx.mode_effective.load(std::memory_order_acquire);
+        if(want.generation==confirmed_gen && want.desired_mode==confirmed_mode) {
+          r.generation=confirmed_gen; r.predecessor=confirmed_gen;
+          r.selected_mode=confirmed_mode; r.result=MODE_SEL_OK;
+          send_frame(fd,mode_reply(CTL_MODE_STATUS,r,rx.seq));
+          break;
+        }
+        if(want.generation!=confirmed_gen+1 || want.expected_predecessor!=confirmed_gen) {
+          r.predecessor=confirmed_gen; r.result=MODE_SEL_ORDER;
+          send_frame(fd,mode_reply(CTL_MODE_STATUS,r,rx.seq));
+          break;
+        }
+        // The fence at ACCEPTANCE for a valid next generation: the outgoing
+        // law's execution authority is retired through its existing owner (the
+        // staged candidate is discarded and a cancel generation is published,
+        // which retires the running reference), and the arm holds its measured
+        // position until RT confirms — RT does so within its next tick and
+        // moves the ingress floor then, which is what stops the outgoing
+        // family's envelopes from actuating.
         uint64_t retire_id=selection.session_id==session?selection.reference_id:0;
         if(upload) {
           if(const auto* cand=upload->candidate_identity())
