@@ -240,6 +240,34 @@ def case_retry_with_running_reference(binary):
         pump.close()
 
 
+def case_native_seed_no_commit(binary):
+    """Proposal §12 limitation 1: a native-seeded epoch before the first commit.
+
+    The v5 stream keeps the deadman alive without actuating, so the arm HOLDS
+    (FLAG_MODE_REFERENCE | FLAG_HOLDING) and CMD_LOST never fires while the PC
+    is streaming. Intentional: native startup streams v5 until the first commit.
+    """
+    token = TOKEN
+    with serve(binary, enable_reference=True) as rt:
+        assert rt.negotiate_reference(token)
+        rt.enable_all()                       # MODE_REFERENCE generation 0, no commit
+        wait_for(lambda: (rt.latest_state()[0] or None)
+                 if (rt.latest_state()[0] and rt.latest_state()[0].armed
+                     and rt.latest_state()[0].selected_mode == p.MODE_REFERENCE)
+                 else None)
+        pump = Pump(rt, [1.0, 1.0, 1.0])      # v5 stream, no reference committed
+        try:
+            wait_for(lambda: rt.latest_state()[0].holding, timeout=2)
+            time.sleep(2.0)                    # well past --fault-ms 1500
+            state = rt.latest_state()[0]
+            assert state.selected_mode == p.MODE_REFERENCE, state.flags
+            assert state.holding, 'native-seeded epoch did not hold before the commit'
+            assert not state.faulted, 'CMD_LOST fired although the v5 stream is alive'
+            assert not tracked(rt, timeout=.3), 'v5 must not actuate in MODE_REFERENCE'
+        finally:
+            pump.close()
+
+
 def main(binary):
     token = TOKEN 
     with serve(binary, enable_reference=True) as rt:
@@ -298,6 +326,8 @@ def main(binary):
     case_native_to_soft(binary)
     case_order_with_running_reference(binary)
     case_retry_with_running_reference(binary)
+    case_native_seed_no_commit(binary)
+
     with serve(binary, enable_reference=False) as rt:
         # enable_reference is off: no capability, and the state stream carries
         # neither mode flag (byte-identical flags to the old build).
@@ -310,7 +340,7 @@ def main(binary):
         assert not state.flags & (p.FLAG_MODE_STREAMED | p.FLAG_MODE_REFERENCE), hex(state.flags)
 
     print('mode select E2E: seed/reject/confirm/same-mode/invalid/latched/stale/bare '
-          '+ native->Soft/native-running ORDER+retry PASS')
+          '+ native->Soft/native-running ORDER+retry/native-seed no-commit PASS')
 
 
 if __name__ == '__main__':
@@ -318,7 +348,8 @@ if __name__ == '__main__':
     # so a before/after result can be reported per case.
     cases = {'native-to-soft': case_native_to_soft,
              'order': case_order_with_running_reference,
-             'retry': case_retry_with_running_reference}
+             'retry': case_retry_with_running_reference,
+             'no-commit-hold': case_native_seed_no_commit}
     binary = str(Path(sys.argv[1]).resolve())
     if len(sys.argv) > 2:
         cases[sys.argv[2]](binary)
