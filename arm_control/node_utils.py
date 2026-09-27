@@ -203,7 +203,7 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | N
         out[key] = expand_named_values(
             spec, names=names, default=0.0, clamp_min=0.0, clamp_max=clamp_max
         )
-    # Integral law (executor-side, rides in tau_ff): mode config only, absent
+    # Integral law (PC controller state, rides in tau_ff): mode config only, absent
     # = zero = off. No arm-table fallback -- it is a tuning of one plant's
     # servo, not a fact about the arm.
     for key in ("ki", "i_limit"):

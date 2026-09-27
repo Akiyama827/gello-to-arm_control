@@ -42,6 +42,7 @@ from arm_control.contracts.impedance import pose_hold_values, unpack_pose_hold_v
 
 from arm_control.control.jog_hold import JogHold
 from arm_control.control.leg_settling import SETTLED, TIMED_OUT, LegSettling
+from arm_control.control.integral import IntegralState
 from arm_control.control.reference import TrajectoryReference
 from arm_control.control.trajectory_executor import gain_error
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
@@ -81,6 +82,7 @@ class ArmController:
         model_token: str | None = None,
         pose_provenance: str = "unbound",
         reference_source=None,
+        integral_state: IntegralState | None = None,
     ) -> None:
         self.node = node
         # Model binding (arm_control.model_bundle). None = unbound graph (sims,
@@ -97,6 +99,10 @@ class ArmController:
         self.arm_id = str(arm_id)
         self.gripper = dict(gripper)
         self.n_arm = executor.n_joints
+        self.integral = integral_state if integral_state is not None else IntegralState(self.n_arm)
+        if self.integral.bias.shape != (self.n_arm,):
+            raise ValueError("integral state must match controller joints")
+        self._cycle_id = 0
         # TWO clock policies, and the choice is `motor_state_period_s`:
         #
         #   set    -> PLANT clock. Trajectory time advances one nominal period
@@ -364,10 +370,11 @@ class ArmController:
             return
         self._jog.set(unpack_jog(value)["q"], self._clock())
 
-    def _jog_command(self) -> JointServoCommand | None:
-        """The servo command for a FRESH jog, or None once it has gone stale."""
+    def _jog_target(self) -> tuple[np.ndarray | None, bool]:
+        """Select the live jog target and report expiry; do not update bias."""
         q_des = self._jog.target(self._clock())
-        if self._jog.take_expired():
+        expired = self._jog.take_expired()
+        if expired:
             # Anchor at the MEASURED pose, explicitly. Clearing the anchor is
             # not enough: _anchored_hold rebuilds it from the last COMMANDED
             # target whenever that command was quiescent, and a jog command is
@@ -382,12 +389,7 @@ class ArmController:
                 f"— holding",
                 flush=True,
             )
-        if q_des is None:
-            return None
-        hold = getattr(self.executor, "hold_command", None)
-        if hold is None:
-            return None
-        return hold(self.last_state, q_des=q_des)
+        return q_des, expired
 
     def on_gripper(self, value) -> None:
         """A commanded finger width, in metres, from an operator console."""
@@ -508,6 +510,10 @@ class ArmController:
             )
             # Fall through: the planner needs a hold streaming from right now,
             # because it is about to spend seconds planning the first leg.
+        if not (np.isfinite(arm.position).all() and np.isfinite(arm.velocity).all()):
+            return
+        self._cycle_id += 1
+        cycle = (self._cycle_id, self._clock())
         if (self.execution_policy is not None and self._running
                 and self._reference is not None):
             # Ordinary joint-goal completion must retain the planned endpoint.
@@ -519,27 +525,31 @@ class ArmController:
             if self._check_completion(arm):
                 if not self.frozen:
                     self.last_command = self._hold_anchor = (
-                        self.executor.hold_command(arm, q_des=goal)
+                        self.executor.hold_command(arm, q_des=goal, integral_bias=self.integral.bias)
                         if goal is not None else None
                     )
                 self._cartesian_now = self._last_cartesian_pose = None
         if self._running and self._reference is not None:
-            command = self.executor.step(self._reference.sample(self.exec_time), arm)
+            point = self._reference.sample(self.exec_time)
+            bias = self.integral.update(*cycle, point.position, arm.position, self.executor.kp)
+            command = self.executor.step(point, arm, integral_bias=bias)
             self._hold_anchor = None  # motion streams: next hold re-anchors
             if self._send(command, self._cartesian_for_time(self.exec_time)) is False:
                 return
             if self.execution_policy is None:
                 self._check_completion(arm)
             return
-        jog = self._jog_command()
+        jog, expired = self._jog_target()
         if jog is not None:
+            bias = self.integral.update(*cycle, jog, arm.position, self.executor.kp)
+            command = self.executor.hold_command(arm, q_des=jog, integral_bias=bias)
             self._hold_anchor = None   # a jog moves: the next hold re-anchors
-            self._send(jog, self._last_cartesian_pose)
+            self._send(command, self._last_cartesian_pose)
             return
         # No trajectory released: hold the anchor. This is the keepalive the
         # plant's deadman needs while the planner searches, while an operator
         # reviews a gated plan, and while a gripper/tilt/graft request is out.
-        command = self._anchored_hold()
+        command = self._anchored_hold(cycle, refresh=expired)
         if command is not None:
             self._send(command, self._last_cartesian_pose)
 
@@ -866,19 +876,15 @@ class ArmController:
         )
 
     # -- outputs -------------------------------------------------------------
-    def _static_hold(self) -> JointServoCommand | None:
-        """Zero-velocity gravity hold at the MEASURED pose (safe freeze).
+    def _static_hold(self) -> JointServoCommand:
+        """Measured-position gravity hold, reading this cycle's existing bias.
 
-        Replaying ``last_command`` verbatim would carry a mid-trajectory qd_des
-        and motion tau_ff into the freeze; fall back to it only when the
-        executor cannot build a hold.
+        Replaying a moving command would retain its velocity/feedforward;
+        constructing this fallback must not advance integral state again.
         """
-        hold = getattr(self.executor, "hold_command", None)
-        if hold is None:
-            return self.last_command
-        return hold(self.last_state)
+        return self.executor.hold_command(self.last_state, integral_bias=self.integral.bias)
 
-    def _anchored_hold(self) -> JointServoCommand | None:
+    def _anchored_hold(self, cycle, *, refresh=False) -> JointServoCommand | None:
         """The gate/keepalive hold, ANCHORED once per hold episode.
 
         Rebuilding the hold from the live measured pose every tick ratchets:
@@ -898,23 +904,19 @@ class ArmController:
             if self._hold_anchor is None or np.any(np.abs(q - self._hold_anchor.q_des) > tolerance):
                 self._hold_anchor = self._static_hold()
             # Keep only the target fixed: feedforward uses the measured pose.
-            return self.executor.hold_command(self.last_state, q_des=self._hold_anchor.q_des)
-        if self._hold_anchor is None:
+            target = self._hold_anchor.q_des
+            bias = self.integral.update(*cycle, target, q, self.executor.kp)
+            return self.executor.hold_command(self.last_state, q_des=target, integral_bias=bias)
+        if self._hold_anchor is None or refresh:
             last = self.last_command
-            hold = getattr(self.executor, "hold_command", None)
-            if (
-                last is not None
-                and hold is not None
-                and float(np.max(np.abs(last.qd_des))) < 0.05
-            ):
-                self._hold_anchor = hold(
-                    JointState(
-                        position=np.asarray(last.q_des, dtype=float).copy(),
-                        velocity=np.zeros(self.n_arm),
-                    )
-                )
-            else:
-                self._hold_anchor = self._static_hold()
+            # Legacy cached holds historically evaluated both gravity and
+            # integral at this synthetic commanded state. Preserve that cadence
+            # and observation choice; a reused cache does not advance state.
+            state = self.last_state
+            if not refresh and last is not None and np.max(np.abs(last.qd_des)) < 0.05:
+                state = JointState(np.asarray(last.q_des, dtype=float).copy(), np.zeros(self.n_arm))
+            bias = self.integral.update(*cycle, state.position, state.position, self.executor.kp)
+            self._hold_anchor = self.executor.hold_command(state, integral_bias=bias)
         return self._hold_anchor
 
     def _cartesian_for_time(self, t_now: float):
@@ -1006,9 +1008,7 @@ class ArmController:
         self._reset_integral()  # the plant went limp; its bias is gone
 
     def _reset_integral(self) -> None:
-        reset = getattr(self.executor, "reset_integral", None)
-        if reset is not None:
-            reset()
+        self.integral.reset()
 
     def _fault(self, reason: str) -> None:
         if self._running:

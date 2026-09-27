@@ -27,6 +27,7 @@ from arm_control.control.arm_controller import ArmController
 from arm_control.control.execution_policy import build_execution_policy
 from arm_control.control.trajectory_executor import JointTrajectoryExecutor
 from arm_control.control.gains import validate_integral_vector
+from arm_control.control.integral import IntegralState
 from arm_control.model_bundle import execution_gravity, model_token, pose_provenance
 from arm_control.node_utils import resolve_gains
 
@@ -141,15 +142,6 @@ def build_executor(
             return gain_vector(cfg, arm_key, n)
         return np.asarray(gains[key], dtype=float).ravel()[:n]
 
-    def _integral_gain(key):
-        if gains is None:
-            return None
-        names = cfg.get("joint_names") or cfg.get("motor_names") or joints
-        values = validate_integral_vector(gains.get(key), len(names), where=key)
-        # Motor-to-arm projection belongs to composition, never to the
-        # executor's public value boundary. Validate trailing motor slots too.
-        return values[:n]
-
     executor = JointTrajectoryExecutor(
         arm_id=arm_id,
         joint_names=joints,
@@ -166,8 +158,6 @@ def build_executor(
         # twice. The legacy standalone executor already honoured this flag; this
         # path silently ignored it.
         gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
-        ki=_integral_gain("ki"),
-        i_limit=_integral_gain("i_limit"),
         payload_frame=ee_frame(cfg),
         **tolerances,
     )
@@ -193,6 +183,13 @@ def build_arm_controller(
         mode_cfg = cfg.get("control_mode") or {}
     gains = resolve_gains(cfg, mode_cfg, names, n)
     executor = build_executor(cfg, arm_id=arm_id, gains=gains)
+    # Validate the complete motor vector before projecting arm slots. The
+    # state owner consumes these gains; the pure executor does not.
+    integral = IntegralState(n, **{
+        key: validate_integral_vector(None if gains is None else gains.get(key),
+                                      len(names) if names else n, where=key)[:n]
+        for key in ("ki", "i_limit")
+    })
     policy_cfg = cfg.get("execution_policy")
     if policy_cfg is not None and gains is None:
         raise ValueError("execution_policy requires resolved per-joint torque limits")
@@ -208,7 +205,7 @@ def build_arm_controller(
     arm = cfg.get("arm") or {}
     return ArmController(
         node, executor, arm_id=arm_id, gripper=gripper_command_cfg(cfg),
-        execution_policy=policy, model_token=model_token(cfg),
+        integral_state=integral, execution_policy=policy, model_token=model_token(cfg),
         pose_provenance=pose_provenance(cfg),
         settle_timeout_s=float(arm.get("settle_timeout_s", 5.0)),
         settle_dwell_s=float(arm.get("settle_dwell_s", 0.2)),

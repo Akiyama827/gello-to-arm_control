@@ -58,19 +58,19 @@ class _FakeExecutor:
     def set_payload(self, mass_kg, *, com_offset=None) -> None:
         self.payload = (float(mass_kg), None if mass_kg == 0 else com_offset)
 
-    def step(self, point, state) -> JointServoCommand:
+    def step(self, point, state, *, integral_bias=0.0) -> JointServoCommand:
         self.steps += 1
         n = self.n_joints
         return JointServoCommand(
-            q_des=np.zeros(n), qd_des=np.zeros(n), tau_ff=np.zeros(n),
+            q_des=np.zeros(n), qd_des=np.zeros(n), tau_ff=np.zeros(n) + integral_bias,
             kp=self.kp, kd=self.kd,
         )
 
-    def hold_command(self, state, q_des=None) -> JointServoCommand:
+    def hold_command(self, state, q_des=None, *, integral_bias=0.0) -> JointServoCommand:
         n = self.n_joints
         q = np.asarray(state.position, dtype=float) if q_des is None else np.asarray(q_des)
         return JointServoCommand(
-            q_des=q, qd_des=np.zeros(n), tau_ff=np.zeros(n), kp=self.kp, kd=self.kd
+            q_des=q, qd_des=np.zeros(n), tau_ff=np.zeros(n) + integral_bias, kp=self.kp, kd=self.kd
         )
 
     def at_goal(self, goal, state, pos_tol=None, vel_tol=None) -> bool:

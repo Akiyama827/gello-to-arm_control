@@ -1,12 +1,11 @@
 """Joint trajectory executor producing servo commands."""
 from __future__ import annotations
 
-import time
-from typing import Callable, Sequence
+from typing import Sequence
 
 import numpy as np
 
-from arm_control.control.gains import validate_integral_vector, validate_torque_limits
+from arm_control.control.gains import validate_torque_limits
 from arm_control.dynamics import PinocchioDynamics
 from arm_control.motion import JointServoCommand, JointState, TrajectoryPoint
 
@@ -43,6 +42,7 @@ def gain_error(kp, kd) -> str | None:
 class JointTrajectoryExecutor:
     """Turns a sampled reference point into a joint servo command.
 
+    Integral bias is an explicit input; constructing commands never updates it.
     It holds no trajectory and no trajectory time: the controller's
     ``control.reference.TrajectoryReference`` owns both and passes the point.
     The feedforward torque is RNEA(q_meas, qd_des, qdd_des), all three taken
@@ -62,9 +62,6 @@ class JointTrajectoryExecutor:
         done_pos_tol: float = 1e-3,
         done_vel_tol: float = 1e-2,
         gravity_comp: bool = False,
-        ki: np.ndarray | None = None,
-        i_limit: np.ndarray | None = None,
-        clock: Callable[[], float] = time.monotonic,
         *,
         payload_frame: str = "",
     ) -> None:
@@ -102,17 +99,6 @@ class JointTrajectoryExecutor:
         # joint) stalls at ~frictionloss/kp and completion would never fire.
         self._done_pos_tol = float(done_pos_tol)
         self._done_vel_tol = float(done_vel_tol)
-        # Clamped integral torque on (q_des - q), riding in tau_ff. A pure PD
-        # parks the arm off target by (unmodelled torque)/kp: on the real FR3
-        # that residual friction/model torque is 1-2 N.m, several mrad per
-        # joint, 2-3 mm at a shared object (2026-09-24). Zero ki = off, which
-        # every plant except the real FR3 keeps. The term is stored as a torque
-        # so the clamp is a torque bound and gain changes cannot make it jump.
-        self._ki = validate_integral_vector(ki, n, where="ki")
-        self._i_limit = validate_integral_vector(i_limit, n, where="i_limit")
-        self._clock = clock
-        self._i_tau = np.zeros(n)
-        self._i_t: float | None = None
 
     @property
     def n_joints(self) -> int:
@@ -132,7 +118,8 @@ class JointTrajectoryExecutor:
         return self._kd.copy()
 
     def hold_command(
-        self, state: JointState, q_des: np.ndarray | None = None
+        self, state: JointState, q_des: np.ndarray | None = None, *,
+        integral_bias: np.ndarray | float = 0.0,
     ) -> JointServoCommand:
         """Static hold: zero desired velocity, gravity (+ payload, + the clamped
         integral when ki > 0) feedforward, current gains, torque-clamped.
@@ -149,7 +136,7 @@ class JointTrajectoryExecutor:
         """
         q = np.asarray(state.position, dtype=float).copy()
         anchor = q if q_des is None else np.asarray(q_des, dtype=float).copy()
-        tau = self._dyn.gravity(q) + self._payload_tau(q) + self._integral(anchor, q)
+        tau = self._dyn.gravity(q) + self._payload_tau(q) + integral_bias
         if self._gravity_comp:
             tau = tau - self._dyn.gravity(q)  # plant adds gravity itself
         tau = np.clip(tau, -self._max_tau, self._max_tau)
@@ -187,34 +174,6 @@ class JointTrajectoryExecutor:
                     raise ValueError("payload CoM must have shape (3,) and be finite")
         self._payload = (mass, com)
 
-    # ponytail: fixed integration window; make it configurable if a plant needs
-    # a different transient/settle boundary.
-    I_WINDOW_RAD = 0.02
-
-    def reset_integral(self) -> None:
-        """Drop the accumulated integral torque (disarm, law change)."""
-        self._i_tau = np.zeros_like(self._i_tau)
-        self._i_t = None
-
-    def _integral(self, q_des: np.ndarray, q: np.ndarray) -> np.ndarray:
-        """Advance and return the clamped integral torque.
-
-        Each command construction reads the executor's clock and updates state.
-        A repeated call has zero dt only if that clock returns the same value.
-        Only errors inside I_WINDOW_RAD integrate: a larger error is a transient the
-        PD is already fighting, and winding up on it overshoots at the end.
-        A joint with no spring (kp == 0: Float, pose hold) carries none.
-        """
-        now = self._clock()
-        dt = 0.0 if self._i_t is None else min(max(now - self._i_t, 0.0), 0.05)
-        self._i_t = now
-        err = np.asarray(q_des, dtype=float) - np.asarray(q, dtype=float)
-        live = (self._kp > 0) & (np.abs(err) < self.I_WINDOW_RAD)
-        self._i_tau = np.where(live, self._i_tau + self._ki * err * dt, self._i_tau)
-        self._i_tau = np.clip(self._i_tau, -self._i_limit, self._i_limit)
-        self._i_tau[self._kp <= 0] = 0.0
-        return self._i_tau.copy()
-
     def _payload_tau(self, q: np.ndarray) -> np.ndarray:
         mass, com = self._payload
         if mass <= 0.0:
@@ -246,14 +205,15 @@ class JointTrajectoryExecutor:
                 raise ValueError(f"kd shape {kd.shape} != expected {self._kd.shape}")
             self._kd = kd
 
-    def step(self, pt: TrajectoryPoint, state: JointState) -> JointServoCommand:
+    def step(self, pt: TrajectoryPoint, state: JointState, *,
+             integral_bias: np.ndarray | float = 0.0) -> JointServoCommand:
         # qdd comes off the SAME polynomial as q and qd (JointTrajectory is a
         # cubic Hermite). It used to be a 1 ms forward difference of qd, which
         # both lagged half a step and straddled knots -- and differenced a qd
         # that was not the derivative of the q being commanded anyway.
         tau_ff = self._dyn.rnea(state.position, pt.velocity, pt.acceleration)
         tau_ff = tau_ff + self._payload_tau(np.asarray(state.position, dtype=float))
-        tau_ff = tau_ff + self._integral(pt.position, state.position)
+        tau_ff = tau_ff + integral_bias
         if self._gravity_comp:
             tau_ff = tau_ff - self._dyn.gravity(state.position)
         tau_ff = np.clip(tau_ff, -self._max_tau, self._max_tau)
@@ -283,65 +243,3 @@ class JointTrajectoryExecutor:
     def completion_tolerances(self) -> tuple[float, float]:
         """Joint position and velocity limits used by default completion."""
         return self._done_pos_tol, self._done_vel_tol
-
-
-def _check_integral() -> None:
-    """The integral term: accumulates, clamps, windows, respects kp=0, resets."""
-
-    class _NoDynamics:
-        def gravity(self, q):
-            return np.zeros(len(q))
-
-    t = [0.0]
-    ex = JointTrajectoryExecutor(
-        "arm", ["j1", "j2"], _NoDynamics(), np.array([100.0, 0.0]),
-        np.array([10.0, 1.0]), np.array([50.0, 50.0]),
-        ki=np.array([200.0, 200.0]), i_limit=np.array([1.0, 1.0]), clock=lambda: t[0],
-    )
-    state = JointState(position=np.zeros(2), velocity=np.zeros(2))
-    target = np.array([0.005, 0.005])
-    assert np.allclose(ex.hold_command(state, q_des=target).tau_ff, 0.0)  # first call: no dt
-    t[0] = 0.01
-    tau = ex.hold_command(state, q_des=target).tau_ff
-    assert np.isclose(tau[0], 200 * 0.005 * 0.01) and tau[1] == 0.0, tau  # kp=0 joint: none
-    assert np.allclose(ex.hold_command(state, q_des=target).tau_ff, tau)  # same tick: once
-    for k in range(200):
-        t[0] = 0.02 + 0.01 * k
-        tau = ex.hold_command(state, q_des=target).tau_ff
-    assert np.isclose(tau[0], 1.0), tau  # clamped at i_limit
-    t[0] += 0.01
-    far = ex.hold_command(state, q_des=np.array([0.5, 0.0])).tau_ff
-    assert np.isclose(far[0], 1.0), far  # outside the window: held, not grown
-    ex.reset_integral()
-    t[0] += 0.01
-    assert np.allclose(ex.hold_command(state, q_des=target).tau_ff, 0.0)
-    off = JointTrajectoryExecutor(
-        "arm", ["j1"], _NoDynamics(), np.array([100.0]), np.array([10.0]), np.array([50.0]),
-        clock=lambda: t[0],
-    )
-    off.hold_command(state_1 := JointState(np.zeros(1), np.zeros(1)), q_des=np.array([0.01]))
-    t[0] += 1.0
-    assert off.hold_command(state_1, q_des=np.array([0.01])).tau_ff[0] == 0.0  # default off
-    def make(**kw):
-        return JointTrajectoryExecutor(
-            "arm", ["j1", "j2"], _NoDynamics(), np.ones(2), np.ones(2), np.ones(2), **kw)
-
-    for name in ("ki", "i_limit"):
-        for bad in (0., [1.], [1., 2., 3.], [[1., 2.]], [-1., 0.],
-                    [np.nan, 0.], [np.inf, 0.], [-np.inf, 0.]):
-            try:
-                make(**{name: bad})
-            except ValueError:
-                pass
-            else:
-                raise AssertionError(f"accepted {name}={bad!r}")
-        supplied = np.array([2., 3.])
-        admitted = make(**{name: supplied})
-        supplied[:] = 99.
-        stored = getattr(admitted, "_" + name)
-        assert np.array_equal(stored, [2., 3.]) and not stored.flags.writeable
-    print("trajectory_executor: integral law and atomic input boundary OK")
-
-
-if __name__ == "__main__":
-    _check_integral()

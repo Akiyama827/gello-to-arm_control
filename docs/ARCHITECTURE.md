@@ -39,8 +39,15 @@ Legacy streamed execution uses its PC start time and pure
 time or active PC interpolation**: this same provider delegates to one
 RT-selected feedback sample per controller tick. The planned trajectory stays
 available for endpoint and Cartesian knot association. `JointTrajectoryExecutor`
-receives that sample and retains RNEA, payload, integral, gains and torque bounds;
-it still stores no trajectory or trajectory time.
+receives that sample and retains RNEA, payload, gains and torque bounds; it
+stores no trajectory, trajectory time or integral state. `control.integral.IntegralState`
+owns the bias and update history. The canonical builder supplies its admitted
+ki/i_limit to `ArmController`, which schedules one update after lifecycle,
+completion and target selection and before tracking admission. Pure executor
+commands receive the bias explicitly; tracking fallback reuses it. Deadline
+ticks may reuse still-fresh observations; stale/nonfinite observations cannot
+advance state. Event-driven cached holds update only when constructed, retaining
+their historical cadence. No PC/RT clock or state owner is duplicated.
 
 For a model-bound supervisor and a capable RT server, v5 session negotiation
 opts into v7. `plants.remote_rt.reference.ReferenceHorizon` uploads unchanged
