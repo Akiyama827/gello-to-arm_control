@@ -173,14 +173,21 @@ class Service:
             pass
 
 
-def main(argv=None) -> None:
+def main(argv=None, *, stream_admission=None) -> None:
+    """Serve one robot.
+
+    ``stream_admission`` is the composition-owned trusted provider for the
+    frozen stream/1 interface (``arm_control.supervisor.admission``). Default
+    launches keep today's neutral path: without a provider the stream
+    extension is not advertised and stream methods refuse.
+    """
     from arm_control.config import load_robot_config
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True, help="robot config (with an rt: block)")
     parser.add_argument("--socket", help="socket path (default: per-user, per-instance)")
     args = parser.parse_args(argv)
-    runtime = RobotRuntime(load_robot_config(args.config))
+    runtime = RobotRuntime(load_robot_config(args.config), stream_admission=stream_admission)
     if not runtime.instance_id:
         raise SystemExit("config has no rt.instance_id")
     stop = threading.Event()
