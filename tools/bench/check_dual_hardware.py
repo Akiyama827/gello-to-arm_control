@@ -588,6 +588,15 @@ def main(pair_path, binary, refinement="none"):
             assert state["pair"]["lifecycle"] == "complete", state
             assert all(np.max(np.abs(np.array(s["q_deg"]) - targets[a]["values"])) < .7
                        for a, s in state["arms"].items())
+            # CTRL-051: reconstruct the executed chain from the bounded trace
+            # the console kept — detached, read-only analysis of the recorded
+            # samples. A lineage report is never an executable trajectory.
+            lineage = diagnostics.reconstruct_lineage(
+                list(app._trace.samples), pair_id=state["pair"]["pair_id"])
+            assert lineage["complete"], lineage["missing"]
+            assert lineage["ticks"] > 0
+            assert set(lineage["links"]) == set(diagnostics.LINE_LINKS)
+            print("Execution lineage reconstructs from the bounded trace: PASS", flush=True)
             print("Two RT sessions: disarmed startup, measured planning, reviewed paired execution: PASS", flush=True)
             if config.shared_object is not None:
                 check_virtual(app, action, wait, refinement)

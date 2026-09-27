@@ -544,7 +544,10 @@ class DualArmConsole:
                     )
                     if self.config.backend == "remote_rt":
                         sample = self.runtime.diagnostic_sample()
-                        sample.update(mode=self.runtime.mode, closure=closure)
+                        sample.update(mode=self.runtime.mode, closure=closure,
+                                      pair_id=self.coordinator.active_pair_id,
+                                      lifecycle=self.coordinator.lifecycle.value,
+                                      revision=self.revision)
                         self._trace.record(sample)
                     if closure is not None:
                         self._check_closure(closure)
@@ -587,7 +590,10 @@ class DualArmConsole:
                     # Alignment can fail before the normal sample is recorded.
                     # Preserve its raw packets too, after requesting stop.
                     sample = self.runtime.diagnostic_sample()
-                    sample.update(mode=self.runtime.mode, closure=None)
+                    sample.update(mode=self.runtime.mode, closure=None,
+                                  pair_id=self.coordinator.active_pair_id,
+                                  lifecycle=self.coordinator.lifecycle.value,
+                                  revision=self.revision)
                     self._trace.record(sample)
                 print(f"[dual_console] runtime fault: {exc}", flush=True)
                 self._save_fault_trace(str(exc))
