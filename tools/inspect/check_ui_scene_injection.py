@@ -22,8 +22,14 @@ def main() -> None:
     transform[:3, :3] = pin.rpy.rpyToMatrix(0.2, -0.3, 0.7)
     transform[:3, 3] = [0.125, -0.25, 0.75]
     geoms = [("fixture", "mesh", Path(__file__), transform)]
+    # __new__ bypasses the URDF-building __init__, so every container the
+    # static-scene path owns must be created here too: add_static_scene fills
+    # _static_bodies/_static_transforms, static_json reads _static/_geom_ids/
+    # _carried, mesh_path reads _geom_ids/_static.
     vfk = VisualFK.__new__(VisualFK)
-    vfk._pin, vfk._static, vfk._geom_ids = pin, [], [0, 1]
+    vfk._pin, vfk._geom_ids = pin, [0, 1]
+    vfk._static, vfk._static_bodies, vfk._static_transforms = [], [], []
+    vfk._carried = {}
     with patch.object(preview, "static_scene_geoms", return_value=geoms) as resolve:
         vfk.add_static_scene({}, geoms=[])
         assert vfk.static_json() == []
@@ -106,14 +112,18 @@ def main() -> None:
         console, "install_signal_handlers",
     ):
         presets = [{"name": "p", "xyz_mm": [1.0, 2.0, 3.0], "rpy_deg": [0.0, 0.0, 0.0]}]
+        actions = {"manual_carry": {"scene": "bench"}}
         console.main(cfg=cfg, collision_world=world, static_geoms=geoms,
                      pose_presets=presets)
         assert run.call_args.kwargs == {
             "cfg": cfg, "collision_world": world, "static_geoms": geoms,
-            "pose_presets": presets,
+            "pose_presets": presets, "scene_actions": None,
         }
         console.main()
         assert run.call_args.kwargs["pose_presets"] is None
+        # The project composition's scene/load actions ride the same seam.
+        console.main(scene_actions=actions)
+        assert run.call_args.kwargs["scene_actions"] == actions
 
     # Stop immediately after startup scene logging: no Dora or HTTP connection.
     class StartupComplete(Exception):

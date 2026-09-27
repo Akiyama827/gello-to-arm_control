@@ -64,66 +64,97 @@ class PairFaultTrace:
 
 # The execution-chain links the dual_fault/v1 sample schema carries, in chain
 # order (CTRL-051). A lineage report is complete exactly when every link is
-# observed in the retained window.
+# JOINED by identity, not when each field merely appears somewhere.
 LINE_LINKS = (
     "requested",    # pair_id: the plan identity the policy requested
     "admitted",     # lifecycle: the admitted phase the pair reached
-    "reference",    # per-arm plan_id + elapsed: the selected reference
+    "reference",    # observed per-arm plan_id == the pair's declared member plan
     "raw",          # tau_ff_pc / integral_bias_pc / raw_pc: controller terms
     "sent",         # q_cmd_pc: the intent actually sent
     "echo",         # last_cmd_seq: the freshest command the servo consumed
     "measured",     # q_rt / dq_rt: measured state
 )
 
+#: Pair phases that mean the pair was actually admitted. STAGING is a request
+#: waiting for member ACKs, not an admission; only READY (both ACKed) and
+#: EXECUTING (released) prove the pair was taken up.
+ADMITTED_PHASES = ("ready", "executing")
+
+#: (link, per-arm sample field) for the links that must belong to the SAME
+#: selected reference as the joined reference link.
+_CHAIN_FIELDS = (("raw", "tau_ff_pc"), ("sent", "q_cmd_pc"),
+                 ("echo", "last_cmd_seq"), ("measured", "q_rt"))
+
 
 def reconstruct_lineage(samples, *, pair_id=None):
     """Correlate one execution chain from the bounded samples a trace kept.
 
-    Read-only detached analysis (CTRL-051): this opens no transport and takes
-    only the recorded samples. A returned chain is a report, never a safe
-    executable trajectory — a command log is not automatically executable,
-    and any approved physical replay goes through fresh scene/model/start/
-    limits/operator admission as a new request. The bounded trace keeps only
-    the newest ticks, so an evicted window reports fewer ticks, never a
+    A chain is a JOIN on identities, never field presence. The reference link
+    requires an arm's observed controller ``plan_id`` to equal the plan the
+    pair declared for that arm (``pair_plans``) while the lifecycle is an
+    admitted phase; every command link must fall at a tick where that same
+    declared plan is still the observed one. A pair that was never admitted,
+    or whose controller is still holding a foreign plan, is reported
+    incomplete with the reason — never a fabricated success.
+
+    Read-only detached analysis: this opens no transport and takes only the
+    recorded samples. A returned chain is a report, never a safe executable
+    trajectory — a command log is not automatically executable, and any
+    approved physical replay goes through fresh scene/model/start/limits/
+    operator admission as a new request. The bounded trace keeps only the
+    newest ticks, so an evicted window reports fewer ticks, never a
     fabricated success.
     """
     kept = [s for s in samples if s.get("pair_id") is not None]
     if pair_id is None:
         pair_id = kept[-1]["pair_id"] if kept else None
     window = [s for s in kept if s.get("pair_id") == pair_id] if pair_id else []
-    links = {}
-    for name in LINE_LINKS:
-        for index, sample in enumerate(window):
-            if name == "requested":
-                hit = sample.get("pair_id") is not None
-            elif name == "admitted":
-                hit = sample.get("lifecycle") is not None
-            elif name == "reference":
-                arms = sample.get("arms") or {}
-                hit = any(v.get("plan_id") is not None for v in arms.values())
-            elif name == "raw":
-                arms = sample.get("arms") or {}
-                hit = any(v.get("tau_ff_pc") is not None for v in arms.values())
-            elif name == "sent":
-                arms = sample.get("arms") or {}
-                hit = any(v.get("q_cmd_pc") is not None for v in arms.values())
-            elif name == "echo":
-                arms = sample.get("arms") or {}
-                hit = any(v.get("last_cmd_seq") is not None for v in arms.values())
-            else:  # measured
-                arms = sample.get("arms") or {}
-                hit = any(
-                    v.get("q_rt") is not None and v.get("dq_rt") is not None
-                    for v in arms.values()
-                )
-            if hit:
-                links[name] = index
-                break
+    # The pair's declared member plans are the identity the reference joins on.
+    declared = {}
+    for sample in window:
+        for arm, plan in (sample.get("pair_plans") or {}).items():
+            if plan is not None:
+                declared.setdefault(arm, plan)
+    # The chain lives in the pair's ADMITTED span: before staging and after a
+    # terminal phase the controllers may legitimately hold another plan, and
+    # those ticks are not this pair's lineage.
+    admitted = [i for i, s in enumerate(window)
+                if s.get("lifecycle") in ADMITTED_PHASES]
+    links, foreign = {}, set()
+    if window:
+        links["requested"] = 0
+    if admitted:
+        first, last = admitted[0], admitted[-1]
+        links["admitted"] = first
+        for index in range(first, last + 1):
+            arms = window[index].get("arms") or {}
+            joined_here = False
+            for arm, view in arms.items():
+                plan = view.get("plan_id")
+                if plan is None:
+                    continue
+                if declared.get(arm) == plan:
+                    joined_here = True
+                else:
+                    foreign.add(arm)
+            if not joined_here:
+                continue
+            if "reference" not in links:
+                links["reference"] = index
+            # Command links must belong to that same declared member plan.
+            for name, field in _CHAIN_FIELDS:
+                if name not in links and any(v.get(field) is not None
+                                             for v in arms.values()):
+                    links[name] = index
+    missing = [name for name in LINE_LINKS if name not in links]
     return dict(
         pair_id=pair_id,
         session=window[0].get("pc_monotonic") if window else None,
         ticks=len(window),
-        complete=bool(window) and len(links) == len(LINE_LINKS),
+        admitted_ticks=len(admitted),
+        declared_plans=dict(declared),
+        foreign_arms=sorted(foreign),
+        complete=bool(window) and not missing,
         links=links,
-        missing=[name for name in LINE_LINKS if name not in links],
+        missing=missing,
     )

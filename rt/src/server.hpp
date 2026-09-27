@@ -85,6 +85,12 @@ struct ServerConfig {
   // given) gates ARM for real backends. The fake backend runs degraded unless
   // this asks it to gate too (device-free checks of the refusal path).
   bool require_rt_setup = false;
+  // Advertise CAP_REFERENCE_HORIZON and accept v7 native-reference negotiation.
+  // OPT-IN, and deliberately so: the native path is not qualified for any
+  // deployment, so a server must not expose it merely by being started. The
+  // deployment registry owns the per-instance fact and renders
+  // --enable-reference; a bare launch keeps the streamed v5/v6 contract.
+  bool enable_reference = false;
   // Bind address for BOTH listeners. Default any: the box is dual-NIC (PC
   // direct link + robot LAN) and INADDR_ANY answers on the robot LAN too —
   // production units should pass --bind <direct-link-ip>.
@@ -367,7 +373,9 @@ struct ServerCtx {
   std::atomic<uint64_t> session_id{0};
   std::atomic<bool> claim_ok{false};
   // Advertise support; per-session MODE negotiation still gates every v7 byte.
-  std::atomic<bool> supports_reference{true};
+  // Set from ServerConfig::enable_reference at startup — OFF unless the
+  // deployment explicitly opted in (see that field).
+  std::atomic<bool> supports_reference{false};
   std::atomic<uint64_t> reference_session{0};
   // DISARM generation: bumped AFTER `armed` is cleared, so a servo tick that
   // reads this value first and `armed` second can only report a stop epoch

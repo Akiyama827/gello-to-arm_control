@@ -544,10 +544,22 @@ class DualArmConsole:
                     )
                     if self.config.backend == "remote_rt":
                         sample = self.runtime.diagnostic_sample()
-                        sample.update(mode=self.runtime.mode, closure=closure,
-                                      pair_id=self.coordinator.active_pair_id,
-                                      lifecycle=self.coordinator.lifecycle.value,
-                                      revision=self.revision)
+                        pair_id = self.coordinator.active_pair_id
+                        # CTRL-051 lineage: the requested pair identity, the
+                        # admitted phase and the pair's DECLARED member plans.
+                        # The plans are the identity the recorded chain joins
+                        # on — a controller still holding a foreign plan must
+                        # not read as this pair's selected reference.
+                        sample.update(
+                            mode=self.runtime.mode, closure=closure,
+                            pair_id=pair_id,
+                            lifecycle=self.coordinator.lifecycle.value,
+                            revision=self.revision,
+                            pair_plans=(
+                                {} if pair_id is None else
+                                {m.arm_id: m.plan_id for m in
+                                 self.coordinator.pair_state(pair_id).members}),
+                        )
                         self._trace.record(sample)
                     if closure is not None:
                         self._check_closure(closure)
@@ -590,10 +602,17 @@ class DualArmConsole:
                     # Alignment can fail before the normal sample is recorded.
                     # Preserve its raw packets too, after requesting stop.
                     sample = self.runtime.diagnostic_sample()
-                    sample.update(mode=self.runtime.mode, closure=None,
-                                  pair_id=self.coordinator.active_pair_id,
-                                  lifecycle=self.coordinator.lifecycle.value,
-                                  revision=self.revision)
+                    pair_id = self.coordinator.active_pair_id
+                    sample.update(
+                        mode=self.runtime.mode, closure=None,
+                        pair_id=pair_id,
+                        lifecycle=self.coordinator.lifecycle.value,
+                        revision=self.revision,
+                        pair_plans=(
+                            {} if pair_id is None else
+                            {m.arm_id: m.plan_id for m in
+                             self.coordinator.pair_state(pair_id).members}),
+                    )
                     self._trace.record(sample)
                 print(f"[dual_console] runtime fault: {exc}", flush=True)
                 self._save_fault_trace(str(exc))

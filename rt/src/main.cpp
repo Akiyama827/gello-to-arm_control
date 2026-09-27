@@ -61,7 +61,7 @@ void usage(const char* argv0) {
       "          [--ee-mass KG] [--ee-com X,Y,Z] [--tau-max NM]\n"
       "          [--dm-spec IF;ID:TYPE[:MST[:PMAX:VMAX:TMAX]],...] [--rt-priority N]\n"
       "          [--active-mask MASK] [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
-      "          [--require-rt-setup]\n"
+      "          [--require-rt-setup] [--enable-reference]\n"
       "\n"
       "  --instance-id  provisioned arm instance id ([A-Za-z0-9_.-], <32 chars);\n"
       "             required for franka/dm. Commanders CLAIM it before ARM.\n"
@@ -75,7 +75,11 @@ void usage(const char* argv0) {
       "  --tau-max  positive operating torque cap per joint (N.m), never above\n"
       "             backend limits; omitted keeps the backend defaults.\n"
       "  --require-rt-setup  refuse ARM if mlockall, SCHED_FIFO or --rt-cpu fails\n"
-      "             (always on for franka/dm; the fake backend runs degraded).\n",
+      "             (always on for franka/dm; the fake backend runs degraded).\n"
+      "  --enable-reference  advertise and accept the v7 native-reference\n"
+      "             contract. OFF by default: the native path is not qualified\n"
+      "             for any deployment, so it must be opted into per instance\n"
+      "             (the deployment registry renders this flag).\n",
       argv0);
 }
 
@@ -181,6 +185,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--rt-priority")) cfg.rt_priority = std::atoi(next("--rt-priority"));
     else if (!std::strcmp(argv[i], "--rt-cpu")) cfg.rt_cpu = std::atoi(next("--rt-cpu"));
     else if (!std::strcmp(argv[i], "--require-rt-setup")) cfg.require_rt_setup = true;
+    else if (!std::strcmp(argv[i], "--enable-reference")) cfg.enable_reference = true;
     else {
       usage(argv[0]);
       return 2;
@@ -237,10 +242,14 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
+  // Off unless this launch opted in: the capability word and the v7 mode
+  // gate both read this, so a bare start cannot expose the native path.
+  ctx.supports_reference.store(cfg.enable_reference);
+
   std::printf("[rt] arm_rt_server: backend=%s udp=%u tcp=%u state=%.0fHz "
-              "hold=%.0fms fault=%.0fms\n",
+              "hold=%.0fms fault=%.0fms reference=%s\n",
               cfg.backend.c_str(), cfg.udp_port, cfg.tcp_port, cfg.state_hz,
-              cfg.hold_ms, cfg.fault_ms);
+              cfg.hold_ms, cfg.fault_ms, cfg.enable_reference ? "on" : "off");
 
   std::thread udp(guarded<void (*)(arm_rt::ServerCtx&)>, "udp_rx", std::ref(ctx),
                   arm_rt::udp_rx_thread);

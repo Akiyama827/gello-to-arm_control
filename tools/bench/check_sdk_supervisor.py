@@ -87,6 +87,9 @@ rt:
   tcp_port: {tcp}
   instance_id: sdk_arm
   state_timeout_s: 0.5
+  # The v7 native path is opt-in (a bare launch stays v5/v6). These fixtures
+  # exercise it, so they declare it explicitly.
+  native_reference: true
 execution_policy:
   command_rate_hz: 100
   state_timeout_sec: 0.25

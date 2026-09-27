@@ -596,6 +596,24 @@ def main(pair_path, binary, refinement="none"):
             assert lineage["complete"], lineage["missing"]
             assert lineage["ticks"] > 0
             assert set(lineage["links"]) == set(diagnostics.LINE_LINKS)
+            assert lineage["declared_plans"] and not lineage["foreign_arms"], lineage
+            # Field presence is not correlation. A controller still holding a
+            # foreign plan, or a pair that never reached an admitted phase,
+            # must NOT reconstruct as a complete chain.
+            foreign_samples = [
+                dict(s, arms={a: dict(v, plan_id="some-other-run")
+                              for a, v in (s.get("arms") or {}).items()})
+                for s in app._trace.samples
+            ]
+            foreign = diagnostics.reconstruct_lineage(
+                foreign_samples, pair_id=state["pair"]["pair_id"])
+            assert not foreign["complete"] and "reference" in foreign["missing"], foreign
+            assert foreign["foreign_arms"], foreign
+            never_admitted = diagnostics.reconstruct_lineage(
+                [dict(s, lifecycle="staging") for s in app._trace.samples],
+                pair_id=state["pair"]["pair_id"])
+            assert not never_admitted["complete"], never_admitted
+            assert "admitted" in never_admitted["missing"], never_admitted
             print("Execution lineage reconstructs from the bounded trace: PASS", flush=True)
             print("Two RT sessions: disarmed startup, measured planning, reviewed paired execution: PASS", flush=True)
             if config.shared_object is not None:

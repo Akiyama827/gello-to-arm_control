@@ -637,7 +637,11 @@ class RobotRuntime:
     def start(self) -> None:
         """Claim the RT server (never ARM) and start the 100 Hz loop."""
         self.link.open()
-        if (self.controller.model_token and (self.cfg.get("rt") or {}).get("native_reference", True)
+        # OPT-IN, like the server's --enable-reference: the v7 native path is
+        # not qualified for any deployment. The registry owns the per-instance
+        # fact and stages it into rt.native_reference, so both sides flip
+        # together; a config that never declares it keeps the streamed path.
+        if (self.controller.model_token and (self.cfg.get("rt") or {}).get("native_reference", False)
                 and self.link.negotiate_reference(self.controller.model_token)):
             self._native = ReferenceHorizon(self.link)
             self.controller.bind_reference_source(lambda: self._native.point)
