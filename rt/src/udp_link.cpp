@@ -256,14 +256,39 @@ void state_tx_thread(ServerCtx& ctx) {
          tail != ctx.gap_head.load(std::memory_order_acquire); ++tail) {
       const LoopGap g = ctx.gaps[tail % LOOP_GAP_RING];
       ctx.gap_tail.store(tail + 1, std::memory_order_release);
-      std::fprintf(stderr,
-                   "[rt] loop gap t=%.6f seq=%u armed=%d period=%.3fms read=%.3fms "
-                   "prev_compute=%.3fms prev_write=%.3fms prev_publish=%.3fms "
-                   "robot_dt=%lldms cmd_success=%.3f dropped=%u\n",
-                   g.t_read_ns / 1e9, g.state_seq, int(g.armed), g.period_ns / 1e6,
-                   g.read_ns / 1e6, g.compute_ns / 1e6, g.write_ns / 1e6,
-                   g.publish_ns / 1e6, (long long)g.robot_dt_ms, g.cmd_success_rate,
-                   ctx.gap_dropped.load(std::memory_order_relaxed));
+      // One bounded line per gap. The controller fields describe the
+      // PREVIOUS write cycle (the compute+write the gap contains);
+      // diag=absent means no servo computation ran in that cycle — the
+      // fields are then absent, never zero-filled as if measured.
+      if (g.diag_valid) {
+        std::fprintf(stderr,
+                     "[rt] loop gap t=%.6f seq=%u armed=%d period=%.3fms read=%.3fms "
+                     "prev_compute=%.3fms prev_write=%.3fms prev_publish=%.3fms "
+                     "robot_dt=%lldms cmd_success=%.3f dropped=%u "
+                     "session=%016llx arm_epoch=%u last_cmd_seq=%u "
+                     "q_err=%.6f qd_err=%.6f tau_ff=%.3f tau_raw=%.3f tau_out=%.3f "
+                     "tau_ref=%.3f tau_meas=%.3f limiter_joint=%d clamp=%d slew=%d\n",
+                     g.t_read_ns / 1e9, g.state_seq, int(g.armed), g.period_ns / 1e6,
+                     g.read_ns / 1e6, g.compute_ns / 1e6, g.write_ns / 1e6,
+                     g.publish_ns / 1e6, (long long)g.robot_dt_ms, g.cmd_success_rate,
+                     ctx.gap_dropped.load(std::memory_order_relaxed),
+                     (unsigned long long)g.session_id, g.arm_epoch, g.last_cmd_seq,
+                     g.diag.q_err_max, g.diag.qd_err_max, g.diag.tau_ff_max,
+                     g.diag.tau_raw_max, g.diag.tau_out_max, g.diag.tau_ref_max,
+                     g.diag.tau_meas_max, g.diag.limiter_joint,
+                     int(g.diag.clamp_active), int(g.diag.slew_active));
+      } else {
+        std::fprintf(stderr,
+                     "[rt] loop gap t=%.6f seq=%u armed=%d period=%.3fms read=%.3fms "
+                     "prev_compute=%.3fms prev_write=%.3fms prev_publish=%.3fms "
+                     "robot_dt=%lldms cmd_success=%.3f dropped=%u "
+                     "session=%016llx arm_epoch=%u last_cmd_seq=%u diag=absent\n",
+                     g.t_read_ns / 1e9, g.state_seq, int(g.armed), g.period_ns / 1e6,
+                     g.read_ns / 1e6, g.compute_ns / 1e6, g.write_ns / 1e6,
+                     g.publish_ns / 1e6, (long long)g.robot_dt_ms, g.cmd_success_rate,
+                     ctx.gap_dropped.load(std::memory_order_relaxed),
+                     (unsigned long long)g.session_id, g.arm_epoch, g.last_cmd_seq);
+      }
     }
     const int ufd = ctx.udp_fd.load();
     if (ufd < 0) continue;

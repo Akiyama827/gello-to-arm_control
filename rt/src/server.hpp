@@ -24,7 +24,9 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -94,6 +96,71 @@ constexpr int MAX_OBSERVERS = 4;
 // One servo iteration that took > LOOP_GAP_NS from read-return to read-return.
 // The gap = previous iteration's compute+write+publish, then this one's read.
 constexpr uint64_t LOOP_GAP_NS = 2'000'000;
+
+// One servo cycle's bounded controller context (CTRL-010), captured right
+// after the law produced its output. Fixed scalars only: no allocation, no
+// per-joint arrays, no callbacks. The gap record stamps the PREVIOUS
+// iteration's capture — a gap is detected at the next read-return, so the
+// scratch then holds exactly the cycle whose compute+write produced it.
+//
+// Torque conventions, kept separate here because collapsing them would
+// mislead every plot built on the export:
+//   * tau_ff  — what the accepted command carried: model feedforward plus
+//               the PC integral bias, indistinguishable at this boundary
+//               (the integral is PC state; separating them is a PC-side
+//               diagnostic).
+//   * tau_raw — the same cycle's algebraic PD+FF before clamp/slew.
+//   * tau_out — the locally sent output after clamp+slew.
+//   * tau_ref — the plant's own echo of the last ACCEPTED torque (franka
+//               tau_J_d analogue), i.e. vendor-acknowledged torque. NEVER
+//               merged with tau_out.
+//   * tau_meas — measured joint torque. Absent fields are reported as
+//               diag_valid=false by the stamping loop, never zero-filled.
+struct CtrlDiag {
+  double q_err_max = 0;     // max |q_des - q| this cycle, rad
+  double qd_err_max = 0;    // max |qd_des - dq| this cycle, rad/s
+  double tau_ff_max = 0;    // max |accepted command feedforward|, N.m
+  double tau_raw_max = 0;   // max |pre-clamp output|, N.m
+  double tau_out_max = 0;   // max |post clamp+slew output|, N.m
+  double tau_ref_max = 0;   // max |vendor echo (slew reference)|, N.m
+  double tau_meas_max = 0;  // max |measured joint torque|, N.m
+  int limiter_joint = -1;   // first joint whose output the limiter changed
+  bool clamp_active = false;  // torque clamp engaged on that joint
+  bool slew_active = false;   // slew limiter engaged on that joint
+};
+
+// Captures the context of one finished servo computation. `changed` uses the
+// raw export from servo_torque: the limiter engaged exactly where the value
+// it consumed differs from the value it wrote (same computation chain, so
+// the compare is exact, not a tolerance).
+inline CtrlDiag capture_ctrl_diag(int n,
+                                  const double* q, const double* dq,
+                                  const double* q_des, const double* qd_des,
+                                  const double* tau_ff,
+                                  const double* tau_raw,
+                                  const double* tau_out,
+                                  const double* tau_ref,
+                                  const double* tau_meas,
+                                  const double* tau_limit,
+                                  double slew) {
+  CtrlDiag d;
+  for (int j = 0; j < n; ++j) {
+    d.q_err_max = std::max(d.q_err_max, std::fabs(q_des[j] - q[j]));
+    d.qd_err_max = std::max(d.qd_err_max, std::fabs(qd_des[j] - dq[j]));
+    d.tau_ff_max = std::max(d.tau_ff_max, std::fabs(tau_ff[j]));
+    d.tau_raw_max = std::max(d.tau_raw_max, std::fabs(tau_raw[j]));
+    d.tau_out_max = std::max(d.tau_out_max, std::fabs(tau_out[j]));
+    d.tau_ref_max = std::max(d.tau_ref_max, std::fabs(tau_ref[j]));
+    d.tau_meas_max = std::max(d.tau_meas_max, std::fabs(tau_meas[j]));
+    if (d.limiter_joint < 0 && tau_raw[j] != tau_out[j]) {
+      d.limiter_joint = j;
+      d.clamp_active = tau_out[j] == tau_limit[j] || tau_out[j] == -tau_limit[j];
+      d.slew_active = std::fabs(tau_out[j] - tau_ref[j]) >= slew - 1e-9;
+    }
+  }
+  return d;
+}
+
 struct LoopGap {
   uint64_t t_read_ns;   // this read's return, server clock (== StatePacket stamp domain)
   uint64_t period_ns;   // read-return to read-return
@@ -105,6 +172,18 @@ struct LoopGap {
   double cmd_success_rate;
   uint32_t state_seq;
   bool armed;
+  // CTRL-010: identity, command sequence and bounded controller context of
+  // the PREVIOUS iteration — the cycle whose compute+write the gap contains.
+  // `state_seq` above points at the state packet published in the SAME
+  // iteration as this record (the current measurement); the controller
+  // fields below describe the previous write cycle. `diag_valid=false` means
+  // no servo computation ran in that cycle (disarmed or plant down): the
+  // controller fields are then absent, never zero-filled as if measured.
+  bool diag_valid;
+  uint64_t session_id;
+  uint32_t arm_epoch;     // ARM generation the previous cycle acted on
+  uint32_t last_cmd_seq;  // freshest command the previous cycle consumed
+  CtrlDiag diag;
 };
 constexpr uint32_t LOOP_GAP_RING = 64;
 

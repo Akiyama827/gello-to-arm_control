@@ -101,6 +101,14 @@ target_include_directories(fault_journal_selfcheck PRIVATE include)
 target_link_libraries(fault_journal_selfcheck PRIVATE Threads::Threads)
 target_compile_options(fault_journal_selfcheck PRIVATE -UNDEBUG)
 
+# CTRL-010 loop-gap diagnostics: forced gap, fixture sequence association,
+# full ring, stalled consumer, law raw-export behavior neutrality.
+add_executable(gap_diagnostic_selfcheck src/gap_diagnostic_selfcheck.cpp
+  src/rt_loop.cpp)
+target_include_directories(gap_diagnostic_selfcheck PRIVATE include)
+target_link_libraries(gap_diagnostic_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
+target_compile_options(gap_diagnostic_selfcheck PRIVATE -UNDEBUG)
+
 # RT <-> non-RT transport: mailbox, command admission, envelope freshness.
 # Build it with -fsanitize=thread as well (see README); no sockets are opened.
 add_executable(ipc_selfcheck src/ipc_selfcheck.cpp src/udp_link.cpp)

@@ -161,6 +161,12 @@ void rt_loop(ServerCtx& ctx) {
   double hold_kp[MAX_JOINTS], hold_kd[MAX_JOINTS];
   double zeros[MAX_JOINTS] = {};
   double tau_out[MAX_JOINTS] = {};
+  double tau_raw[MAX_JOINTS] = {};  // pre-clamp law output, diagnostics only
+  // Bounded controller context of the LAST finished servo computation
+  // (CTRL-010). Stamped into a loop-gap record at the NEXT read-return, so a
+  // gap record describes exactly the cycle whose compute+write it contains.
+  CtrlDiag diag{};
+  bool diag_valid = false;
   for (int j = 0; j < MAX_JOINTS; ++j) {
     hold_kp[j] = ctx.cfg.hold_kp;
     hold_kd[j] = ctx.cfg.hold_kd;
@@ -220,7 +226,9 @@ void rt_loop(ServerCtx& ctx) {
         ctx.gaps[head % LOOP_GAP_RING] = LoopGap{
             t_read, t_read - prev_t_read, t_read - t_top, prev_compute, prev_write,
             prev_publish, int64_t(ps.robot_time_ms) - int64_t(prev_robot_ms),
-            ps.cmd_success_rate, state_seq + 1, ctx.armed.load()};
+            ps.cmd_success_rate, state_seq + 1, ctx.armed.load(),
+            diag_valid, ctx.session_id.load(std::memory_order_acquire),
+            uint32_t(seen_gen), last_cmd_seq, diag};
         ctx.gap_head.store(head + 1, std::memory_order_release);
       } else {
         ctx.gap_dropped.fetch_add(1, std::memory_order_relaxed);
@@ -347,6 +355,7 @@ void rt_loop(ServerCtx& ctx) {
       controller.reset();
       holding = false;  // nothing is held — the robot's own safety has it
       std::memset(tau_out, 0, sizeof(tau_out));
+      diag_valid = false;  // no servo computation ran: context is absent
     } else if (armed) {
       if (!faulted && fresh) {
         holding = false;
@@ -383,10 +392,15 @@ void rt_loop(ServerCtx& ctx) {
       q_des = selected.q_des;
       qd_des = selected.qd_des;
       servo_torque(n, ps.q, ps.dq, selected.q_des, selected.qd_des, selected.tau_ff,
-                   selected.kp, selected.kd, ps.tau_ref, tau_limits, slew, tau_out);
+                   selected.kp, selected.kd, ps.tau_ref, tau_limits, slew, tau_out,
+                   tau_raw);
       t_w0 = mono_ns();
       const bool wrote = backend->write_command(selected, slew, tau_out);
       t_w1 = mono_ns();
+      diag = capture_ctrl_diag(n, ps.q, ps.dq, selected.q_des, selected.qd_des,
+                               selected.tau_ff, tau_raw, tau_out, ps.tau_ref,
+                               ps.tau, tau_limits, slew);
+      diag_valid = true;
       if (!wrote) {
         ctx.latch(FAULT_PLANT, backend->fault_text().c_str(), seen_gen);
         plant_ok = false;
@@ -399,6 +413,7 @@ void rt_loop(ServerCtx& ctx) {
         ctx.journal(FAULT_STOP_FAILED, FAULT_PLANT, backend->fault_text().c_str(), seen_gen);
       holding = false;
       std::memset(tau_out, 0, sizeof(tau_out));
+      diag_valid = false;  // no servo computation ran: context is absent
       // Disarmed at this sample and any stop() returned: the request is done
       // as far as this process can know. Not a claim about the robot's brakes.
       stop_epoch = uint32_t(disarm_gen);

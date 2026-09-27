@@ -27,6 +27,15 @@ inline double clamp(double v, double lo, double hi) {
 // All arrays length n. Writes tau_out; safe to alias tau_out with tau_ref? No
 // — caller keeps them distinct (asserted by convention, not code: this runs
 // at RT priority, branches are budget).
+//
+// `tau_raw` is an optional diagnostics export of the PRE-CLAMP algebraic
+// PD+FF (CTRL-010 bounded controller diagnostics). When null — every
+// existing caller (the MuJoCo sim twin, the offline selfchecks) — the loop
+// compiles to exactly the former behavior. The RT servo passes a fixed
+// caller-owned buffer, so the one added compare is loop-invariant and
+// perfectly predicted in both directions. This is still ONE law body: the
+// diagnostic value is the same `t` the limiter consumes, never a
+// recomputation that could drift from it.
 inline void servo_torque(int n,
                          const double* q, const double* dq,
                          const double* q_des, const double* qd_des,
@@ -35,12 +44,14 @@ inline void servo_torque(int n,
                          const double* tau_ref,
                          const double* tau_limit,
                          double slew_per_tick,
-                         double* tau_out) {
+                         double* tau_out,
+                         double* tau_raw = nullptr) {
   for (int j = 0; j < n; ++j) {
     // (clamp runs before the slew; the final re-clamp below closes the case
     // where tau_ref itself sits outside the limit — impossible for franka's
     // tau_J_d and the fake's self-echo, cheap insurance for the DM bus)
     double t = kp[j] * (q_des[j] - q[j]) + kd[j] * (qd_des[j] - dq[j]) + tau_ff[j];
+    if (tau_raw) tau_raw[j] = t;
     t = clamp(t, -tau_limit[j], tau_limit[j]);
     t = clamp(t, tau_ref[j] - slew_per_tick, tau_ref[j] + slew_per_tick);
     tau_out[j] = clamp(t, -tau_limit[j], tau_limit[j]);
