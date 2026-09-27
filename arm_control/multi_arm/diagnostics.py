@@ -82,20 +82,25 @@ ADMITTED_PHASES = ("ready", "executing")
 
 #: (link, per-arm sample field) for the links that must belong to the SAME
 #: selected reference as the joined reference link.
-_CHAIN_FIELDS = (("raw", "tau_ff_pc"), ("sent", "q_cmd_pc"),
+CHAIN_FIELDS = (("raw", "tau_ff_pc"), ("sent", "q_cmd_pc"),
                  ("echo", "last_cmd_seq"), ("measured", "q_rt"))
 
 
 def reconstruct_lineage(samples, *, pair_id=None):
     """Correlate one execution chain from the bounded samples a trace kept.
 
-    A chain is a JOIN on identities, never field presence. The reference link
-    requires an arm's observed controller ``plan_id`` to equal the plan the
-    pair declared for that arm (``pair_plans``) while the lifecycle is an
-    admitted phase; every command link must fall at a tick where that same
-    declared plan is still the observed one. A pair that was never admitted,
-    or whose controller is still holding a foreign plan, is reported
-    incomplete with the reason — never a fabricated success.
+    A chain is a JOIN on identities, never field presence, and it belongs to
+    the whole pair. Inside the admitted span (``ADMITTED_PHASES``; STAGING is a
+    request, not an admission):
+
+    * the reference link exists only once EVERY declared member has been seen
+      on its own declared ``pair_plans`` entry — one member joining is not the
+      pair's selected reference;
+    * every command link comes from a JOINED arm only, so an arm still running
+      a foreign plan can never supply a link the joined arm cannot;
+    * command links fall at or after that reference tick;
+    * a foreign-plan arm anywhere in the span, or a pair that was never
+      admitted, makes the report incomplete rather than a fabricated chain.
 
     Read-only detached analysis: this opens no transport and takes only the
     recorded samples. A returned chain is a report, never a safe executable
@@ -120,7 +125,7 @@ def reconstruct_lineage(samples, *, pair_id=None):
     # those ticks are not this pair's lineage.
     admitted = [i for i, s in enumerate(window)
                 if s.get("lifecycle") in ADMITTED_PHASES]
-    links, foreign = {}, set()
+    links, foreign, joined = {}, set(), set()
     if window:
         links["requested"] = 0
     if admitted:
@@ -128,33 +133,44 @@ def reconstruct_lineage(samples, *, pair_id=None):
         links["admitted"] = first
         for index in range(first, last + 1):
             arms = window[index].get("arms") or {}
-            joined_here = False
-            for arm, view in arms.items():
-                plan = view.get("plan_id")
-                if plan is None:
-                    continue
-                if declared.get(arm) == plan:
-                    joined_here = True
-                else:
-                    foreign.add(arm)
+            joined_here = {arm for arm, view in arms.items()
+                           if view.get("plan_id") is not None
+                           and declared.get(arm) == view.get("plan_id")}
+            foreign.update(arm for arm, view in arms.items()
+                           if view.get("plan_id") is not None
+                           and declared.get(arm) != view.get("plan_id"))
             if not joined_here:
                 continue
-            if "reference" not in links:
+            joined |= joined_here
+            # The reference link is the pair's: it exists only once EVERY
+            # declared member has been seen on its own declared plan, so a
+            # pair with one member still (or forever) elsewhere cannot claim
+            # a selected reference.
+            if joined == set(declared) and "reference" not in links:
                 links["reference"] = index
-            # Command links must belong to that same declared member plan.
-            for name, field in _CHAIN_FIELDS:
-                if name not in links and any(v.get(field) is not None
-                                             for v in arms.values()):
+            if "reference" not in links:
+                continue
+            # Command links come from a JOINED arm only. An arm still running a
+            # foreign plan contributes nothing to this chain — its data must
+            # never satisfy a link the joined arm cannot.
+            for name, field in CHAIN_FIELDS:
+                if name not in links and any(arms[arm].get(field) is not None
+                                             for arm in joined_here):
                     links[name] = index
     missing = [name for name in LINE_LINKS if name not in links]
+    # A foreign arm inside the admitted span means the pair/controller binding
+    # was not clean for this window; report incomplete rather than a chain that
+    # silently ignored it.
+    complete = bool(window) and not missing and not foreign
     return dict(
         pair_id=pair_id,
         session=window[0].get("pc_monotonic") if window else None,
         ticks=len(window),
         admitted_ticks=len(admitted),
         declared_plans=dict(declared),
+        joined_arms=sorted(joined),
         foreign_arms=sorted(foreign),
-        complete=bool(window) and not missing,
+        complete=complete,
         links=links,
         missing=missing,
     )

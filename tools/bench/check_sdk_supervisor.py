@@ -152,10 +152,17 @@ def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="sdk_supervisor_"))
     udp, tcp = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
     sock = tmp / "sdk_arm.sock"
+    server_argv = [args.server, "--backend", "fake", "--n", "3", "--instance-id", "sdk_arm",
+                   "--joint-names", ",".join(JOINTS), "--udp-port", str(udp),
+                   "--tcp-port", str(tcp), "--hold-ms", "100", "--fault-ms", "600"]
+    if args.native and not args.legacy_server:
+        # The server's v7 capability is opt-in, so the fixture that exercises
+        # the native path must opt the SERVER in too. --legacy-server stands in
+        # for a build that has no such flag, so it deliberately omits it and
+        # expects the v5 fallback.
+        server_argv.append("--enable-reference")
     rt = subprocess.Popen(
-        [args.server, "--backend", "fake", "--n", "3", "--instance-id", "sdk_arm",
-         "--joint-names", ",".join(JOINTS), "--udp-port", str(udp), "--tcp-port", str(tcp),
-         "--hold-ms", "100", "--fault-ms", "600"],
+        server_argv,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.monotonic() + 10
     while not tcp_listening(tcp):

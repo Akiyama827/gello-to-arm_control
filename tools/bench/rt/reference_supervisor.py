@@ -34,7 +34,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from check_sdk_supervisor import write_config
 
 
-def until(fn, timeout=5):
+def until(fn, timeout=20):
+    """Bounded wait for a phase transition.
+
+    Generous on purpose: this bounds a wait, it is not a deadline. Each
+    transition takes milliseconds at 100 Hz, but this check may run beside
+    other fake-server checks, and a 5 s bound flaked about 1 run in 4 under
+    that load (seen in a full-sweep pass) with no real fault present. An
+    actual hang is still caught — by the per-check timeout outside this file.
+    """
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         out = fn()
@@ -107,7 +115,7 @@ def main(binary):
             )
             status = runtime.submit("test", request)
             assert status.phase is Phase.ADMITTED, status
-            until(lambda: runtime.status(status.execution_id).terminal, 8)
+            until(lambda: runtime.status(status.execution_id).terminal)
             done = runtime.status(status.execution_id)
             assert done.phase is Phase.COMPLETED, done
             phases = [r.phase for r in runtime.receipts(status.execution_id)]

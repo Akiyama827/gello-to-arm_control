@@ -614,6 +614,39 @@ def main(pair_path, binary, refinement="none"):
                 pair_id=state["pair"]["pair_id"])
             assert not never_admitted["complete"], never_admitted
             assert "admitted" in never_admitted["missing"], never_admitted
+            # A command link must come from a JOINED arm: strip the joined
+            # arm's command data and let the foreign-plan arm keep its own —
+            # the chain must stay incomplete, not borrow the foreign numbers.
+            declared = lineage["declared_plans"]
+            joined_arm, other_arm = sorted(declared)
+            command_only_foreign = [
+                dict(s, arms={
+                    joined_arm: dict((s.get("arms") or {}).get(joined_arm) or {},
+                                     plan_id=declared[joined_arm],
+                                     **{f: None for _, f in diagnostics.CHAIN_FIELDS}),
+                    other_arm: dict((s.get("arms") or {}).get(other_arm) or {},
+                                    plan_id="some-other-run"),
+                })
+                for s in app._trace.samples
+            ]
+            borrowed = diagnostics.reconstruct_lineage(
+                command_only_foreign, pair_id=state["pair"]["pair_id"])
+            assert not borrowed["complete"], borrowed
+            assert "raw" in borrowed["missing"] and "sent" in borrowed["missing"], borrowed
+            assert borrowed["joined_arms"] == [joined_arm], borrowed
+            # One of two declared members joining is not the PAIR's reference.
+            half_joined = [
+                dict(s, arms={
+                    arm: dict(view, plan_id=(declared[arm] if arm == joined_arm else None))
+                    for arm, view in (s.get("arms") or {}).items()
+                })
+                for s in app._trace.samples
+            ]
+            partial = diagnostics.reconstruct_lineage(
+                half_joined, pair_id=state["pair"]["pair_id"])
+            assert not partial["complete"], partial
+            assert "reference" in partial["missing"], partial
+            assert partial["joined_arms"] == [joined_arm], partial
             print("Execution lineage reconstructs from the bounded trace: PASS", flush=True)
             print("Two RT sessions: disarmed startup, measured planning, reviewed paired execution: PASS", flush=True)
             if config.shared_object is not None:
