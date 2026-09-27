@@ -375,17 +375,17 @@ void rt_loop(ServerCtx& ctx) {
     ctx.reference_feedback.write(reference.info());
     // Wrong reference identity/phase never refreshes the command deadline.
     // A retired revision can report a live transport, but cannot regain selection.
-    // Which law may actuate is the MODE's decision, not the reference ID's.
-    // An envelope of the retired family, or one already in the Mailbox when the
-    // floor was raised, is not authority and cannot move the deadman either.
+    // Family validity — EXACTLY the baseline predicate, unaffected by the
+    // mode. Wrong reference identity/phase never refreshes the command
+    // deadline, and a retired revision cannot regain it, whatever law the mode
+    // currently authorizes. The mode gates ACTUATION below, not liveness.
     const bool incoming_native =
         envelope.packet.command.version==REFERENCE_VERSION;
-    bool admit_envelope = mode.admits(incoming_native, envelope.rx_ns,
-                                      session, uint32_t(gen));
-    if(admit_envelope && incoming_native) {
+    bool admit_envelope=true;
+    if(incoming_native) {
       admit_envelope=reference_envelope_fresh(envelope.reference,reference.info(),
                                                now,envelope.rx_ns,hold_ns);
-    }
+    } else if(reference.info().reference_id) admit_envelope=false;
     authority.observe(gen, arm_start, admit_envelope?cmd_v:0, envelope);
     const uint64_t rx_ns = authority.deadman_base();
     // Deadman age (CMD_LOST), from this generation only. SIGNED, clamped age:
@@ -407,12 +407,15 @@ void rt_loop(ServerCtx& ctx) {
 
     const bool native_command=cmd.version==REFERENCE_VERSION;
     if(native_command) {
-      fresh=fresh && reference.active() && reference_envelope_fresh(
+      // Which law may actuate is the MODE's decision, not the reference ID's.
+      // A retired family, or an envelope already in the Mailbox when the floor
+      // was raised, is not authority and holds instead.
+      fresh=fresh && mode.admits(true, authority.current.rx_ns, session, uint32_t(gen))
+            && reference.active() && reference_envelope_fresh(
         authority.current.reference,reference.info(),now,authority.current.rx_ns,hold_ns);
-    } else if(!mode.admits(false, authority.current.rx_ns, session, uint32_t(gen))) {
-      // Streamed envelope left over from before a mode change or floor rise:
-      // it is neither tracked nor able to move this generation's deadline.
-      fresh=false;
+    } else {
+      fresh=fresh && mode.admits(false, authority.current.rx_ns,
+                                 session, uint32_t(gen));
     }
 
     const double* q_des = zeros;
