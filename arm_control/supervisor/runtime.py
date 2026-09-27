@@ -33,6 +33,8 @@ from arm_control.motion import JointTrajectory
 from arm_control.config import arm_joints
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.factory import build_arm_controller
+from arm_control.control.presets import resolve_presets
+from arm_control.execution.controller import ControllerState, PayloadState, PayloadValue
 from arm_control.execution import codec
 from arm_control.execution.stream import (StreamOpen, StreamRevision, StreamView,
                                           SpliceAnchor, RevisionStatus, SelectionState)
@@ -88,6 +90,7 @@ class _Node(QueueControllerNode):
 class _Execution:
     request: TrajectoryRequest
     stream: _Stream | None = field(default=None, kw_only=True)
+    payload_revision: int = field(default=0, kw_only=True)
     status: ExecutionStatus
     receipts: list[Receipt] = field(default_factory=list)
     first_seq: int | None = None
@@ -116,6 +119,7 @@ class _Stream:
     facts: StreamFacts
     epoch: tuple
     gains: tuple
+    payload_revision: int
     anchor: SpliceAnchor | None = None
     pending: str | None = None
     selected: str | None = None
@@ -144,6 +148,13 @@ class RobotRuntime:
         self._native_epoch = 0
         self._native_failed = False
         self.controller = self._build_controller()
+        self._payload = PayloadState(0, PayloadValue(0.))
+        self._presets = resolve_presets(cfg.get('control_mode') or {}, self.joints,
+                                       self.controller.executor.kp, self.controller.executor.kd)
+        self._soft_ids = itertools.count(1)
+        self._selected_soft = None
+        self._mode_feedback = dict(law='joint', kp=self.controller.executor.kp.copy(),
+                                   kd=self.controller.executor.kd.copy())
         self.period = self.controller.execution_policy.period
         self._profile_gains = (self.controller.executor.kp.copy(),
                                self.controller.executor.kd.copy())
@@ -172,7 +183,86 @@ class RobotRuntime:
 
     @property
     def extensions(self):
-        return {'stream': 1} if self._native is not None and self._stream_admission is not None else {}
+        result = {'controller': 1}
+        if self._native is not None and self._stream_admission is not None:
+            result['stream'] = 1
+        return result
+
+    # -- controller/1: runtime consequences, existing controller law -------------
+    def controller_presets(self):
+        return tuple(p.choice for p in self._presets.values())
+
+    def controller_state(self):
+        with self._cv:
+            return self._controller_state()
+
+    def _controller_state(self):
+        mode = self._mode_feedback
+        preset_id = None
+        for name, preset in self._presets.items():
+            if preset.choice.law != mode['law']:
+                continue
+            if mode['law'] == 'soft':
+                if name == self._selected_soft:
+                    preset_id = name
+            elif (np.array_equal(preset.kp, mode['kp'])
+                  and np.array_equal(preset.kd, mode['kd'])):
+                preset_id = name
+                break
+        return ControllerState(mode['law'], preset_id, tuple(mode['kp']),
+                               tuple(mode['kd']), self._payload)
+
+    def select_control_preset(self, session, preset_id):
+        return self._call(self._select_control_preset, session, preset_id)
+
+    def _select_control_preset(self, session, preset_id):
+        self._owns(session)
+        preset = self._presets.get(preset_id)
+        if preset is None:
+            raise Refused(f'unknown controller preset {preset_id!r}')
+        c = self.controller
+        spec = None
+        if preset.pose_hold is not None:
+            state, _ = self.link.latest_state()
+            if (self._native is not None and state is not None and state.reference
+                    and state.reference['reference_id']):
+                raise Refused('Soft unavailable after native reference use in this ARM epoch: '
+                              'RT retains reference ownership after cancellation')
+            try:
+                spec = c.validate_pose_hold(dict(preset.pose_hold, id=next(self._soft_ids)))
+            except (TypeError, ValueError) as exc:
+                raise Refused(str(exc)) from exc
+        if self._controller_state().preset_id == preset_id:
+            return self._controller_state()
+        for ex in list(self._executions.values()):
+            if not ex.status.terminal:
+                self._cancel_execution(ex, f'controller preset changed to {preset_id}')
+        # The shared controller still owns resets, hold capture and Soft law.
+        if spec is not None:
+            self._selected_soft = preset_id
+            c.on_control(pack_control_update(pose_hold=spec))
+        else:
+            self._selected_soft = None
+            c.on_control(pack_control_update(gains=dict(kp=preset.kp.tolist(), kd=preset.kd.tolist())))
+        self._pump_controller()
+        state = self._controller_state()
+        if state.law != preset.choice.law:
+            raise Refused('controller did not confirm the requested law')
+        return state
+
+    def set_payload(self, session, payload):
+        return self._call(self._set_payload, session, payload)
+
+    def _set_payload(self, session, payload):
+        self._owns(session)
+        payload = codec.payload_from(codec.encode(payload))
+        if self._current() is not None:
+            raise Refused('cancel and retire the arm execution before replacing payload')
+        # Install the validated complete value once; the executor applies its
+        # compensation, while this revision owns admission identity.
+        self.controller.executor.set_payload(payload.mass_kg, com_offset=payload.com_ee)
+        self._payload = PayloadState(self._payload.revision + 1, payload)
+        return self._payload
 
     # -- stream/1: same execution ledger, reference owner and control loop -------
     def open_stream(self, session, request):
@@ -221,7 +311,7 @@ class RobotRuntime:
 
     def _stream_retry(self, session, request):
         self._owns(session)
-        if not self.extensions:
+        if self.extensions.get('stream') != 1:
             raise Refused('stream/1 requires native reference and trusted admission')
         old = self._stream_attempts.get((session, request.request_id))
         if old is not None and codec.encode(old.request) != codec.encode(request):
@@ -240,10 +330,10 @@ class RobotRuntime:
         s = ex.stream
         if self.controller.mode_law != 'joint':
             return 'stream requires joint-impedance mode'
-        if self.controller.executor.payload_mass_kg != 0.:
+        if self._payload.value.mass_kg != 0. or s.payload_revision != self._payload.revision:
             return 'transient PC compensation payload must be zero for stream/1'
-        if facts != s.facts or not facts.empty_load:
-            return 'model/scene/policy/load snapshot changed or transient load is not known zero'
+        if facts != s.facts:
+            return 'model/scene/policy snapshot changed'
         if facts.model_token != self.controller.model_token or facts.model_token != s.opened.model_token:
             return 'stream model differs from bound execution model'
         if facts.scene_token != s.opened.scene_token or facts.policy.stream_policy_id != s.opened.stream_policy_id:
@@ -270,8 +360,10 @@ class RobotRuntime:
         receipt = Receipt(eid, request.request_id, self.instance_id, Phase.REQUESTED, at)
         stream = _Stream(session, request, facts,
                          (session, self.link.session_id, self._authority.arm_epoch),
-                         tuple(x.copy() for x in self._profile_gains), pending=request.request_id)
-        ex = _Execution(request.as_request(), ExecutionStatus.start(receipt), [receipt], stream=stream)
+                         tuple(x.copy() for x in self._profile_gains), self._payload.revision,
+                         pending=request.request_id)
+        ex = _Execution(request.as_request(), ExecutionStatus.start(receipt), [receipt], stream=stream,
+                        payload_revision=self._payload.revision)
         attempt = self._new_attempt(ex, request, request.initial, at)
         self._executions[eid] = ex
         self._stream_attempts[session, request.request_id] = attempt
@@ -734,7 +826,8 @@ class RobotRuntime:
         current = self._current()
         eid = f"{self.instance_id}.{next(self._ids)}.{uuid.uuid4().hex[:8]}"
         first = Receipt(eid, request.request_id, self.instance_id, Phase.REQUESTED, self.now())
-        ex = _Execution(request, ExecutionStatus.start(first), [first])
+        ex = _Execution(request, ExecutionStatus.start(first), [first],
+                        payload_revision=self._payload.revision)
         self._executions[eid] = ex
         self._by_request[request.request_id] = eid
         refusal = (
@@ -822,6 +915,7 @@ class RobotRuntime:
 
     def _cancel_execution(self, ex: _Execution, reason: str) -> None:
         ex.cancel_reason = reason
+        ex.completed_at = None
         if ex.stream is not None:
             ex.stream.anchor = None
             if ex.status.phase is Phase.REQUESTED:
@@ -853,6 +947,8 @@ class RobotRuntime:
         return live[-1].status if live else None
 
     def _receipt(self, ex: _Execution, phase: Phase, reason: str = "", **evidence) -> None:
+        if phase is Phase.ADMITTED:
+            evidence["payload_revision"] = ex.payload_revision
         r = Receipt(ex.status.execution_id, ex.status.request_id, self.instance_id, phase,
                     self.now(), reason, evidence)
         ex.status = ex.status.apply(r)
@@ -916,6 +1012,8 @@ class RobotRuntime:
     def _on_event(self, event: dict) -> None:
         ex = self._executions.get(event.get("plan_id") or "")
         kind = event["kind"]
+        if kind == 'mode' and event.get('ok') and event.get('mode_state'):
+            self._mode_feedback = event['mode_state']
         if ex is None or ex.status.terminal:
             return
         if kind == "plan_staged":

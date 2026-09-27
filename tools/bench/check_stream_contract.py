@@ -5,6 +5,7 @@ import sys
 
 import numpy as np
 
+from arm_control.execution.controller import PayloadValue, PayloadState, ControllerState
 from arm_control.execution import codec
 from arm_control.execution.contract import CONTRACT_VERSION, Clock, Stamp, Start
 from arm_control.execution.stream import StreamOpen, StreamRevision, SpliceAnchor
@@ -62,11 +63,39 @@ def check():
             else:
                 raise AssertionError('unnegotiated extension accepted')
         assert channel.calls == ['hello']
+    payload = PayloadValue(.5, [1., 2., 3.])
+    state = ControllerState('joint', None, [1.], [2.], PayloadState(3, payload))
+    assert codec.controller_state_from(codec.encode(state)) == state
+    for mass, com in ((-1, None), (float('nan'), None), (float('inf'), None),
+                      (.5, [1, 2]), (.5, [1, 2, 3, 4]), (.5, [0, 0, float('nan')])):
+        try:
+            PayloadValue(mass, com)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid payload accepted')
+    assert PayloadValue(0, [float('nan')]).com_ee is None
+    original = [1., 2., 3.]
+    value = PayloadValue(.5, original)
+    original[0] = 100.
+    assert value.com_ee == (1., 2., 3.)
+    for extension in ({}, {'controller': 2}):
+        channel = Channel(extension)
+        arm = ArmClient('fake', channel=channel)
+        for fn in (arm.controller_presets, arm.controller_state,
+                   lambda: arm.select_control_preset('track'), lambda: arm.set_payload(payload)):
+            try:
+                fn()
+            except Refused:
+                pass
+            else:
+                raise AssertionError('unnegotiated controller extension accepted')
+        assert channel.calls == ['hello']
     assert CONTRACT_VERSION == 1
     assert not any(name.split('.')[0] in {'mujoco', 'pinocchio', 'pyarrow', 'dora', 'rerun', 'ompl'} for name in sys.modules)
     assert not any(name.startswith(('arm_control.supervisor', 'arm_control.plants')) for name in sys.modules)
     assert np.array_equal(request.initial.velocities, [[0.], [0.]])
-    print('PASS: stream codec/immutable input, uint64 syntax, absent extension refuses all six methods, SDK device-free, execution v1 unchanged')
+    print('PASS: stream/controller codecs, complete payload, immutable input, uint64 syntax, absent extension refuses all six methods, SDK device-free, execution v1 unchanged')
 
 
 if __name__ == '__main__':

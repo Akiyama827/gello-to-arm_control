@@ -723,3 +723,25 @@ would introduce competing control owners. Retirement requires migrating that
 console and its graph peers to one supervisor owner without dropping those
 controls. This checkpoint is not a completed console migration or hardware
 qualification.
+
+### controller/1 task checkpoint (CTRL-033)
+
+The optional SDK/service extension lists configured named presets and observes
+controller law/gains plus canonical transient payload state. RobotRuntime validates
+before retiring its execution/native generation; ArmController owns the existing
+law transition and emits confirmation. Soft admission is shared through
+`validate_pose_hold()`, not copied into the supervisor. `control.presets` resolves
+the deployment configuration; applications select names, not numerical gains.
+
+Runtime owns payload value/revision. Replacement refuses while any execution is
+nonterminal. Stream admission captures that revision and requires zero mass;
+StreamFacts no longer provides a second mutable load declaration. The executor
+stores only the installed compensation value, and its redundant mass-admission
+accessor is removed. F5 vendor fixed-load ownership remains unresolved.
+
+This remains unintegrated: console migration is stopped on native-to-Soft mode
+arbitration. RT retains the reference identity after CANCEL and rejects all v5/v6
+commands for the rest of that ARM epoch. The SDK refuses Soft in that state rather
+than confirming a law RT cannot apply. No implicit DISARM/re-ARM or RT ownership
+change is implemented. Existing console preset resolution and raw jog remain until
+one-owner migration and its silence/cancel/expiry checks are complete.

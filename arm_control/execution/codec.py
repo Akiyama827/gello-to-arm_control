@@ -157,3 +157,23 @@ def _self_check() -> None:
 
 if __name__ == "__main__":
     _self_check()
+
+
+def payload_from(d):
+    from .controller import PayloadValue
+    return PayloadValue(**d)
+
+
+def payload_state_from(d):
+    from .controller import PayloadState
+    return PayloadState(d['revision'], payload_from(d['value']))
+
+
+def preset_from(d):
+    from .controller import ControllerPreset
+    return ControllerPreset(**d)
+
+
+def controller_state_from(d):
+    from .controller import ControllerState
+    return ControllerState(**{**d, 'payload': payload_state_from(d['payload'])})

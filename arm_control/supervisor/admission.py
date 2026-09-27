@@ -3,7 +3,7 @@
 RobotRuntime captures snapshot() on its loop: it must be bounded and nonblocking.
 check(curve, snapshot) runs on the single bounded non-RT admission worker and
 returns an empty string on success or a refusal reason. Project composition owns
-scene/model/load truth; producer messages cannot populate these facts.
+scene/model truth; RobotRuntime owns transient payload truth; producer messages cannot populate these facts.
 """
 from dataclasses import dataclass
 import math
@@ -40,13 +40,6 @@ class StreamFacts:
     model_token: str
     scene_token: str
     policy: StreamPolicy
-    load_revision: str
-    transient_mass_kg: float | None
-
-    @property
-    def empty_load(self):
-        return (bool(self.load_revision) and self.transient_mass_kg is not None
-                and math.isfinite(self.transient_mass_kg) and self.transient_mass_kg == 0.)
 
 
 class StreamAdmission(Protocol):

@@ -208,6 +208,26 @@ class ArmClient:
         return tuple(codec.receipt_from(r) for r in
                      self._channel.call("receipts", execution_id=execution_id))
 
+    # -- negotiated controller/1 -----------------------------------------------
+    def _controller_call(self, op, **args):
+        if self.extensions.get('controller') != 1:
+            raise Refused('supervisor does not advertise controller/1')
+        return self._channel.call(op, **args)
+
+    def controller_presets(self):
+        return tuple(codec.preset_from(p) for p in self._controller_call('controller_presets'))
+
+    def controller_state(self):
+        return codec.controller_state_from(self._controller_call('controller_state'))
+
+    def select_control_preset(self, preset_id: str):
+        return codec.controller_state_from(self._controller_call(
+            'controller_select', preset_id=preset_id))
+
+    def set_payload(self, payload):
+        return codec.payload_state_from(self._controller_call(
+            'controller_payload', payload=codec.encode(payload)))
+
     # -- negotiated stream/1 ----------------------------------------------------
     def _stream_call(self, op, **args):
         if self.extensions.get('stream') != 1:

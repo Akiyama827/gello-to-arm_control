@@ -653,26 +653,31 @@ class ArmController:
     def on_plant_capabilities(self, value) -> None:
         self.supports_pose_hold = bool(unpack_json_message(value).get("supports_pose_hold", False))
 
+    def validate_pose_hold(self, spec: dict) -> dict:
+        """Pure admission shared with the supervisor; never retires execution."""
+        if self.execution_policy is not None and self._observation_error():
+            raise ValueError("Soft needs fresh, healthy measured state")
+        spec = unpack_pose_hold_values(pose_hold_values(spec))
+        if self.pose_provenance == "calibrated":
+            # The RT pose hold closes on the plant's own (vendor) task
+            # model; no calibrated RT task space exists. Mixing a
+            # calibrated PC model with vendor feedback is refused.
+            raise ValueError("Soft uses the RT vendor task model; unavailable "
+                             "while a calibrated model bundle is active")
+        if (not self.supports_pose_hold or not self.armed or not self.ready_sent
+                or self.stopped or self.frozen):
+            raise ValueError("Soft needs an armed, ready, capable plant")
+        if (self._last_state_at is None or self._clock() - self._last_state_at > 1.0
+                or not np.isfinite(self.last_state.position).all()
+                or not np.isfinite(self.last_state.velocity).all()):
+            raise ValueError("Soft needs fresh, finite measured state")
+        if self._running or self._jog.active or np.max(np.abs(self.last_state.velocity)) > 0.05:
+            raise ValueError("Stop and settle before selecting Soft")
+        return spec
+
     def _set_pose_hold(self, spec: dict) -> None:
         try:
-            if self.execution_policy is not None and self._observation_error():
-                raise ValueError("Soft needs fresh, healthy measured state")
-            spec = unpack_pose_hold_values(pose_hold_values(spec))
-            if self.pose_provenance == "calibrated":
-                # The RT pose hold closes on the plant's own (vendor) task
-                # model; no calibrated RT task space exists. Mixing a
-                # calibrated PC model with vendor feedback is refused.
-                raise ValueError("Soft uses the RT vendor task model; unavailable "
-                                 "while a calibrated model bundle is active")
-            if (not self.supports_pose_hold or not self.armed or not self.ready_sent
-                    or self.stopped or self.frozen):
-                raise ValueError("Soft needs an armed, ready, capable plant")
-            if (self._last_state_at is None or self._clock() - self._last_state_at > 1.0
-                    or not np.isfinite(self.last_state.position).all()
-                    or not np.isfinite(self.last_state.velocity).all()):
-                raise ValueError("Soft needs fresh, finite measured state")
-            if self._running or self._jog.active or np.max(np.abs(self.last_state.velocity)) > 0.05:
-                raise ValueError("Stop and settle before selecting Soft")
+            spec = self.validate_pose_hold(spec)
         except (TypeError, ValueError) as exc:
             self._report_mode(ok=False, reason=str(exc))
             return

@@ -16,6 +16,7 @@ import time
 import numpy as np
 
 from arm_control.config import load_robot_config
+from arm_control.execution.controller import PayloadValue
 from arm_control.execution import codec
 from arm_control.execution.contract import Phase, Start
 from arm_control.execution.stream import StreamOpen, StreamRevision, SelectionState
@@ -35,8 +36,7 @@ from check_sdk_supervisor import write_config
 class Scene:
     def __init__(self):
         self.facts = StreamFacts('analytical-three-joint-fixture', 'scene-1',
-                                 StreamPolicy('analytical-envelope-1', .05, .4, 3., (.1,)*3),
-                                 'empty-1', 0.)
+                                 StreamPolicy('analytical-envelope-1', .05, .4, 3., (.1,)*3))
         self.entered = threading.Event()
         self.resume = threading.Event()
         self.resume.set()
@@ -80,7 +80,7 @@ def main(binary):
             serving = threading.Thread(target=service.serve, args=(stop,), daemon=True)
             serving.start()
             with ArmClient('fake', socket_path=service.path) as arm:
-                assert arm.extensions == {'stream': 1}
+                assert arm.extensions == {'stream': 1, 'controller': 1}
                 arm.claim()
                 arm.arm()
                 def opened(seq, rid, start=Start.ON_ADMIT):
@@ -171,12 +171,12 @@ def main(binary):
                 done = arm.wait(eid, 5.)
                 assert done.phase is Phase.FAULTED and 'UNDERFLOW' in done.reason, done
                 assert arm.authority().lifecycle.value == 'armed'
-                for i, mass in enumerate((None, .5)):
+                for i, mass in enumerate((.5, 1.)):
                     until(lambda: runtime._stream_job is None)
-                    scene.facts = replace(scene.facts, transient_mass_kg=mass)
+                    arm.set_payload(PayloadValue(mass))
                     _, view = opened(20+i, f'load{i}')
                     assert arm.wait(view.execution.execution_id, 1.).phase is Phase.REJECTED
-                print('PASS: nonterminal silence underflow, known-zero admission, unknown/nonzero load refusal')
+                print('PASS: nonterminal silence underflow, known-zero admission, canonical nonzero load refusal')
         except Exception:
             print('attempts', [(k, v.status, v.upload_started) for k, v in runtime._stream_attempts.items()])
             print('native', runtime._native_pending, runtime._native.key, runtime._native.candidate_selection, runtime._native.candidate_error, runtime._native.busy)

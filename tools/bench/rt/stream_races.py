@@ -1,7 +1,8 @@
 """Adversarial stream/1 admission checks over SDK/socket and fake-only RT.
 
 The gates block trusted scene work or an upload reply, never the control loop.
-All model/scene/load changes are analytical fault injection, not deployment facts.
+All model/scene changes are analytical fault injection, not deployment facts.
+Transient payload changes use the canonical SDK owner.
 """
 from dataclasses import replace
 from pathlib import Path
@@ -18,6 +19,7 @@ import numpy as np
 
 from arm_control.config import load_robot_config
 from arm_control.execution.contract import Phase, Start
+from arm_control.execution.controller import PayloadValue
 from arm_control.execution.stream import StreamOpen, StreamRevision, SelectionState
 from arm_control.motion import JointTrajectory
 from arm_control.sdk import ArmClient
@@ -49,9 +51,6 @@ def cases(arm, runtime, scene, service):
         'model': replace(base, model_token='other-model'),
         'scene': replace(base, scene_token='scene-2'),
         'policy': replace(base, policy=replace(base.policy, max_future_s=9.5)),
-        'load-revision': replace(base, load_revision='empty-2'),
-        'load-positive': replace(base, transient_mass_kg=.5),
-        'load-unknown': replace(base, transient_mass_kg=None),
     }
     # Facts change while the scene worker is blocked. Its late success must
     # neither admit the old snapshot nor restore the execution after cancellation.
@@ -73,7 +72,7 @@ def cases(arm, runtime, scene, service):
         assert arm.open_stream(req).execution == result
         refusal(lambda: arm.open_stream(replace(req, request_id=req.request_id+'-new')))
         scene.facts = base
-    print('PASS: model/scene/policy/load worker races and late-result rejection')
+    print('PASS: model/scene/policy worker races and late-result rejection')
 
     # Same facts change after native SEAL but before COMMIT. The task snapshot
     # was valid at admission; now the admitted execution must retire unselected.
@@ -103,7 +102,7 @@ def cases(arm, runtime, scene, service):
         observed = runtime._native.observed
         assert observed is None or observed['reference_id'] != candidate
         scene.facts = base
-    print('PASS: model/scene/policy/load changes after SEAL cannot select')
+    print('PASS: model/scene/policy changes after SEAL cannot select')
 
     # A valid start can become invalid after trusted admission. Inject only
     # the observed velocity in the readback, leaving fake plant/command laws alone.
@@ -132,15 +131,14 @@ def cases(arm, runtime, scene, service):
     idle()
     print('PASS: changed start velocity refuses after SEAL before COMMIT')
 
-    # Executor compensation state is a second check, not proof supplied by the
-    # producer or a provider accidentally retaining its old empty-load snapshot.
-    runtime._call(runtime.controller.executor.set_payload, .5)
+    # Payload truth is now owned by the runtime, never the provider.
+    arm.set_payload(PayloadValue(.5))
     req = request('pc-payload')
     view = arm.open_stream(req)
     assert arm.wait(view.execution.execution_id, 1.).phase is Phase.REJECTED
-    runtime._call(runtime.controller.executor.set_payload, 0.)
+    arm.set_payload(PayloadValue(0.))
     idle()
-    print('PASS: actual PC payload rejects despite stale provider zero-load facts')
+    print('PASS: canonical PC payload refuses loaded streams')
 
     # One candidate and one admission job despite many syntactically valid intents.
     # The SDK serializes requests; a stalled scene worker must not serialize cancel.
@@ -201,7 +199,7 @@ def cases(arm, runtime, scene, service):
     # The production eviction implementation and session marks are unchanged.
     retained = runtime_module.RETAINED
     runtime_module.RETAINED = 8
-    scene.facts = replace(base, transient_mass_kg=None)
+    arm.set_payload(PayloadValue(.5))
     oldest = None
     try:
         for i in range(12):
@@ -221,6 +219,7 @@ def cases(arm, runtime, scene, service):
         assert runtime._stream_marks[arm.session][0] == high
     finally:
         runtime_module.RETAINED = retained
+        arm.set_payload(PayloadValue(0.))
         scene.facts = base
     print('PASS: metadata eviction and unclaim/reclaim cannot replay an open sequence')
 
@@ -284,19 +283,22 @@ def cases(arm, runtime, scene, service):
     print('PASS: reconnect resets namespace only; old owned work cannot resurrect')
 
 
-def main(binary):
+def main(binary, scenario=cases, configure=None):
     udp, tcp = unused_port(socket.SOCK_DGRAM), unused_port(socket.SOCK_STREAM)
     with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryFile(mode='w+') as log:
         root = Path(tmp)
-        proc = subprocess.Popen([binary, str(udp), str(tcp)], stdout=log, stderr=log)
         path = write_config(root, udp, tcp)
         for file in (path, root/'three.urdf'):
             file.write_text(re.sub(r'\bj([123])\b', lambda m: f'j{int(m[1])-1}',
                                    file.read_text().replace('sdk_arm', 'fake')))
         scene = Scene()
-        runtime = RobotRuntime(load_robot_config(path), stream_admission=scene)
+        cfg = load_robot_config(path)
+        if configure is not None:
+            configure(cfg)
+        runtime = RobotRuntime(cfg, stream_admission=scene)
         runtime.controller.model_token = scene.facts.model_token
         stop, service = threading.Event(), None
+        proc = subprocess.Popen([binary, str(udp), str(tcp)], stdout=log, stderr=log)
         try:
             time.sleep(.2)
             runtime.start()
@@ -306,7 +308,7 @@ def main(binary):
             with ArmClient('fake', socket_path=service.path) as arm:
                 arm.claim()
                 arm.arm()
-                cases(arm, runtime, scene, service)
+                scenario(arm, runtime, scene, service)
         except Exception:
             log.seek(0)
             print(log.read())

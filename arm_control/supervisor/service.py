@@ -38,6 +38,17 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
         return dict(session=session, contract_version=CONTRACT_VERSION,
                     identity=enc(runtime.identity), capabilities=enc(runtime.capabilities),
                     now=enc(runtime.now()), extensions=runtime.extensions)
+    if op.startswith('controller_'):
+        if runtime.extensions.get('controller') != 1:
+            raise Refused('controller/1 is unavailable')
+        if op == 'controller_presets':
+            return enc(runtime.controller_presets())
+        if op == 'controller_state':
+            return enc(runtime.controller_state())
+        if op == 'controller_select':
+            return enc(runtime.select_control_preset(session, str(args['preset_id'])))
+        if op == 'controller_payload':
+            return enc(runtime.set_payload(session, codec.payload_from(args['payload'])))
     if op.startswith('stream_'):
         if runtime.extensions.get('stream') != 1:
             raise Refused('stream/1 is unavailable')
