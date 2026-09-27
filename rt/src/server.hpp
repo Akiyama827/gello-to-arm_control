@@ -39,6 +39,7 @@
 #include "arm_rt/protocol.hpp"
 #include "arm_rt/mailbox.hpp"
 #include "arm_rt/reference_selection.hpp"
+#include "arm_rt/mode_selection.hpp"
 
 namespace arm_rt {
 
@@ -394,6 +395,18 @@ struct ServerCtx {
   std::atomic<uint64_t> reference_published{0}, reference_done{0};
   std::atomic<uint32_t> reference_result{REF_NOT_ADMITTED};
   std::atomic<uint64_t> reference_cancel_generation{0};
+  // Armed-only mode selection (CAP_MODE_SELECT). The control thread publishes a
+  // request at ACCEPTANCE (that is the fence); the RT loop confirms, refuses or
+  // reports the ordering error. `mode_generation` is the CONFIRMED generation,
+  // read by the control thread to stamp reference commits: a commit posted
+  // before a mode change can then never land after it.
+  Mailbox<ModeSelectRequest> mode_in;     // control -> RT, one pending
+  Mailbox<ModeSelectInfo> mode_feedback;  // RT -> control
+  std::atomic<uint64_t> mode_published{0}, mode_done{0};
+  std::atomic<uint64_t> mode_generation{0};
+  // Confirmed effective mode, for the control thread's reply fields. Written by
+  // the RT loop only (seed at ARM, then on each confirmation, cleared on DISARM).
+  std::atomic<uint16_t> mode_effective{MODE_UNSELECTED};
   // control thread (CTL_ARM) -> rt_loop. The staleness clock starts AT ARM;
   // the RT loop owns the deadline (CommandAuthority), not a shared stamp.
   Mailbox<ArmStart> arm_start;

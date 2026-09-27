@@ -191,6 +191,19 @@ class State:
     def online_mask(self) -> int:
         return online_mask(self.flags)
 
+    @property
+    def selected_mode(self) -> int:
+        """Confirmed effective law, or MODE_UNSELECTED.
+
+        Only servers advertising ``CAP_MODE_SELECT`` set these bits; a bare
+        server leaves both clear, so this reads MODE_UNSELECTED there.
+        """
+        if self.flags & FLAG_MODE_REFERENCE:
+            return MODE_REFERENCE
+        if self.flags & FLAG_MODE_STREAMED:
+            return MODE_STREAMED
+        return MODE_UNSELECTED
+
 
 def unpack_state(data: bytes) -> State:
     if len(data) != STATE_SIZE:
@@ -281,6 +294,101 @@ def unpack_control(data: bytes) -> Control:
         raise ValueError(f"bad control packet (magic {magic:#x}, version {version})")
     return Control(ctl_type, seq, arg, t,
                    text.split(b"\x00", 1)[0].decode(errors="replace"), text)
+
+
+# Armed-only bounded mode selection (CAP_MODE_SELECT). "Soft" is the operator
+# alias for MODE_STREAMED. A v5-range control opcode: TCP control channel only,
+# no UDP packet changes.
+CAP_MODE_SELECT = 1 << 4
+FLAG_MODE_STREAMED = 1 << 5
+FLAG_MODE_REFERENCE = 1 << 6
+CTL_MODE_SELECT = 12
+CTL_MODE_STATUS = 13
+MODE_UNSELECTED, MODE_STREAMED, MODE_REFERENCE = 0, 1, 2
+MODE_SEL_OK, MODE_SEL_PENDING, MODE_SEL_MALFORMED, MODE_SEL_IDENTITY = range(4)
+MODE_SEL_UNSUPPORTED, MODE_SEL_ORDER, MODE_SEL_BUSY, MODE_SEL_REFUSED = range(4, 8)
+_MODE_SELECT_FMT = "<QQQIHH32sI36s"  # 104, ControlPacket.text
+_MODE_STATUS_FMT = "<QQQIIHHI64s"  # 104
+assert (struct.calcsize(_MODE_SELECT_FMT), struct.calcsize(_MODE_STATUS_FMT)) == (104, 104)
+
+
+def pack_mode_select(*, session_id: int, generation: int, expected_predecessor: int,
+                     arm_epoch: int, desired_mode: int, model_digest: bytes = b"",
+                     seq: int = 0, t_mono_ns: int = 0) -> bytes:
+    if desired_mode not in (MODE_STREAMED, MODE_REFERENCE):
+        raise ValueError("desired_mode must be MODE_STREAMED or MODE_REFERENCE")
+    if len(model_digest) not in (0, 32):
+        raise ValueError("model_digest must be empty or 32 bytes")
+    digest = model_digest.ljust(32, b"\0")
+    if desired_mode == MODE_REFERENCE and not any(digest):
+        raise ValueError("MODE_REFERENCE requires a model_digest")
+    if desired_mode == MODE_STREAMED and any(digest):
+        raise ValueError("MODE_STREAMED must not carry a model_digest")
+    if not (session_id and generation and arm_epoch):
+        raise ValueError("session_id, generation and arm_epoch must be nonzero")
+    if generation != expected_predecessor + 1:
+        raise ValueError("generation must equal expected_predecessor + 1")
+    body = struct.pack(_MODE_SELECT_FMT, session_id, generation,
+                       expected_predecessor, arm_epoch, desired_mode, 0, digest, 0,
+                       b"\0" * 36)
+    return struct.pack(_CTL_FMT, MAGIC_CTL, VERSION, CTL_MODE_SELECT, seq, 0,
+                       t_mono_ns, body)
+
+
+def unpack_mode_select(data: bytes) -> dict:
+    if len(data) != CTL_SIZE:
+        raise ValueError("mode select must contain 128 bytes")
+    magic, version, op, seq, arg, _, body = struct.unpack(_CTL_FMT, data)
+    if magic != MAGIC_CTL or version != VERSION or arg or op != CTL_MODE_SELECT:
+        raise ValueError("malformed mode select header")
+    p = dict(zip(("session_id", "generation", "expected_predecessor", "arm_epoch",
+                  "desired_mode", "reserved0", "model_digest", "request_flags",
+                  "reserved"),
+                 struct.unpack(_MODE_SELECT_FMT, body)))
+    if (p["reserved0"] or p["request_flags"] or any(p["reserved"])):
+        raise ValueError("mode select reserved bytes must be zero")
+    if not (p["session_id"] and p["generation"] and p["arm_epoch"]):
+        raise ValueError("mode select identities must be nonzero")
+    if p["generation"] != p["expected_predecessor"] + 1:
+        raise ValueError("mode select generation must be predecessor + 1")
+    if p["desired_mode"] not in (MODE_STREAMED, MODE_REFERENCE):
+        raise ValueError("unknown desired mode")
+    if (p["desired_mode"] == MODE_REFERENCE) != bool(any(p["model_digest"])):
+        raise ValueError("model_digest must be present iff MODE_REFERENCE")
+    p["seq"] = seq
+    return p
+
+
+def pack_mode_status(*, session_id: int, generation: int, predecessor: int,
+                     arm_epoch: int, result: int, selected_mode: int,
+                     requested_mode: int, detail: int = 0, seq: int = 0,
+                     t_mono_ns: int = 0) -> bytes:
+    body = struct.pack(_MODE_STATUS_FMT, session_id, generation, predecessor,
+                       arm_epoch, result, selected_mode, requested_mode, detail,
+                       b"\0" * 64)
+    return struct.pack(_CTL_FMT, MAGIC_CTL, VERSION, CTL_MODE_STATUS, seq, 0,
+                       t_mono_ns, body)
+
+
+def unpack_mode_status(data: bytes) -> dict:
+    if len(data) != CTL_SIZE:
+        raise ValueError("mode status must contain 128 bytes")
+    magic, version, op, seq, arg, _, body = struct.unpack(_CTL_FMT, data)
+    if magic != MAGIC_CTL or version != VERSION or arg or op != CTL_MODE_STATUS:
+        raise ValueError("malformed mode status header")
+    p = dict(zip(("session_id", "generation", "predecessor", "arm_epoch", "result",
+                  "selected_mode", "requested_mode", "detail", "reserved"),
+                 struct.unpack(_MODE_STATUS_FMT, body)))
+    if any(p["reserved"]):
+        raise ValueError("mode status reserved bytes must be zero")
+    if not MODE_SEL_OK <= p["result"] <= MODE_SEL_REFUSED:
+        raise ValueError("unknown mode select result")
+    if p["requested_mode"] not in (MODE_STREAMED, MODE_REFERENCE):
+        raise ValueError("unknown requested mode")
+    if p["selected_mode"] not in (MODE_UNSELECTED, MODE_STREAMED, MODE_REFERENCE):
+        raise ValueError("unknown selected mode")
+    p["seq"] = seq
+    return p
 
 
 # Negotiated native reference extension. Base HELLO/IDENTITY/CLAIM stay v5;

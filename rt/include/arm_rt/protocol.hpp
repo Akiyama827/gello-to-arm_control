@@ -53,6 +53,10 @@ constexpr uint32_t CAP_OBSERVER = 1u << 1;      // UDP observer lease
 // THIS instance. No backend sets it today: libfranka's own model is not a
 // calibrated model, and pose hold must not be sold as precision control.
 constexpr uint32_t CAP_CALIBRATED_TASK_SPACE = 1u << 2;
+// Armed-only bounded selection generation (CTL_MODE_SELECT). Advertised only
+// where native reference is supported, so a bare (enable_reference: false)
+// deployment neither offers it nor sets the mode flags below.
+constexpr uint32_t CAP_MODE_SELECT = 1u << 4;
 
 // StatePacket.flags bits
 constexpr uint32_t FLAG_ARMED = 1u << 0;
@@ -60,6 +64,11 @@ constexpr uint32_t FLAG_FAULTED = 1u << 1;
 constexpr uint32_t FLAG_HOLDING = 1u << 2;      // staleness hold active
 constexpr uint32_t FLAG_WRENCH_VALID = 1u << 3; // reserved FT-sensor fields live
 constexpr uint32_t FLAG_CLAIMED = 1u << 4;      // this control session's CLAIM matched
+// Confirmed effective law for the current ARM epoch. Mutually exclusive, both
+// zero = MODE_UNSELECTED. Set ONLY by servers advertising CAP_MODE_SELECT, and
+// only once the selection is confirmed (never while a request is pending).
+constexpr uint32_t FLAG_MODE_STREAMED = 1u << 5;
+constexpr uint32_t FLAG_MODE_REFERENCE = 1u << 6;
 constexpr uint32_t ONLINE_MASK_SHIFT = 16;
 constexpr uint32_t ONLINE_MASK_BITS = 0xFFFFu << ONLINE_MASK_SHIFT;
 
@@ -85,6 +94,9 @@ enum CtlType : uint16_t {
   CTL_REFERENCE_MODE = 11, // v5 opt-in after CLAIM, disarmed only
   CTL_CLAIM = 10,     // client -> server: text = expected IdentityPayload;
                       // STATUS answers with FLAG_CLAIMED set or a refusal
+  CTL_MODE_SELECT = 12, // armed-only bounded selection generation; text =
+                        // ModeSelectPayload
+  CTL_MODE_STATUS = 13, // server -> client: text = ModeSelectReplyPayload
 };
 // ACK correlation (ControlPacket.seq of the STATUS reply):
 //   ARM    -> the ARM generation every command of this epoch must carry
@@ -109,6 +121,24 @@ enum ReferenceResult : uint32_t {
 };
 constexpr uint32_t REFERENCE_HERMITE = 1u << 0;
 constexpr uint32_t REFERENCE_TERMINAL = 1u << 1;
+
+// Armed-only mode selection. "Soft" (the operator alias) is MODE_STREAMED: the
+// existing v5 joint-command / v6 pose-hold law. MODE_UNSELECTED is the
+// pre-ARM/disarmed value and is never effective while armed: ARM seeds
+// generation 0 from the disarmed CTL_REFERENCE_MODE opt-in.
+enum ModeId : uint16_t {
+  MODE_UNSELECTED = 0, MODE_STREAMED = 1, MODE_REFERENCE = 2,
+};
+enum ModeSelectResult : uint32_t {
+  MODE_SEL_OK = 0,          // confirmed; this generation is authoritative
+  MODE_SEL_PENDING = 1,     // no RT acknowledgement within the bounded budget
+  MODE_SEL_MALFORMED = 2,   // body failed validation; no state change
+  MODE_SEL_IDENTITY = 3,    // session / ARM epoch / model digest mismatch
+  MODE_SEL_UNSUPPORTED = 4, // capability, opt-in or requested mode not offered
+  MODE_SEL_ORDER = 5,       // generation/predecessor wrong; reply carries current
+  MODE_SEL_BUSY = 6,        // a different request is still awaiting RT
+  MODE_SEL_REFUSED = 7,     // faulted, latched or disarmed only
+};
 
 #pragma pack(push, 1)
 
@@ -207,6 +237,35 @@ struct ReferenceModePayload {
   uint32_t enable;                  // 48: exactly 1; reconnect to leave mode
   uint8_t reserved[52];             // 52
 };
+// CTL_MODE_SELECT body. Armed-only, one bounded selection generation
+// subordinate to the session/ARM epoch. Structural validation is a pure
+// predicate (valid_mode_select_body); the semantic checks (armed, opt-in,
+// digest equality, ordering) happen where the authority lives.
+struct ModeSelectPayload {
+  uint64_t session_id;              // 0
+  uint64_t generation;              // 8: nonzero; expected_predecessor + 1
+  uint64_t expected_predecessor;    // 16: 0 for the first selection
+  uint32_t arm_epoch;               // 24: nonzero, must equal the live epoch
+  uint16_t desired_mode;            // 28: MODE_STREAMED | MODE_REFERENCE
+  uint16_t reserved0;               // 30: zero (rejected otherwise)
+  uint8_t model_digest[32];         // 32: nonzero iff MODE_REFERENCE
+  uint32_t request_flags;           // 64: zero (reserved)
+  uint8_t reserved[36];             // 68: zero
+};
+// CTL_MODE_STATUS body. `detail` is result-dependent. `predecessor` carries
+// RT's current generation on MODE_SEL_ORDER, and the prior generation
+// otherwise.
+struct ModeSelectReplyPayload {
+  uint64_t session_id;              // 0
+  uint64_t generation;              // 8: echoes the request
+  uint64_t predecessor;             // 16: RT's generation before this outcome
+  uint32_t arm_epoch;               // 24
+  uint32_t result;                  // 28: ModeSelectResult
+  uint16_t selected_mode;           // 32: RT's effective mode at reply time
+  uint16_t requested_mode;          // 34
+  uint32_t detail;                  // 36: result-dependent
+  uint8_t reserved[64];             // 40: zero
+};
 struct ReferenceBeginPayload {
   uint64_t session_id;              // 0
   uint64_t upload_id;               // 8: nonzero, monotonically increasing
@@ -304,6 +363,8 @@ static_assert(sizeof(IdentityPayload) == 104, "identity size");
 static_assert(sizeof(ObserveRequest) == 16, "observe size");
 
 static_assert(sizeof(ReferenceModePayload) == 104, "reference mode layout");
+static_assert(sizeof(ModeSelectPayload) == 104, "mode select layout");
+static_assert(sizeof(ModeSelectReplyPayload) == 104, "mode status layout");
 static_assert(sizeof(ReferenceBeginPayload) == 104, "reference begin layout");
 static_assert(sizeof(ReferenceChunkPayload) == 104, "reference chunk layout");
 static_assert(sizeof(ReferenceSealPayload) == 104, "reference seal layout");
@@ -386,6 +447,41 @@ inline bool decode_reference_control(const void* bytes, size_t size, bool negoti
       (p.type==CTL_REFERENCE_MODE ? p.version!=VERSION
         : !negotiated || p.version!=REFERENCE_VERSION || !reference_opcode(p.type)) ||
       !valid_reference_body(p.type,p.text)) return false;
+  out=p; return true;
+}
+inline bool mode_select_opcode(uint16_t type) {
+  return type==CTL_MODE_SELECT || type==CTL_MODE_STATUS;
+}
+// Structural validation only: no state, no semantic authority. The semantic
+// checks (armed, opt-in, digest equality, generation ordering) live where that
+// authority lives.
+inline bool valid_mode_select_body(const void* body) {
+  ModeSelectPayload p; std::memcpy(&p,body,sizeof(p));
+  const bool reference=p.desired_mode==MODE_REFERENCE;
+  return p.session_id && p.generation && p.arm_epoch &&
+    p.generation==p.expected_predecessor+1 &&
+    (p.desired_mode==MODE_STREAMED || reference) &&
+    !p.reserved0 && !p.request_flags &&
+    (reference ? !zero_bytes(p.model_digest,32) : zero_bytes(p.model_digest,32)) &&
+    zero_bytes(p.reserved,sizeof(p.reserved));
+}
+inline bool valid_mode_status_body(const void* body) {
+  ModeSelectReplyPayload p; std::memcpy(&p,body,sizeof(p));
+  return p.result<=MODE_SEL_REFUSED &&
+    (p.selected_mode==MODE_UNSELECTED || p.selected_mode==MODE_STREAMED ||
+     p.selected_mode==MODE_REFERENCE) &&
+    (p.requested_mode==MODE_STREAMED || p.requested_mode==MODE_REFERENCE) &&
+    zero_bytes(p.reserved,sizeof(p.reserved));
+}
+// v5-range control opcode; available whenever CAP_MODE_SELECT is advertised.
+inline bool decode_mode_select(const void* bytes, size_t size, uint16_t want_type,
+                               ControlPacket& out) {
+  if (size!=sizeof(out)) return false;
+  ControlPacket p; std::memcpy(&p,bytes,sizeof(p));
+  if (p.magic!=MAGIC_CTL || p.arg || p.type!=want_type || p.version!=VERSION)
+    return false;
+  if (want_type==CTL_MODE_SELECT ? !valid_mode_select_body(p.text)
+                                 : !valid_mode_status_body(p.text)) return false;
   out=p; return true;
 }
 inline bool decode_reference_command(const void* bytes, size_t size, bool negotiated,

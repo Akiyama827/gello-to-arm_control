@@ -59,9 +59,26 @@ uint32_t flags_snapshot(const ServerCtx& ctx) {
 
 uint32_t capabilities(const ServerCtx& ctx) {
   // CAP_CALIBRATED_TASK_SPACE is never advertised: no backend evaluates a
-  // deployment-approved model in the servo (see protocol.hpp).
+  // deployment-approved model in the servo (see protocol.hpp). CAP_MODE_SELECT
+  // rides on native-reference support, so a bare (enable_reference: false)
+  // deployment neither offers the opcode nor sets the mode flags.
   return CAP_OBSERVER | (ctx.supports_pose_hold.load() ? CAP_POSE_HOLD : 0u) |
-    (ctx.supports_reference.load() ? CAP_REFERENCE_HORIZON : 0u);
+    (ctx.supports_reference.load()
+       ? uint32_t(CAP_REFERENCE_HORIZON | CAP_MODE_SELECT) : 0u);
+}
+
+// Bounded wait for RT's mode-selection acknowledgement. The control thread does
+// NOT block: it keeps servicing the socket and answers when `mode_done` matches
+// its ticket, or reports PENDING once this budget expires. RT confirms within
+// its next tick normally, and the poll below is 100 ms, so 250 ms leaves margin
+// for one missed poll without turning a healthy handoff into PENDING.
+constexpr uint64_t MODE_SELECT_WAIT_NS = 250'000'000;
+
+ControlPacket mode_reply(uint16_t type, const ModeSelectReplyPayload& r,
+                         uint32_t seq) {
+  ControlPacket pkt = make(type, 0, nullptr, seq);
+  std::memcpy(pkt.text, &r, sizeof(r));
+  return pkt;
 }
 
 IdentityPayload identity(const ServerCtx& ctx, uint64_t session) {
@@ -166,10 +183,43 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   ReferenceReplyPayload commit_reply{};
   ReferenceRetirePayload last_cancel{};
   bool commit_waiting=false, have_commit_reply=false;
+  // Armed-only mode selection: the request outstanding until RT answers, and
+  // whether we already told the client PENDING (we do not send a second frame;
+  // a later retry reconciles through RT's idempotent generation).
+  ModeSelectPayload mode_request{};
+  ControlPacket mode_frame{};
+  ModeSelectInfo mode_info{};
+  uint64_t mode_ticket=0, mode_deadline_ns=0;
+  bool mode_outstanding=false, mode_pending_sent=false;
   ControlPacket rx;
   size_t have = 0;
   while (!ctx.shutdown.load()) {
     ctx.reference_feedback.read(selection);
+    // Bounded wait for the RT mode-selection acknowledgement. Never blocks the
+    // servo and never blocks this socket: we keep polling and answer when the
+    // ticket completes, or report PENDING once and keep reconciling.
+    if (mode_outstanding &&
+        ctx.mode_done.load(std::memory_order_acquire)==mode_ticket) {
+      ctx.mode_feedback.read(mode_info);
+      if (!mode_pending_sent &&
+          !send_frame(fd, mode_reply(CTL_MODE_STATUS, mode_info.reply,
+                                     mode_frame.seq)))
+        break;
+      mode_outstanding=false;
+      mode_pending_sent=false;
+    } else if (mode_outstanding && !mode_pending_sent &&
+               mono_ns()>=mode_deadline_ns) {
+      ModeSelectReplyPayload r{};
+      r.session_id=mode_request.session_id;
+      r.generation=mode_request.generation;
+      r.arm_epoch=mode_request.arm_epoch;
+      r.requested_mode=mode_request.desired_mode;
+      r.selected_mode=ctx.mode_effective.load(std::memory_order_acquire);
+      r.predecessor=ctx.mode_generation.load(std::memory_order_acquire);
+      r.result=MODE_SEL_PENDING;
+      if(!send_frame(fd, mode_reply(CTL_MODE_STATUS,r,mode_frame.seq))) break;
+      mode_pending_sent=true;
+    }
     if(commit_waiting && ctx.reference_done.load(std::memory_order_acquire)==pending.ticket) {
       commit_reply.result=ctx.reference_result.load(std::memory_order_relaxed);
       ControlPacket answer=make(CTL_REFERENCE_STATUS,0,nullptr,commit_frame.seq);
@@ -247,6 +297,10 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           if(c.session_id!=session || c.arm_epoch!=ctx.arm_gen.load() || !ctx.armed.load()) {
             result=REF_IDENTITY; break;
           }
+          // A mode selection owns the law until RT confirms it: a COMMIT
+          // arriving in that window must not land, and must not be silently
+          // queued behind the handoff either.
+          if(mode_outstanding) { result=REF_BUSY; break; }
           if(commit_waiting) {
             if(!std::memcmp(commit_frame.text,rx.text,sizeof(rx.text))) {
               commit_frame.seq=rx.seq; continue; // same operation, latest correlation
@@ -328,6 +382,78 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
         }
         send_frame(fd,make(CTL_STATUS,flags_snapshot(ctx),why?why:"reference mode accepted",rx.seq));
         break;
+      }
+      case CTL_MODE_SELECT: {
+        ControlPacket checked{};
+        ModeSelectPayload want{};
+        std::memcpy(&want,rx.text,sizeof(want));
+        const bool valid=decode_mode_select(&rx,sizeof(rx),CTL_MODE_SELECT,checked);
+        // An unresolved request owns the generation: an identical retry is
+        // still PENDING, a different one is BUSY until RT answers.
+        if (mode_outstanding) {
+          ModeSelectReplyPayload r{};
+          r.session_id=session; r.arm_epoch=want.arm_epoch;
+          r.requested_mode=want.desired_mode;
+          r.selected_mode=ctx.mode_effective.load(std::memory_order_acquire);
+          r.predecessor=ctx.mode_generation.load(std::memory_order_acquire);
+          if (!std::memcmp(&want,&mode_request,sizeof(want))) {
+            r.generation=want.generation; r.result=MODE_SEL_PENDING;
+          } else {
+            r.generation=mode_request.generation; r.result=MODE_SEL_BUSY;
+          }
+          send_frame(fd,mode_reply(CTL_MODE_STATUS,r,rx.seq));
+          break;
+        }
+        ModeSelectReplyPayload r{};
+        r.session_id=session; r.generation=want.generation;
+        r.arm_epoch=want.arm_epoch; r.requested_mode=want.desired_mode;
+        r.selected_mode=ctx.mode_effective.load(std::memory_order_acquire);
+        r.predecessor=ctx.mode_generation.load(std::memory_order_acquire);
+        uint32_t result;
+        if(!ctx.supports_reference.load())
+          result=MODE_SEL_UNSUPPORTED;      // capability off: never offered
+        else if(!valid || !ctx.claim_ok.load() || want.session_id!=session)
+          result=MODE_SEL_MALFORMED;
+        else if(!ctx.armed.load() || ctx.fault.load() ||
+                ctx.latch_state.load()==ServerCtx::LATCH_SET ||
+                want.arm_epoch!=ctx.arm_gen.load())
+          result=MODE_SEL_REFUSED;          // faulted, latched or disarmed
+        else if(want.desired_mode==MODE_REFERENCE &&
+                (ctx.reference_session.load()!=session || !upload))
+          result=MODE_SEL_UNSUPPORTED;      // requires the disarmed opt-in
+        else if(want.desired_mode==MODE_REFERENCE &&
+                std::memcmp(want.model_digest,bound.model_digest,32)!=0)
+          result=MODE_SEL_IDENTITY;         // digest must equal the bound digest
+        else
+          result=MODE_SEL_OK;
+        if (result!=MODE_SEL_OK) {
+          r.result=result;
+          send_frame(fd,mode_reply(CTL_MODE_STATUS,r,rx.seq));
+          break;
+        }
+        // Fence at ACCEPTANCE: the outgoing law's execution authority is
+        // retired through its existing owner (upload candidate discarded, a
+        // cancel generation published) and the arm holds its measured position
+        // until RT confirms. No state changes if RT later reports ORDER.
+        uint64_t retire_id=selection.session_id==session?selection.reference_id:0;
+        if(upload) {
+          if(const auto* cand=upload->candidate_identity())
+            retire_id=std::max(retire_id,cand->reference_id);
+          upload->discard();
+        }
+        const uint64_t generation=ctx.reference_cancel_generation.load()+1;
+        // `revision` is only wire-CANCEL correlation; this internal fence does
+        // not consume it, so 0 is explicit rather than a stale selection value.
+        ctx.reference_cancel.write(ReferenceCancel{session,retire_id,generation,
+                                                   want.arm_epoch,0u});
+        ctx.reference_cancel_generation.store(generation,std::memory_order_release);
+        mode_request=want; mode_frame=rx;
+        mode_ticket=ctx.mode_published.load()+1;
+        mode_outstanding=true; mode_pending_sent=false;
+        mode_deadline_ns=mono_ns()+MODE_SELECT_WAIT_NS;
+        ctx.mode_in.write(ModeSelectRequest{mode_request,mode_ticket});
+        ctx.mode_published.store(mode_ticket,std::memory_order_release);
+        break;  // answered by the bounded wait at the top of the loop
       }
       case CTL_STATUS:
         // Read-only inspection; never changes authority or clears a fault.

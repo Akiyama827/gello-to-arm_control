@@ -147,6 +147,9 @@ void rt_loop(ServerCtx& ctx) {
   ReferenceCommit reference_commit{};
   ReferenceCancel reference_cancel{};
   uint64_t reference_seen=0, cancel_seen=0;
+  ArmMode mode;
+  ModeSelectRequest mode_request{};
+  uint64_t mode_seen=0;
   double reference_point[1+3*MAX_JOINTS]{};
   bool prev_armed = false;
   bool holding = false;
@@ -263,6 +266,76 @@ void rt_loop(ServerCtx& ctx) {
     ctx.arm_start.read(arm_start);
     const uint64_t cmd_v = ctx.cmd_in.read(envelope);
     const uint64_t session=ctx.session_id.load(std::memory_order_acquire);
+    // --- ARM-epoch mode authority (CAP_MODE_SELECT) ------------------------
+    // ARM seeds generation 0: MODE_REFERENCE iff this session's disarmed
+    // CTL_REFERENCE_MODE opt-in was accepted, else MODE_STREAMED. DISARM and a
+    // new epoch discard the whole state; MODE_UNSELECTED never survives an ARM.
+    if (armed && (gen != mode.epoch || session != mode.session_id)) {
+      const uint16_t seed =
+          (session && ctx.supports_reference.load(std::memory_order_acquire) &&
+           ctx.reference_session.load(std::memory_order_acquire) == session)
+              ? MODE_REFERENCE : MODE_STREAMED;
+      mode.arm(session, uint32_t(gen), seed);
+      ctx.mode_generation.store(mode.generation, std::memory_order_release);
+      ctx.mode_effective.store(mode.mode, std::memory_order_release);
+    } else if (!armed && mode.mode != MODE_UNSELECTED) {
+      mode.disarm();
+      ctx.mode_generation.store(0, std::memory_order_release);
+      ctx.mode_effective.store(MODE_UNSELECTED, std::memory_order_release);
+    }
+    // A request published at acceptance is answered within this tick. While it
+    // is unconfirmed both families are fenced (the arm holds); confirmation
+    // moves the floor to `now`, so the envelope already in the Mailbox never
+    // actuates. RT is the only confirmer.
+    const uint64_t mode_pub = ctx.mode_published.load(std::memory_order_acquire);
+    if (mode_pub != mode_seen) {
+      ctx.mode_in.read(mode_request);
+      if (mode_request.ticket == mode_pub) {
+        ModeSelectInfo info{};
+        ModeSelectReplyPayload& r = info.reply;
+        const ModeSelectPayload& mreq = mode_request.request;
+        r.session_id = mreq.session_id;
+        r.generation = mreq.generation;
+        r.predecessor = mode.generation;
+        r.arm_epoch = mreq.arm_epoch;
+        r.requested_mode = mreq.desired_mode;
+        r.selected_mode = mode.mode;
+        uint32_t result;
+        const bool latched =
+            ctx.latch_state.load(std::memory_order_acquire) == ServerCtx::LATCH_SET;
+        if (!armed || faulted || latched) {
+          result = MODE_SEL_REFUSED;
+        } else if (!mode.belongs(session, uint32_t(gen)) ||
+                   mreq.session_id != session || mreq.arm_epoch != gen) {
+          // The epoch this request named has ended: it can never be confirmed.
+          result = MODE_SEL_REFUSED;
+        } else if (mreq.desired_mode == MODE_REFERENCE &&
+                   ctx.reference_session.load(std::memory_order_acquire) != session) {
+          result = MODE_SEL_UNSUPPORTED;
+        } else if (mreq.generation == mode.generation &&
+                   mreq.desired_mode == mode.mode) {
+          result = MODE_SEL_OK;  // exact retry of the confirmed generation
+        } else if (mreq.generation == mode.generation + 1 &&
+                   mreq.expected_predecessor == mode.generation) {
+          // Retire the outgoing law through its existing owner BEFORE the new
+          // one becomes authoritative: no old reference, envelope or candidate
+          // survives, and `holding=false` re-captures the measured hold pose.
+          reference.retire();
+          holding = false;
+          mode.confirm(mreq, now);
+          ctx.mode_generation.store(mode.generation, std::memory_order_release);
+          ctx.mode_effective.store(mode.mode, std::memory_order_release);
+          r.selected_mode = mode.mode;
+          result = MODE_SEL_OK;
+        } else {
+          result = MODE_SEL_ORDER;
+        }
+        r.result = result;
+        ctx.mode_feedback.write(info);
+        ctx.mode_done.store(mode_pub, std::memory_order_release);
+        mode_seen = mode_pub;
+      }
+    }
     reference.reset(session,uint32_t(gen));
     const uint64_t published=ctx.reference_published.load(std::memory_order_acquire);
     if(published!=reference_seen) ctx.reference_in.read(reference_commit);
@@ -283,8 +356,15 @@ void rt_loop(ServerCtx& ctx) {
     reference.evaluate(now,reference_point);
     if(published!=reference_seen && reference_commit.ticket==published) {
       ReferenceResult result=REF_IDENTITY;
-      if(armed && !faulted && ctx.reference_session.load()==session)
-        result=reference.commit(reference_commit,now,cancelled);
+      if(armed && !faulted && ctx.reference_session.load()==session) {
+        // A reference is admitted only into the native law. A mode change
+        // retires an in-flight COMMIT through the cancel generation the control
+        // thread publishes at acceptance, so nothing from the old law lands.
+        if(mode.mode!=MODE_REFERENCE)
+          result=REF_NOT_ADMITTED;
+        else
+          result=reference.commit(reference_commit,now,cancelled);
+      }
       ctx.reference_result.store(result,std::memory_order_relaxed);
       reference_seen=published;
       ctx.reference_done.store(published,std::memory_order_release);
@@ -295,11 +375,17 @@ void rt_loop(ServerCtx& ctx) {
     ctx.reference_feedback.write(reference.info());
     // Wrong reference identity/phase never refreshes the command deadline.
     // A retired revision can report a live transport, but cannot regain selection.
-    bool admit_envelope=true;
-    if(envelope.packet.command.version==REFERENCE_VERSION) {
+    // Which law may actuate is the MODE's decision, not the reference ID's.
+    // An envelope of the retired family, or one already in the Mailbox when the
+    // floor was raised, is not authority and cannot move the deadman either.
+    const bool incoming_native =
+        envelope.packet.command.version==REFERENCE_VERSION;
+    bool admit_envelope = mode.admits(incoming_native, envelope.rx_ns,
+                                      session, uint32_t(gen));
+    if(admit_envelope && incoming_native) {
       admit_envelope=reference_envelope_fresh(envelope.reference,reference.info(),
                                                now,envelope.rx_ns,hold_ns);
-    } else if(reference.info().reference_id) admit_envelope=false;
+    }
     authority.observe(gen, arm_start, admit_envelope?cmd_v:0, envelope);
     const uint64_t rx_ns = authority.deadman_base();
     // Deadman age (CMD_LOST), from this generation only. SIGNED, clamped age:
@@ -323,7 +409,11 @@ void rt_loop(ServerCtx& ctx) {
     if(native_command) {
       fresh=fresh && reference.active() && reference_envelope_fresh(
         authority.current.reference,reference.info(),now,authority.current.rx_ns,hold_ns);
-    } else if(reference.info().reference_id) fresh=false;
+    } else if(!mode.admits(false, authority.current.rx_ns, session, uint32_t(gen))) {
+      // Streamed envelope left over from before a mode change or floor rise:
+      // it is neither tracked nor able to move this generation's deadline.
+      fresh=false;
+    }
 
     const double* q_des = zeros;
     const double* qd_des = zeros;
@@ -426,11 +516,19 @@ void rt_loop(ServerCtx& ctx) {
     out.state_seq = ++state_seq;
     out.last_cmd_seq = last_cmd_seq;
     out.t_mono_ns = now;
+    // Confirmed effective law, reported ONLY where CAP_MODE_SELECT is
+    // advertised: a bare (enable_reference: false) server's flags stay exactly
+    // as they were, so its state stream is byte-identical.
+    uint32_t mode_flags = 0;
+    if (ctx.supports_reference.load(std::memory_order_acquire)) {
+      if (mode.mode == MODE_REFERENCE) mode_flags = FLAG_MODE_REFERENCE;
+      else if (mode.mode == MODE_STREAMED) mode_flags = FLAG_MODE_STREAMED;
+    }
     out.flags = with_online_mask(
         (armed ? FLAG_ARMED : 0u) |
             (ctx.fault.load(std::memory_order_acquire) ? FLAG_FAULTED : 0u) |
             (holding ? FLAG_HOLDING : 0u) |
-            (ps.wrench_valid ? FLAG_WRENCH_VALID : 0u),
+            (ps.wrench_valid ? FLAG_WRENCH_VALID : 0u) | mode_flags,
         ctx.online_mask.load(std::memory_order_acquire));
     out.fault_code = ctx.fault_code.load(std::memory_order_acquire);
     out.session_id = ctx.session_id.load(std::memory_order_acquire);

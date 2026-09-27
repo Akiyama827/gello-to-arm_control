@@ -212,6 +212,11 @@ class RtBackend:
         self._reference_cv = threading.Condition()
         self._reference_wait_seq = None
         self._reference_reply = None
+        # Armed-only mode selection (CAP_MODE_SELECT). The generation restarts
+        # at 0 on every ARM; the client mirrors it so a retry after a lost reply
+        # still carries the identical bytes RT can answer idempotently.
+        self._mode_q: queue.Queue = queue.Queue()
+        self._mode_generation = 0
 
     @classmethod
     def from_config(cls, cfg) -> "RtBackend":
@@ -228,6 +233,7 @@ class RtBackend:
         self._reference_mode = False
         self._reference_model = b""
         self._reference_seq = self._upload_id = 0
+        self._mode_generation = 0
         self._upload_cancel.set()
         cfg = self.config
         try:
@@ -349,6 +355,7 @@ class RtBackend:
         if status.seq == 0:
             raise RtLinkError("arm ack carries no ARM epoch (pre-v5 server?)")
         self._arm_epoch = status.seq
+        self._mode_generation = 0  # a new epoch seeds generation 0
 
     def _seed_command_seq(self) -> None:
         """Number this epoch's commands above the server's ``last_cmd_seq``.
@@ -387,6 +394,7 @@ class RtBackend:
             return False
         acked = time.monotonic()
         self._arm_epoch = 0  # no further command of the old epoch is admissible
+        self._mode_generation = 0
         if status.arg & rtp.FLAG_ARMED:
             print("[rt_link] disarm ack still shows ARMED", flush=True)
             return False
@@ -520,6 +528,49 @@ class RtBackend:
         self._reference_model = digest
         self._reference_mode = True
         return True
+
+    def select_mode(self, desired_mode: int, *, model_token: str | None = None,
+                    timeout_s: float | None = None) -> dict:
+        """Armed-only bounded selection generation; "Soft" = MODE_STREAMED.
+
+        Returns the server's ``unpack_mode_status`` reply. On
+        ``MODE_SEL_OK`` the client advances its mirrored generation, so an
+        identical retry after a lost reply carries the same bytes RT answers
+        idempotently. MODE_REFERENCE requires ``CAP_MODE_SELECT`` and the
+        disarmed opt-in with a matching bound digest.
+        """
+        if self.identity is None:
+            raise RtLinkError("no identity: connect and claim first")
+        if not self._arm_epoch:
+            raise RtLinkError("mode selection is armed-only")
+        digest = b""
+        if desired_mode == rtp.MODE_REFERENCE:
+            if not self.identity.capabilities & rtp.CAP_MODE_SELECT:
+                raise RtLinkError("server does not offer mode selection")
+            if not self._reference_mode:
+                raise RtLinkError("MODE_REFERENCE requires the disarmed opt-in")
+            if not model_token:
+                raise RtLinkError("MODE_REFERENCE requires the bound model token")
+            digest = hashlib.sha256(model_token.encode()).digest()
+        elif desired_mode != rtp.MODE_STREAMED:
+            raise ValueError("desired_mode must be MODE_STREAMED or MODE_REFERENCE")
+        predecessor = self._mode_generation
+        generation = predecessor + 1
+        packet = rtp.pack_mode_select(
+            session_id=self.session_id, generation=generation,
+            expected_predecessor=predecessor, arm_epoch=self._arm_epoch,
+            desired_mode=desired_mode, model_digest=digest)
+        while not self._mode_q.empty():
+            self._mode_q.get_nowait()
+        self._send_frame(packet)
+        budget = self.config.ack_timeout_s if timeout_s is None else timeout_s
+        try:
+            reply = self._mode_q.get(timeout=budget)
+        except queue.Empty as exc:
+            raise RtLinkError("no mode select acknowledgement") from exc
+        if reply["generation"] == generation and reply["result"] == rtp.MODE_SEL_OK:
+            self._mode_generation = generation
+        return reply
 
     def _reference_exchange(self, operation: int, *, _scope=None, _socket=None, **fields) -> dict:
         # One frame in flight, and no send lock held while awaiting a reply.
@@ -833,6 +884,11 @@ class RtBackend:
                 print(f"[rt_link] FAULT from server — {self._latched_fault}", flush=True)
             elif msg.ctl_type == rtp.CTL_STATUS:
                 self._status_q.put(msg)
+            elif msg.ctl_type == rtp.CTL_MODE_STATUS:
+                try:
+                    self._mode_q.put(rtp.unpack_mode_status(frame))
+                except ValueError:
+                    pass
             elif msg.ctl_type == rtp.CTL_PING:
                 try:
                     self._send_control(rtp.CTL_PONG)
