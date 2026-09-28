@@ -92,7 +92,7 @@ class ReferenceHorizon:
 
     def _record(self, kind, reference_id=None, revision=None, *, at=None, **details):
         at = time.monotonic() if at is None else at
-        event = dict(kind=kind, pc_monotonic_s=at, wall_time_ns=time.time_ns(),
+        event = dict(kind=kind, pc_monotonic_s=at, recorded_wall_time_ns=time.time_ns(),
                      reference_id=self.id if reference_id is None else reference_id,
                      revision=self._revision if revision is None else revision,
                      **details)
@@ -131,7 +131,7 @@ class ReferenceHorizon:
                 self._wake_lateness.append(max(0., duration))
         if duration > SENDER_GAP_S:
             event = dict(kind=kind, duration_ms=duration*1000,
-                         pc_monotonic_s=at, wall_time_ns=time.time_ns())
+                         pc_monotonic_s=at, recorded_wall_time_ns=time.time_ns())
             with self._diagnostic_lock:
                 self._sender_gaps.append(event)
             self._record('sender_gap', at=at, cause=kind, duration_ms=duration*1000)
