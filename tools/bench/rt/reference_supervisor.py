@@ -164,13 +164,17 @@ def main(binary, remote=None):
             blocked = Future()
             runtime._ops.put((block_sender, (), blocked))
             blocked.result(timeout=2)
-            until(lambda: any(g['kind'] == 'decision_lock_wait'
+            until(lambda: runtime._native.diagnostics()['schedstat_status'] == 'ok'
+                  and any(g['kind'] == 'decision_lock_wait'
                               and g['classification'] == 'python_lock_contention'
                               and g['cpu_delta_ms'] >= g['duration_ms'] * .5
-                              and (g['runqueue_wait_delta_ns'] is None
-                                   or g['runqueue_wait_delta_ns']
-                                   < g['duration_ms'] * 500_000)
+                              and g['runqueue_wait_delta_ns'] is not None
+                              and g['runqueue_wait_delta_ns']
+                              < g['duration_ms'] * 500_000
                               for g in runtime._native.diagnostics()['sender_gaps']))
+            schedstat = runtime._native.diagnostics()
+            assert (schedstat['schedstat_timeslices_end']
+                    > schedstat['schedstat_timeslices_start']), schedstat
             # Cancellation is an explicit retirement followed by the same
             # controller-owned measured, compensated hold as streamed mode.
             q0 = runtime.state().q
@@ -542,9 +546,13 @@ def main(binary, remote=None):
             raise
         finally:
             if runtime._native is not None:
-                wake = runtime._native.diagnostics()['sender_wake_lateness_ms']
+                diagnostic = runtime._native.diagnostics()
+                wake = diagnostic['sender_wake_lateness_ms']
                 print(f"  sender_wake_lateness n={wake['samples']} "
                       f"p99.9={wake['p99_9']:.3f}ms max={wake['max']:.3f}ms")
+                print(f"  sender_schedstat status={diagnostic['schedstat_status']} "
+                      f"timeslices={diagnostic['schedstat_timeslices_start']}"
+                      f"..{diagnostic['schedstat_timeslices_end']}")
             latencies = [int(seconds * 1e6) for _, seconds in
                          (runtime._native.selection_latencies if runtime._native else ())]
             if latencies:

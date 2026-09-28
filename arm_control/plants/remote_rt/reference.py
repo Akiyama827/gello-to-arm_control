@@ -91,21 +91,57 @@ class ReferenceHorizon:
         self._sender_gaps = deque(maxlen=256)
         self._sender_gaps_pending = deque(maxlen=256)
         self._schedstat_fd = None
+        self._schedstat_status = 'unavailable'
         self._schedstat_error = None
         self._schedstat_warning_emitted = False
+        self._schedstat_first_timeslices = None
+        self._schedstat_last_timeslices = None
+        self._schedstat_stagnant_loops = 0
         self._envelope_thread.start()
 
-    def _runqueue_wait_ns(self):
-        """Sender-thread runqueue wait, read from its open proc fd."""
+    def _schedstat_sample(self):
+        """Sender-thread CPU, runqueue wait and timeslices from its proc fd."""
         if self._schedstat_fd is None:
             return None
         try:
-            return int(os.pread(self._schedstat_fd, 128, 0).split()[1])
+            fields = os.pread(self._schedstat_fd, 128, 0).split()
+            if len(fields) != 3:
+                raise ValueError(f'expected 3 schedstat fields, got {len(fields)}')
+            sample = tuple(int(field) for field in fields)
+            if any(value < 0 for value in sample):
+                raise ValueError('negative schedstat field')
+            return sample
         except (OSError, ValueError, IndexError) as exc:
             self._schedstat_error = str(exc)
+            self._schedstat_status = 'unavailable'
             os.close(self._schedstat_fd)
             self._schedstat_fd = None
             return None
+
+    def _runqueue_wait_ns(self):
+        sample = self._schedstat_sample()
+        # A zero wait counter alone cannot establish that the kernel collects it.
+        # Use it only after the timeslice counter has demonstrated liveness.
+        return sample[1] if sample is not None and self._schedstat_status == 'ok' else None
+
+    def _check_schedstat_liveness(self, sample):
+        if sample is None:
+            return
+        timeslices = sample[2]
+        if self._schedstat_first_timeslices is None:
+            self._schedstat_first_timeslices = timeslices
+            self._schedstat_stagnant_loops = 1
+        elif timeslices > self._schedstat_last_timeslices:
+            self._schedstat_status = 'ok'
+            self._schedstat_stagnant_loops = 0
+        else:
+            self._schedstat_stagnant_loops += 1
+            if self._schedstat_stagnant_loops >= 20:
+                self._schedstat_status = 'not_collected'
+                self._schedstat_error = 'timeslice count did not increase in 20 sender loops'
+                os.close(self._schedstat_fd)
+                self._schedstat_fd = None
+        self._schedstat_last_timeslices = timeslices
 
     def _record(self, kind, reference_id=None, revision=None, *, at=None, **details):
         at = time.monotonic() if at is None else at
@@ -134,7 +170,10 @@ class ReferenceHorizon:
             ages = sorted(self._wake_lateness)
             gaps = list(self._sender_gaps)
         percentile = ages[min(len(ages)-1, int(.999 * (len(ages)-1)))] if ages else 0.
-        return dict(timeline=events, sender_wake_lateness_ms=dict(
+        return dict(timeline=events, schedstat_status=self._schedstat_status,
+                    schedstat_timeslices_start=self._schedstat_first_timeslices,
+                    schedstat_timeslices_end=self._schedstat_last_timeslices,
+                    sender_wake_lateness_ms=dict(
             samples=len(ages), p99_9=percentile*1000,
             max=(ages[-1]*1000 if ages else 0.)), sender_gaps=gaps)
 
@@ -375,8 +414,8 @@ class ReferenceHorizon:
         """Once per PC control tick; takes one immutable feedback sample."""
         if self._schedstat_error is not None and not self._schedstat_warning_emitted:
             self._schedstat_warning_emitted = True
-            _LOG.warning('reference sender schedstat unavailable; CPU-time fallback: %s',
-                         self._schedstat_error)
+            _LOG.warning('reference sender schedstat %s; CPU-time fallback: %s',
+                         self._schedstat_status, self._schedstat_error)
         self._drain_sender_gaps()
         if self._job is not None and self._job[1].done():
             kind, job = self._job
@@ -509,6 +548,7 @@ class ReferenceHorizon:
     def _envelope_loop(self):
         try:
             self._schedstat_fd = os.open('/proc/thread-self/schedstat', os.O_RDONLY)
+            self._schedstat_status = 'not_collected'  # pending liveness proof
         except OSError as exc:
             self._schedstat_error = str(exc)
         due = time.monotonic()
@@ -520,7 +560,10 @@ class ReferenceHorizon:
         while not self._envelope_stop.is_set():
             started = time.monotonic()
             started_cpu = time.process_time()
-            started_runqueue = self._runqueue_wait_ns()
+            started_stat = self._schedstat_sample()
+            self._check_schedstat_liveness(started_stat)
+            started_runqueue = (started_stat[1] if started_stat is not None
+                                and self._schedstat_status == 'ok' else None)
             if wait_cpu is not None:
                 self._sender_interval('wake_late', max(0., started-due), started,
                                       wait_cpu, started_cpu, wait_runqueue,
@@ -554,8 +597,8 @@ class ReferenceHorizon:
         with self._envelope_lock:
             acquired = time.monotonic()
             acquired_cpu = time.process_time()
-            acquired_runqueue = self._runqueue_wait_ns()
             decision = self._envelope_decision
+        acquired_runqueue = self._runqueue_wait_ns()
         self._sender_interval('decision_lock_wait', acquired-waiting, acquired,
                               waiting_cpu, acquired_cpu, waiting_runqueue,
                               acquired_runqueue)
