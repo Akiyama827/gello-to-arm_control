@@ -3,12 +3,13 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "server.hpp"
 
 namespace arm_rt {
 namespace {
-enum Case { STALE_FIRST, RECENT_REARM, CURRENT_FIRST };
+enum Case { STALE_FIRST, RECENT_REARM, CURRENT_FIRST, INCOMING_STALE, HELD_STALE };
 ServerCtx* ctx;
 Case scenario;
 int tick;
@@ -42,7 +43,8 @@ void commit(uint64_t session, uint32_t epoch, uint64_t ticket) {
   ctx->reference_published.store(ticket);
 }
 
-void envelope(uint64_t session, uint64_t epoch, uint32_t seq, double phase) {
+void envelope(uint64_t session, uint64_t epoch, uint32_t seq, double phase,
+              uint32_t age_us = 0, uint64_t reference_id = 1) {
   PoseHoldCommandPacket packet{};
   packet.command.magic = MAGIC_CMD;
   packet.command.version = REFERENCE_VERSION;
@@ -55,9 +57,11 @@ void envelope(uint64_t session, uint64_t epoch, uint32_t seq, double phase) {
     packet.command.kd[j] = .1;
   }
   ReferenceEnvelopeBinding binding{};
-  binding.reference_id = binding.revision = 1;
+  binding.reference_id = reference_id;
+  binding.revision = 1;
   binding.phase = phase;
   binding.valid_for_us = binding.phase_window_us = 100'000;
+  binding.age_us = age_us;
   ctx->cmd_in.write(CommandEnvelope{packet, mono_ns(), epoch, session, binding});
 }
 
@@ -65,6 +69,24 @@ ReferenceStatePacket state() {
   ReferenceStatePacket out{};
   assert(ctx->reference_state_out.read(out));
   return out;
+}
+
+void expect_expiry_text(const char* rule, bool envelope_detail) {
+  assert(ctx->fault_head.load() == 1);
+  const auto& slot = ctx->fault_ring[0];
+  assert(slot.ready.load() == 1);
+  assert(slot.rec.code == FAULT_REFERENCE_EXPIRED);
+  const char* text = slot.rec.text;
+  assert(std::strstr(text, rule) != nullptr);
+  if (envelope_detail) {
+    assert(std::strstr(text, "arm_gen=2") != nullptr);
+    assert(std::strstr(text, "session_id=0000000000000016") != nullptr);
+    assert(std::strstr(text, "reference_id=1 revision=1") != nullptr);
+    assert(std::strstr(text, scenario == INCOMING_STALE
+                                  ? "age_us=110000" : "age_us=111000") != nullptr);
+  } else {
+    assert(std::strstr(text, "reference_id=1 revision=1 gap_age_us=102000") != nullptr);
+  }
 }
 
 class ScriptedBackend final : public Backend {
@@ -109,19 +131,29 @@ class ScriptedBackend final : public Backend {
       assert(previous.state.session_id == B && previous.state.arm_epoch == 2);
       assert(previous.reference_id == 1 && previous.revision == 1);
       assert(previous.status == REFERENCE_RUNNING);
-      if (scenario == CURRENT_FIRST) {
+      if (scenario == CURRENT_FIRST || scenario == INCOMING_STALE ||
+          scenario == HELD_STALE) {
         skew_ns += 49'000'000;  // B+50 ms; a real B envelope arrives
-        envelope(B, 2, 2, .05);
+        envelope(B, 2, 2, .05, scenario == INCOMING_STALE ? 110'000 : 0);
       } else {
         skew_ns += 98'000'000;  // B+99 ms; no B envelope yet
       }
     } else if (tick == 5) {
       const auto previous = state();
+      if (scenario == INCOMING_STALE) {
+        assert(previous.status == REFERENCE_CANCELLED);
+        expect_expiry_text("incoming envelope stale", true);
+        ctx->shutdown.store(true);
+        return true;
+      }
       assert(previous.status == REFERENCE_RUNNING);
       if (scenario == CURRENT_FIRST) {
         assert(previous.state.last_cmd_seq == 2);
         assert(!(previous.state.flags & FLAG_HOLDING));
         skew_ns += 59'000'000;  // B+110 ms, B envelope still valid
+      } else if (scenario == HELD_STALE) {
+        skew_ns += 110'000'000;  // accepted B envelope is now old
+        envelope(B, 2, 3, .16, 0, 2);  // wrong id: not a new active envelope
       } else {
         skew_ns += 2'000'000;  // B+102 ms: only the first-envelope limit retires
       }
@@ -129,6 +161,9 @@ class ScriptedBackend final : public Backend {
       const auto previous = state();
       assert(previous.status == (scenario == CURRENT_FIRST
                                      ? REFERENCE_RUNNING : REFERENCE_CANCELLED));
+      if (scenario == HELD_STALE) expect_expiry_text("held envelope stale", true);
+      else if (scenario != CURRENT_FIRST)
+        expect_expiry_text("first-envelope gap", false);
       ctx->shutdown.store(true);
     }
     return true;
@@ -152,7 +187,8 @@ std::unique_ptr<Backend> make_dm_backend(const std::string&, uint32_t, double) {
 
 int main() {
   using namespace arm_rt;
-  for (Case which : {STALE_FIRST, RECENT_REARM, CURRENT_FIRST}) {
+  for (Case which : {STALE_FIRST, RECENT_REARM, CURRENT_FIRST,
+                     INCOMING_STALE, HELD_STALE}) {
     ServerCtx context;
     ctx = &context;
     scenario = which;
@@ -164,8 +200,8 @@ int main() {
     context.cfg.rt_priority = 0;
     context.supports_reference.store(true);
     rt_loop(context);
-    assert(!context.failed && tick == 6);
+    assert(!context.failed && tick == (which == INCOMING_STALE ? 5 : 6));
   }
   std::puts("PASS RT stale envelope scope: old session/epoch cannot retire or "
-            "mark a new (1,1), current envelope tracks, first gap retires at 100 ms");
+            "mark a new (1,1), current envelope tracks, expiry journal identifies rule");
 }
