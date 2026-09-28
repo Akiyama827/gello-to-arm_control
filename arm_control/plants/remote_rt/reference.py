@@ -481,7 +481,10 @@ class ReferenceHorizon:
             return
         if self.link.session_id != self._session:
             return
+        reading = time.monotonic()
         state, _received_at = self.link.latest_state()
+        self._sender_interval('state_lock_wait', time.monotonic()-reading,
+                              time.monotonic())
         ref = None if state is None else state.reference
         if (state is None or ref is None or not state.armed
                 or state.session_id != self._session or state.arm_epoch != self._epoch):
@@ -505,6 +508,8 @@ class ReferenceHorizon:
                 valid_for_s=VALID_FOR_S, phase_window_s=PHASE_WINDOW_S,
                 session_id=self._session, arm_epoch=self._epoch)
         except (RtLinkError, ValueError, OSError):
+            self._sender_interval('udp_send_duration', time.monotonic()-sending,
+                                  time.monotonic())
             return
         self._sender_interval('udp_send_duration', time.monotonic()-sending,
                               time.monotonic())
