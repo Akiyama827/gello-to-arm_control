@@ -26,6 +26,7 @@ from arm_control.motion import JointTrajectory, TrajectoryPoint
 from arm_control.supervisor.runtime import RobotRuntime
 from native_reference import unused_port
 from envelope_age import EnvelopeAgeMonitor
+from bench_target import parse_target
 from arm_control.plants.remote_rt import protocol as p
 from arm_control.plants.remote_rt.client import RtLinkError
 import socket
@@ -53,22 +54,27 @@ def until(fn, timeout=20):
     raise AssertionError("timed out: " + str(fn()))
 
 
-def main(binary):
-    udp, tcp = unused_port(socket.SOCK_DGRAM), unused_port(socket.SOCK_STREAM)
+def main(binary, remote=None):
+    udp = remote.udp_port if remote else unused_port(socket.SOCK_DGRAM)
+    tcp = remote.tcp_port if remote else unused_port(socket.SOCK_STREAM)
+    instance = remote.instance_id if remote else 'fake'
     with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryFile(mode="w+") as log:
-        proc = subprocess.Popen([binary, str(udp), str(tcp)], stdout=log, stderr=log)
+        proc = (None if remote else subprocess.Popen(
+            [binary, str(udp), str(tcp)], stdout=log, stderr=log))
         path = write_config(Path(tmp), udp, tcp)
         # Dedicated fake server uses j0,j1,j2 and id=fake. Names are changed in
         # both the URDF and config, leaving all analytic dynamics unchanged.
         for file in (path, Path(tmp) / "three.urdf"):
-            txt = file.read_text().replace("sdk_arm", "fake")
+            txt = file.read_text().replace("sdk_arm", instance)
+            if remote and file == path:
+                txt = txt.replace('host: 127.0.0.1', f'host: {remote.host}')
             file.write_text(re.sub(r"\bj([123])\b", lambda m: f"j{int(m[1])-1}", txt))
         cfg = load_robot_config(path)
         runtime = RobotRuntime(cfg)
         # This is an analytical test binding, not project hardware staging.
         runtime.controller.model_token = "analytical-three-joint-fixture"
         oracle_executor = build_arm_controller(
-            cfg, QueueControllerNode(), arm_id="fake", require_policy=True
+            cfg, QueueControllerNode(), arm_id=instance, require_policy=True
         ).executor
         step = runtime.controller.executor.step
         parity_samples = []
@@ -96,6 +102,8 @@ def main(binary):
         try:
             time.sleep(0.2)
             runtime.start()
+            assert runtime.link.backend_name == 'fake', 'bench refuses a non-fake RT backend'
+            assert runtime.link.hold_ms == 100, runtime.link.hold_ms
             assert runtime._native is not None
             runtime.claim("test")
             gen = runtime.arm("test")
@@ -111,7 +119,7 @@ def main(binary):
             v = (6 * u - 6 * u * u)[:, None] * delta / t[-1]
             request = TrajectoryRequest(
                 "long",
-                "fake",
+                instance,
                 ("j0", "j1", "j2"),
                 JointTrajectory(t, q, v),
                 model_token=runtime.controller.model_token,
@@ -122,8 +130,9 @@ def main(binary):
             until(lambda: runtime.status(status.execution_id).terminal)
             done = runtime.status(status.execution_id)
             assert done.phase is Phase.COMPLETED, done
-            long_over = ages.window('reference_supervisor long')
-            assert long_over == 0, f'{long_over} frames over the 50 ms ceiling'
+            limit_us = 50_000 if remote else 100_000
+            long_over = ages.window('reference_supervisor long', ceiling_us=limit_us)
+            assert long_over == 0, f'{long_over} frames over the {limit_us // 1000} ms bound'
             phases = [r.phase for r in runtime.receipts(status.execution_id)]
             assert phases == [
                 Phase.REQUESTED,
@@ -146,7 +155,7 @@ def main(binary):
             )
             req = TrajectoryRequest(
                 "cancel",
-                "fake",
+                instance,
                 ("j0", "j1", "j2"),
                 tr,
                 model_token=runtime.controller.model_token,
@@ -514,9 +523,11 @@ def main(binary):
                       f'max={max(latencies)}us')
             ages.__exit__()
             runtime.close()
-            proc.terminate()
-            proc.wait(3)
+            if proc is not None:
+                proc.terminate()
+                proc.wait(3)
 
 
 if __name__ == "__main__":
-    main(str(Path(sys.argv[1]).resolve()))
+    binary, remote = parse_target(__doc__)
+    main(str(Path(binary).resolve()) if binary else None, remote)

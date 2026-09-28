@@ -200,6 +200,23 @@ class ArmController:
         self._pending_traj: JointTrajectory | None = None
         self._reference: TrajectoryReference | None = None
         self._running = False
+        # Transport acceptance, not command construction, starts the local
+        # streamed deadman. Only the supervisor can report a successful send.
+        self._stream_gap_limit_s: float | None = None
+        self._stream_sent_at: float | None = None
+        self._stream_sent_target: np.ndarray | None = None
+
+    def set_stream_hold_deadline(self, hold_ms: float, *, margin_ms: float = 20.0) -> None:
+        """Bind the negotiated RT hold threshold for legacy streamed motion."""
+        if not (np.isfinite(hold_ms) and hold_ms > margin_ms > 0):
+            raise ValueError("RT hold_ms must exceed the streamed guard margin")
+        self._stream_gap_limit_s = (hold_ms - margin_ms) / 1000.0
+
+    def streamed_command_sent(self, plan_id: str, q_des, sent_at: float) -> None:
+        """Record a transport-accepted command for the still-running leg."""
+        if self._running and self.current_plan_id == plan_id and self._reference_source is None:
+            self._stream_sent_target = np.asarray(q_des, dtype=float).copy()
+            self._stream_sent_at = sent_at
 
     # -- clock ---------------------------------------------------------------
     @property
@@ -533,6 +550,20 @@ class ArmController:
             # because it is about to spend seconds planning the first leg.
         if not (np.isfinite(arm.position).all() and np.isfinite(arm.velocity).all()):
             return
+        if (self._running and self._reference_source is None
+                and self._stream_gap_limit_s is not None
+                and self._stream_sent_at is not None
+                and self._clock() - self._stream_sent_at > self._stream_gap_limit_s):
+            # A delayed state/health frame must not let the resumed PC tick
+            # sample a trajectory that advanced while RT held the old target.
+            target = self._stream_sent_target.copy()
+            self._cancel("PC streamed command gap exceeded RT hold margin — re-plan from measured pose")
+            self._hold_anchor = self.executor.hold_command(
+                arm, q_des=target, integral_bias=self.integral.bias)
+            self._stream_sent_at = None
+            self._stream_sent_target = None
+            self._send(self._hold_anchor, None)
+            return
         self._cycle_id += 1
         cycle = (self._cycle_id, self._clock())
         if (self.execution_policy is not None and self._running
@@ -667,6 +698,8 @@ class ArmController:
             self._plan.get("cartesian_poses"), source)
         self._settling.begin(None if source else start + self._reference.duration_sec)
         self._completion_sample_at = None
+        self._stream_sent_at = None
+        self._stream_sent_target = None
         self._running = True
         print(
             f"[arm_controller] executing {self._plan['phase']} "
@@ -908,6 +941,8 @@ class ArmController:
 
     def _finish_leg(self, *, ok: bool, reason: str, completion=None) -> None:
         plan_id = "" if self._plan is None else self._plan["plan_id"]
+        self._stream_sent_at = None
+        self._stream_sent_target = None
         self._reference = None
         self._running = False
         self._plan = None

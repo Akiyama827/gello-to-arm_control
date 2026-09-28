@@ -297,6 +297,12 @@ class RtBackend:
         flags = dict(
             p.split("=", 1) for p in parts[1:] if "=" in p
         )
+        # The streamed executor uses the server's actual deadman threshold,
+        # never a locally assumed launch flag. Legacy bare-name HELLOs leave
+        # this unknown and retain their existing RT-holding feedback path.
+        self.hold_ms = float(flags["hold_ms"]) if "hold_ms" in flags else None
+        if self.hold_ms is not None and (not np.isfinite(self.hold_ms) or self.hold_ms <= 0):
+            raise RtLinkError("server advertised an invalid hold_ms")
         self.supports_pose_hold = flags.get("pose_hold") == str(rtp.POSE_HOLD_VERSION)
         self._active_mask = int(flags.get("active", str((1 << self.n) - 1)), 0)
         # Process-local RT setup: "ok" or the failed parts; older servers omit it.

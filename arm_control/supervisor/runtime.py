@@ -645,6 +645,8 @@ class RobotRuntime:
                 and self.link.negotiate_reference(self.controller.model_token)):
             self._native = ReferenceHorizon(self.link)
             self.controller.bind_reference_source(lambda: self._native.point)
+        elif self.link.hold_ms is not None:
+            self.controller.set_stream_hold_deadline(self.link.hold_ms)
         ident = self.link.identity
         self.identity = RobotIdentity(self.instance_id, tuple(self.joints),
                                       f"rt:{self.link.backend_name}", ident.model_id)
@@ -985,9 +987,12 @@ class RobotRuntime:
         sent, events = [], []
         for topic, value in c.node.sent:
             if topic == "motor_command":
-                seq = self._send_command(unpack_motor_command(value, c.n_arm))
+                command = unpack_motor_command(value, c.n_arm)
+                seq = self._send_command(command)
                 if seq is not None:
                     sent.append(seq)
+                    if sent_for is not None and self._native is None:
+                        c.streamed_command_sent(sent_for, command['position'], time.monotonic())
             elif topic == "controller_event":
                 events.append(unpack_controller_event(value))
         c.node.sent = []

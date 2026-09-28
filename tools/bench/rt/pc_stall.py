@@ -28,7 +28,6 @@ from contextlib import contextmanager
 from pathlib import Path
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -39,6 +38,7 @@ from arm_control.motion import JointTrajectory
 from arm_control.plants.remote_rt import protocol as p
 from arm_control.plants.remote_rt.reference import ReferenceHorizon
 from envelope_age import EnvelopeAgeMonitor
+from bench_target import parse_target
 from arm_control.plants.remote_rt.client import RtBackend, RtConfig, RtLinkError
 
 FRESHNESS_MS = 100     # min(hold_ms, valid_for_us); V1 declares both as 100 ms
@@ -146,19 +146,24 @@ class Recorder:
 
 
 @contextmanager
-def server(binary):
-    udp, tcp = unused_port(socket.SOCK_DGRAM), unused_port(socket.SOCK_STREAM)
-    argv = [binary, '--backend', 'fake', '--n', '3', '--instance-id', 'fake',
+def server(binary, remote=None):
+    udp = remote.udp_port if remote else unused_port(socket.SOCK_DGRAM)
+    tcp = remote.tcp_port if remote else unused_port(socket.SOCK_STREAM)
+    instance = remote.instance_id if remote else 'fake'
+    argv = [binary, '--backend', 'fake', '--n', '3', '--instance-id', instance,
             '--joint-names', 'j0,j1,j2', '--udp-port', str(udp), '--tcp-port', str(tcp),
             '--bind', '127.0.0.1', '--hold-ms', str(HOLD_MS), '--fault-ms', str(FAULT_MS),
             '--state-hz', '1000', '--enable-reference']
     log = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.log')
-    proc = subprocess.Popen(argv, stdout=log, stderr=log)
-    rt = RtBackend(RtConfig(host='127.0.0.1', udp_port=udp, tcp_port=tcp,
-                            instance_id='fake'), ['j0', 'j1', 'j2'])
+    proc = None if remote else subprocess.Popen(argv, stdout=log, stderr=log)
+    rt = RtBackend(RtConfig(host=remote.host if remote else '127.0.0.1',
+                            udp_port=udp, tcp_port=tcp, instance_id=instance),
+                   ['j0', 'j1', 'j2'])
     try:
         time.sleep(.2)
         rt.open()
+        assert rt.backend_name == 'fake', 'bench refuses a non-fake RT backend'
+        assert rt.hold_ms == HOLD_MS, f'expected hold_ms={HOLD_MS}, got {rt.hold_ms}'
         assert rt.negotiate_reference('pc-stall-fixture-model')
         rt.enable_all()
         yield rt, log.name
@@ -168,8 +173,9 @@ def server(binary):
         raise
     finally:
         rt.close()
-        proc.terminate()
-        proc.wait(3)
+        if proc is not None:
+            proc.terminate()
+            proc.wait(3)
         log.close()
 
 
@@ -206,7 +212,7 @@ def inject(rt, pump, recorder, stall_ms, *, resume):
     return t0, recorder.since(mark)
 
 
-def horizon_expiry_report(binary):
+def horizon_expiry_report(binary, remote=None):
     """Item 2: the supervisor-facing horizon reports an RT expiry retire as a
     failed segment (REFERENCE_EXPIRED) and never plans a continuation; a LOCAL
     cancel is not misreported as an expiry."""
@@ -218,6 +224,14 @@ def horizon_expiry_report(binary):
         while time.monotonic() < deadline and not (h.selected and not h.error):
             state, received = rt.latest_state()
             h.poll(state, received)
+            if (state and state.armed and not h.selected
+                    and not (state.reference or {}).get('reference_id')):
+                # A persistent remote server is not restarted between probe
+                # sessions. Keep the newly armed, pre-selection session live
+                # while its bounded upload/COMMIT worker runs.
+                rt.apply_command(dict(position=np.asarray(state.q),
+                                      velocity=np.zeros(3), torque=np.zeros(3),
+                                      kp=np.ones(3) * 2, kd=np.ones(3) * .1))
             if h.ready and not h.selected:
                 h.approve()
             if h.selected:
@@ -228,7 +242,7 @@ def horizon_expiry_report(binary):
             time.sleep(0.005)
         assert h.selected and not h.error, h.error
 
-    with server(binary) as (rt, _log):
+    with server(binary, remote) as (rt, _log):
         h = ReferenceHorizon(rt)
         try:
             h.stage("expiry", ramp(np.zeros(3), 2.0), stream=True)
@@ -243,7 +257,7 @@ def horizon_expiry_report(binary):
             print('  report  unsolicited RT retire -> horizon.error=REFERENCE_EXPIRED')
         finally:
             h.close()
-    with server(binary) as (rt, _log):
+    with server(binary, remote) as (rt, _log):
         h = ReferenceHorizon(rt)
         try:
             h.stage("local-cancel", ramp(np.zeros(3), 2.0), stream=True)
@@ -259,8 +273,8 @@ def horizon_expiry_report(binary):
             h.close()
 
 
-def main(binary):
-    with server(binary) as (rt, logpath):
+def main(binary, remote=None):
+    with server(binary, remote) as (rt, logpath):
         recorder = Recorder(rt)
         pump = Pump(rt)
         # CTRL-034 B1: record the RT envelope age for the normal (S1) stream
@@ -269,10 +283,14 @@ def main(binary):
         ages.__enter__()
         try:
             # ---- steady stream: report the ages before any injected stall ---
-            wait_for(lambda: commit(rt, 1, np.zeros(3)))
+            wait_for(lambda: commit(rt, 1, np.asarray(rt.latest_state()[0].q)))
             wait_for(lambda: not rt.latest_state()[0].holding)
             time.sleep(0.2)
             ages.report('pc_stall steady')
+            if remote:
+                assert ages.rt_ages and max(ages.rt_ages) < 50_000, (
+                    'normal-running RT-total envelope age must remain below 50 ms',
+                    max(ages.rt_ages, default=None))
 
             # ---- S1/S2: shorter than the ceiling, no hold, no retire -------
             for stall_ms, tag in ((30, 'S1'), (60, 'S2')):
@@ -400,16 +418,20 @@ def main(binary):
                   f'{FRESHNESS_MS} ms expiry (budget {FAULT_MS - FRESHNESS_MS} ms)')
 
             # The retire is distinguishable in the evidence by its cause.
-            journal = Path(logpath).read_text()
-            assert 'reference envelope expired' in journal, journal[-2000:]
-            print('  journal names "reference envelope expired" as the cause')
+            if remote:
+                print('  check external fake-server journal for "reference envelope expired"')
+            else:
+                journal = Path(logpath).read_text()
+                assert 'reference envelope expired' in journal, journal[-2000:]
+                print('  journal names "reference envelope expired" as the cause')
         finally:
             recorder.close()
             pump.close()
-    horizon_expiry_report(binary)
+    horizon_expiry_report(binary, remote)
     print(f'pc stall: S1-S4 PASS (ceiling {FRESHNESS_MS} ms, hold {HOLD_MS}, '
           f'fault {FAULT_MS}, speed {SPEED} rad/s)')
 
 
 if __name__ == '__main__':
-    main(str(Path(sys.argv[1]).resolve()))
+    binary, remote = parse_target(__doc__)
+    main(str(Path(binary).resolve()) if binary else None, remote)
