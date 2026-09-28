@@ -382,7 +382,9 @@ void rt_loop(ServerCtx& ctx) {
     // deadman and latch CMD_LOST on a healthy, streaming PC (found by the
     // native->Soft transition case). Wrong reference identity/phase still never
     // refreshes the deadline, and a bare server never has an id to retain.
-    const bool incoming_native =
+    const bool envelope_current = cmd_v != 0 && envelope.arm_gen == gen &&
+        envelope.session_id == session;
+    const bool incoming_native = envelope_current &&
         envelope.packet.command.version==REFERENCE_VERSION;
     // CTRL-034 decision (a), gap bound: a selected (reference_id, revision)
     // that has not admitted ANY envelope within the freshness ceiling is about

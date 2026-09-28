@@ -78,6 +78,8 @@ build/dm_backend_selfcheck                                # DM lifecycle via int
 build/franka_backend_selfcheck                            # FR3 exception containment, scripted franka::
 build/fault_journal_selfcheck                             # first-cause fault journal ring
 build/ipc_selfcheck                                       # mailbox, command admission; also build with -fsanitize=thread
+build/stale_envelope_scope_selfcheck                      # prior ARM envelope cannot own a new reference
+PYTHONPATH=. python tools/bench/rt/stale_envelope_scope.py build/arm_rt_server  # 50 fake-RT collisions
 ```
 
 ## DM wire mappings
