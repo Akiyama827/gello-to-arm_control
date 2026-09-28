@@ -70,7 +70,7 @@ class Pump:
                             command, reference_id=ref['reference_id'],
                             revision=ref['revision'] + int(self.wrong_revision),
                             phase=0 if self.phase_zero else ref['phase'], sample_received_at=rx,
-                            valid_for_s=.05, phase_window_s=.05)
+                            valid_for_s=.1, phase_window_s=.1)
                     else:
                         r.apply_command(command)
                 except (ValueError, OSError) as exc:

@@ -22,9 +22,14 @@ class _NotDispatched(RtLinkError):
     """Local proof that COMMIT never entered the transport."""
 
 
-# CTRL-034 B1: the fixed rate of the dedicated envelope sender. The sender owns
-# the v7 stream so an upload, a plan or a TCP round-trip in the caller's loop
-# cannot stretch the gap between envelopes; the RT's freshness ceiling is 50 ms.
+# CTRL-034 B1 (V1, operator decision): the declared PC envelope bounds. The RT's
+# effective ceiling is min(--hold-ms, valid_for_us) and --hold-ms defaults to
+# 100 ms, so this is 100 ms unless a unit lowers hold_ms.
+VALID_FOR_S = 0.1
+PHASE_WINDOW_S = 0.1
+# The fixed send rate of the dedicated sender. The sender may repeat a decision,
+# but it NEVER re-stamps one: the envelope always carries the decision's own
+# sample time and phase, so its reported age grows while the decision is reused.
 ENVELOPE_PERIOD_S = 0.005
 
 
@@ -37,7 +42,6 @@ class ReferenceHorizon:
         self._interrupt = threading.Event()
         self._envelope_lock = threading.Lock()
         self._envelope_decision = None
-        self._envelope_identity = None
         self._envelope_last = None
         self._envelope_stop = threading.Event()
         self._envelope_thread = threading.Thread(
@@ -331,36 +335,37 @@ class ReferenceHorizon:
                         self._stage_window(max(first, start))
 
     # -- fixed-rate envelope stream (CTRL-034 B1) -----------------------------
-    def publish(self, command, *, reference_id, revision):
-        """Publish the latest PC dynamics decision for the fixed-rate sender.
+    def publish(self, command, *, reference_id, revision, phase, sample_received_at):
+        """Publish one PC dynamics decision: the command, the reference phase it
+        was computed at, and the RT state sample it was computed from.
 
-        The identity is the RT selection the decision was computed against (the
-        RT's observed id/revision, which may still be an endpoint while a new
-        candidate uploads). The caller publishes only while the controller is
-        actually tracking that selection; ``unpublish`` on every other command
-        path is what keeps the stream a decision, never a blind heartbeat.
+        The decision is atomic and immutable once published. The sender may
+        repeat it at the fixed rate, but it never re-stamps it: every envelope
+        carries this sample time and this phase, so its age keeps growing until
+        the caller publishes again or the ceiling makes the stream stop.
         """
         with self._envelope_lock:
-            self._envelope_decision = dict(command)
-            self._envelope_identity = (int(reference_id), int(revision),
-                                       self._session, self._epoch)
+            self._envelope_decision = (dict(command), int(reference_id), int(revision),
+                                       float(phase), float(sample_received_at))
 
     def unpublish(self):
         with self._envelope_lock:
             self._envelope_decision = None
 
     def last_seq(self):
-        """Sequence of the most recent envelope sent for the current decision."""
+        """Sequence of the most recent envelope the sender put on the wire.
+
+        The caller has just published a decision, so this is the previous
+        send of the same running stream (one sender period old at most). It is
+        the plant-acceptance evidence the supervisor's SENT/APPLIED receipts
+        need; the sender's asynchronous first send cannot be awaited.
+        """
         with self._envelope_lock:
-            if self._envelope_last is None or self._envelope_identity is None:
+            if self._envelope_last is None or self._envelope_decision is None:
                 return None
-            seq, identity = self._envelope_last
-            return seq if identity == self._envelope_identity else None
+            return self._envelope_last
 
     def _envelope_loop(self):
-        # One fresh RT state sample per envelope: `phase` and `sample_received_at`
-        # both come from THIS read, so `age_us` measures the sender-to-RT
-        # transport, not the caller's tick or an upload round-trip.
         while not self._envelope_stop.is_set():
             started = time.monotonic()
             self._send_envelope()
@@ -370,29 +375,37 @@ class ReferenceHorizon:
 
     def _send_envelope(self):
         with self._envelope_lock:
-            decision, identity = self._envelope_decision, self._envelope_identity
-        if decision is None or identity is None:
+            decision = self._envelope_decision
+        if decision is None:
+            return
+        command, reference_id, revision, phase, sample_received_at = decision
+        if time.monotonic() - sample_received_at > VALID_FOR_S:
+            # The decision itself is older than the ceiling: send NOTHING, so the
+            # RT's freshness rule — not a re-stamped heartbeat — owns the hold.
             return
         if self._interrupt.is_set() or self.error or self.link.session_id != self._session:
             return
-        state, received_at = self.link.latest_state()
+        state, _received_at = self.link.latest_state()
         ref = None if state is None else state.reference
         if (state is None or ref is None or not state.armed
                 or state.session_id != self._session or state.arm_epoch != self._epoch):
             return
-        if (ref['reference_id'] != identity[0] or ref['revision'] != identity[1]
-                or ref['status'] not in (p.REFERENCE_RUNNING, p.REFERENCE_END)):
+        if ref['reference_id'] != reference_id:
             return
+        if ref['status'] not in (p.REFERENCE_RUNNING, p.REFERENCE_END):
+            return
+        # B2: keep the decision's OWN revision even after RT switches — the RT's
+        # revision-(r-1) prefix rule admits it until the caller republishes.
         try:
             seq = self.link.apply_reference_envelope(
-                decision, reference_id=ref['reference_id'], revision=ref['revision'],
-                phase=ref['phase'], sample_received_at=received_at,
-                valid_for_s=.05, phase_window_s=.05,
+                command, reference_id=reference_id, revision=revision,
+                phase=phase, sample_received_at=sample_received_at,
+                valid_for_s=VALID_FOR_S, phase_window_s=PHASE_WINDOW_S,
                 session_id=self._session, arm_epoch=self._epoch)
         except (RtLinkError, ValueError, OSError):
             return
         with self._envelope_lock:
-            self._envelope_last = (seq, identity)
+            self._envelope_last = seq
 
     def cancel(self):
         if not self.id or self._interrupt.is_set():

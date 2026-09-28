@@ -507,7 +507,9 @@ admitted from the measured state resumes motion. A reference at its stationary
 ordinary PC CANCEL keeps its retained id/phase fresh so the envelopes the PC
 keeps streaming still hold the deadman. A selected `(id, revision)` that admits
 no envelope within `min(hold_ms, valid_for_us)` is retired with the same cause,
-so a late first envelope cannot be sampled at the advanced phase. Retirement is
+so a late first envelope cannot be sampled at the advanced phase. V1 declares
+`valid_for_us = phase_window_us = 100 ms`; `--hold-ms` defaults to 100, so the
+effective ceiling is 100 ms and lowering `--hold-ms` lowers it. Retirement is
 journal/diagnostic only: no new `ReferenceStatus` value and no packet change.
 
 **Revision handover (CTRL-034 B2).** For the same `reference_id`, an envelope
@@ -517,9 +519,13 @@ byte-identical, so the dynamics decision is unchanged. The previous revision's
 envelope counts for the first-envelope bound too. Without it every revision
 switch held the arm until the new revision's first envelope arrived — at
 0.4 rad/s, one hold frame per switch. The PC side owns the stream with a
-dedicated fixed-rate sender (`ReferenceHorizon`), which takes a fresh state
-sample per envelope so the caller's tick, uploads or TCP round-trips cannot
-stretch the reported envelope age.
+dedicated fixed-rate sender (`ReferenceHorizon`). The sender may repeat a
+decision but never re-stamps it: every envelope carries the decision's own RT
+sample time and reference phase, so the reported age grows while the decision is
+reused and the sender stops once it passes the ceiling — a stalled caller makes
+the RT expire and retire rather than feeding a heartbeat. After RT switches
+revision the sender keeps the decision's original revision until the caller
+republishes.
 
 Offline schema check (no server/device):
 

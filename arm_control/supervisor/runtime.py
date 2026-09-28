@@ -147,7 +147,6 @@ class RobotRuntime:
         self._native_pending = None
         self._native_epoch = 0
         self._native_failed = False
-        self._last_command = None  # last controller command, for a first envelope
         self.controller = self._build_controller()
         self._payload = PayloadState(0, PayloadValue(0.))
         self._presets = resolve_presets(cfg.get('control_mode') or {}, self.joints,
@@ -1156,20 +1155,6 @@ class RobotRuntime:
             if ex.status.phase is Phase.ADMITTED:
                 self._receipt(ex, Phase.SELECTED, reference_id=h.id, reference_revision=h.revision,
                               reference_phase=h.point.time, arm_epoch=h.arm_epoch)
-                # CTRL-034 B1: the 50 ms first-envelope bound starts at the RT's
-                # COMMIT, but this tick may not reach the controller step that
-                # produces the reference decision for another tick or more.
-                # Publish the controller's LAST decision (its hold at the
-                # measured position, whose feedforward is the compensation at
-                # this configuration) so the fixed-rate sender establishes the
-                # stream immediately; the next control tick replaces it. The
-                # reference is planned from the measured state, so this is
-                # continuous within the plan's own start tolerance.
-                observed = h.observed
-                if self._last_command is not None and observed is not None:
-                    h.publish(self._last_command,
-                              reference_id=observed['reference_id'],
-                              revision=observed['revision'])
             c.on_control(pack_control_update(execute=eid))
             self._native_pending = None
             if not c.runtime_state['executing']:
@@ -1187,7 +1172,6 @@ class RobotRuntime:
         h = self._native
         if h is None:
             return self.link.apply_command(command)
-        self._last_command = command
         state, _ = self.link.latest_state()
         if state is None or not state.armed:
             h.unpublish()
@@ -1204,11 +1188,13 @@ class RobotRuntime:
             matches = (np.array_equal(command['position'], point.position)
                        and np.array_equal(command['velocity'], point.velocity))
             if matches:
-                # The dedicated sender owns the v7 stream; it takes a fresh RT
-                # state sample per envelope, so the caller's tick (planning,
-                # uploads, TCP) can no longer stretch the envelope age.
+                # CTRL-034 B1: the fixed-rate sender repeats this decision at its
+                # own rate but never re-stamps it — the envelope always carries
+                # this decision's sample time and phase, so a stalled tick makes
+                # the decision age and the RT expire the reference.
                 h.publish(command, reference_id=ref['reference_id'],
-                          revision=ref['revision'])
+                          revision=ref['revision'], phase=point.time,
+                          sample_received_at=h.received_at)
                 return h.last_seq()
         # Any other command path is not tracking the selected reference: stop
         # the stream so the RT's own freshness rule owns the hold.

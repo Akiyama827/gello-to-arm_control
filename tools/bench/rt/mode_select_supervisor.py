@@ -144,7 +144,7 @@ class NativePump:
                         reference_id=state.reference['reference_id'],
                         revision=state.reference['revision'],
                         phase=state.reference['phase'], sample_received_at=rx,
-                        valid_for_s=.05, phase_window_s=.05)
+                        valid_for_s=.1, phase_window_s=.1)
             except (ValueError, OSError, RtLinkError) as exc:
                 self.errors.append(str(exc))
             self.stop.wait(.005)

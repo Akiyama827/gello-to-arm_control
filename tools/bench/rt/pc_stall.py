@@ -5,7 +5,12 @@ reference is FINISHED. The arm holds its measured position with the captured
 gains and zero feedforward; the running reference is RETIRED
 (REFERENCE_CANCELLED) with a distinct journal cause; envelopes for it are never
 re-admitted; and motion resumes only through a NEW reference the PC plans from
-the measured position. The PC recovery budget is `fault_ms - expiry`.
+the measured position. The PC recovery budget is `fault_ms - ceiling`.
+
+V1 ceiling: `valid_for_us = phase_window_us = 100 ms` and the deployed
+`--hold-ms 100`, so `min(hold_ms, valid_for_us) = 100 ms`. Stall matrix:
+S1 30 ms and S2 60 ms never expire; S2b 120 ms and S3 150 ms expire at ~100 ms
+and RETIRE; S4 latches CMD_LOST ~900 ms after expiry.
 
 Retirement applies only while the reference is RUNNING (never at a stationary
 END), and only to a reference the RT retired on expiry: an ordinary PC cancel
@@ -36,7 +41,7 @@ from arm_control.plants.remote_rt.reference import ReferenceHorizon
 from envelope_age import EnvelopeAgeMonitor
 from arm_control.plants.remote_rt.client import RtBackend, RtConfig, RtLinkError
 
-FRESHNESS_MS = 50      # min(hold_ms, valid_for_us); valid_for/phase_window = 50 ms
+FRESHNESS_MS = 100     # min(hold_ms, valid_for_us); V1 declares both as 100 ms
 HOLD_MS, FAULT_MS = 100, 1000
 SPEED = 0.4            # planner speed cap, rad/s
 POLL_S = 0.001
@@ -96,7 +101,7 @@ class Pump:
                             command, reference_id=state.reference['reference_id'],
                             revision=state.reference['revision'],
                             phase=state.reference['phase'], sample_received_at=rx,
-                            valid_for_s=.05, phase_window_s=.05)
+                            valid_for_s=.1, phase_window_s=.1)
                 except (ValueError, OSError, RtLinkError) as exc:
                     self.errors.append(str(exc))
             self.stop.wait(.002)
@@ -219,7 +224,7 @@ def horizon_expiry_report(binary):
                 rt.apply_reference_envelope(
                     command, reference_id=h.id, revision=h.feedback['revision'],
                     phase=h.point.time, sample_received_at=received,
-                    valid_for_s=.05, phase_window_s=.05)
+                    valid_for_s=.1, phase_window_s=.1)
             time.sleep(0.005)
         assert h.selected and not h.error, h.error
 
@@ -263,21 +268,25 @@ def main(binary):
         ages = EnvelopeAgeMonitor(rt)
         ages.__enter__()
         try:
-            # ---- S1: 30 ms never expires, never retires --------------------
+            # ---- steady stream: report the ages before any injected stall ---
             wait_for(lambda: commit(rt, 1, np.zeros(3)))
             wait_for(lambda: not rt.latest_state()[0].holding)
-            t0, rows = inject(rt, pump, recorder, 30, resume=True)
-            edge, at_ms = hold_edge(rows, t0)
-            assert edge is None, f'30 ms stall caused a hold at {at_ms:.0f} ms'
-            state = rt.latest_state()[0]
-            assert state.reference['status'] == p.REFERENCE_RUNNING, state.reference
-            assert not state.faulted
-            ages.__exit__()
-            ages.report('pc_stall S1')
-            print('  S1   30 ms -> no hold, reference still RUNNING')
+            time.sleep(0.2)
+            ages.report('pc_stall steady')
 
-            # ---- S2/S3: expire at ~50 ms, RETIRE, no resume, no jump -------
-            for stall_ms, ref_id, tag in ((60, 2, 'S2'), (150, 3, 'S3')):
+            # ---- S1/S2: shorter than the ceiling, no hold, no retire -------
+            for stall_ms, tag in ((30, 'S1'), (60, 'S2')):
+                t0, rows = inject(rt, pump, recorder, stall_ms, resume=True)
+                edge, at_ms = hold_edge(rows, t0)
+                assert edge is None, f'{tag} {stall_ms} ms caused a hold at {at_ms:.0f} ms'
+                state = rt.latest_state()[0]
+                assert state.reference['status'] == p.REFERENCE_RUNNING, state.reference
+                assert not state.faulted
+                print(f'  {tag}  {stall_ms:>3} ms -> no hold, reference still RUNNING')
+            ages.__exit__()
+
+            # ---- S2b/S3: expire at ~100 ms, RETIRE, no resume, no jump -----
+            for stall_ms, ref_id, tag in ((120, 2, 'S2b'), (150, 3, 'S3')):
                 t0, rows = inject(rt, pump, recorder, stall_ms, resume=True)
                 edge, at_ms = hold_edge(rows, t0)
                 assert edge is not None, f'{stall_ms} ms stall produced no hold'
@@ -332,6 +341,12 @@ def main(binary):
             rt.commit_reference(load, reference_id=gap_id)
             wait_for(lambda: rt.latest_state()[0].reference['status']
                      == p.REFERENCE_CANCELLED, timeout=2)
+            # The 1 ms recorder may lag the state read above; wait for both edges
+            # to be recorded before analysing them.
+            wait_for(lambda: any(r['status'] == p.REFERENCE_RUNNING
+                                 for r in recorder.since(mark)), timeout=1)
+            wait_for(lambda: any(r['status'] == p.REFERENCE_CANCELLED
+                                 for r in recorder.since(mark)), timeout=1)
             before_gap = recorder.since(mark)
             running_row = next((r for r in before_gap
                                 if r['status'] == p.REFERENCE_RUNNING), None)

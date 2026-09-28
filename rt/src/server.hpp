@@ -289,12 +289,12 @@ inline double clamped_age_ns(uint64_t now, uint64_t then) {
 
 // CTRL-034 decision (a): the longest a freshly selected (reference_id,
 // revision) may go without admitting ANY envelope before the RT retires it.
-// The per-envelope ceiling is min(--hold-ms, valid_for_us), and every PC path
-// declares valid_for_us = 50 ms; this constant mirrors that declared ceiling
-// for the one interval where no envelope exists yet. Without it, a first
-// envelope arriving after the ceiling would be accepted at the advanced
-// reference phase and step the arm by SPEED x gap on the first resumed frame.
-constexpr double REFERENCE_FIRST_ENVELOPE_NS = 50'000'000;  // 50 ms
+// The per-envelope ceiling is min(--hold-ms, valid_for_us); V1 declares
+// valid_for_us = 100 ms and --hold-ms defaults to 100 ms, so the effective
+// ceiling is 100 ms (lowering --hold-ms lowers it). Without this bound a first
+// envelope arriving later would be accepted at the advanced reference phase and
+// step the arm.
+constexpr double REFERENCE_FIRST_ENVELOPE_NS = 100'000'000;  // 100 ms
 
 // Which revision an envelope may bind. The selected revision always matches.
 // The IMMEDIATELY PREVIOUS revision also matches while its phase lies inside

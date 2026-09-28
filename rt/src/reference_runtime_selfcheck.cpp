@@ -14,7 +14,11 @@ int main(int argc,char** argv) {
   arm_rt::ServerCtx ctx;
   ctx.cfg.backend="fake"; ctx.cfg.instance_id="fake"; ctx.cfg.n=3;
   ctx.cfg.udp_port=std::atoi(argv[1]); ctx.cfg.tcp_port=std::atoi(argv[2]);
-  ctx.cfg.hold_ms=50; ctx.cfg.fault_ms=500; ctx.cfg.state_hz=200;
+  // CTRL-034 V1: the deployed default is --hold-ms 100, and the effective
+  // envelope ceiling is min(hold_ms, valid_for_us) = min(100, 100) = 100 ms.
+  // The fixture uses the same hold so the offline native benches exercise the
+  // V1 ceiling rather than a shorter one.
+  ctx.cfg.hold_ms=100; ctx.cfg.fault_ms=500; ctx.cfg.state_hz=200;
   ctx.supports_reference.store(true);
   running=&ctx; std::signal(SIGTERM,stop); std::signal(SIGINT,stop);
   std::thread udp(arm_rt::udp_rx_thread,std::ref(ctx));
