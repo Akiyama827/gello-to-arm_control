@@ -25,6 +25,9 @@ Fake backend only, one `arm_rt_server --enable-reference --hold-ms 100
 from __future__ import annotations
 
 from contextlib import contextmanager
+import itertools
+import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -40,6 +43,7 @@ from arm_control.plants.remote_rt.reference import ReferenceHorizon
 from envelope_age import EnvelopeAgeMonitor
 from bench_target import parse_target
 from arm_control.plants.remote_rt.client import RtBackend, RtConfig, RtLinkError
+from first_envelope_trace import TraceBackend
 
 FRESHNESS_MS = 100     # min(hold_ms, valid_for_us); V1 declares both as 100 ms
 HOLD_MS, FAULT_MS = 100, 1000
@@ -54,6 +58,14 @@ STEP_LIMIT = 0.05
 # advanced phase. At 1 kHz the normal per-frame setpoint step is SPEED/1000 =
 # 0.4 mrad; before this bound the reviewer measured ~107 mrad in ONE frame.
 GAP_STEP_LIMIT = 0.005
+TRACE_OUT = os.environ.get('CTRL034_FIRST_ENVELOPE_TRACE')
+TRACE_EVENTS = []
+TRACE_SESSIONS = itertools.count(1)
+
+
+def trace(rt, event, **fields):
+    if TRACE_OUT:
+        rt.record(event, **fields)
 
 
 def unused_port(kind):
@@ -156,9 +168,11 @@ def server(binary, remote=None):
             '--state-hz', '1000', '--enable-reference']
     log = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.log')
     proc = None if remote else subprocess.Popen(argv, stdout=log, stderr=log)
-    rt = RtBackend(RtConfig(host=remote.host if remote else '127.0.0.1',
-                            udp_port=udp, tcp_port=tcp, instance_id=instance),
-                   ['j0', 'j1', 'j2'])
+    config = RtConfig(host=remote.host if remote else '127.0.0.1',
+                      udp_port=udp, tcp_port=tcp, instance_id=instance)
+    rt = (TraceBackend(config, ['j0', 'j1', 'j2'], events=TRACE_EVENTS,
+                       run=next(TRACE_SESSIONS)) if TRACE_OUT else
+          RtBackend(config, ['j0', 'j1', 'j2']))
     try:
         time.sleep(.2)
         rt.open()
@@ -233,19 +247,24 @@ def horizon_expiry_report(binary, remote=None):
                                       velocity=np.zeros(3), torque=np.zeros(3),
                                       kp=np.ones(3) * 2, kd=np.ones(3) * .1))
             if h.ready and not h.selected:
+                trace(rt, 'approve_requested')
                 h.approve()
             if h.selected:
+                trace(rt, 'selection_seen')
                 rt.apply_reference_envelope(
                     command, reference_id=h.id, revision=h.feedback['revision'],
                     phase=h.point.time, sample_received_at=received,
                     valid_for_s=.1, phase_window_s=.1)
             time.sleep(0.005)
+        if not h.selected or h.error:
+            trace(rt, 'selection_failed', error=h.error)
         assert h.selected and not h.error, h.error
 
     with server(binary, remote) as (rt, _log):
         h = ReferenceHorizon(rt)
         try:
             h.stage("expiry", ramp(np.zeros(3), 2.0), stream=True)
+            trace(rt, 'stage_requested', section='expiry')
             run_to_selection(rt, h)
             # Stop feeding: RT retires the reference when the envelope expires.
             deadline = time.monotonic() + 2
@@ -261,7 +280,9 @@ def horizon_expiry_report(binary, remote=None):
         h = ReferenceHorizon(rt)
         try:
             h.stage("local-cancel", ramp(np.zeros(3), 2.0), stream=True)
+            trace(rt, 'stage_requested', section='local-cancel')
             run_to_selection(rt, h)
+            trace(rt, 'cancel_requested')
             h.cancel()                     # OUR cancel, not an expiry
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline and h.selected:
@@ -433,5 +454,10 @@ def main(binary, remote=None):
 
 
 if __name__ == '__main__':
-    binary, remote = parse_target(__doc__)
-    main(str(Path(binary).resolve()) if binary else None, remote)
+    try:
+        binary, remote = parse_target(__doc__)
+        main(str(Path(binary).resolve()) if binary else None, remote)
+    finally:
+        if TRACE_OUT:
+            Path(TRACE_OUT).write_text(
+                '\n'.join(json.dumps(event) for event in TRACE_EVENTS) + '\n')
