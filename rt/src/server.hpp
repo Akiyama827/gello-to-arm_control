@@ -287,17 +287,26 @@ inline double clamped_age_ns(uint64_t now, uint64_t then) {
   return double(age < 0 ? 0 : age);
 }
 
+// CTRL-034 decision (a): the longest a freshly selected (reference_id,
+// revision) may go without admitting ANY envelope before the RT retires it.
+// The per-envelope ceiling is min(--hold-ms, valid_for_us), and every PC path
+// declares valid_for_us = 50 ms; this constant mirrors that declared ceiling
+// for the one interval where no envelope exists yet. Without it, a first
+// envelope arriving after the ceiling would be accepted at the advanced
+// reference phase and step the arm by SPEED x gap on the first resumed frame.
+constexpr double REFERENCE_FIRST_ENVELOPE_NS = 50'000'000;  // 50 ms
+
 // One envelope validity rule for admission and continued use. Wall age uses
 // local elapsed intervals only; phase is the shared semantic coordinate.
+// Retirement CAUSE is deliberately NOT part of this rule: an ordinary PC
+// cancel keeps its retained id/phase fresh so the continuing envelopes still
+// hold the command deadman, while the RT loop separately excludes a reference
+// IT retired on expiry (ReferenceSelection::retired_by_expiry).
 inline bool reference_envelope_fresh(const ReferenceEnvelopeBinding& b,
                                     const ReferenceSelectionInfo& r,
                                     uint64_t now,uint64_t ingress,double hold_ns) {
   const double lag=r.phase-b.phase;
-  // A RETIRED selection never regains freshness: reusing its id/revision would
-  // otherwise let the retired reference keep the deadman alive. UNDERFLOW and
-  // END are still fresh (a nonterminal run-off is not a retirement).
-  return r.status!=REFERENCE_CANCELLED &&
-    r.reference_id==b.reference_id && r.revision==b.revision && lag>=0 &&
+  return r.reference_id==b.reference_id && r.revision==b.revision && lag>=0 &&
     lag*1e6<=b.phase_window_us && lag*1e9<=hold_ns &&
     clamped_age_ns(now,ingress)+double(b.age_us)*1000<=
       std::min(hold_ns,double(b.valid_for_us)*1000);

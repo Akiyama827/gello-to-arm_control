@@ -146,6 +146,29 @@ def main(binary):
             assert timeout.reference['status']==p.REFERENCE_UNDERFLOW
         finally:
             pump.close()
+    # CTRL-034 F2: an ORDINARY PC cancel keeps the pre-(a) behaviour. The
+    # retired selection retains its id and phase, so the envelopes the PC keeps
+    # streaming stay fresh and hold the command deadman: the arm holds and never
+    # latches CMD_LOST. Only a reference the RT retired on envelope EXPIRY loses
+    # liveness (covered by the invalid cases below). The reviewer's probe:
+    # cancel a RUNNING reference while the PC keeps streaming -> no fault on
+    # 0755f01, CMD_LOST at fault_ms when CANCELLED was excluded from freshness.
+    with fake(binary) as rt:
+        pump = Pump(rt)
+        try:
+            u = rt.upload_reference(curve(3.), reference_id=1, terminal=False)
+            rt.commit_reference(u, reference_id=1)
+            wait_state(rt, lambda s: s.reference['phase']>.15 and not s.holding)
+            ref = rt.latest_state()[0].reference
+            rt.cancel_reference(ref['reference_id'], ref['revision'])
+            wait_state(rt, lambda s: s.reference['status']==p.REFERENCE_CANCELLED)
+            time.sleep(1.2)  # deployed default hold/fault are 100/1000 ms
+            state, _ = rt.latest_state()
+            assert state.armed and not state.faulted, (state.faulted, state.fault_code)
+            assert state.holding, 'cancel must keep the measured compensated hold'
+            assert state.reference['reference_id']==1
+        finally:
+            pump.close()
     for invalid in ('phase_zero', 'wrong_revision', 'pause'):
         with fake(binary) as rt:
             pump = Pump(rt)
@@ -163,7 +186,8 @@ def main(binary):
             finally:
                 pump.close()
     print('PASS native fake E2E: terminal, exact commit/cancel retry, retired late commit, '
-          'underflow independent of command timeout, stale phase/revision/wall age')
+          'underflow independent of command timeout, plain cancel keeps liveness, '
+          'stale phase/revision/wall age')
 
 
 if __name__ == '__main__':

@@ -7,6 +7,13 @@ gains and zero feedforward; the running reference is RETIRED
 re-admitted; and motion resumes only through a NEW reference the PC plans from
 the measured position. The PC recovery budget is `fault_ms - expiry`.
 
+Retirement applies only while the reference is RUNNING (never at a stationary
+END), and only to a reference the RT retired on expiry: an ordinary PC cancel
+keeps its retained id/phase fresh so the continuing envelopes still hold the
+deadman (native_reference.py). A COMMIT whose FIRST envelope arrives later than
+the freshness ceiling is retired too, so the late envelope cannot be sampled at
+the advanced phase and step the arm.
+
 Fake backend only, one `arm_rt_server --enable-reference --hold-ms 100
 --fault-ms 1000 --state-hz 1000`. No hardware, no deployment, no service action.
 """
@@ -37,6 +44,10 @@ SLACK_MS = 25
 # have advanced by SPEED * elapsed. A resume jump is therefore ~SPEED * elapsed,
 # and the resume assertion below bounds the observed step at half of that.
 STEP_LIMIT = 0.05
+# A first envelope later than the ceiling must be REFUSED, not sampled at the
+# advanced phase. At 1 kHz the normal per-frame setpoint step is SPEED/1000 =
+# 0.4 mrad; before this bound the reviewer measured ~107 mrad in ONE frame.
+GAP_STEP_LIMIT = 0.005
 
 
 def unused_port(kind):
@@ -295,27 +306,59 @@ def main(binary):
                 print(f'  {tag}  {stall_ms:>3} ms -> hold at {at_ms:.0f} ms, '
                       f'CANCELLED, resumes only from a new measured-state commit')
 
-            # ---- Negative: the COMMIT -> first-envelope gap never retires --
-            # A new reference may replace one that has reached its terminal END.
-            # It then has NO accepted envelope yet, so the guard
-            # `held_for_active` is false and a stale-free gap is not an expiry.
-            # Without that guard every new reference would be retired between
-            # COMMIT and its first envelope.
+            # ---- F3: a first envelope later than the ceiling RETIRES --------
+            # A new reference may replace one that has reached its terminal END
+            # (a normal first envelope is admitted well inside the ceiling and
+            # stays RUNNING). If that FIRST envelope takes longer than the
+            # freshness ceiling, the RT retires the selection so the late
+            # envelope cannot be sampled at the advanced reference phase. The
+            # RT's COMMIT acknowledgement can itself take ~100 ms, so the retire
+            # latency is measured from the recorder's first RUNNING sample.
             wait_for(lambda: rt.latest_state()[0].reference['status']
                      == p.REFERENCE_END, timeout=5)
             gap_id = rt.latest_state()[0].reference['reference_id'] + 1
             pump.pause = True                       # no envelope for the new reference
-            commit(rt, gap_id, np.array(rt.latest_state()[0].q), duration=2.0)
-            time.sleep(0.2)                         # well past the 50 ms ceiling
-            gap_state = rt.latest_state()[0]
-            assert gap_state.reference['status'] == p.REFERENCE_RUNNING, gap_state.reference
-            assert not gap_state.faulted
+            mark = recorder.mark()
+            load = rt.upload_reference(
+                ramp(np.array(rt.latest_state()[0].q), 2.0),
+                reference_id=gap_id, terminal=True)
+            rt.commit_reference(load, reference_id=gap_id)
+            wait_for(lambda: rt.latest_state()[0].reference['status']
+                     == p.REFERENCE_CANCELLED, timeout=2)
+            before_gap = recorder.since(mark)
+            running_row = next((r for r in before_gap
+                                if r['status'] == p.REFERENCE_RUNNING), None)
+            cancelled_row = next((r for r in before_gap
+                                  if r['status'] == p.REFERENCE_CANCELLED), None)
+            assert running_row is not None and cancelled_row is not None
+            retire_ms = (cancelled_row['t'] - running_row['t']) * 1000.0
+            assert retire_ms <= FRESHNESS_MS + 2 * SLACK_MS, \
+                f'first-envelope gap retired after {retire_ms:.0f} ms, '\
+                f'expected ~{FRESHNESS_MS}'
+            # From here the arm must HOLD: the late first envelope is refused.
+            # The window starts after the retire so the legitimate new-plan
+            # re-selection at COMMIT (a step from the old terminal setpoint to
+            # the measured start) is not mistaken for the stale-reference jump.
+            step_mark = recorder.mark()
+            time.sleep(0.35)                        # first envelope finally arrives
             pump.pause = False
-            wait_for(lambda: not rt.latest_state()[0].holding, timeout=3)
-            print('  gap  COMMIT->first envelope -> RUNNING (not retired); '
-                  'revision switch covered by reference_horizon.py')
+            time.sleep(0.25)
+            gap_state = rt.latest_state()[0]
+            assert gap_state.reference['status'] == p.REFERENCE_CANCELLED, gap_state.reference
+            assert not gap_state.faulted
+            rows = recorder.since(step_mark)
+            steps = [abs(b['q_cmd'][0] - a['q_cmd'][0]) for a, b in zip(rows, rows[1:])]
+            assert steps and max(steps) <= GAP_STEP_LIMIT, \
+                f'gap: single-frame step {max(steps, default=0):.4f} rad on the late '\
+                f'first envelope (normal per-frame is {SPEED / 1000:.4f})'
+            print(f'  gap  first envelope late -> retired {retire_ms:.0f} ms after RUNNING, '
+                  f'max step {max(steps):.4f} rad (was ~0.12), still armed')
 
             # ---- S4: no new commit -> CMD_LOST at the recovery budget ------
+            # A fresh reference from the current measured hold; its first
+            # envelope is admitted normally and is NOT retired.
+            s4_id = gap_state.reference['reference_id'] + 1
+            commit(rt, s4_id, np.array(rt.latest_state()[0].q), duration=3.0)
             wait_for(lambda: not rt.latest_state()[0].holding)
             assert rt.latest_state()[0].reference['status'] == p.REFERENCE_RUNNING
             mark, t0 = recorder.mark(), time.monotonic()

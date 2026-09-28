@@ -228,18 +228,52 @@ def main(binary):
             time.sleep(0.1)
             state, _ = runtime.link.latest_state()
             assert runtime.status(ex.execution_id).phase is Phase.CANCELLED
-            # Decision (a) changes what this section can own. The previously
-            # selected endpoint is RETIRED once its envelope expires (its id is
-            # still reported), so "the previous endpoint stays selected" is no
-            # longer the expected behavior: a new reference — including this
-            # one, had it committed — is the only way motion resumes. What the
-            # section still owns is that cancelling an unselected candidate
-            # neither faults nor disarms, and leaves no stale selection behind.
+            # Cancelling this unselected upload ABORTs only that candidate. The
+            # previous terminal endpoint stays selected: an END reference is
+            # stationary, so decision (a) never retires it (retirement on
+            # expiry applies only while the reference is RUNNING).
             assert state.armed and not state.faulted
             assert (
-                state.reference["reference_id"] >= before_id
-                or state.reference["status"] == p.REFERENCE_CANCELLED
+                state.reference["reference_id"] == before_id
+                and state.reference["status"] == p.REFERENCE_END
             ), (state.reference, before_id)
+
+            # A RUNNING reference whose accepted envelope goes stale is RETIRED
+            # by the RT (decision (a)). The segment fails REFERENCE_EXPIRED, the
+            # arm stays armed on its measured compensated hold, and the runtime
+            # is not stopped; only a NEW reference planned from the measured
+            # position resumes motion.
+            send_envelope = runtime.link.apply_reference_envelope
+
+            def stale_envelope(command, **kw):
+                kw["sample_received_at"] = time.monotonic() - 1.0
+                return send_envelope(command, **kw)
+
+            q0 = runtime.state().q
+            stale_tr = JointTrajectory(
+                [0.0, 1.5, 3.0],
+                np.stack([q0, q0 + 0.03, q0 + 0.06]),
+                np.zeros((3, 3)),
+            )
+            ex = runtime.submit(
+                "test",
+                replace(
+                    req,
+                    request_id="stale-expiry",
+                    trajectory=stale_tr,
+                    admit_by=None,
+                ),
+            )
+            until(lambda: Phase.APPLIED in runtime.status(ex.execution_id).reached)
+            runtime.link.apply_reference_envelope = stale_envelope
+            until(lambda: runtime.status(ex.execution_id).terminal)
+            runtime.link.apply_reference_envelope = send_envelope
+            stale = runtime.status(ex.execution_id)
+            assert stale.phase is Phase.FAULTED, stale
+            assert stale.reason == "REFERENCE_EXPIRED", stale
+            state, _ = runtime.link.latest_state()
+            assert state.armed and not state.faulted, state
+            assert not runtime.controller.stopped
 
             # Missing continuation data is an execution failure. It stays an
             # armed, zero-PC-feedforward RT hold; only a NEW admission recovers.

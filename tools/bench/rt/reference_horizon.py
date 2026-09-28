@@ -21,6 +21,8 @@ def main(binary):
         horizon.stage("long-plan", trajectory)
         revisions = set()
         previous = None
+        previous_revision = None
+        revision_switches = 0
         deadline = time.monotonic() + 6
         samples = 0
         try:
@@ -40,6 +42,16 @@ def main(binary):
                 if horizon.selected:
                     ref, point = horizon.feedback, horizon.point
                     revisions.add(ref["revision"])
+                    if (previous_revision is not None
+                            and ref["revision"] != previous_revision):
+                        # CTRL-034 F3: a normal revision switch is not a
+                        # first-envelope gap. The new revision's first envelope
+                        # is admitted well inside the 50 ms ceiling, so the RT
+                        # never retires it and the run continues RUNNING.
+                        revision_switches += 1
+                        assert ref["status"] == p.REFERENCE_RUNNING, ref
+                        assert not horizon.error, horizon.error
+                    previous_revision = ref["revision"]
                     oracle = trajectory.sample_at(point.time)
                     np.testing.assert_allclose(
                         point.position, oracle.position, rtol=0, atol=1e-15
@@ -78,7 +90,8 @@ def main(binary):
             else:
                 raise AssertionError("long reference did not reach terminal end")
             print(
-                f"PASS 321 knots through {len(revisions)} bounded revisions; "
+                f"PASS 321 knots through {len(revisions)} bounded revisions "
+                f"({revision_switches} switches stayed RUNNING); "
                 f"{samples} feedback samples match original curve, monotonic RT phase"
             )
         finally:

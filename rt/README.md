@@ -499,6 +499,17 @@ not immediately latch CMD_LOST; existing independent command/session deadlines
 remain in force. No late upload heals retirement. These execution semantics
 are approved requirements, **not implemented by the B1 codecs**.
 
+Envelope expiry (decision (a)) retires a **RUNNING** reference — status
+`CANCELLED` on the wire, a journal-only `reference envelope expired` cause — and
+the arm holds its measured position with zero feedforward; only a NEW reference
+admitted from the measured state resumes motion. A reference at its stationary
+`END` is never retired, a normal revision switch is never retired, and an
+ordinary PC CANCEL keeps its retained id/phase fresh so the envelopes the PC
+keeps streaming still hold the deadman. A selected `(id, revision)` that admits
+no envelope within `min(hold_ms, valid_for_us)` is retired with the same cause,
+so a late first envelope cannot be sampled at the advanced phase. Retirement is
+journal/diagnostic only: no new `ReferenceStatus` value and no packet change.
+
 Offline schema check (no server/device):
 
 ```sh

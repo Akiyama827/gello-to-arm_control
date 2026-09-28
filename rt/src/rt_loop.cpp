@@ -384,24 +384,46 @@ void rt_loop(ServerCtx& ctx) {
     // refreshes the deadline, and a bare server never has an id to retain.
     const bool incoming_native =
         envelope.packet.command.version==REFERENCE_VERSION;
+    // CTRL-034 decision (a), gap bound: a selected (reference_id, revision)
+    // that has not admitted ANY envelope within the freshness ceiling is about
+    // to be retired. This is evaluated BEFORE admission so the late first
+    // envelope cannot be accepted at the advanced reference phase: that is
+    // exactly the 107 mrad single-frame step the reviewer measured when the
+    // first envelope arrived ~300 ms after COMMIT.
+    const bool reference_gap =
+        mode.mode==MODE_REFERENCE && reference.info().status==REFERENCE_RUNNING &&
+        reference.admitted_at_ns()!=0 && !reference.envelope_seen() &&
+        clamped_age_ns(now,reference.admitted_at_ns()) >
+          std::min(hold_ns,REFERENCE_FIRST_ENVELOPE_NS);
     bool admit_envelope=true;
     if(incoming_native) {
-      admit_envelope=reference_envelope_fresh(envelope.reference,reference.info(),
-                                               now,envelope.rx_ns,hold_ns);
+      const bool for_active =
+          envelope.reference.reference_id==reference.info().reference_id &&
+          envelope.reference.revision==reference.info().revision;
+      admit_envelope = !reference.retired_by_expiry() &&
+          !reference_gap &&
+          reference_envelope_fresh(envelope.reference,reference.info(),
+                                   now,envelope.rx_ns,hold_ns);
+      if(admit_envelope && for_active && reference.active())
+        reference.mark_envelope();
     } else if(reference.info().reference_id && mode.mode!=MODE_STREAMED) {
       admit_envelope=false;
     }
     authority.observe(gen, arm_start, admit_envelope?cmd_v:0, envelope);
     // --- retire on expiry (CTRL-034 decision (a)) --------------------------
-    // In MODE_REFERENCE a run reference whose accepted envelope has expired is
-    // FINISHED, not merely held: the arm holds its measured position with the
-    // captured gains and zero feedforward, and motion resumes only through a
-    // NEW reference the PC plans from the measured position. The guard is
+    // In MODE_REFERENCE a RUNNING reference whose accepted envelope has expired
+    // is FINISHED, not merely held: the arm holds its measured position with
+    // the captured gains and zero feedforward, and motion resumes only through
+    // a NEW reference the PC plans from the measured position. The guard is
     // `held_for_active`: an envelope for the CURRENT (reference_id, revision)
-    // must already have been accepted, which is exactly what keeps the
-    // COMMIT->first-envelope gap and a normal revision switch from retiring a
-    // healthy reference. MODE_STREAMED never retires here.
-    if (mode.mode == MODE_REFERENCE && reference.active()) {
+    // must already have been accepted, which is exactly what keeps a normal
+    // revision switch from retiring a healthy reference; the no-envelope gap
+    // is bounded separately by `reference_gap`. END is deliberately excluded:
+    // a terminal endpoint is stationary, so retiring it buys no safety and
+    // would drop the compensated endpoint hold the PC still relies on.
+    // MODE_STREAMED never retires here.
+    if (mode.mode == MODE_REFERENCE
+        && reference.info().status == REFERENCE_RUNNING) {
       const ReferenceSelectionInfo& info = reference.info();
       const bool incoming_for_active = incoming_native &&
           envelope.reference.reference_id == info.reference_id &&
@@ -411,16 +433,16 @@ void rt_loop(ServerCtx& ctx) {
           authority.current.packet.command.version == REFERENCE_VERSION &&
           authority.current.reference.reference_id == info.reference_id &&
           authority.current.reference.revision == info.revision;
-      bool expired = false;
-      if (incoming_for_active) {
+      bool expired = reference_gap;
+      if (!expired && incoming_for_active) {
         expired = !reference_envelope_fresh(envelope.reference, info, now,
                                             envelope.rx_ns, hold_ns);
-      } else if (held_for_active) {
+      } else if (!expired && held_for_active) {
         expired = !reference_envelope_fresh(authority.current.reference, info, now,
                                             authority.current.rx_ns, hold_ns);
       }
       if (expired) {
-        reference.retire();
+        reference.retire(0, /*expired=*/true);
         retire_cause = FAULT_REFERENCE_EXPIRED;
         holding = false;  // capture the measured position once, at this event
         ctx.journal(FAULT_EVENT, FAULT_REFERENCE_EXPIRED,

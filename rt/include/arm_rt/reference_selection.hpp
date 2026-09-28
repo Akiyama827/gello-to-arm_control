@@ -29,10 +29,21 @@ class ReferenceSelection {
     if(session_==session && epoch_==epoch) return;
     session_=session; epoch_=epoch; highest_id_=0; info_={};
     info_.session_id=session; info_.arm_epoch=epoch;
+    admitted_at_ns_=0; envelope_seen_=false; retired_by_expiry_=false;
   }
   bool active() const { return info_.status==REFERENCE_RUNNING || info_.status==REFERENCE_END; }
   const ReferenceSelectionInfo& info() const { return info_; }
   const AdmittedReference& selected() const { return active_; }
+  // CTRL-034 decision (a) bookkeeping. `retired_by_expiry_` is the ONLY state
+  // that separates "RT retired this reference because its dynamics envelope
+  // expired" from every ordinary retirement (PC cancel, disarm, mode change):
+  // only the former may let the command deadman lapse. `admitted_at_ns_`/
+  // `envelope_seen_` bound the COMMIT->first-envelope gap so a late first
+  // envelope cannot be sampled at an advanced phase and step the arm.
+  uint64_t admitted_at_ns() const { return admitted_at_ns_; }
+  bool envelope_seen() const { return envelope_seen_; }
+  bool retired_by_expiry() const { return retired_by_expiry_; }
+  void mark_envelope() { envelope_seen_=true; }
   double phase(uint64_t now) const {
     return now>=anchor_ns_?double(now-anchor_ns_)/1e9:0.;
   }
@@ -64,6 +75,9 @@ class ReferenceSelection {
       if(!prefix_matches(c.admitted,p.protected_until,at)) return REF_PREFIX;
     }
     if(!p.expected_revision) anchor_ns_=now;
+    admitted_at_ns_=now;
+    envelope_seen_=false;
+    retired_by_expiry_=false;
     active_=c.admitted;
     highest_id_=p.reference_id;
     info_={p.reference_id,p.revision,REFERENCE_RUNNING,phase(now),session_,epoch_};
@@ -71,8 +85,10 @@ class ReferenceSelection {
   }
   // Cancellation also retires a pending id before it can be selected. The
   // caller validates the cancel target against selected/pending identity.
-  void retire(uint64_t pending_id=0) {
+  // `expired` is set ONLY by the RT loop's envelope-expiry retirement.
+  void retire(uint64_t pending_id=0,bool expired=false) {
     highest_id_=std::max(highest_id_,pending_id);
+    if(expired) retired_by_expiry_=true;
     if(active()) info_.status=REFERENCE_CANCELLED;
   }
   // false means no selected reference: existing RT lifecycle owns measured
@@ -119,6 +135,9 @@ class ReferenceSelection {
   AdmittedReference active_{};
   ReferenceSelectionInfo info_{};
   uint64_t session_=0, anchor_ns_=0, highest_id_=0;
+  uint64_t admitted_at_ns_=0;  // when the current (id,revision) was selected
+  bool envelope_seen_=false;   // an envelope for it has been accepted since
+  bool retired_by_expiry_=false;  // retired by the RT envelope-expiry rule
   uint32_t epoch_=0;
 };
 } // namespace arm_rt
