@@ -30,6 +30,7 @@ class ReferenceSelection {
     session_=session; epoch_=epoch; highest_id_=0; info_={};
     info_.session_id=session; info_.arm_epoch=epoch;
     admitted_at_ns_=0; envelope_seen_=false; retired_by_expiry_=false;
+    protected_until_=0.;
   }
   bool active() const { return info_.status==REFERENCE_RUNNING || info_.status==REFERENCE_END; }
   const ReferenceSelectionInfo& info() const { return info_; }
@@ -44,6 +45,11 @@ class ReferenceSelection {
   bool envelope_seen() const { return envelope_seen_; }
   bool retired_by_expiry() const { return retired_by_expiry_; }
   void mark_envelope() { envelope_seen_=true; }
+  // The current revision's protected prefix cut. Envelopes for the PREVIOUS
+  // revision stay admissible while their phase is <= this: prefix_matches has
+  // already proven that retained prefix byte-identical, so the decision is
+  // unchanged and a revision switch must not cost a hold frame.
+  double protected_until() const { return protected_until_; }
   double phase(uint64_t now) const {
     return now>=anchor_ns_?double(now-anchor_ns_)/1e9:0.;
   }
@@ -78,6 +84,7 @@ class ReferenceSelection {
     admitted_at_ns_=now;
     envelope_seen_=false;
     retired_by_expiry_=false;
+    protected_until_=p.protected_until;
     active_=c.admitted;
     highest_id_=p.reference_id;
     info_={p.reference_id,p.revision,REFERENCE_RUNNING,phase(now),session_,epoch_};
@@ -136,6 +143,7 @@ class ReferenceSelection {
   ReferenceSelectionInfo info_{};
   uint64_t session_=0, anchor_ns_=0, highest_id_=0;
   uint64_t admitted_at_ns_=0;  // when the current (id,revision) was selected
+  double protected_until_=0.;  // current revision's protected prefix cut
   bool envelope_seen_=false;   // an envelope for it has been accepted since
   bool retired_by_expiry_=false;  // retired by the RT envelope-expiry rule
   uint32_t epoch_=0;

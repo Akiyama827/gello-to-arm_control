@@ -33,6 +33,7 @@ import numpy as np
 from arm_control.motion import JointTrajectory
 from arm_control.plants.remote_rt import protocol as p
 from arm_control.plants.remote_rt.reference import ReferenceHorizon
+from envelope_age import EnvelopeAgeMonitor
 from arm_control.plants.remote_rt.client import RtBackend, RtConfig, RtLinkError
 
 FRESHNESS_MS = 50      # min(hold_ms, valid_for_us); valid_for/phase_window = 50 ms
@@ -257,6 +258,10 @@ def main(binary):
     with server(binary) as (rt, logpath):
         recorder = Recorder(rt)
         pump = Pump(rt)
+        # CTRL-034 B1: record the RT envelope age for the normal (S1) stream
+        # only; S2-S4 intentionally hold/retire, which is not a stream lapse.
+        ages = EnvelopeAgeMonitor(rt)
+        ages.__enter__()
         try:
             # ---- S1: 30 ms never expires, never retires --------------------
             wait_for(lambda: commit(rt, 1, np.zeros(3)))
@@ -267,6 +272,8 @@ def main(binary):
             state = rt.latest_state()[0]
             assert state.reference['status'] == p.REFERENCE_RUNNING, state.reference
             assert not state.faulted
+            ages.__exit__()
+            ages.report('pc_stall S1')
             print('  S1   30 ms -> no hold, reference still RUNNING')
 
             # ---- S2/S3: expire at ~50 ms, RETIRE, no resume, no jump -------

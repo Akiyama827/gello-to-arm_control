@@ -1,0 +1,97 @@
+"""CTRL-034 B1 acceptance: run the native benches under a constrained CPU.
+
+Pins every bench (and the fake server it spawns, which inherits the affinity)
+to two CPUs and runs a background CPU hog on the same set. Reports pass/fail per
+iteration plus the envelope-age p99.9/max each bench printed, so a run on a
+different machine can be compared directly.
+
+No hardware, no deployment: fake backend only.
+
+    python tools/bench/rt/constrained_cpu.py --build /tmp/arm_rt_build --count 20
+"""
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+BENCHES = (
+    # (label, script, which server binary, needs reference_runtime_selfcheck)
+    ('supervisor', 'reference_supervisor.py', True),
+    ('horizon', 'reference_horizon.py', True),
+    ('pc-stall', 'pc_stall.py', False),
+)
+AGE = re.compile(r'age\s+(.+?):.*p99\.9=(\d+)us\s+max=(\d+)us\s+over_(\d+)ms=(\d+)')
+
+
+def main() -> int:
+    here = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--build', default='/tmp/arm_rt_build',
+                        help='directory containing the built RT binaries')
+    parser.add_argument('--count', type=int, default=20)
+    parser.add_argument('--cpus', default='0,1')
+    parser.add_argument('--bench', action='append', choices=[b[0] for b in BENCHES])
+    parser.add_argument('--timeout', type=float, default=300.0)
+    args = parser.parse_args()
+
+    build = Path(args.build).resolve()
+    binaries = {
+        'runtime': build / 'reference_runtime_selfcheck',
+        'server': build / 'arm_rt_server',
+    }
+    for path in binaries.values():
+        assert path.exists(), f'missing {path}'
+
+    # Its own session so an interrupted run cannot leave the hog behind.
+    hog = subprocess.Popen(['taskset', '-c', args.cpus, 'sh', '-c',
+                            'while :; do :; done'], start_new_session=True)
+    time.sleep(0.3)
+    selected = [b for b in BENCHES if not args.bench or b[0] in args.bench]
+    failures = 0
+    try:
+        for label, script, native in selected:
+            binary = binaries['runtime' if native else 'server']
+            passed, ages = 0, []
+            for i in range(args.count):
+                proc = subprocess.run(
+                    ['taskset', '-c', args.cpus, sys.executable,
+                     str(here / script), str(binary)],
+                    capture_output=True, text=True, timeout=args.timeout)
+                ok = proc.returncode == 0
+                passed += ok
+                for line in proc.stdout.splitlines():
+                    found = AGE.search(line)
+                    if found:
+                        ages.append((found.group(1), int(found.group(2)),
+                                     int(found.group(3)), int(found.group(5))))
+                if not ok:
+                    failures += 1
+                    text = (proc.stdout + '\n' + proc.stderr).splitlines()
+                    tail = [ln for ln in text
+                            if 'Error' in ln or 'expired' in ln][-2:]
+                    print(f'  {label} run {i + 1}/{args.count} FAIL {tail}')
+                else:
+                    print(f'  {label} run {i + 1}/{args.count} PASS')
+            print(f'{label}: {passed}/{args.count} PASS')
+            for name in sorted({a[0] for a in ages}):
+                rows = [a for a in ages if a[0] == name]
+                print(f'  {name}: p99.9_max={max(r[1] for r in rows)}us '
+                      f'max={max(r[2] for r in rows)}us over={sum(r[3] for r in rows)}')
+    finally:
+        try:
+            os.killpg(os.getpgid(hog.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        hog.wait(3)
+    print('CONSTRAINED-CPU ACCEPTANCE:', 'PASS' if failures == 0 else f'{failures} FAIL')
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -22,6 +22,12 @@ class _NotDispatched(RtLinkError):
     """Local proof that COMMIT never entered the transport."""
 
 
+# CTRL-034 B1: the fixed rate of the dedicated envelope sender. The sender owns
+# the v7 stream so an upload, a plan or a TCP round-trip in the caller's loop
+# cannot stretch the gap between envelopes; the RT's freshness ceiling is 50 ms.
+ENVELOPE_PERIOD_S = 0.005
+
+
 class ReferenceHorizon:
     def __init__(self, link):
         self.link = link
@@ -29,6 +35,14 @@ class ReferenceHorizon:
         self._job = None
         self._cancel_job = None
         self._interrupt = threading.Event()
+        self._envelope_lock = threading.Lock()
+        self._envelope_decision = None
+        self._envelope_identity = None
+        self._envelope_last = None
+        self._envelope_stop = threading.Event()
+        self._envelope_thread = threading.Thread(
+            target=self._envelope_loop, name='reference-envelope', daemon=True)
+        self._envelope_thread.start()
         self._next_id = 0
         self.id = 0
         self.key = None
@@ -316,6 +330,70 @@ class ReferenceHorizon:
                     else:
                         self._stage_window(max(first, start))
 
+    # -- fixed-rate envelope stream (CTRL-034 B1) -----------------------------
+    def publish(self, command, *, reference_id, revision):
+        """Publish the latest PC dynamics decision for the fixed-rate sender.
+
+        The identity is the RT selection the decision was computed against (the
+        RT's observed id/revision, which may still be an endpoint while a new
+        candidate uploads). The caller publishes only while the controller is
+        actually tracking that selection; ``unpublish`` on every other command
+        path is what keeps the stream a decision, never a blind heartbeat.
+        """
+        with self._envelope_lock:
+            self._envelope_decision = dict(command)
+            self._envelope_identity = (int(reference_id), int(revision),
+                                       self._session, self._epoch)
+
+    def unpublish(self):
+        with self._envelope_lock:
+            self._envelope_decision = None
+
+    def last_seq(self):
+        """Sequence of the most recent envelope sent for the current decision."""
+        with self._envelope_lock:
+            if self._envelope_last is None or self._envelope_identity is None:
+                return None
+            seq, identity = self._envelope_last
+            return seq if identity == self._envelope_identity else None
+
+    def _envelope_loop(self):
+        # One fresh RT state sample per envelope: `phase` and `sample_received_at`
+        # both come from THIS read, so `age_us` measures the sender-to-RT
+        # transport, not the caller's tick or an upload round-trip.
+        while not self._envelope_stop.is_set():
+            started = time.monotonic()
+            self._send_envelope()
+            remaining = ENVELOPE_PERIOD_S - (time.monotonic() - started)
+            if remaining > 0:
+                self._envelope_stop.wait(remaining)
+
+    def _send_envelope(self):
+        with self._envelope_lock:
+            decision, identity = self._envelope_decision, self._envelope_identity
+        if decision is None or identity is None:
+            return
+        if self._interrupt.is_set() or self.error or self.link.session_id != self._session:
+            return
+        state, received_at = self.link.latest_state()
+        ref = None if state is None else state.reference
+        if (state is None or ref is None or not state.armed
+                or state.session_id != self._session or state.arm_epoch != self._epoch):
+            return
+        if (ref['reference_id'] != identity[0] or ref['revision'] != identity[1]
+                or ref['status'] not in (p.REFERENCE_RUNNING, p.REFERENCE_END)):
+            return
+        try:
+            seq = self.link.apply_reference_envelope(
+                decision, reference_id=ref['reference_id'], revision=ref['revision'],
+                phase=ref['phase'], sample_received_at=received_at,
+                valid_for_s=.05, phase_window_s=.05,
+                session_id=self._session, arm_epoch=self._epoch)
+        except (RtLinkError, ValueError, OSError):
+            return
+        with self._envelope_lock:
+            self._envelope_last = (seq, identity)
+
     def cancel(self):
         if not self.id or self._interrupt.is_set():
             return
@@ -350,5 +428,8 @@ class ReferenceHorizon:
 
     def close(self):
         self._interrupt.set()
+        self._envelope_stop.set()
+        with self._envelope_lock:
+            self._envelope_decision = None
         self.link.interrupt_reference_upload()
         self._worker.shutdown(wait=False, cancel_futures=True)

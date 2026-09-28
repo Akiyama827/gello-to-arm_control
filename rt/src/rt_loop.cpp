@@ -395,14 +395,14 @@ void rt_loop(ServerCtx& ctx) {
         reference.admitted_at_ns()!=0 && !reference.envelope_seen() &&
         clamped_age_ns(now,reference.admitted_at_ns()) >
           std::min(hold_ns,REFERENCE_FIRST_ENVELOPE_NS);
+    const double reference_cut = reference.protected_until();
     bool admit_envelope=true;
     if(incoming_native) {
-      const bool for_active =
-          envelope.reference.reference_id==reference.info().reference_id &&
-          envelope.reference.revision==reference.info().revision;
+      const bool for_active = reference_envelope_revision_ok(
+          envelope.reference,reference.info(),reference_cut);
       admit_envelope = !reference.retired_by_expiry() &&
           !reference_gap &&
-          reference_envelope_fresh(envelope.reference,reference.info(),
+          reference_envelope_fresh(envelope.reference,reference.info(),reference_cut,
                                    now,envelope.rx_ns,hold_ns);
       if(admit_envelope && for_active && reference.active())
         reference.mark_envelope();
@@ -426,19 +426,18 @@ void rt_loop(ServerCtx& ctx) {
         && reference.info().status == REFERENCE_RUNNING) {
       const ReferenceSelectionInfo& info = reference.info();
       const bool incoming_for_active = incoming_native &&
-          envelope.reference.reference_id == info.reference_id &&
-          envelope.reference.revision == info.revision;
+          reference_envelope_revision_ok(envelope.reference,info,reference_cut);
       const bool held_for_active = authority.have &&
           authority.current.arm_gen == gen &&
           authority.current.packet.command.version == REFERENCE_VERSION &&
-          authority.current.reference.reference_id == info.reference_id &&
-          authority.current.reference.revision == info.revision;
+          reference_envelope_revision_ok(authority.current.reference,info,reference_cut);
       bool expired = reference_gap;
       if (!expired && incoming_for_active) {
-        expired = !reference_envelope_fresh(envelope.reference, info, now,
-                                            envelope.rx_ns, hold_ns);
+        expired = !reference_envelope_fresh(envelope.reference, info, reference_cut,
+                                            now, envelope.rx_ns, hold_ns);
       } else if (!expired && held_for_active) {
-        expired = !reference_envelope_fresh(authority.current.reference, info, now,
+        expired = !reference_envelope_fresh(authority.current.reference, info,
+                                            reference_cut, now,
                                             authority.current.rx_ns, hold_ns);
       }
       if (expired) {
@@ -475,7 +474,8 @@ void rt_loop(ServerCtx& ctx) {
       // was raised, is not authority and holds instead.
       fresh=fresh && mode.admits(true, authority.current.rx_ns, session, uint32_t(gen))
             && reference.active() && reference_envelope_fresh(
-        authority.current.reference,reference.info(),now,authority.current.rx_ns,hold_ns);
+        authority.current.reference,reference.info(),reference_cut,now,
+        authority.current.rx_ns,hold_ns);
     } else {
       fresh=fresh && mode.admits(false, authority.current.rx_ns,
                                  session, uint32_t(gen));

@@ -510,6 +510,17 @@ no envelope within `min(hold_ms, valid_for_us)` is retired with the same cause,
 so a late first envelope cannot be sampled at the advanced phase. Retirement is
 journal/diagnostic only: no new `ReferenceStatus` value and no packet change.
 
+**Revision handover (CTRL-034 B2).** For the same `reference_id`, an envelope
+for revision − 1 is still admissible while its phase is ≤ the current revision's
+`protected_until`: `prefix_matches` already proved that retained prefix
+byte-identical, so the dynamics decision is unchanged. The previous revision's
+envelope counts for the first-envelope bound too. Without it every revision
+switch held the arm until the new revision's first envelope arrived — at
+0.4 rad/s, one hold frame per switch. The PC side owns the stream with a
+dedicated fixed-rate sender (`ReferenceHorizon`), which takes a fresh state
+sample per envelope so the caller's tick, uploads or TCP round-trips cannot
+stretch the reported envelope age.
+
 Offline schema check (no server/device):
 
 ```sh

@@ -25,6 +25,7 @@ from arm_control.execution.contract import (
 from arm_control.motion import JointTrajectory, TrajectoryPoint
 from arm_control.supervisor.runtime import RobotRuntime
 from native_reference import unused_port
+from envelope_age import EnvelopeAgeMonitor
 from arm_control.plants.remote_rt import protocol as p
 from arm_control.plants.remote_rt.client import RtLinkError
 import socket
@@ -90,6 +91,8 @@ def main(binary):
             return actual
 
         runtime.controller.executor.step = checked_step
+        ages = EnvelopeAgeMonitor(runtime.link)
+        ages.__enter__()
         try:
             time.sleep(0.2)
             runtime.start()
@@ -115,9 +118,12 @@ def main(binary):
             )
             status = runtime.submit("test", request)
             assert status.phase is Phase.ADMITTED, status
+            ages.reset()
             until(lambda: runtime.status(status.execution_id).terminal)
             done = runtime.status(status.execution_id)
             assert done.phase is Phase.COMPLETED, done
+            long_over = ages.window('reference_supervisor long')
+            assert long_over == 0, f'{long_over} frames over the 50 ms ceiling'
             phases = [r.phase for r in runtime.receipts(status.execution_id)]
             assert phases == [
                 Phase.REQUESTED,
@@ -493,6 +499,7 @@ def main(binary):
             print(log.read())
             raise
         finally:
+            ages.__exit__()
             runtime.close()
             proc.terminate()
             proc.wait(3)

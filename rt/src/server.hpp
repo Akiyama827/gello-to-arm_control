@@ -296,6 +296,20 @@ inline double clamped_age_ns(uint64_t now, uint64_t then) {
 // reference phase and step the arm by SPEED x gap on the first resumed frame.
 constexpr double REFERENCE_FIRST_ENVELOPE_NS = 50'000'000;  // 50 ms
 
+// Which revision an envelope may bind. The selected revision always matches.
+// The IMMEDIATELY PREVIOUS revision also matches while its phase lies inside
+// the current revision's protected prefix cut: prefix_matches proved that
+// retained prefix byte-identical, so the dynamics decision is unchanged and a
+// revision switch must not cost a hold frame (or, with the gap rule, a retire)
+// while the new revision's first envelope is still in flight.
+inline bool reference_envelope_revision_ok(const ReferenceEnvelopeBinding& b,
+                                           const ReferenceSelectionInfo& r,
+                                           double protected_until) {
+  if(b.reference_id!=r.reference_id) return false;
+  if(b.revision==r.revision) return true;
+  return r.revision>1 && b.revision+1==r.revision && b.phase<=protected_until;
+}
+
 // One envelope validity rule for admission and continued use. Wall age uses
 // local elapsed intervals only; phase is the shared semantic coordinate.
 // Retirement CAUSE is deliberately NOT part of this rule: an ordinary PC
@@ -304,9 +318,10 @@ constexpr double REFERENCE_FIRST_ENVELOPE_NS = 50'000'000;  // 50 ms
 // IT retired on expiry (ReferenceSelection::retired_by_expiry).
 inline bool reference_envelope_fresh(const ReferenceEnvelopeBinding& b,
                                     const ReferenceSelectionInfo& r,
+                                    double protected_until,
                                     uint64_t now,uint64_t ingress,double hold_ns) {
   const double lag=r.phase-b.phase;
-  return r.reference_id==b.reference_id && r.revision==b.revision && lag>=0 &&
+  return reference_envelope_revision_ok(b,r,protected_until) && lag>=0 &&
     lag*1e6<=b.phase_window_us && lag*1e9<=hold_ns &&
     clamped_age_ns(now,ingress)+double(b.age_us)*1000<=
       std::min(hold_ns,double(b.valid_for_us)*1000);
