@@ -157,12 +157,16 @@ def main(binary, remote=None):
             # rather than attributed to network or RT receipt latency.
             def block_sender():
                 with runtime._native._envelope_lock:
-                    time.sleep(0.035)
+                    end = time.monotonic() + 0.05
+                    while time.monotonic() < end:
+                        pass  # keep the interpreter active while holding the lock
 
             blocked = Future()
             runtime._ops.put((block_sender, (), blocked))
             blocked.result(timeout=2)
             until(lambda: any(g['kind'] == 'decision_lock_wait'
+                              and g['classification'] == 'python_lock_contention'
+                              and g['cpu_delta_ms'] >= g['duration_ms'] * .5
                               for g in runtime._native.diagnostics()['sender_gaps']))
             # Cancellation is an explicit retirement followed by the same
             # controller-owned measured, compensated hold as streamed mode.
