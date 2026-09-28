@@ -167,6 +167,9 @@ def main(binary, remote=None):
             until(lambda: any(g['kind'] == 'decision_lock_wait'
                               and g['classification'] == 'python_lock_contention'
                               and g['cpu_delta_ms'] >= g['duration_ms'] * .5
+                              and (g['runqueue_wait_delta_ns'] is None
+                                   or g['runqueue_wait_delta_ns']
+                                   < g['duration_ms'] * 500_000)
                               for g in runtime._native.diagnostics()['sender_gaps']))
             # Cancellation is an explicit retirement followed by the same
             # controller-owned measured, compensated hold as streamed mode.

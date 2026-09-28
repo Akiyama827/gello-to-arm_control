@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 import json
 import logging
+import os
 import threading
 import time
 
@@ -89,7 +90,22 @@ class ReferenceHorizon:
         self._wake_lateness = deque(maxlen=4096)
         self._sender_gaps = deque(maxlen=256)
         self._sender_gaps_pending = deque(maxlen=256)
+        self._schedstat_fd = None
+        self._schedstat_error = None
+        self._schedstat_warning_emitted = False
         self._envelope_thread.start()
+
+    def _runqueue_wait_ns(self):
+        """Sender-thread runqueue wait, read from its open proc fd."""
+        if self._schedstat_fd is None:
+            return None
+        try:
+            return int(os.pread(self._schedstat_fd, 128, 0).split()[1])
+        except (OSError, ValueError, IndexError) as exc:
+            self._schedstat_error = str(exc)
+            os.close(self._schedstat_fd)
+            self._schedstat_fd = None
+            return None
 
     def _record(self, kind, reference_id=None, revision=None, *, at=None, **details):
         at = time.monotonic() if at is None else at
@@ -126,20 +142,28 @@ class ReferenceHorizon:
         _LOG.warning('reference diagnostics %s', json.dumps(
             dict(reason=reason, **self.diagnostics()), separators=(',', ':')))
 
-    def _sender_interval(self, kind, duration, at, cpu_start, cpu_end):
+    def _sender_interval(self, kind, duration, at, cpu_start, cpu_end,
+                         runqueue_start, runqueue_end):
         if kind == 'wake_late':
             with self._diagnostic_lock:
                 self._wake_lateness.append(max(0., duration))
         if duration > SENDER_GAP_S:
             cpu_delta = max(0., cpu_end-cpu_start)
             active = cpu_delta >= duration * .5
+            runqueue_delta = (None if runqueue_start is None or runqueue_end is None
+                              else max(0, runqueue_end-runqueue_start))
             # process_time covers all process threads, including native ones.
             # A measured lock wait plus active CPU is the specific Python-lock
             # signal; other active intervals do not identify a GIL owner.
             if kind == 'decision_lock_wait':
                 cause = 'python_lock_contention' if active else 'lock_wait_cpu_idle'
             elif kind == 'wake_late':
-                cause = 'process_cpu_active' if active else 'os_scheduler_delay'
+                if runqueue_delta is not None:
+                    cause = ('os_runqueue_delay' if runqueue_delta >= duration*5e8
+                             else 'python_lock_or_same_process' if active
+                             else 'process_cpu_idle')
+                else:
+                    cause = 'process_cpu_active' if active else 'os_scheduler_delay'
             elif kind in ('state_lock_wait', 'udp_send_duration'):
                 cause = kind  # an operation blocked; do not call it OS starvation
             else:
@@ -147,7 +171,10 @@ class ReferenceHorizon:
             event = dict(kind=kind, duration_ms=duration*1000,
                          pc_monotonic_s=at, recorded_wall_time_ns=time.time_ns(),
                          cpu_start_s=cpu_start, cpu_end_s=cpu_end,
-                         cpu_delta_ms=cpu_delta*1000, classification=cause)
+                         cpu_delta_ms=cpu_delta*1000,
+                         runqueue_wait_start_ns=runqueue_start,
+                         runqueue_wait_end_ns=runqueue_end,
+                         runqueue_wait_delta_ns=runqueue_delta, classification=cause)
             with self._diagnostic_lock:
                 self._sender_gaps.append(event)
                 self._sender_gaps_pending.append(event)
@@ -155,8 +182,8 @@ class ReferenceHorizon:
     def _drain_sender_gaps(self):
         """Called by the supervisor, never the sender thread."""
         with self._diagnostic_lock:
-            pending = tuple(self._sender_gaps_pending)
-            self._sender_gaps_pending.clear()
+            pending = [self._sender_gaps_pending.popleft()
+                       for _ in range(min(8, len(self._sender_gaps_pending)))]
         for event in pending:
             _LOG.warning('reference sender gap %s', json.dumps(event, separators=(',', ':')))
 
@@ -346,6 +373,10 @@ class ReferenceHorizon:
 
     def poll(self, state, received_at):
         """Once per PC control tick; takes one immutable feedback sample."""
+        if self._schedstat_error is not None and not self._schedstat_warning_emitted:
+            self._schedstat_warning_emitted = True
+            _LOG.warning('reference sender schedstat unavailable; CPU-time fallback: %s',
+                         self._schedstat_error)
         self._drain_sender_gaps()
         if self._job is not None and self._job[1].done():
             kind, job = self._job
@@ -476,41 +507,58 @@ class ReferenceHorizon:
                     == self._envelope_decision[1] else None)
 
     def _envelope_loop(self):
+        try:
+            self._schedstat_fd = os.open('/proc/thread-self/schedstat', os.O_RDONLY)
+        except OSError as exc:
+            self._schedstat_error = str(exc)
         due = time.monotonic()
         previous = None
         previous_cpu = None
+        previous_runqueue = None
         wait_cpu = None
+        wait_runqueue = None
         while not self._envelope_stop.is_set():
             started = time.monotonic()
             started_cpu = time.process_time()
+            started_runqueue = self._runqueue_wait_ns()
             if wait_cpu is not None:
                 self._sender_interval('wake_late', max(0., started-due), started,
-                                      wait_cpu, started_cpu)
+                                      wait_cpu, started_cpu, wait_runqueue,
+                                      started_runqueue)
             if previous is not None and self._envelope_decision is not None:
                 self._sender_interval('period_gap', started-previous, started,
-                                      previous_cpu, started_cpu)
+                                      previous_cpu, started_cpu, previous_runqueue,
+                                      started_runqueue)
             previous = started
             previous_cpu = started_cpu
+            previous_runqueue = started_runqueue
             self._send_envelope()
             due = started + ENVELOPE_PERIOD_S
             remaining = due - time.monotonic()
             if remaining > 0:
                 wait_cpu = time.process_time()
+                wait_runqueue = self._runqueue_wait_ns()
                 self._envelope_stop.wait(remaining)
             else:
                 # A slow send/lock call overran the period; this was not a
                 # late wake-up from sleep. Its interval has its own cause.
                 wait_cpu = None
+        if self._schedstat_fd is not None:
+            os.close(self._schedstat_fd)
+            self._schedstat_fd = None
 
     def _send_envelope(self):
         waiting = time.monotonic()
         waiting_cpu = time.process_time()
+        waiting_runqueue = self._runqueue_wait_ns()
         with self._envelope_lock:
             acquired = time.monotonic()
             acquired_cpu = time.process_time()
+            acquired_runqueue = self._runqueue_wait_ns()
             decision = self._envelope_decision
         self._sender_interval('decision_lock_wait', acquired-waiting, acquired,
-                              waiting_cpu, acquired_cpu)
+                              waiting_cpu, acquired_cpu, waiting_runqueue,
+                              acquired_runqueue)
         if decision is None:
             return
         command, reference_id, revision, phase, sample_received_at = decision
@@ -522,9 +570,11 @@ class ReferenceHorizon:
             return
         reading = time.monotonic()
         reading_cpu = time.process_time()
+        reading_runqueue = self._runqueue_wait_ns()
         state, _received_at = self.link.latest_state()
         self._sender_interval('state_lock_wait', time.monotonic()-reading,
-                              time.monotonic(), reading_cpu, time.process_time())
+                              time.monotonic(), reading_cpu, time.process_time(),
+                              reading_runqueue, self._runqueue_wait_ns())
         ref = None if state is None else state.reference
         if (state is None or ref is None or not state.armed
                 or state.session_id != self._session or state.arm_epoch != self._epoch):
@@ -543,6 +593,7 @@ class ReferenceHorizon:
         try:
             sending = time.monotonic()
             sending_cpu = time.process_time()
+            sending_runqueue = self._runqueue_wait_ns()
             seq = self.link.apply_reference_envelope(
                 command, reference_id=reference_id, revision=revision,
                 phase=phase, sample_received_at=sample_received_at,
@@ -550,10 +601,12 @@ class ReferenceHorizon:
                 session_id=self._session, arm_epoch=self._epoch)
         except (RtLinkError, ValueError, OSError):
             self._sender_interval('udp_send_duration', time.monotonic()-sending,
-                                  time.monotonic(), sending_cpu, time.process_time())
+                                  time.monotonic(), sending_cpu, time.process_time(),
+                                  sending_runqueue, self._runqueue_wait_ns())
             return
         self._sender_interval('udp_send_duration', time.monotonic()-sending,
-                              time.monotonic(), sending_cpu, time.process_time())
+                              time.monotonic(), sending_cpu, time.process_time(),
+                              sending_runqueue, self._runqueue_wait_ns())
         if seq is not None:
             self._record_first('first_envelope_sent', reference_id, revision,
                                at=time.monotonic(), sequence=seq,
