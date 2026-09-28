@@ -597,8 +597,11 @@ class ArmController:
         if not self.armed or not self.ready_sent:
             return "not armed"
         if self.execution_policy is not None:
-            return self._observation_error() or self.execution_policy.plan_error(
-                self._plan, self.last_state.position, self.n_arm)
+            # on_plan certified the staged trajectory. Selection
+            # only needs the current observation and start-pose check; repeating
+            # continuous Hermite bounds here delayed the first native envelope.
+            return self._observation_error() or self.execution_policy.start_error(
+                self._plan["positions"][0], self.last_state.position)
         return ""
 
     def _release(self, plan_id: str) -> None:

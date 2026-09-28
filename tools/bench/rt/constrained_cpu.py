@@ -19,6 +19,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 # (label, script, reference_runtime_selfcheck?, script arguments)
@@ -32,6 +33,7 @@ AGE = re.compile(
     r'age\s+(.+?):\s+decision\s+n=\d+\s+p99\.9=(\d+)us\s+max=(\d+)us\s+\|\s+'
     r'transport\s+p99\.9=(\d+)us\s+max=(\d+)us\s+\|\s+'
     r'rt_total\s+p99\.9=(\d+)us\s+max=(\d+)us\s+over_\d+ms=(\d+)')
+SELECTION = re.compile(r'selected_to_tracking n=(\d+) p99\.9=(\d+)us max=(\d+)us')
 
 
 def main() -> int:
@@ -41,6 +43,8 @@ def main() -> int:
                         help='directory containing the built RT binaries')
     parser.add_argument('--count', type=int, default=20)
     parser.add_argument('--cpus', default='0,1')
+    parser.add_argument('--server-cpus', default=None,
+                        help='pin the fake RT separately from the PC bench')
     parser.add_argument('--hogs', type=int, default=1,
                         help='background CPU hogs on the same CPU set (0 = unpinned noise only)')
     parser.add_argument('--no-pin', action='store_true',
@@ -58,6 +62,15 @@ def main() -> int:
         assert path.exists(), f'missing {path}'
 
     prefix = [] if args.no_pin else ['taskset', '-c', args.cpus]
+    wrapper_dir = tempfile.TemporaryDirectory()
+    if args.server_cpus is not None:
+        for label, binary in tuple(binaries.items()):
+            wrapper = Path(wrapper_dir.name) / label
+            wrapper.write_text(
+                '#!/bin/sh\nexec taskset -c ' + args.server_cpus + ' ' + str(binary)
+                + ' "$@"\n')
+            wrapper.chmod(0o755)
+            binaries[label] = wrapper
     # Each hog owns its session so an interrupted run cannot leave it behind.
     hogs = []
     if not args.no_pin:
@@ -71,7 +84,7 @@ def main() -> int:
     try:
         for label, script, native, extra in selected:
             binary = binaries['runtime' if native else 'server']
-            passed, ages = 0, []
+            passed, ages, selections = 0, [], []
             for i in range(args.count):
                 proc = subprocess.run(
                     prefix + [sys.executable, str(here / script), str(binary), *extra],
@@ -86,6 +99,9 @@ def main() -> int:
                                      int(found.group(4)), int(found.group(5)),
                                      int(found.group(6)), int(found.group(7)),
                                      int(found.group(8))))
+                    found = SELECTION.search(line)
+                    if found:
+                        selections.append(tuple(map(int, found.groups())))
                 if not ok:
                     failures += 1
                     text = (proc.stdout + '\n' + proc.stderr).splitlines()
@@ -103,6 +119,10 @@ def main() -> int:
                       f'max={max(r[4] for r in rows)}us | '
                       f'rt_total p99.9_max={max(r[5] for r in rows)}us '
                       f'max={max(r[6] for r in rows)}us over={sum(r[7] for r in rows)}')
+            if selections:
+                print(f'  selected_to_tracking: runs={len(selections)} '
+                      f'p99.9_max={max(r[1] for r in selections)}us '
+                      f'max={max(r[2] for r in selections)}us')
     finally:
         for hog in hogs:
             try:
@@ -110,6 +130,7 @@ def main() -> int:
             except ProcessLookupError:
                 pass
             hog.wait(3)
+        wrapper_dir.cleanup()
     print('CONSTRAINED-CPU ACCEPTANCE:', 'PASS' if failures == 0 else f'{failures} FAIL')
     return 1 if failures else 0
 

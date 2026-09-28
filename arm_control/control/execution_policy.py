@@ -136,7 +136,11 @@ class ExecutionPolicy:
                     return f"Cartesian trajectory {key} must be finite with shape {shape}"
                 if key != "task_R" and np.any(value < 0):
                     return f"Cartesian trajectory {key} must be nonnegative"
-        error = float(np.max(np.abs(q[0] - measured)))
+        return self.start_error(q[0], measured)
+
+    def start_error(self, start, measured):
+        """Recheck the live start pose when an already validated plan is released."""
+        error = float(np.max(np.abs(start - measured)))
         if not error <= self.start_pos_tol_rad:
             return f"start point {error:.3f} rad from measured pose (tol {self.start_pos_tol_rad:g}) — re-plan"
         return None

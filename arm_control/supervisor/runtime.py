@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from arm_control.motion import JointTrajectory
+from arm_control.motion import JointState, JointTrajectory
 from arm_control.config import arm_joints
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.factory import build_arm_controller
@@ -1097,6 +1097,24 @@ class RobotRuntime:
         h, c = self._native, self.controller
         state, rx = sample
         h.poll(state, rx)
+        old_end = (h.observed is not None and h.observed_point is not None
+                   and h.observed['status'] == rtp.REFERENCE_END
+                   and h.observed['reference_id'] != h.id)
+        if (old_end and state is not None and np.isfinite(state.q).all()
+                and np.isfinite(state.dq).all()):
+            # A new candidate does not own the already selected END reference.
+            # Keep its stationary endpoint and deadman alive during upload and
+            # abort, using a fresh compensation decision from this sample.
+            self._publish_measured_reference_hold(
+                state, rx, h.observed, h.observed_point)
+        if (h.selected and h._selection_rx == rx and h._first_tracking_at is None
+                and h.key is not None and state is not None
+                and np.isfinite(state.q).all() and np.isfinite(state.dq).all()):
+            # RT has selected, but the controller has not made its first
+            # tracking decision yet. Publish a measured-position compensation
+            # decision from THIS state sample, with its original sample time.
+            # The sender may repeat it but never make its age look younger.
+            self._publish_measured_reference_hold(state, rx, h.feedback, h.point)
         if self._stream_step():
             return
         if state is None or not state.armed:
@@ -1168,6 +1186,16 @@ class RobotRuntime:
             else:
                 h.approve()
 
+    def _publish_measured_reference_hold(self, state, rx, ref, point) -> None:
+        c = self.controller
+        hold = c.executor.hold_command(
+            JointState(np.asarray(state.q), np.asarray(state.dq)),
+            integral_bias=c.integral.bias)
+        self._native.publish(dict(position=hold.q_des, velocity=hold.qd_des,
+                                  torque=hold.tau_ff, kp=hold.kp, kd=hold.kd),
+                             reference_id=ref['reference_id'], revision=ref['revision'],
+                             phase=point.time, sample_received_at=rx, tracking=False)
+
     def _send_command(self, command):
         h = self._native
         if h is None:
@@ -1179,6 +1207,11 @@ class RobotRuntime:
         ref, point = h.observed, h.observed_point
         if (state.session_id, state.arm_epoch) != (h.session_id, h.arm_epoch):
             ref = point = None
+        if (ref is not None and ref['status'] == rtp.REFERENCE_END
+                and ref['reference_id'] != h.id):
+            # The candidate has no authority over the selected old endpoint.
+            # _native_step published this sample's compensated END decision.
+            return None
         # Before this ARM generation has ever selected a reference, the
         # existing compensated idle hold remains the v5 command path.
         if state.reference is None or not state.reference['reference_id']:

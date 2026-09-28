@@ -8,6 +8,7 @@ framing/backpressure remains RtBackend's responsibility.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 import threading
 import time
 
@@ -74,6 +75,10 @@ class ReferenceHorizon:
         self._candidate_curve = None
         self._candidate_terminal = True
         self._latest_phase = 0.
+        self._selection_rx = None
+        self._selection_phase = 0.
+        self._first_tracking_at = None
+        self.selection_latencies = deque(maxlen=128)
 
     @property
     def session_id(self):
@@ -129,6 +134,8 @@ class ReferenceHorizon:
         self._epoch = int(self.link.motor_health()['arm_epoch'])
         self._interrupt = threading.Event()
         self.error, self.point, self.feedback = '', None, None
+        self._selection_rx = self._first_tracking_at = None
+        self._selection_phase = 0.
         self._window, self._revision = (0, 0), 0
         self._stage_window(0)
         return self.id
@@ -299,6 +306,9 @@ class ReferenceHorizon:
         self.feedback = dict(ref) if valid else None
         self.point = self.observed_point if valid else None
         self.received_at = received_at
+        if valid and self.selected and self._selection_rx is None:
+            self._selection_rx = received_at
+            self._selection_phase = float(ref['phase'])
         if (self.stream and valid and ref['revision'] == self._revision
                 and ref['status'] in (p.REFERENCE_RUNNING, p.REFERENCE_END, p.REFERENCE_UNDERFLOW)):
             self.candidate_selection = 'selected'
@@ -335,7 +345,8 @@ class ReferenceHorizon:
                         self._stage_window(max(first, start))
 
     # -- fixed-rate envelope stream (CTRL-034 B1) -----------------------------
-    def publish(self, command, *, reference_id, revision, phase, sample_received_at):
+    def publish(self, command, *, reference_id, revision, phase, sample_received_at,
+                tracking=True):
         """Publish one PC dynamics decision: the command, the reference phase it
         was computed at, and the RT state sample it was computed from.
 
@@ -347,6 +358,14 @@ class ReferenceHorizon:
         with self._envelope_lock:
             self._envelope_decision = (dict(command), int(reference_id), int(revision),
                                        float(phase), float(sample_received_at))
+            if (tracking and reference_id == self.id and self._selection_rx is not None
+                    and self._first_tracking_at is None):
+                self._first_tracking_at = time.monotonic()
+                # Initial reference phase is RT time since SELECTED. It is a
+                # duration, so adding it needs no synchronized PC/RT clocks.
+                self.selection_latencies.append(
+                    (self.id, self._first_tracking_at - self._selection_rx
+                     + self._selection_phase))
 
     def unpublish(self):
         with self._envelope_lock:
@@ -363,7 +382,8 @@ class ReferenceHorizon:
         with self._envelope_lock:
             if self._envelope_last is None or self._envelope_decision is None:
                 return None
-            return self._envelope_last
+            return (self._envelope_last[1] if self._envelope_last[0]
+                    == self._envelope_decision[1] else None)
 
     def _envelope_loop(self):
         while not self._envelope_stop.is_set():
@@ -383,7 +403,7 @@ class ReferenceHorizon:
             # The decision itself is older than the ceiling: send NOTHING, so the
             # RT's freshness rule — not a re-stamped heartbeat — owns the hold.
             return
-        if self._interrupt.is_set() or self.error or self.link.session_id != self._session:
+        if self.link.session_id != self._session:
             return
         state, _received_at = self.link.latest_state()
         ref = None if state is None else state.reference
@@ -394,6 +414,11 @@ class ReferenceHorizon:
             return
         if ref['status'] not in (p.REFERENCE_RUNNING, p.REFERENCE_END):
             return
+        if self._interrupt.is_set() or self.error:
+            # Candidate cancellation/errors fence its envelopes, but cannot
+            # silence an older selected terminal endpoint in the same session.
+            if reference_id == self.id or ref['status'] != p.REFERENCE_END:
+                return
         # B2: keep the decision's OWN revision even after RT switches — the RT's
         # revision-(r-1) prefix rule admits it until the caller republishes.
         try:
@@ -405,7 +430,7 @@ class ReferenceHorizon:
         except (RtLinkError, ValueError, OSError):
             return
         with self._envelope_lock:
-            self._envelope_last = seq
+            self._envelope_last = (reference_id, seq)
 
     def cancel(self):
         if not self.id or self._interrupt.is_set():

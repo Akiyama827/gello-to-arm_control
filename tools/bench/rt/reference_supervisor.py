@@ -228,6 +228,13 @@ def main(binary):
                 replace(req, request_id="abort-upload", trajectory=tr, admit_by=None),
             )
             until(entered.is_set)
+            # The new candidate does not silence the older selected END.
+            # Exceed the fake RT's 600 ms fault_ms while CHUNK is stalled.
+            time.sleep(0.75)
+            pending_state, _ = runtime.link.latest_state()
+            assert (pending_state.armed and not pending_state.faulted
+                    and pending_state.reference['reference_id'] == before_id
+                    and pending_state.reference['status'] == p.REFERENCE_END), pending_state
             runtime.cancel("test", ex.execution_id)
             until(lambda: not runtime._native.busy)
             runtime.link._reference_exchange = exchange
@@ -499,6 +506,12 @@ def main(binary):
             print(log.read())
             raise
         finally:
+            latencies = [int(seconds * 1e6) for _, seconds in
+                         runtime._native.selection_latencies]
+            if latencies:
+                print(f'  selected_to_tracking n={len(latencies)} '
+                      f'p99.9={sorted(latencies)[min(len(latencies)-1, round(.999*(len(latencies)-1)))]}us '
+                      f'max={max(latencies)}us')
             ages.__exit__()
             runtime.close()
             proc.terminate()

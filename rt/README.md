@@ -626,3 +626,15 @@ hold, stale envelopes, old epochs, owner loss, restart, upload flood and stalled
 peers. v5 base/v6 pose bytes remain unchanged. The pre-integration v7 checkpoint
 binaries are not a deployment interface: use a matched final source/binary pair.
 No hardware deployment or worst-case RT timing qualification is implied.
+
+For the CTRL-034 first-envelope check, RT selection immediately publishes a
+measured-position compensation decision for the selected reference, using that
+feedback sample's reference phase and original PC receipt time. The fixed-rate
+sender repeats the decision without changing its age. The first tracking
+decision is measured separately: its latency uses the first selected packet's
+receipt time plus that packet's reference phase, so no PC/RT clock equality is
+assumed. Full Hermite bounds are checked at staging; release rechecks current
+observation and start pose without repeating the whole-curve calculation.
+While a new candidate uploads or aborts, an older selected terminal endpoint
+keeps receiving freshly computed compensation decisions from its own state
+samples. Candidate interruption cannot silence that END reference.
