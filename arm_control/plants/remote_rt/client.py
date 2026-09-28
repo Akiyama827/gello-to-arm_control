@@ -578,7 +578,8 @@ class RtBackend:
             self._mode_generation = generation
         return reply
 
-    def _reference_exchange(self, operation: int, *, _scope=None, _socket=None, **fields) -> dict:
+    def _reference_exchange(self, operation: int, *, _scope=None, _socket=None,
+                            _trace=None, **fields) -> dict:
         # One frame in flight, and no send lock held while awaiting a reply.
         # Lifecycle traffic/PONG can interleave even with a stalled upload peer.
         if _scope is not None:
@@ -600,6 +601,8 @@ class RtBackend:
                 if _scope is not None:
                     self._reference_scope(*_scope)
                 self._send_frame(packet, sock=connection)
+                if _trace is not None:
+                    _trace('commit_sent', time.monotonic(), attempt)
                 deadline = time.monotonic() + self.config.ack_timeout_s
                 with self._reference_cv:
                     while self._reference_reply is None:
@@ -611,6 +614,8 @@ class RtBackend:
                         self._reference_cv.wait(min(.02, remaining))
                     reply = self._reference_reply
                 if reply is not None:
+                    if _trace is not None:
+                        _trace('commit_reply', time.monotonic(), reply['result'])
                     if reply['operation'] != operation or reply['result'] != rtp.REF_OK:
                         raise ReferenceRefused(operation, reply["result"])
                     return reply
@@ -684,12 +689,13 @@ class RtBackend:
     def commit_reference(self, upload_id: int, *, reference_id: int, revision: int = 1,
                          expected_revision: int = 0, protected_until: float = 0.,
                          latest_phase: float = 0., session_id: int | None = None,
-                         arm_epoch: int | None = None, selection_budget_ns: int = 0) -> dict:
+                         arm_epoch: int | None = None, selection_budget_ns: int = 0,
+                         _trace=None) -> dict:
         session_id, arm_epoch = self._reference_scope(session_id, arm_epoch)
         with self._upload_lock:
             self._upload_cancel.clear()
             return self._reference_exchange(
-                rtp.CTL_REFERENCE_COMMIT, _scope=(session_id, arm_epoch),
+                rtp.CTL_REFERENCE_COMMIT, _scope=(session_id, arm_epoch), _trace=_trace,
                 session_id=session_id, upload_id=upload_id,
                 reference_id=reference_id, arm_epoch=arm_epoch, revision=revision,
                 expected_revision=expected_revision, protected_until=protected_until,

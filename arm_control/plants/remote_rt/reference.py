@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
+import json
+import logging
 import threading
 import time
 
@@ -32,6 +34,8 @@ PHASE_WINDOW_S = 0.1
 # but it NEVER re-stamps one: the envelope always carries the decision's own
 # sample time and phase, so its reported age grows while the decision is reused.
 ENVELOPE_PERIOD_S = 0.005
+SENDER_GAP_S = 0.020
+_LOG = logging.getLogger(__name__)
 
 
 class ReferenceHorizon:
@@ -47,7 +51,6 @@ class ReferenceHorizon:
         self._envelope_stop = threading.Event()
         self._envelope_thread = threading.Thread(
             target=self._envelope_loop, name='reference-envelope', daemon=True)
-        self._envelope_thread.start()
         self._next_id = 0
         self.id = 0
         self.key = None
@@ -79,6 +82,60 @@ class ReferenceHorizon:
         self._selection_phase = 0.
         self._first_tracking_at = None
         self.selection_latencies = deque(maxlen=128)
+        self._diagnostic_lock = threading.Lock()
+        self._timeline = deque(maxlen=256)
+        self._first_events = deque(maxlen=128)
+        self._latest_first_event = {}
+        self._wake_lateness = deque(maxlen=4096)
+        self._sender_gaps = deque(maxlen=256)
+        self._envelope_thread.start()
+
+    def _record(self, kind, reference_id=None, revision=None, *, at=None, **details):
+        at = time.monotonic() if at is None else at
+        event = dict(kind=kind, pc_monotonic_s=at, wall_time_ns=time.time_ns(),
+                     reference_id=self.id if reference_id is None else reference_id,
+                     revision=self._revision if revision is None else revision,
+                     **details)
+        with self._diagnostic_lock:
+            self._timeline.append(event)
+
+    def _record_first(self, kind, reference_id, revision, *, at=None, **details):
+        key = (kind, reference_id, revision)
+        with self._diagnostic_lock:
+            if self._latest_first_event.get(kind) == key:
+                return
+            if key in self._first_events:
+                return
+            self._first_events.append(key)
+            self._latest_first_event[kind] = key
+        self._record(kind, reference_id, revision, at=at, **details)
+
+    def diagnostics(self):
+        """Bounded snapshot; percentile sorting is never done on the sender."""
+        with self._diagnostic_lock:
+            events = sorted(self._timeline, key=lambda event: event['pc_monotonic_s'])
+            ages = sorted(self._wake_lateness)
+            gaps = list(self._sender_gaps)
+        percentile = ages[min(len(ages)-1, int(.999 * (len(ages)-1)))] if ages else 0.
+        return dict(timeline=events, sender_wake_lateness_ms=dict(
+            samples=len(ages), p99_9=percentile*1000,
+            max=(ages[-1]*1000 if ages else 0.)), sender_gaps=gaps)
+
+    def dump_diagnostics(self, reason):
+        _LOG.warning('reference diagnostics %s', json.dumps(
+            dict(reason=reason, **self.diagnostics()), separators=(',', ':')))
+
+    def _sender_interval(self, kind, duration, at):
+        if kind == 'wake_late':
+            with self._diagnostic_lock:
+                self._wake_lateness.append(max(0., duration))
+        if duration > SENDER_GAP_S:
+            event = dict(kind=kind, duration_ms=duration*1000,
+                         pc_monotonic_s=at, wall_time_ns=time.time_ns())
+            with self._diagnostic_lock:
+                self._sender_gaps.append(event)
+            self._record('sender_gap', at=at, cause=kind, duration_ms=duration*1000)
+            _LOG.warning('reference sender gap %s', json.dumps(event, separators=(',', ':')))
 
     @property
     def session_id(self):
@@ -255,7 +312,9 @@ class ReferenceHorizon:
             return self.link.commit_reference(
                 upload, reference_id=identity, revision=revision,
                 expected_revision=revision-1, protected_until=cut, latest_phase=phase_deadline,
-                session_id=session, arm_epoch=epoch, selection_budget_ns=budget)
+                session_id=session, arm_epoch=epoch, selection_budget_ns=budget,
+                _trace=lambda kind, at, value: self._record(
+                    kind, identity, revision, at=at, value=value))
 
         self._stage_ready = False
         self.selection_requested = True
@@ -309,6 +368,8 @@ class ReferenceHorizon:
         if valid and self.selected and self._selection_rx is None:
             self._selection_rx = received_at
             self._selection_phase = float(ref['phase'])
+            self._record_first('first_selected_pc_state', self.id, ref['revision'],
+                               at=received_at, phase=float(ref['phase']))
         if (self.stream and valid and ref['revision'] == self._revision
                 and ref['status'] in (p.REFERENCE_RUNNING, p.REFERENCE_END, p.REFERENCE_UNDERFLOW)):
             self.candidate_selection = 'selected'
@@ -327,6 +388,7 @@ class ReferenceHorizon:
             # segment as failed — a local cancel sets _interrupt and never
             # reaches here — and do NOT plan a continuation implicitly.
             self.error = 'REFERENCE_EXPIRED'
+            self.dump_diagnostics('REFERENCE_EXPIRED')
         if self.stream or self._interrupt.is_set() or self.error or not self.selected:
             return
         # Replacements were already admitted as part of the full PC plan. No
@@ -355,6 +417,7 @@ class ReferenceHorizon:
         carries this sample time and this phase, so its age keeps growing until
         the caller publishes again or the ceiling makes the stream stop.
         """
+        at = time.monotonic()
         with self._envelope_lock:
             self._envelope_decision = (dict(command), int(reference_id), int(revision),
                                        float(phase), float(sample_received_at))
@@ -366,6 +429,9 @@ class ReferenceHorizon:
                 self.selection_latencies.append(
                     (self.id, self._first_tracking_at - self._selection_rx
                      + self._selection_phase))
+        self._record_first('first_publish', reference_id, revision, at=at,
+                           sample_received_at=sample_received_at, phase=phase,
+                           tracking=tracking)
 
     def unpublish(self):
         with self._envelope_lock:
@@ -386,16 +452,26 @@ class ReferenceHorizon:
                     == self._envelope_decision[1] else None)
 
     def _envelope_loop(self):
+        due = time.monotonic()
+        previous = None
         while not self._envelope_stop.is_set():
             started = time.monotonic()
+            self._sender_interval('wake_late', max(0., started-due), started)
+            if previous is not None and self._envelope_decision is not None:
+                self._sender_interval('period_gap', started-previous, started)
+            previous = started
             self._send_envelope()
-            remaining = ENVELOPE_PERIOD_S - (time.monotonic() - started)
+            due = started + ENVELOPE_PERIOD_S
+            remaining = due - time.monotonic()
             if remaining > 0:
                 self._envelope_stop.wait(remaining)
 
     def _send_envelope(self):
+        waiting = time.monotonic()
         with self._envelope_lock:
+            acquired = time.monotonic()
             decision = self._envelope_decision
+        self._sender_interval('decision_lock_wait', acquired-waiting, acquired)
         if decision is None:
             return
         command, reference_id, revision, phase, sample_received_at = decision
@@ -422,6 +498,7 @@ class ReferenceHorizon:
         # B2: keep the decision's OWN revision even after RT switches — the RT's
         # revision-(r-1) prefix rule admits it until the caller republishes.
         try:
+            sending = time.monotonic()
             seq = self.link.apply_reference_envelope(
                 command, reference_id=reference_id, revision=revision,
                 phase=phase, sample_received_at=sample_received_at,
@@ -429,6 +506,12 @@ class ReferenceHorizon:
                 session_id=self._session, arm_epoch=self._epoch)
         except (RtLinkError, ValueError, OSError):
             return
+        self._sender_interval('udp_send_duration', time.monotonic()-sending,
+                              time.monotonic())
+        if seq is not None:
+            self._record_first('first_envelope_sent', reference_id, revision,
+                               at=time.monotonic(), sequence=seq,
+                               sample_received_at=sample_received_at, phase=phase)
         with self._envelope_lock:
             self._envelope_last = (reference_id, seq)
 

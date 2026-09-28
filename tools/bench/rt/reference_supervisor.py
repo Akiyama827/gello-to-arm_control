@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import threading
+from concurrent.futures import Future
 from dataclasses import replace
 import numpy as np
 
@@ -151,6 +152,18 @@ def main(binary, remote=None):
             np.testing.assert_array_equal(state.reference["q_ref"], q[-1])
             time.sleep(0.2)
             assert runtime.authority().lifecycle is Lifecycle.ARMED
+            # A supervisor operation holds the sender's decision lock across
+            # several periods. This must be classified as PC lock starvation,
+            # rather than attributed to network or RT receipt latency.
+            def block_sender():
+                with runtime._native._envelope_lock:
+                    time.sleep(0.035)
+
+            blocked = Future()
+            runtime._ops.put((block_sender, (), blocked))
+            blocked.result(timeout=2)
+            until(lambda: any(g['kind'] == 'decision_lock_wait'
+                              for g in runtime._native.diagnostics()['sender_gaps']))
             # Cancellation is an explicit retirement followed by the same
             # controller-owned measured, compensated hold as streamed mode.
             q0 = runtime.state().q
@@ -515,12 +528,18 @@ def main(binary, remote=None):
                 "PASS supervisor: 321 knots, RT source, SELECTED/SENT/APPLIED/COMPLETED, endpoint retention, cancel/compensated hold"
             )
         except BaseException:
+            if runtime._native is not None:
+                runtime._native.dump_diagnostics('reference_supervisor_bench_failure')
             log.seek(0)
             print(log.read())
             raise
         finally:
+            if runtime._native is not None:
+                wake = runtime._native.diagnostics()['sender_wake_lateness_ms']
+                print(f"  sender_wake_lateness n={wake['samples']} "
+                      f"p99.9={wake['p99_9']:.3f}ms max={wake['max']:.3f}ms")
             latencies = [int(seconds * 1e6) for _, seconds in
-                         runtime._native.selection_latencies]
+                         (runtime._native.selection_latencies if runtime._native else ())]
             if latencies:
                 print(f'  selected_to_tracking n={len(latencies)} '
                       f'p99.9={sorted(latencies)[min(len(latencies)-1, round(.999*(len(latencies)-1)))]}us '
