@@ -149,6 +149,7 @@ class ArmController:
                 raise ValueError("deadline execution_policy requires wall time, not motor_state_period_s")
         self._health_at: float | None = None
         self._health_ok = not bool(plant_reports_health)
+        self._rt_holding = False
         self._observation_paused = False
         self._plant_t = 0.0
         self._finger_m = 0.0
@@ -403,6 +404,21 @@ class ArmController:
             self._health_ok = (payload.get("state_fresh") is True
                                and not payload.get("any_fault", False)
                                and not payload.get("latched_fault"))
+            holding = payload.get("holding") is True
+            if (self._reference_source is None and holding and not self._rt_holding
+                    and self._health_ok):
+                # RT has replaced the moving command with a measured hold.
+                # Retire a running leg before wall-clock sampling resumes;
+                # inherit that exact RT hold target for the PC keepalive. A
+                # later measurement may differ after residual motion, but
+                # relatching it would introduce another q_des step.
+                hold_q = np.asarray(payload.get("holding_q"), dtype=float)
+                if self._running:
+                    self._cancel("RT command-staleness hold — re-plan from measured pose")
+                if hold_q.shape == (self.n_arm,) and np.isfinite(hold_q).all():
+                    self._hold_anchor = self.executor.hold_command(
+                        self.last_state, q_des=hold_q, integral_bias=self.integral.bias)
+            self._rt_holding = holding
             if not self._health_ok:
                 self._pause_observation("plant health is faulted or stale")
         self.supports_pose_hold = bool(payload.get("supports_pose_hold", False))
@@ -433,7 +449,10 @@ class ArmController:
                 return
             if (previous_state_at is not None
                     and self._clock() - previous_state_at > self.execution_policy.state_timeout_sec):
-                self._pause_observation("motor state gap — re-plan")
+                self._pause_observation(
+                    "motor state gap — re-plan",
+                    preserve_rt_hold=self._reference_source is None,
+                )
         self.last_state = arm
         if finger_m is not None:
             self._finger_m = float(finger_m)
@@ -472,14 +491,16 @@ class ArmController:
             return "motor health stale or faulted — re-plan"
         return None
 
-    def _pause_observation(self, reason):
+    def _pause_observation(self, reason, *, preserve_rt_hold=False):
+        anchor = (self._hold_anchor if preserve_rt_hold and self._rt_holding
+                  and self._health_ok else None)
         if (not self._observation_paused or self._plan is not None
                 or self._running or self._jog.active or self._pose_hold is not None):
             self._cancel(reason)
         self._observation_paused = True
         self.ready_sent = False
         self.last_command = None
-        self._hold_anchor = None
+        self._hold_anchor = anchor
 
     def tick(self):
         """One deadline-driven command; unused by event-driven deployments."""

@@ -796,6 +796,7 @@ class RtBackend:
             "latched_fault": fault,
             "any_fault": bool(fault) or bool(state and state.faulted),
             "holding": bool(state and state.holding),
+            "holding_q": list(state.q_cmd) if state and state.holding else None,
             "backend": self.backend_name,
             "supports_pose_hold": self.supports_pose_hold,
             "state_age_s": age if rx_t > 0 else -1.0,

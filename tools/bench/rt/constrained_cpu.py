@@ -28,6 +28,7 @@ BENCHES = (
     ('horizon-0.05', 'reference_horizon.py', True, ('0.05',)),
     ('horizon-0.4', 'reference_horizon.py', True, ('0.4',)),
     ('pc-stall', 'pc_stall.py', False, ()),
+    ('streamed-hold', 'streamed_hold.py', False, ()),
 )
 AGE = re.compile(
     r'age\s+(.+?):\s+decision\s+n=\d+\s+p99\.9=(\d+)us\s+max=(\d+)us\s+\|\s+'
