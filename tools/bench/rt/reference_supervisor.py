@@ -133,6 +133,10 @@ def main(binary, remote=None):
             limit_us = 50_000 if remote else 100_000
             long_over = ages.window('reference_supervisor long', ceiling_us=limit_us)
             assert long_over == 0, f'{long_over} frames over the {limit_us // 1000} ms bound'
+            if remote:
+                assert ages.rt_ages and max(ages.rt_ages) < limit_us, (
+                    'normal-running RT-total envelope age must remain below 50 ms',
+                    max(ages.rt_ages, default=None))
             phases = [r.phase for r in runtime.receipts(status.execution_id)]
             assert phases == [
                 Phase.REQUESTED,
