@@ -21,6 +21,7 @@ For current ownership and commands, read [Architecture](../ARCHITECTURE.md) and
 | [Cartesian soft plan](2026-09-07-cartesian-soft-plan.md) | Delivered plan for the soft/Cartesian mode |
 | [Cartesian soft verification](2026-09-07-cartesian-soft-verification.md) | That plan's acceptance evidence |
 | [Native DM MIT plan](2026-09-09-dm-native-mit-plan.md) | Delivered plan for native MIT forwarding (`pack_native_mit`); moved out of `docs/superpowers/` on 2026-09-11 |
+| [CTRL-034 pending-COMMIT cancel](2026-09-30-ctrl034-pending-commit-cancel.md) | Root cause, forced-order reproduction, fix and evidence for the stuck stream candidate slot |
 
 Old relative links and command examples remain historical evidence rather than
 being rewritten to imply that the original documents described today's tree.
