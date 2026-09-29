@@ -115,8 +115,7 @@ Reproduced by pinning 8 parallel runs plus 6 busy loops to 4 cores: 10 of 80 run
 failed, every one with status `NOT_REQUESTED` (phase ADMITTED or REQUESTED) and a
 gate entry of `stream=False key=None id=4`, the hold reference. Fix `42d4b1a`:
 non-stream commits pass through the gate. Same load after the fix: 0 of 80 fail
-at this assertion. Not fixed and unrelated: under that 4x oversubscription about
-5 of 80 runs still fail earlier or at `entered.wait` (see limits).
+at this assertion. Not fixed and unrelated: under that 4x oversubscription 3 to 6 of 80 runs (two runs of that load) still fail earlier or at `entered.wait` (see limits).
 
 ## Evidence
 
