@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(arm_rt LANGUAGES CXX)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -172,3 +173,31 @@ add_executable(controller_selfcheck src/controller_selfcheck.cpp)
 target_include_directories(controller_selfcheck PRIVATE include)
 target_link_libraries(controller_selfcheck PRIVATE Eigen3::Eigen)
 target_compile_options(controller_selfcheck PRIVATE -UNDEBUG)
+
+if(BUILD_TESTING)
+  foreach(selfcheck IN ITEMS
+      protocol_selfcheck hand_admission_selfcheck pose_hold_selfcheck
+      torque_cap_selfcheck dm_command_selfcheck franka_backend_selfcheck
+      fault_journal_selfcheck gap_diagnostic_selfcheck ipc_selfcheck
+      dm_backend_selfcheck reference_protocol_selfcheck reference_upload_selfcheck
+      reference_selection_selfcheck
+      mode_select_selfcheck mode_select_session_selfcheck
+      stale_envelope_scope_selfcheck
+      controller_selfcheck)
+    add_test(NAME ${selfcheck} COMMAND $<TARGET_FILE:${selfcheck}>)
+  endforeach()
+  # These two self-check binaries are harnesses: one needs a socketpair FD,
+  # the other free UDP/TCP ports. Their existing Python probes supply them.
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME reference_session_selfcheck COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/../tools/bench/rt/reference_upload.py
+    $<TARGET_FILE:reference_session_selfcheck>)
+  add_test(NAME reference_runtime_selfcheck COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/../tools/bench/rt/native_reference.py
+    $<TARGET_FILE:reference_runtime_selfcheck>)
+  set_tests_properties(reference_session_selfcheck reference_runtime_selfcheck
+    PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/..")
+  if(TARGET hand_bridge_selfcheck)
+    add_test(NAME hand_bridge_selfcheck COMMAND $<TARGET_FILE:hand_bridge_selfcheck>)
+  endif()
+endif()
