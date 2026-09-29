@@ -72,9 +72,12 @@ Every `tools/bench/rt/*.py` file has one role. **Regression** entries belong
 to the device-free C3 suite (`95ea1d9`); `native_reference.py` and
 `reference_upload.py` run there through their CTest self-check wrappers.
 **Diagnostic** entries are opt-in investigations or support modules, not
-routine pass gates. The current `controller_extension.py` regression exposes a
-reproducible pending-COMMIT cancellation failure at `3c82090`; C3 reports it
-as FAIL, and CTRL-033 owns the behavior correction.
+routine pass gates. The current `controller_extension.py` regression exposes an
+intermittent pending-COMMIT cancellation race (10/15 runs fail at `3c82090`);
+C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
+`task/control/CTRL-034-pending-commit-cancel`). Reviewer bisection
+(failures/runs): 0/21 at `425a943`–`5b06d28`; 1/6 at `55188d3`; 1/7 at
+`30037e1`; 0/6 at `5325bb8`; 3/6 at `9184f43`; 10/15 at `3c82090`.
 
 | File | Class | Scope |
 |---|---|---|
