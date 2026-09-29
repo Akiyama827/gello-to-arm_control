@@ -444,6 +444,13 @@ class ReferenceHorizon:
                 self._cancel_job.result()
             except RtLinkError as exc:
                 self.error = str(exc)
+            else:
+                # The one worker runs CANCEL after any COMMIT, so its ack settles
+                # a selection the PC never got to observe (RUNNING retired within
+                # ms of COMMIT). Without this the slot stays pending, busy blocks
+                # every command, and the RT's command stream is lost.
+                if self.candidate_selection == 'pending':
+                    self.candidate_selection = 'not_requested'
             self._cancel_job = None
             self._stage_ready = False
         ref = None if state is None else state.reference
