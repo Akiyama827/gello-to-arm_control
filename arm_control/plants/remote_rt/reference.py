@@ -19,7 +19,7 @@ import numpy as np
 
 from arm_control.motion import JointTrajectory, TrajectoryPoint
 from . import protocol as p
-from .client import RtLinkError, ReferenceRefused
+from .client import RtLinkError, ReferenceRefused, ReferenceCancelledBeforeDispatch
 
 
 class _NotDispatched(RtLinkError):
@@ -62,6 +62,7 @@ class ReferenceHorizon:
         self._cut = 0.
         self._stage_ready = False
         self.selection_requested = False
+        self._commit_undispatched = False
         self.error = ''
         self.point = None
         self.feedback = None
@@ -379,8 +380,15 @@ class ReferenceHorizon:
         observed_phase = None if self.point is None else self.point.time
 
         def commit():
+            try:
+                return dispatch()
+            except ReferenceCancelledBeforeDispatch:
+                self._commit_undispatched = True  # read by retire() after this job
+                raise
+
+        def dispatch():
             if cancelled.is_set():
-                raise RtLinkError('reference selection cancelled')
+                raise ReferenceCancelledBeforeDispatch('reference selection cancelled')
             budget = 0 if deadline is None else deadline-time.monotonic_ns()
             if deadline is not None and budget <= 0:
                 raise _NotDispatched('selection deadline expired before COMMIT')
@@ -407,6 +415,7 @@ class ReferenceHorizon:
 
         self._stage_ready = False
         self.selection_requested = True
+        self._commit_undispatched = False
         self.candidate_selection = 'pending'
         self._job = ('commit', self._worker.submit(commit))
 
@@ -675,12 +684,18 @@ class ReferenceHorizon:
         unselected = not self.selection_requested
 
         def retire():
-            if unselected:
+            # The one worker runs this after any COMMIT job, so the flag is final.
+            if unselected or self._commit_undispatched:
+                # The RT never saw COMMIT: only a sealed upload can exist.
                 try:
                     self.link.abort_reference_upload(session_id=session, arm_epoch=epoch)
                 except ReferenceRefused as exc:
                     if exc.result != p.REF_RETIRED:
                         raise
+                if not unselected and selected_revision:
+                    # An undispatched replacement leaves the selected revision running.
+                    self.link.cancel_reference(identity, selected_revision,
+                                               session_id=session, arm_epoch=epoch)
                 return
             try:
                 self.link.cancel_reference(identity, revision, session_id=session, arm_epoch=epoch)
