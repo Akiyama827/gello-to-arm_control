@@ -66,6 +66,47 @@ bridge process death and physical stopping latency are not certified by the
 offline checks. Deployment and an authorized empty-Hand stopping test remain
 separate acceptance steps.
 
+## Bench inventory
+
+Every `tools/bench/rt/*.py` file has one role. **Regression** entries belong
+to the device-free C3 suite (`95ea1d9`); `native_reference.py` and
+`reference_upload.py` run there through their CTest self-check wrappers.
+**Diagnostic** entries are opt-in investigations or support modules, not
+routine pass gates. The current `controller_extension.py` regression exposes a
+reproducible pending-COMMIT cancellation failure at `3c82090`; C3 reports it
+as FAIL, and CTRL-033 owns the behavior correction.
+
+| File | Class | Scope |
+|---|---|---|
+| `bench_target.py` | diagnostic | Local/remote bench target helper |
+| `check_two_instances.py` | regression | Two fake instance isolation |
+| `constrained_cpu.py` | diagnostic | Loaded timing matrix runner |
+| `controller_extension.py` | regression | Controller preset/payload transitions |
+| `envelope_age.py` | diagnostic | Timing collection helper |
+| `first_envelope_probe.py` | diagnostic | First-envelope collision investigation |
+| `first_envelope_trace.py` | diagnostic | Opt-in client timeline helper |
+| `mode_select.py` | regression | Mode wire parity and malformed packets |
+| `mode_select_supervisor.py` | regression | Mode handoff through fake RT |
+| `native_reference.py` | regression | Native reference and expiry through CTest |
+| `pc_stall.py` | regression | PC stall and local cancel |
+| `reference_horizon.py` | regression | Bounded horizon execution |
+| `reference_mode_boundary.py` | diagnostic | Historical v5/v7 arbitration probe |
+| `reference_numerics.py` | regression | Native/Python Hermite parity |
+| `reference_protocol.py` | regression | v7 wire parity and malformed packets |
+| `reference_supervisor.py` | regression | Supervisor/native execution |
+| `reference_upload.py` | regression | Upload/session through CTest |
+| `stale_envelope_scope.py` | regression | Prior-session envelope collision |
+| `stream_races.py` | regression | Stream admission races |
+| `stream_supervisor.py` | regression | Stream SDK/supervisor flow |
+| `streamed_hold.py` | regression | Streamed-command stall guard |
+| `timing.py` | diagnostic | Passive server timing observation |
+| `torque_cap.py` | regression | Torque admission and protocol parity |
+
+No tool is classified as retired: the historical probes remain useful for
+diagnosis or legacy-compatibility checks, and `first_envelope_trace.py` is
+still imported by the active `pc_stall.py` trace path. There is therefore no
+retired-tool deletion commit in C4.
+
 ## Build
 
 ```bash
