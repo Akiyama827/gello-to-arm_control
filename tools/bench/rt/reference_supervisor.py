@@ -153,25 +153,39 @@ def main(binary, remote=None):
             time.sleep(0.2)
             assert runtime.authority().lifecycle is Lifecycle.ARMED
             # A supervisor operation holds the sender's decision lock across
-            # several periods. This must be classified as PC lock starvation,
-            # rather than attributed to network or RT receipt latency.
+            # several periods. Depending on when the sender is scheduled, it
+            # may wait on that lock, wake late, or only record a period gap.
             def block_sender():
                 with runtime._native._envelope_lock:
-                    end = time.monotonic() + 0.05
+                    start = time.monotonic()
+                    end = start + 0.05
                     while time.monotonic() < end:
                         pass  # keep the interpreter active while holding the lock
+                return start, time.monotonic()
 
             blocked = Future()
             runtime._ops.put((block_sender, (), blocked))
-            blocked.result(timeout=2)
-            until(lambda: runtime._native.diagnostics()['schedstat_status'] == 'ok'
-                  and any(g['kind'] == 'decision_lock_wait'
-                              and g['classification'] == 'python_lock_contention'
-                              and g['cpu_delta_ms'] >= g['duration_ms'] * .5
-                              and g['runqueue_wait_delta_ns'] is not None
-                              and g['runqueue_wait_delta_ns']
-                              < g['duration_ms'] * 500_000
-                              for g in runtime._native.diagnostics()['sender_gaps']))
+            block_start, block_end = blocked.result(timeout=2)
+
+            def injected_sender_stall_seen():
+                diagnostic = runtime._native.diagnostics()
+                if diagnostic['schedstat_status'] != 'ok':
+                    return False
+                return any(
+                    g['pc_monotonic_s'] >= block_start
+                    and g['pc_monotonic_s'] - g['duration_ms'] / 1000 <= block_end
+                    and (g['kind'], g['classification']) in (
+                        ('decision_lock_wait', 'python_lock_contention'),
+                        ('wake_late', 'python_lock_or_same_process'),
+                        ('period_gap', 'process_cpu_active'),
+                    )
+                    and g['cpu_delta_ms'] >= g['duration_ms'] * .5
+                    and g['runqueue_wait_delta_ns'] is not None
+                    and g['runqueue_wait_delta_ns'] < g['duration_ms'] * 500_000
+                    for g in diagnostic['sender_gaps']
+                )
+
+            until(injected_sender_stall_seen)
             schedstat = runtime._native.diagnostics()
             assert (schedstat['schedstat_timeslices_end']
                     > schedstat['schedstat_timeslices_start']), schedstat

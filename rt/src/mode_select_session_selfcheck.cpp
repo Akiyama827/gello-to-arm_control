@@ -7,10 +7,12 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "control_session.cpp"
@@ -47,14 +49,20 @@ static bool read_type(int fd, uint16_t want, ModeSelectReplyPayload& out,
                       int timeout_ms) {
   const uint64_t end = mono_ns() + uint64_t(timeout_ms) * 1000000ull;
   ControlPacket p{};
+  size_t have = 0;
   while (mono_ns() < end) {
     pollfd pfd{fd, POLLIN, 0};
     const int left = int((end - mono_ns()) / 1000000ull);
     const int ready = poll(&pfd, 1, left > 0 ? left : 1);
-    if (ready <= 0) return false;
-    const ssize_t got = ::read(fd, &p, sizeof(p));
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready < 0) return false;
+    if (ready == 0) continue;
+    const ssize_t got = ::read(fd, reinterpret_cast<char*>(&p) + have,
+                               sizeof(p) - have);
     if (got <= 0) return false;
-    if (got != sizeof(p)) return false;
+    have += size_t(got);
+    if (have < sizeof(p)) continue;
+    have = 0;
     if (p.type == CTL_PING) { send_all(fd, frame(CTL_PONG, 0, nullptr)); continue; }
     if (p.type != want) continue;
     std::memcpy(&out, p.text, sizeof(out));
@@ -117,6 +125,39 @@ int main() {
     f.select(3, 2, MODE_REFERENCE, 5, 0, digest);
     assert(read_type(f.sv[1], CTL_MODE_STATUS, r, 600));
     assert(r.result == MODE_SEL_BUSY && r.generation == 1);
+  }
+
+  // A servo acknowledgement must not sit behind the idle 100 ms socket poll.
+  // This fixture supplies RT's reply immediately after observing publication.
+  {
+    Fixture f(true, true, ServerCtx::LATCH_FREE);
+    f.select(4, 1, MODE_STREAMED);
+    const uint64_t publication_deadline = mono_ns() + 100'000'000;
+    while (f.ctx.mode_published.load(std::memory_order_acquire) != 1 &&
+           mono_ns() < publication_deadline)
+      std::this_thread::yield();
+    assert(f.ctx.mode_published.load(std::memory_order_acquire) == 1);
+    ModeSelectReplyPayload r{};
+    // Drain HELLO/IDENTITY/initial PING and answer that PING before measuring.
+    // Otherwise its queued PONG wakes even the old 100 ms poll immediately.
+    assert(!read_type(f.sv[1], CTL_MODE_STATUS, r, 10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ModeSelectInfo info{};
+    info.reply.session_id = 123;
+    info.reply.arm_epoch = 5;
+    info.reply.generation = 1;
+    info.reply.requested_mode = MODE_STREAMED;
+    info.reply.selected_mode = MODE_STREAMED;
+    info.reply.result = MODE_SEL_OK;
+    f.ctx.mode_feedback.write(info);
+    const uint64_t done_at = mono_ns();
+    f.ctx.mode_done.store(1, std::memory_order_release);
+    assert(read_type(f.sv[1], CTL_MODE_STATUS, r, 50));
+    const uint64_t reply_us = (mono_ns() - done_at) / 1000;
+    assert(reply_us < 10'000);
+    assert(r.result == MODE_SEL_OK && r.generation == 1);
+    std::printf("mode-select reply latency %llu us (<10000 us)\n",
+                static_cast<unsigned long long>(reply_us));
   }
 
   // --- pre-flight refusals --------------------------------------------------

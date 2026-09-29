@@ -382,7 +382,9 @@ void rt_loop(ServerCtx& ctx) {
     // deadman and latch CMD_LOST on a healthy, streaming PC (found by the
     // native->Soft transition case). Wrong reference identity/phase still never
     // refreshes the deadline, and a bare server never has an id to retain.
-    const bool incoming_native =
+    const bool envelope_current = cmd_v != 0 && envelope.arm_gen == gen &&
+        envelope.session_id == session;
+    const bool incoming_native = envelope_current &&
         envelope.packet.command.version==REFERENCE_VERSION;
     // CTRL-034 decision (a), gap bound: a selected (reference_id, revision)
     // that has not admitted ANY envelope within the freshness ceiling is about
@@ -432,21 +434,49 @@ void rt_loop(ServerCtx& ctx) {
           authority.current.packet.command.version == REFERENCE_VERSION &&
           reference_envelope_revision_ok(authority.current.reference,info,reference_cut);
       bool expired = reference_gap;
+      const char* expiry_rule = "first-envelope gap";
+      const CommandEnvelope* expired_envelope = nullptr;
       if (!expired && incoming_for_active) {
         expired = !reference_envelope_fresh(envelope.reference, info, reference_cut,
                                             now, envelope.rx_ns, hold_ns);
+        if (expired) {
+          expiry_rule = "incoming envelope stale";
+          expired_envelope = &envelope;
+        }
       } else if (!expired && held_for_active) {
         expired = !reference_envelope_fresh(authority.current.reference, info,
                                             reference_cut, now,
                                             authority.current.rx_ns, hold_ns);
+        if (expired) {
+          expiry_rule = "held envelope stale";
+          expired_envelope = &authority.current;
+        }
       }
       if (expired) {
         reference.retire(0, /*expired=*/true);
         retire_cause = FAULT_REFERENCE_EXPIRED;
         holding = false;  // capture the measured position once, at this event
-        ctx.journal(FAULT_EVENT, FAULT_REFERENCE_EXPIRED,
-                    "reference envelope expired; reference retired (held; PC recovery "
-                    "budget = fault_ms - expiry)", gen);
+        char detail[FAULT_RECORD_TEXT]{};
+        if (expired_envelope) {
+          const auto& b = expired_envelope->reference;
+          const double age_us =
+              clamped_age_ns(now, expired_envelope->rx_ns) / 1000.0 + b.age_us;
+          std::snprintf(detail, sizeof(detail),
+                        "reference envelope expired: %s arm_gen=%llu "
+                        "session_id=%016llx reference_id=%llu revision=%u age_us=%.0f",
+                        expiry_rule,
+                        static_cast<unsigned long long>(expired_envelope->arm_gen),
+                        static_cast<unsigned long long>(expired_envelope->session_id),
+                        static_cast<unsigned long long>(b.reference_id), b.revision, age_us);
+        } else {
+          std::snprintf(detail, sizeof(detail),
+                        "reference envelope expired: %s reference_id=%llu revision=%u "
+                        "gap_age_us=%.0f",
+                        expiry_rule, static_cast<unsigned long long>(info.reference_id),
+                        info.revision,
+                        clamped_age_ns(now, reference.admitted_at_ns()) / 1000.0);
+        }
+        ctx.journal(FAULT_EVENT, FAULT_REFERENCE_EXPIRED, detail, gen);
       }
     }
     const uint64_t rx_ns = authority.deadman_base();

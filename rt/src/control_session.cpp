@@ -70,8 +70,8 @@ uint32_t capabilities(const ServerCtx& ctx) {
 // Bounded wait for RT's mode-selection acknowledgement. The control thread does
 // NOT block: it keeps servicing the socket and answers when `mode_done` matches
 // its ticket, or reports PENDING once this budget expires. RT confirms within
-// its next tick normally, and the poll below is 100 ms, so 250 ms leaves margin
-// for one missed poll without turning a healthy handoff into PENDING.
+// its next tick normally. While a reply is outstanding, the control thread
+// polls at 1 ms so acknowledgement is not delayed by the idle 100 ms wait.
 constexpr uint64_t MODE_SELECT_WAIT_NS = 250'000'000;
 
 ControlPacket mode_reply(uint16_t type, const ModeSelectReplyPayload& r,
@@ -245,7 +245,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
     }
     if (now - last_alive_ns > DEAD_AFTER_NS) break;  // half-open: treat as lost
     pollfd pfd{fd, POLLIN, 0};
-    const int ready = poll(&pfd, 1, 100);
+    const int ready = poll(&pfd, 1, (commit_waiting || mode_outstanding) ? 1 : 100);
     if (ready < 0) break;
     if (ready == 0) continue;
     const ssize_t got = recv(fd, reinterpret_cast<char*>(&rx) + have,
