@@ -459,22 +459,25 @@ void rt_loop(ServerCtx& ctx) {
         char detail[FAULT_RECORD_TEXT]{};
         if (expired_envelope) {
           const auto& b = expired_envelope->reference;
-          const double age_us =
-              clamped_age_ns(now, expired_envelope->rx_ns) / 1000.0 + b.age_us;
+          const uint64_t age_us =
+              static_cast<uint64_t>(clamped_age_ns(now, expired_envelope->rx_ns) / 1000.0) +
+              b.age_us;
           std::snprintf(detail, sizeof(detail),
                         "reference envelope expired: %s arm_gen=%llu "
-                        "session_id=%016llx reference_id=%llu revision=%u age_us=%.0f",
+                        "session_id=%016llx reference_id=%llu revision=%u age_us=%llu",
                         expiry_rule,
                         static_cast<unsigned long long>(expired_envelope->arm_gen),
                         static_cast<unsigned long long>(expired_envelope->session_id),
-                        static_cast<unsigned long long>(b.reference_id), b.revision, age_us);
+                        static_cast<unsigned long long>(b.reference_id), b.revision,
+                        static_cast<unsigned long long>(age_us));
         } else {
           std::snprintf(detail, sizeof(detail),
                         "reference envelope expired: %s reference_id=%llu revision=%u "
-                        "gap_age_us=%.0f",
+                        "gap_age_us=%llu",
                         expiry_rule, static_cast<unsigned long long>(info.reference_id),
                         info.revision,
-                        clamped_age_ns(now, reference.admitted_at_ns()) / 1000.0);
+                        static_cast<unsigned long long>(
+                            clamped_age_ns(now, reference.admitted_at_ns()) / 1000.0));
         }
         ctx.journal(FAULT_EVENT, FAULT_REFERENCE_EXPIRED, detail, gen);
       }
