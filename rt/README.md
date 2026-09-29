@@ -82,6 +82,22 @@ build/stale_envelope_scope_selfcheck                      # prior ARM envelope c
 PYTHONPATH=. python tools/bench/rt/stale_envelope_scope.py build/arm_rt_server  # 50 fake-RT collisions
 ```
 
+The consolidated device-free check is:
+
+```bash
+python tools/bench/rt_offline_suite.py
+```
+
+It builds with `WITH_FRANKA=OFF`, runs all 19 available C++ self-checks through
+CTest, checks the SDK in streamed and native modes, then runs the fast local
+fake-RT regression benches. `reference_session_selfcheck` and
+`reference_runtime_selfcheck` need socket/port harnesses; CTest runs them
+through the existing `reference_upload.py` and `native_reference.py` probes.
+The command prints a revision-labeled PASS/FAIL line for every check and writes
+`rt/build-offline/offline-summary.json` plus individual logs. This does not
+connect to an RT host or qualify physical control. With `WITH_FRANKA=ON`, CTest
+also registers `hand_bridge_selfcheck`.
+
 ## DM wire mappings
 
 `--dm-spec 'IF;ID:TYPE[:MST[:PMAX:VMAX:TMAX]],...'` configures each motor's
