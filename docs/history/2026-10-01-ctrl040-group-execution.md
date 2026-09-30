@@ -103,3 +103,12 @@ Bench `group_coordinator.py` runs the servers with the approved flags. Measured 
 0.4-1.6 ms; a killed peer is enforced on the survivor's state stream after 33-36 ms and reported to its client after
 30.6 ms. The first version of the bench measured the REPORT at ~100 ms: the control thread polled at 100 ms when idle;
 it now polls at 1 ms while joined to a group (enforcement in the tick was always ~31 ms). Not measured: the FR3 host.
+
+Round-1 review of the driver (BLOCK, fixed): cleanup ran only on an `RtLinkError`, so any other exception (a reference the RT
+refuses at upload, an error while building the record) left members joined (a later group refused at JOIN) or running (reproduced:
+both references running 0.3 s later); `start()` now cancels the group on ANY exception and validates knot/joint counts before any RT
+contact. `GroupStartError.members` now lists every member's outcome, including a member that was selected before a peer failed. A
+started group stays joined until `cancel(group_id)` (a DONE member just leaves): documented in the module docstring. The docstring's
+"provably one clock domain" is corrected (an all-unattested group is accepted and labelled; the shared record already confines a group
+to one host). The bench's report-latency threshold is tightened to 60 ms (the old 100 ms bound did not reliably fail on the pre-change
+100 ms idle control poll: 1 in 3 on the old binary), and a failure-path case was added.

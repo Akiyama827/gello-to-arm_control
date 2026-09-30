@@ -13,8 +13,14 @@ No unit file may pass ``--group-*`` until the FR3-host measurement and the CTRL-
 
 NOT wired into ``RemoteHardware``, the supervisor or the console: those run the streamed or per-arm
 supervisor paths. Wiring (and any change to the execution contract or SDK) is a separate, unapproved step
-(CTRL-053). What this module refuses to do: start a group whose members are not provably on one clock domain,
-whose references are shorter than ``H``, or that has fewer than two members.
+(CTRL-053). What this module refuses to do: start a group whose members are on different or half-attested RT clock
+domains (a group whose members are ALL unattested, i.e. older servers, is accepted and labelled 'unattested';
+the shared record already confines a group to one host), whose references are shorter than ``H`` or exceed the wire
+limits, or that has fewer than two members.
+
+Lifecycle: a started group stays joined on the RT until ``cancel(group_id)``. Call it when the group is finished
+(both references ended: a DONE member only leaves, nothing is retired) or to abort (a running member is retired and
+its peers follow). A later ``start()`` with a new id is refused at JOIN while an old group is still joined.
 """
 from __future__ import annotations
 
@@ -96,6 +102,8 @@ class GroupCoordinator:
             raise ValueError("a group needs 2 to 4 members")
         if not (0 < budget_s <= rtp.GROUP_MAX_BUDGET_NS / 1e9):
             raise ValueError("budget must be positive and within the wire bound")
+        if not horizon_s > 0:
+            raise ValueError("H must be positive")
         self.links, self.budget_s, self.horizon_s = dict(links), budget_s, horizon_s
         self.names = list(self.links)
 
@@ -119,6 +127,12 @@ class GroupCoordinator:
             if not getattr(link, "group_capable", False):
                 raise GroupStartError(f"group refused: {name} has no group record", {name: "no group"})
         for name, trajectory in trajectories.items():
+            knots = len(trajectory.times)
+            if not 2 <= knots <= rtp.MAX_REFERENCE_KNOTS:
+                raise ValueError(f"{name}: reference needs 2..{rtp.MAX_REFERENCE_KNOTS} knots, has {knots}")
+            joints = getattr(self.links[name], "n", None)
+            if joints is not None and trajectory.positions.shape[1] != joints:
+                raise ValueError(f"{name}: reference has {trajectory.positions.shape[1]} joints, the arm {joints}")
             span = float(trajectory.times[-1] - trajectory.times[0])
             if span < self.horizon_s:
                 raise ValueError(f"{name}: reference covers {span:.3f} s, less than H = {self.horizon_s:.3f} s")
@@ -126,10 +140,18 @@ class GroupCoordinator:
 
     # -- lifecycle ------------------------------------------------------------------------------
     def start(self, group_id: int, trajectories: dict, reference_ids: dict) -> GroupStartRecord:
-        """JOIN, upload, COMMIT together. Returns the start record; on any failure the group is cancelled
-        on every member and GroupStartError carries what each member reported."""
+        """JOIN, upload, COMMIT together. Returns the start record; on ANY failure the group is cancelled on
+        every member; GroupStartError carries what each member reported (selected members included)."""
         domain = self._validate(trajectories, reference_ids)
         count = len(self.names)
+        try:
+            return self._start(group_id, trajectories, reference_ids, domain, count)
+        except BaseException:
+            # Whatever went wrong (not only a link error), no member is left joined or running.
+            self.cancel(group_id)
+            raise
+
+    def _start(self, group_id, trajectories, reference_ids, domain, count) -> GroupStartRecord:
         try:
             for index, name in enumerate(self.names):
                 self.links[name].group_join(group_id, index, count)
@@ -137,7 +159,6 @@ class GroupCoordinator:
                                                                 reference_id=reference_ids[name])
                        for name in self.names}
         except RtLinkError as exc:
-            self.cancel(group_id)
             raise GroupStartError(f"group {group_id} could not be prepared: {exc}") from exc
 
         budget_ns = int(self.budget_s * 1e9)
@@ -149,21 +170,28 @@ class GroupCoordinator:
                 reply = self.links[name].group_commit(
                     uploads[name], reference_id=reference_ids[name], group_id=group_id,
                     member_index=index, budget_ns=budget_ns)
-            except ReferenceRefused as exc:
-                return name, exc, sent, time.monotonic()
-            except RtLinkError as exc:
+            except (ReferenceRefused, RtLinkError) as exc:
                 return name, exc, sent, time.monotonic()
             return name, reply, sent, time.monotonic()
 
         with ThreadPoolExecutor(max_workers=count) as pool:
             outcomes = list(pool.map(commit, enumerate(self.names)))
-        failed = {n: (r.result, r.reply) if isinstance(r, ReferenceRefused) else str(r)
-                  for n, r, _, _ in outcomes if not isinstance(r, dict)}
-        if failed:
-            self.cancel(group_id)
-            raise GroupStartError(f"group {group_id} did not start", failed)
-        members = {n: MemberStart(n, reference_ids[n], r["selected_ns"], r["deadline_ns"], sent, got)
-                   for n, r, sent, got in outcomes}
+        # Every member's outcome, including a member that WAS selected before a peer failed.
+        report = {}
+        for n, r, _, _ in outcomes:
+            if isinstance(r, ReferenceRefused):
+                report[n] = (r.result, r.reply)
+            elif isinstance(r, RtLinkError):
+                report[n] = str(r)
+            else:
+                report[n] = ("selected", {k: r[k] for k in ("selected_ns", "deadline_ns", "state")})
+        if any(not isinstance(r, dict) for _, r, _, _ in outcomes):
+            raise GroupStartError(f"group {group_id} did not start", report)
+        members = {}
+        for n, r, sent, got in outcomes:
+            if not (r["selected_ns"] > 0 and r["deadline_ns"] > 0):
+                raise GroupStartError(f"group {group_id}: {n} reported no selection stamp", report)
+            members[n] = MemberStart(n, reference_ids[n], r["selected_ns"], r["deadline_ns"], sent, got)
         return GroupStartRecord(group_id, domain, members)
 
     def cancel(self, group_id: int) -> dict:

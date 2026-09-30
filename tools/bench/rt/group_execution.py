@@ -126,8 +126,8 @@ def pair(binary, tmp, count=2, member_kwargs=None):
     members = []
     try:
         for i in range(count):
-            members.append(Member(binary, shm, i, count, tmp, **(member_kwargs or {}).get(i, {}),
-                                  **(member_kwargs or {}).get('all', {})))
+            members.append(Member(binary, shm, i, count, tmp,
+                                  **{**(member_kwargs or {}).get('all', {}), **(member_kwargs or {}).get(i, {})}))
         yield members
     finally:
         for m in members:
