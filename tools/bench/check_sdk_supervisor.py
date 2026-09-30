@@ -193,10 +193,17 @@ def main() -> None:
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     try:
         deadline = time.monotonic() + 30
-        while not sock.exists():
+        while True:  # the socket file exists at bind(); it accepts only after listen()
             assert sup.poll() is None, sup.stdout.read()
             assert time.monotonic() < deadline, "supervisor did not come up"
-            time.sleep(0.05)
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(str(sock))
+                break
+            except OSError:
+                time.sleep(0.05)
+            finally:
+                probe.close()
         scenario(sock, rt, sup)
     except BaseException:
         for name, proc in (("supervisor", sup), ("rt server", rt)):
