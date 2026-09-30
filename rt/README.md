@@ -93,6 +93,7 @@ C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 | `lifecycle_states.py` | regression | Which signals distinguish armed-hold, executing, post-cancel hold reference, disarmed and re-armed for one arm (CTRL-021 transition input for CTRL-040) |
 | `clock_domain.py` | regression | HELLO `clk=mono:<host>:<boot>` (CTRL-041): keyed host+boot identity matches an independent HMAC, changes with boot id/host, absent when unreadable |
 | `group_execution.py` | regression | CTRL-040: two fake servers share a group record; one group deadline, per-member selection stamps, peer never commits, late commit, cancel after staging, peer process loss/cancel/fault, new group after a fault, second group/old epoch/wrong member refused. Bench timing values are not proposals |
+| `tick_jitter.py` | measurement | Servo-tick period distribution of a fake server from its state stream (input to the CTRL-040 constants proposal); not a pass/fail gate, not in the suite |
 | `envelope_age.py` | diagnostic | Timing collection helper |
 | `first_envelope_probe.py` | diagnostic | First-envelope collision investigation |
 | `first_envelope_trace.py` | diagnostic | Opt-in client timeline helper |
