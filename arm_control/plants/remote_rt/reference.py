@@ -535,7 +535,11 @@ class ReferenceHorizon:
             self.dump_diagnostics('REFERENCE_EXPIRED')
         # Evidence recorded in this same poll wins: an expired reference is reported
         # as REFERENCE_EXPIRED (never healed by an implicit hold), not as unresolved.
-        if (self.stream and self.candidate_selection == 'pending' and not self.error
+        # Only the two RT-evidence errors take precedence. Any OTHER error (a refused or lost
+        # CANCEL, a failed retire job) leaves the candidate 'pending' with no path back to free the
+        # slot, so it must not suppress this rule (round-1 review of the repeated 4b review).
+        if (self.stream and self.candidate_selection == 'pending'
+                and self.error not in ('REFERENCE_UNDERFLOW', 'REFERENCE_EXPIRED')
                 and self._pending_since is not None
                 and time.monotonic() - self._pending_since > SELECTION_UNRESOLVED_S):
             # The slot leaves 'pending' here, so it can never again suppress commands.
