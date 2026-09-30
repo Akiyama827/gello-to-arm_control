@@ -69,7 +69,7 @@ class Member:
              "--group-member", str(index), "--group-members", str(count),
              "--group-peer-max-age-ms", str(PEER_MAX_AGE_MS), "--group-min-lead-ms", str(MIN_LEAD_MS),
              "--machine-id-file", str(tmp / "machine-id"), "--boot-id-file", str(tmp / "boot-id")],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            stdout=tempfile.TemporaryFile(mode="w+"), stderr=subprocess.STDOUT, text=True)  # not a pipe: nobody drains it
         self.link = RtBackend(RtConfig(host="127.0.0.1", udp_port=self.udp, tcp_port=self.tcp,
                                        instance_id=f"arm{index}"), JOINTS)
         deadline = time.monotonic() + 8
@@ -105,7 +105,10 @@ class Member:
             self.pump.thread.join(2)
         except Exception:  # noqa: BLE001
             pass
-        self.link.close()
+        try:
+            self.link.close()
+        except Exception:  # noqa: BLE001 - its server may be gone (killed by the bench)
+            pass
         if self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -269,7 +272,6 @@ def peer_process_loss(binary, tmp):
         time.sleep(.8)  # the survivor keeps its deadman alive and stays healthy
         assert not a.state().faulted
     finally:
-        b.close = lambda: None
         cm.__exit__(None, None, None)
 
 
