@@ -26,10 +26,11 @@ import subprocess
 import tempfile
 import time
 
-from arm_control.plants.remote_rt.client import RtBackend, RtConfig, RtLinkError
+from arm_control.plants.remote_rt.client import RtBackend, RtConfig, RtLinkError, parse_clock_domain
 
 JOINTS = [f"j{i}" for i in range(1, 4)]
 MACHINE_1, MACHINE_2 = "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"
+PLACEHOLDER = "uninitialized"
 BOOT_1, BOOT_2 = "11111111-2222-3333-4444-555555555555", "66666666-7777-8888-9999-000000000000"
 
 
@@ -38,6 +39,14 @@ def expected(machine: str, boot: str) -> tuple[str, str, str]:
         return hmac.new(machine.encode(), msg.encode(), hashlib.sha256).hexdigest()[:12]
     return ("mono", h("arm_rt_server:clock-domain:host:v1"),
             h("arm_rt_server:clock-domain:boot:v1:" + boot))
+
+
+def parse_checks():
+    good = "aabbccddeeff:112233445566"
+    assert parse_clock_domain(good) == ("mono", "aabbccddeeff", "112233445566")
+    for bad in ("", "aabbccddeeff", "aabbccddeeff:1122", good[:-1], good + "0", "AABBCCDDEEFF:112233445566",
+                "aabbccddeeff:11223344556g", "mono:aabbccddeeff:112233445566"):
+        assert parse_clock_domain(bad) is None, bad
 
 
 def free_port(kind: int) -> int:
@@ -83,6 +92,7 @@ def domain_of(binary: str, tmp: Path, machine: str | None, boot: str | None):
 
 def main() -> int:
     binary = sys.argv[1] if len(sys.argv) > 1 else str(_ROOT / "rt/build/arm_rt_server")
+    parse_checks()
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         a = domain_of(binary, tmp, MACHINE_1, BOOT_1)
@@ -96,6 +106,7 @@ def main() -> int:
         assert MACHINE_1[:12] not in "".join(a)
         assert domain_of(binary, tmp, None, BOOT_1) is None, "unreadable machine-id: unattested"
         assert domain_of(binary, tmp, MACHINE_1, None) is None, "unreadable boot-id: unattested"
+        assert domain_of(binary, tmp, PLACEHOLDER, BOOT_1) is None, "not a machine-id: unattested"
     print("PASS: HELLO clock domain is a keyed host+boot identity (matches an independent HMAC), "
           "changes with the boot id or host, and is absent when unreadable")
     return 0

@@ -1,8 +1,8 @@
 // CTRL-041: the RT host's clock identity, advertised in HELLO as
-//   clk=mono:<host12>:<boot12>
+//   clk=<host12>:<boot12>   (CLOCK_MONOTONIC implied; 5 bytes shorter, HELLO text has 104)
 // so a client can tell "one CLOCK_MONOTONIC" from "same host string". Both fields are
-// keyed hashes (HMAC-SHA256, first 6 bytes as hex), as machine-id(5) requires: the raw
-// machine-id is never sent or logged. host = HMAC(key=machine-id, "host" label);
+// keyed hashes (HMAC-SHA256, first 6 bytes as hex), the keyed construction machine-id(5)
+// recommends (the raw machine-id is never sent or logged; the 48-bit truncation is ours). host = HMAC(key=machine-id, "host" label);
 // boot = HMAC(key=machine-id, "boot" label + boot_id). Equal (host, boot) means one
 // CLOCK_MONOTONIC epoch; anything else is a different domain. Empty result = the
 // identity could not be read: the server says nothing and the client treats the domain
@@ -39,16 +39,20 @@ inline std::string keyed_hex12(const std::string& key, const std::string& messag
   return std::string(hex, 12);
 }
 
-// "clk=mono:<host12>:<boot12>", or "" when the machine-id or boot-id is unreadable.
+// "clk=<host12>:<boot12>", or "" when the machine-id (32 lowercase hex) or boot-id is unreadable.
 inline std::string clock_domain_token(const std::string& machine_id_file,
                                       const std::string& boot_id_file) {
   const std::string machine = read_id_file(machine_id_file);
   const std::string boot = read_id_file(boot_id_file);
-  if (machine.empty() || boot.empty()) return {};
+  // machine-id(5) format: 32 lowercase hex digits; anything else (e.g. the first-boot
+  // placeholder "uninitialized") is not an identity. Time namespaces are out of scope.
+  if (machine.size() != 32 || boot.empty()) return {};
+  for (char c : machine)
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return {};
   const std::string host = keyed_hex12(machine, "arm_rt_server:clock-domain:host:v1");
   const std::string bt = keyed_hex12(machine, "arm_rt_server:clock-domain:boot:v1:" + boot);
   if (host.empty() || bt.empty()) return {};
-  return "clk=mono:" + host + ":" + bt;
+  return "clk=" + host + ":" + bt;
 }
 
 }  // namespace arm_rt

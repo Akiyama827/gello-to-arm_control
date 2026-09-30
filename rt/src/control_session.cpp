@@ -151,7 +151,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   // extra key=value token, so existing clients ignore it.
   char hello[sizeof(ControlPacket{}.text)];
   char capability[24] = {};
-  char clock_domain[48] = {};  // " clk=mono:<host12>:<boot12>" (CTRL-041), before rt= so a long rt= truncates first
+  char clock_domain[48] = {};  // " clk=<host12>:<boot12>" (CTRL-041), before rt= so a long rt= truncates first
   char rt_setup[48];
   {
     const std::string token = clock_domain_token(ctx.cfg.machine_id_file, ctx.cfg.boot_id_file);
