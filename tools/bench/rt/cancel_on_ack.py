@@ -19,6 +19,7 @@ from arm_control.execution.stream import StreamOpen
 from arm_control.motion import JointTrajectory
 from arm_control.plants.remote_rt import protocol as rtp
 from arm_control.plants.remote_rt.client import ReferenceRefused
+from arm_control.sdk import Refused
 from controller_extension import configure
 from reference_supervisor import until
 from stream_races import main
@@ -73,6 +74,12 @@ def cases(arm, runtime, scene, service):
         refuse.append(rtp.REF_BUSY)
         blind.append(True)
         arm.select_control_preset('float')
+        try:  # a cancelled stream awaiting confirmation offers no anchor to revise
+            arm.stream_anchor(eid)
+        except Refused:
+            pass
+        else:
+            raise AssertionError('anchor offered for a cancelled stream')
         time.sleep(.5)  # well past the RT's 100 ms envelope ceiling, inside --fault-ms
         status = arm.status(eid)
         assert not status.terminal and status.phase is not Phase.CANCELLED, (status.reason, arm.receipts(eid)[-2:])

@@ -35,3 +35,7 @@ the **one explicit exception** to "CANCELLED means confirmed": an ADMITTED execu
 COMMIT worker is stuck can be CANCELLED before the CANCEL is sent (the RT may hold it; CANCEL is
 queued and its outcome is not awaited).
 The bench reopens a stream after a BEGIN refusal (open CTRL-034 item 4a).
+
+Round-2 review: `stream_anchor`/`revise_stream` are refused while a drop awaits confirmation (they
+were accepted for a moment after the change; benched). If the PC never sees the RT state again
+(dead link) the execution stays non-terminal until restart; nothing is claimed about the RT.

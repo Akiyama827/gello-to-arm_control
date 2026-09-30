@@ -386,7 +386,7 @@ class RobotRuntime:
         self._owns(session)
         ex = self._stream_get(session, execution_id)
         s, h, now = ex.stream, self._native, self.now()
-        if ex.status.terminal or s.pending is not None or h.busy or h.key != execution_id:
+        if ex.status.terminal or ex.drop is not None or s.pending is not None or h.busy or h.key != execution_id:
             raise Refused('stream candidate slot unavailable')
         if not h.selected or h.terminal or self._state.validity is not Validity.VALID:
             raise Refused('stream is stale, unselected or terminal')
@@ -411,7 +411,7 @@ class RobotRuntime:
         ex = self._stream_get(session, request.execution_id)
         marks = self._stream_slot(session, request.proposal_seq, 1)
         s, h, at = ex.stream, self._native, self.now()
-        if ex.status.terminal or s.pending is not None or h.busy or h.key != request.execution_id:
+        if ex.status.terminal or ex.drop is not None or s.pending is not None or h.busy or h.key != request.execution_id:
             raise Refused('stream candidate slot unavailable')
         anchor = s.anchor
         if (anchor is None or anchor.anchor_id != request.anchor_id or anchor.expires_at.ns <= at.ns
