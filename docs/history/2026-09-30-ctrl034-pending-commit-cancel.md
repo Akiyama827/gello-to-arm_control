@@ -2,7 +2,9 @@
 
 Branch `task/control/CTRL-034-pending-commit-cancel`, base `c52034f`. Round 1:
 `f8c9003` (settle the slot on CANCEL ack), `1e82057` (this note). Round 2, after
-review: `42d4b1a` (test gate), `1b2bd4b` (abort before dispatch). Offline software
+review: `42d4b1a` (test gate), `1b2bd4b` (abort before dispatch). Round 3:
+`b29fc28` (settle on the pre-dispatch failure itself, tolerate stale refusals, test
+the replacement path). Offline software
 and a fake-backend network rerun only; no FCI, no robot, no deployed unit.
 
 ## Symptom
@@ -70,10 +72,19 @@ interruption after the send stays a plain `RtLinkError`: that outcome is
 uncertain. `commit()` records the distinct error, and `cancel()`'s queued job
 (which runs after the COMMIT job on the one worker) sends ABORT of the sealed
 upload instead of CANCEL, then still cancels a selected revision if a
-replacement was the undispatched one. That last branch is untested: the bench
-covers initial references only. The runtime's own deadline-expiry path
+replacement was the undispatched one. Round 3 tests that branch. The runtime's own deadline-expiry path
 (`_NotDispatched`) still ends in CANCEL; the RT discards a matching staged
 candidate on CANCEL, so nothing leaks there either.
+
+**Round 3 (`b29fc28`).** Two review points:
+
+1. A commit job that raised `ReferenceCancelledBeforeDispatch` is proof of
+   non-selection, so `poll()` sets `candidate_selection = 'not_requested'` at once
+   (not `REF_LATE`). Before, the slot depended on the queued ABORT/CANCEL
+   succeeding; a failed retire would have left it pending again.
+2. In `retire()`, the selected-revision `cancel_reference` tolerates
+   `REF_REVISION`/`REF_RETIRED`, like the existing path. Any other refusal
+   propagates and is reported as `error`; the slot is already settled.
 
 ## Deterministic reproduction
 
@@ -91,7 +102,20 @@ and the `rt/README.md` table. Explicit gates, no timing:
   RT state during that window, which is the ~1 ms case made certain instead of
   probable. (Round 1 gated before `commit_reference`; with the round-2 client that
   point is ordering 1.) Asserted: CANCEL, no ABORT.
-- **No sealed upload afterwards** (both). With the runtime's hold upload
+- **Slot settles first** (ordering 1 and the replacement cases). The queued
+  ABORT is held inside the worker; while it is held the slot must already read
+  `not_requested` and the cancel job must still be running. On `94a9ce8` this
+  times out.
+- **Replacement, `replacement_cancel_*`.** Revision 1 is selected; the
+  replacement's COMMIT is held at the horizon's cancel check; the preset change
+  runs; the gate opens. Asserted: ABORT, then CANCEL(1). Three variants: CANCEL(1)
+  succeeds; is refused `REF_RETIRED` (tolerated, no error); is refused `REF_BUSY`
+  (error `... refused` surfaced, slot settled). The refusals are scripted in the
+  bench (the RT is not contacted), then the test sends the real CANCEL(1) so the
+  RT is not left with a running, unfed reference. Checked to bite: removing the
+  tolerance fails the tolerated variant; swallowing every refusal fails the
+  refused variant.
+- **No sealed upload afterwards** (all cases). With the runtime's hold upload
   suppressed, a COMMIT of the last upload must be refused by the RT; a leftover
   sealed upload would be accepted. Checked to bite: a mutant that skips the ABORT
   fails with "RT still held a sealed upload".
@@ -122,13 +146,30 @@ at this assertion. Not fixed and unrelated: under that 4x oversubscription 3 to 
 | Check | Result |
 | --- | --- |
 | `pending_commit_cancel.py` on `c52034f` / `1e82057` | FAIL (stuck slot / CANCEL not ABORT) |
-| `pending_commit_cancel.py` on `1b2bd4b`, 20 sequential runs | **20/20** |
+| `pending_commit_cancel.py` on `1b2bd4b`, 20 sequential runs | **20/20** (round 2) |
 | `controller_extension.py` on `1b2bd4b`, 30 sequential runs | **30/30** |
 | `rt_offline_suite.py`, clean tree, `1b2bd4b945032a4ff3da4a4a869508a341070b3b` | **20 PASS, 0 FAIL** |
 | Remote fake-RT, `reference_supervisor.py` x 10, fresh scratch server each | 10/10 PASS; schedstat `ok` x10; worst `rt_total` 18.2 ms, `over_50ms=0` x10; worst sender wake lateness 21.3 ms |
 | Remote fake-RT, `pc_stall.py` x 10, fresh scratch server each | 10/10 S1-S4 PASS |
 
-Round-1 evidence (`f8c9003`: 20/20, 20 PASS, 10 + 10) is superseded by the above.
+Round 3, on `b29fc28` (clean tree):
+
+| Check | Result |
+| --- | --- |
+| `pending_commit_cancel.py` (with the replacement cases), 20 sequential runs | **20/20** |
+| `controller_extension.py`, 10 sequential runs | **10/10** |
+| `rt_offline_suite.py`, `b29fc28fc874a1070a2c8c6f2d89a4d77d35aa16` | **20 PASS, 0 FAIL** |
+| Remote fake-RT, `reference_supervisor.py` x 10 | 10/10 PASS; schedstat `ok` x10; worst `rt_total` 21.8 ms, `over_50ms=0` x10; worst sender wake lateness 23.5 ms |
+| Remote fake-RT, `pc_stall.py` x 10 | 10/10 S1-S4 PASS |
+
+Remote setup as in round 2 (scratch `arm_rt_server` sha256 `eaf8de56...`, ports free
+before each run, fresh scratch server per run, logs saved as
+`pcc3-<bench>-<run>.server.log`). Window 2026-09-30 10:44:48-10:48:06 +08:00, PC
+revision `b29fc28` clean, 1-min load 0.23 at start. Deployed units untouched
+(`NRestarts` 228640 -> 228729 and 228453 -> 228542). The 10 `command stream lost`
+lines are `pc_stall`'s S4 case, one per run; `reference_supervisor` had none.
+
+Round-1 and round-2 evidence (`f8c9003`, `1b2bd4b`) is superseded by the above.
 
 Remote setup, per `ctrl034-remote-fake-rt-runbook.md`: `ok@172.16.1.2`, scratch
 `arm_rt_server` (sha256 `eaf8de56...`, verified before use), `--backend fake
@@ -142,6 +183,37 @@ host was overwritten this time.
 
 Every `command stream lost` line in the 20 RT journals is the bench's own S4
 scenario (10, one per `pc_stall` run; asserted). `reference_supervisor` had none.
+
+## Open CTRL-034 items
+
+**(a) BEGIN refused `REF_REVISION` while a reference is RUNNING.** Under heavy load
+the runtime's own measured-hold reference can still be RUNNING when a new stream's
+BEGIN arrives, and the stream is REJECTED (`reference operation 32 refused: 4`).
+From the RT (`rt/src/reference_upload.hpp` `begin()`, `control_session.cpp`): BEGIN
+compares `expected_revision` with the selected revision only if a reference of
+this session **and ARM epoch** is RUNNING or END (`new_after_end` excepts a
+higher-id first revision after END); otherwise it compares with 0. So any
+first-revision BEGIN issued while an earlier reference of the same ARM epoch is
+still RUNNING is refused. Can a single non-stream first reference hit it? **No,
+not in a fresh ARM epoch:** nothing is selected, so `active` is false and the
+expected revision is 0. The runtime also stages no hold reference before the first
+reference (until then the idle hold stays on the v5 command path, `_send_command`).
+It applies to a second or later first-revision reference (a new stream, or the
+runtime's hold reference) started while the previous one is still RUNNING. This
+reasoning is from the RT source and the trace above; it has not been run as a
+dedicated test. Multi-window refills of one reference are unaffected: they carry
+`expected_revision = selected revision` for the same id. A related fact from the
+same function: a BEGIN while any upload is present returns `REF_BUSY`, so a
+leftover sealed upload would have blocked the next upload.
+
+**(b) Design follow-up: an unresolved `pending` selection should be reported.**
+While `candidate_selection == 'pending'` the runtime's tail returns `None` and
+sends nothing, so an unresolved selection silently suppresses every command until
+the RT latches CMD_LOST. The fixes so far make `pending` resolve in the known
+cases; they do not bound it. Report an unresolved `pending` explicitly, with a
+bounded wait (a fault or error the operator sees) instead of silence. Not
+implemented; needs a decision on the bound and on whether the horizon or the
+runtime owns it.
 
 ## Limits and open points
 
