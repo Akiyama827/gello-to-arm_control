@@ -73,3 +73,18 @@ load, and the mutant without the guard fails. Recorded, not changed after ACCEPT
   the CANCEL/ABORT is acknowledged, as `_cancel_execution` already does. Operator's call.
 - `stream_supervisor.py`'s lost-ack revision case holds a candidate pending across several
   SDK calls with an unmeasured margin to 250 ms: the likeliest future flake.
+
+## Repeated review on the designated reviewer (2026-10-01)
+Round 1 BLOCK (one blocking finding, otherwise mechanism, phase mapping and benches held): the guard `not
+self.error` suppressed the 250 ms rule for ANY error, so a stream pending with an unobserved selection whose
+CANCEL was refused (or lost, or that raced a DISARM) stayed `pending` forever: busy, no commands, CMD_LOST, and
+DISARM/ARM did not recover it (reproduced 4/4). Not a regression (the parent deadlocks too), but 4b claimed to
+bound every stuck-pending case. Fixed: only `REFERENCE_UNDERFLOW` and `REFERENCE_EXPIRED` (RT evidence recorded in the
+same poll) take precedence. Second finding (non-blocking, fixed): the 250 ms rule pre-empted an operator cancel that
+was waiting for the RT's confirmation, rewriting its reason to "selection unresolved"; when `ex.drop` is set it now
+only frees the slot and the receipt (and the operator's reason) stay with `_confirm_drops`. Bench:
+`selection_unresolved_cancel.py`. Known and unchanged: `reference_revision=h.revision` is 0 whenever feedback is
+unobserved, so that evidence key is uninformative; "commands resume" also depends on the CANCEL ack arriving within
+the client's ack timeout (a 600 ms ack still latched CMD_LOST in the reviewer's run); a state stream delivered more
+than 250 ms late can trip the rule (safe: an explicit CANCEL follows, and an unobserved reference gets no envelopes
+and is retired by the RT at ~100 ms anyway); explicit CANCEL of a still-RUNNING reference is untested.

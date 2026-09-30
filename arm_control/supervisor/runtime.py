@@ -1165,6 +1165,12 @@ class RobotRuntime:
         the measured hold, so commands resume instead of starving to CMD_LOST.
         """
         ex = self._executions.get(h.key)
+        if ex is not None and ex.drop is not None and not ex.status.terminal:
+            # An operator cancel is already waiting for the RT's confirmation: free the slot, but leave
+            # the receipt (and the operator's reason) to _confirm_drops.
+            ex.stream.pending = ex.stream.anchor = None
+            self._native_pending = None
+            return
         if ex is not None and ex.stream is not None and not ex.status.terminal:
             s = ex.stream
             # REJECTED means "never moved"; the RT may have selected this candidate, so an
