@@ -11,8 +11,8 @@ cases; this bounds the rest.
   `'unresolved'`, which is not `'pending'`, so it can never again suppress commands.
 - `RobotRuntime._selection_unresolved()` fails the execution with a receipt
   (`CANCELLED` if still `ADMITTED`, otherwise `FAULTED`; reason `selection unresolved: ...`),
-  marks its attempts the same way with the selection state left as is (structurally
-  uncertain: the RT may have selected), and retires the reference through the existing
+  marks the pending attempt `CANCELLED` and, on a live selected stream, the selected attempt
+  `FAULTED` (selection states left as is: structurally uncertain, the RT may have selected), and retires the reference through the existing
   `_drop_staged` path, which sends an explicit CANCEL (or ABORT if COMMIT was never sent)
   and cancels the controller plan. It does not set `_native_failed`, so once the slot is
   free the ordinary tail stages the measured hold and commands resume.
@@ -56,3 +56,20 @@ Recorded, not changed:
 - `pc_stall.py` and `first_envelope_probe.py` call `poll()` on streams they stage and can
   now see `SelectionUnresolved` if a candidate stays pending 250 ms; that is a real
   failure there and is not swallowed.
+
+## Review round 2 (ACCEPT)
+
+Both blockers verified closed; suite 22/0 at `4e2947d`; the new benches 10/10 under CPU
+load, and the mutant without the guard fails. Recorded, not changed after ACCEPT:
+- **Guard breadth.** `not self.error` suppresses the rule on any earlier error, not only
+  evidence from this poll. A tighter guard is `self.error not in ('REFERENCE_UNDERFLOW',
+  'REFERENCE_EXPIRED')`. The reviewer could not make a stuck slot starve with it as
+  written (a failed CANCEL still recovers). Open item.
+- On `a85e169` `selection_expiry_precedence.py` fails only because the hook needs
+  `_pending_since`; its real evidence is the mutant and the stall probe (identical to the
+  parent: FAULTED `REFERENCE_EXPIRED`, latched, no implicit hold).
+- Phase choice (CANCELLED for ADMITTED, FAULTED for SELECTED) is legal and reasonable; a
+  single CANCELLED for both is a legal alternative. The terminal receipt is issued before
+  the CANCEL/ABORT is acknowledged, as `_cancel_execution` already does. Operator's call.
+- `stream_supervisor.py`'s lost-ack revision case holds a candidate pending across several
+  SDK calls with an unmeasured margin to 250 ms: the likeliest future flake.
