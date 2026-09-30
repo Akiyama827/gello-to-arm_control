@@ -26,6 +26,14 @@ class _NotDispatched(RtLinkError):
     """Local proof that COMMIT never entered the transport."""
 
 
+class SelectionUnresolved(RtLinkError):
+    """A stream candidate's COMMIT outcome stayed unknown past SELECTION_UNRESOLVED_S."""
+
+
+# CTRL-033 (operator decision): how long a candidate may stay 'pending' before the
+# horizon reports it. Until then a pending candidate suppresses every command.
+SELECTION_UNRESOLVED_S = 0.25
+
 # CTRL-034 B1 (V1, operator decision): the declared PC envelope bounds. The RT's
 # effective ceiling is min(--hold-ms, valid_for_us) and --hold-ms defaults to
 # 100 ms, so this is 100 ms unless a unit lowers hold_ms.
@@ -75,6 +83,7 @@ class ReferenceHorizon:
         self.terminal = True
         self.protected_until = 0.
         self.candidate_selection = 'not_requested'
+        self._pending_since = None
         self.candidate_error = ''
         self.candidate_result = None
         self._candidate_curve = None
@@ -417,6 +426,7 @@ class ReferenceHorizon:
         self.selection_requested = True
         self._commit_undispatched = False
         self.candidate_selection = 'pending'
+        self._pending_since = time.monotonic()
         self._job = ('commit', self._worker.submit(commit))
 
     def poll(self, state, received_at):
@@ -503,6 +513,17 @@ class ReferenceHorizon:
             # reaches here — and do NOT plan a continuation implicitly.
             self.error = 'REFERENCE_EXPIRED'
             self.dump_diagnostics('REFERENCE_EXPIRED')
+        # Evidence recorded in this same poll wins: an expired reference is reported
+        # as REFERENCE_EXPIRED (never healed by an implicit hold), not as unresolved.
+        if (self.stream and self.candidate_selection == 'pending' and not self.error
+                and self._pending_since is not None
+                and time.monotonic() - self._pending_since > SELECTION_UNRESOLVED_S):
+            # The slot leaves 'pending' here, so it can never again suppress commands.
+            # The RT may or may not have selected: the caller cancels and reports it.
+            self.candidate_selection = 'unresolved'
+            self.candidate_error = 'selection unresolved'
+            raise SelectionUnresolved(
+                f'selection unresolved: COMMIT pending for over {SELECTION_UNRESOLVED_S * 1000:.0f} ms')
         if self.stream or self._interrupt.is_set() or self.error or not self.selected:
             return
         # Replacements were already admitted as part of the full PC plan. No

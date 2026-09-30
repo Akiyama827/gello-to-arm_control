@@ -86,6 +86,8 @@ C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 | `constrained_cpu.py` | diagnostic | Loaded timing matrix runner |
 | `controller_extension.py` | regression | Controller preset/payload transitions |
 | `pending_commit_cancel.py` | regression | Cancel racing a pending stream COMMIT frees the slot (forced orderings) |
+| `selection_unresolved.py` | regression | A stuck pending selection is reported after 250 ms (receipt, CANCEL, hold); the control run starves to CMD_LOST |
+| `selection_expiry_precedence.py` | regression | A stall after COMMIT ends FAULTED `REFERENCE_EXPIRED`, not unresolved; no implicit hold |
 | `envelope_age.py` | diagnostic | Timing collection helper |
 | `first_envelope_probe.py` | diagnostic | First-envelope collision investigation |
 | `first_envelope_trace.py` | diagnostic | Opt-in client timeline helper |

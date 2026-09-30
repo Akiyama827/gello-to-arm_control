@@ -51,7 +51,7 @@ from arm_control.messages import (
 from arm_control.control.inprocess import QueueControllerNode
 from arm_control.plants.remote_rt import protocol as rtp
 from arm_control.plants.remote_rt.client import RtBackend, epoch_reached
-from arm_control.plants.remote_rt.reference import ReferenceHorizon
+from arm_control.plants.remote_rt.reference import ReferenceHorizon, SelectionUnresolved
 from arm_control.plants.remote_rt.observation import AppliedTracker, authority, robot_state
 
 #: Executions kept for status queries and request_id idempotency.
@@ -1098,10 +1098,41 @@ class RobotRuntime:
         if self._native is not None and self._native.key == execution_id:
             self._native.cancel()
 
+    def _selection_unresolved(self, h, reason: str) -> None:
+        """A candidate stayed pending too long: fail it, retire it explicitly, then hold.
+
+        The RT may or may not have selected it, so the execution is failed (never
+        assumed selected) and CANCEL/ABORT is sent through the horizon's retire path.
+        _native_failed stays clear: once the slot is free, the ordinary tail stages
+        the measured hold, so commands resume instead of starving to CMD_LOST.
+        """
+        ex = self._executions.get(h.key)
+        if ex is not None and ex.stream is not None and not ex.status.terminal:
+            s = ex.stream
+            # REJECTED means "never moved"; the RT may have selected this candidate, so an
+            # ADMITTED execution is CANCELLED (dropped; holds if it had been selected),
+            # and one already SELECTED is FAULTED. The reason carries the cause.
+            failure = Phase.CANCELLED if ex.status.phase is Phase.ADMITTED else Phase.FAULTED
+            for rid in (s.selected, s.pending):
+                attempt = self._stream_attempts.get((s.owner, rid)) if rid is not None else None
+                if attempt is not None and not attempt.status.phase.terminal:
+                    # selection_state stays as is: structurally uncertain, never claimed refused
+                    phase = failure if attempt.status.request_id == s.selected else Phase.CANCELLED
+                    attempt.status = replace(attempt.status, phase=phase, at=self.now(), reason=reason)
+            self._receipt(ex, failure, reason, reference_id=h.id, reference_revision=h.revision)
+            s.pending = s.anchor = None
+            self._native_pending = None
+            self._drop_staged(ex, reason)  # explicit CANCEL/ABORT + controller plan cancel
+        else:
+            h.cancel()
+
     def _native_step(self, sample) -> None:
         h, c = self._native, self.controller
         state, rx = sample
-        h.poll(state, rx)
+        try:
+            h.poll(state, rx)
+        except SelectionUnresolved as exc:
+            self._selection_unresolved(h, str(exc))
         old_end = (h.observed is not None and h.observed_point is not None
                    and h.observed['status'] == rtp.REFERENCE_END
                    and h.observed['reference_id'] != h.id)
