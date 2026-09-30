@@ -347,7 +347,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
     }
     if (now - last_alive_ns > DEAD_AFTER_NS) break;  // half-open: treat as lost
     pollfd pfd{fd, POLLIN, 0};
-    const int ready = poll(&pfd, 1, (commit_waiting || mode_outstanding) ? 1 : 100);
+    const int ready = poll(&pfd, 1, (commit_waiting || mode_outstanding || grp.joined) ? 1 : 100);
     if (ready < 0) break;
     if (ready == 0) continue;
     const ssize_t got = recv(fd, reinterpret_cast<char*>(&rx) + have,

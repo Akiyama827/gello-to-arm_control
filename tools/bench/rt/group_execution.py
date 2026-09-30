@@ -58,7 +58,8 @@ def curve(seconds=3.0):
 
 
 class Member:
-    def __init__(self, binary, shm, index, count, tmp):
+    def __init__(self, binary, shm, index, count, tmp, peer_max_age_ms=PEER_MAX_AGE_MS,
+                 min_lead_ms=MIN_LEAD_MS, machine_id_file=None, boot_id_file=None):
         self.index, self.count = index, count
         self.udp, self.tcp = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
         self.proc = subprocess.Popen(
@@ -67,8 +68,9 @@ class Member:
              "--tcp-port", str(self.tcp), "--bind", "127.0.0.1", "--hold-ms", "100",
              "--fault-ms", "500", "--enable-reference", "--group-shm", shm,
              "--group-member", str(index), "--group-members", str(count),
-             "--group-peer-max-age-ms", str(PEER_MAX_AGE_MS), "--group-min-lead-ms", str(MIN_LEAD_MS),
-             "--machine-id-file", str(tmp / "machine-id"), "--boot-id-file", str(tmp / "boot-id")],
+             "--group-peer-max-age-ms", str(peer_max_age_ms), "--group-min-lead-ms", str(min_lead_ms),
+             "--machine-id-file", str(machine_id_file or tmp / "machine-id"),
+             "--boot-id-file", str(boot_id_file or tmp / "boot-id")],
             stdout=tempfile.TemporaryFile(mode="w+"), stderr=subprocess.STDOUT, text=True)  # not a pipe: nobody drains it
         self.link = RtBackend(RtConfig(host="127.0.0.1", udp_port=self.udp, tcp_port=self.tcp,
                                        instance_id=f"arm{index}"), JOINTS)
@@ -118,13 +120,14 @@ class Member:
 
 
 @contextmanager
-def pair(binary, tmp, count=2):
+def pair(binary, tmp, count=2, member_kwargs=None):
     shm = f"/arm_rt_group_bench_{os.getpid()}"
     from multiprocessing import shared_memory  # noqa: F401  (segment lives in /dev/shm)
     members = []
     try:
         for i in range(count):
-            members.append(Member(binary, shm, i, count, tmp))
+            members.append(Member(binary, shm, i, count, tmp, **(member_kwargs or {}).get(i, {}),
+                                  **(member_kwargs or {}).get('all', {})))
         yield members
     finally:
         for m in members:
