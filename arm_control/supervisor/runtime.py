@@ -811,10 +811,10 @@ class RobotRuntime:
     def _disarm(self, session: str) -> int:
         self._owns(session)
         for ex in list(self._executions.values()):
-            if ex.stream is not None and not ex.status.terminal:
+            if not ex.status.terminal and (ex.stream is not None or ex.completed_at is None):
+                # Also planned native executions: their CANCELLED waits for the RT to show
+                # the DISARM (rt_disarmed / rt_epoch), not for the request being sent.
                 self._cancel_execution(ex, "disarmed")
-            if not ex.status.terminal and ex.completed_at is None:
-                ex.cancel_reason = ex.cancel_reason or "disarmed"
         # The controller's own stop path: cancel the leg, then drop authority.
         # Always emits the controller's ``arm`` output, so a DISARM is always sent.
         self.controller.on_control(pack_control_update(cancel=True, arm=False, reason="disarm"))

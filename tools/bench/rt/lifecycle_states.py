@@ -37,7 +37,7 @@ def cases(arm, runtime, scene, service):
         'life', 'fake', tuple(runtime.joints),
         JointTrajectory([0., 1., 2.], [q, q+.001, q+.002], np.zeros((3, 3))),
         model_token=scene.facts.model_token, start=Start.ON_RELEASE))
-    until(lambda: plan.phase is Phase.ADMITTED, 5)
+    until(lambda: arm.status(plan.execution_id).phase is Phase.ADMITTED, 5)
     assert arm.authority().holding is True and rt().reference['reference_id'] == 0  # staged: still held
     arm.release(plan.execution_id)
     until(lambda: arm.status(plan.execution_id).phase is Phase.APPLIED, 8)

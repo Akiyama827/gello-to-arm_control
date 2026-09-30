@@ -13,7 +13,11 @@ Scoping: `Control/docs/ctrl021-scoping-for-ctrl040.md`. Findings on the fake RT:
   controller's own leg cancel produced CANCELLED without the RT's confirmation. Now the same
   rule as for streams (`cancel_on_ack.py`, see `2026-10-01-ctrl033-cancel-on-ack.md`): CANCELLED
   only on a confirmed drop; a refused CANCEL of a planned execution surfaces as the existing
-  FAULTED "reference operation refused", never as CANCELLED.
+  FAULTED "reference operation refused" when the RT's state is hidden from the PC, and as CANCELLED
+  (`drop_confirmed='rt_observed'`) when the PC sees the RT retire it; the rule proven is "never
+  CANCELLED without confirmation". DISARM now goes through the same path for planned executions
+  (round-1 review: it had written CANCELLED as soon as the DISARM was sent); benched with a
+  delayed DISARM ack.
 - Not done: no enum or wire field was added for "armed-hold"; nothing would consume it before
   CTRL-040's group record exists.
 
@@ -24,3 +28,8 @@ All four now wait for the CANCELLED that follows the drop's confirmation (the ru
 purpose; the tests' assumption did not hold). After the fix: `reference_supervisor` 25/25,
 `controller_extension` 15/15, `console_adapter`/`selection_unresolved`/`stream_supervisor`/
 `reference_horizon`/`stream_races` 15/15 each.
+
+Known, not changed: a planned execution cancelled while ADMITTED with its COMMIT in flight, whose
+queued CANCEL is then refused, can end REJECTED/EXPIRED 'cancel refused' by the existing error rule
+(read as "never moved" though the RT may have selected). A drop-pending execution stays current, so
+a new submit is refused with the 'selection in flight' text until the drop is confirmed.

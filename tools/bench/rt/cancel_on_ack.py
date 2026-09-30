@@ -144,6 +144,38 @@ def cases(arm, runtime, scene, service):
         arm.arm()
         arm.select_control_preset('track')
 
+        # DISARM: even with its ack delayed, a planned execution is CANCELLED only with a
+        # confirmation of the drop (the reference's CANCEL ack, or the RT state), never on the
+        # DISARM merely having been sent.
+        real_stop = link.safe_stop
+
+        def slow_stop(*args, **kwargs):
+            time.sleep(1.2)
+            return real_stop(*args, **kwargs)
+        link.safe_stop = slow_stop
+        try:
+            until(lambda: not h.busy, 5)
+            eid = planned('plan3')
+            try:
+                arm.disarm(timeout_s=.3)
+            except Exception:  # noqa: BLE001 - only the RT state below matters
+                pass
+            time.sleep(.6)
+            until(lambda: arm.status(eid).phase is Phase.CANCELLED, 8)
+            assert evidence(eid) in ('rt_disarmed', 'rt_epoch', 'ack', 'rt_observed'), evidence(eid)
+        finally:
+            link.safe_stop = real_stop
+        until(lambda: not link.latest_state()[0].armed, 8)
+
+        def rearm():
+            try:
+                arm.arm()
+            except Refused:  # the delayed DISARM is still being confirmed
+                return False
+            return True
+        until(rearm, 8)
+        arm.select_control_preset('track')
+
         # A proof is not overwritten by a later failed cancel job.
         h._record_drop('k', 'undispatched')
         h._record_drop('k', 'unconfirmed')
