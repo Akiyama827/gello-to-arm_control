@@ -31,21 +31,21 @@ def cases(arm, runtime, scene, service):
         return (mode['law'], tuple(np.round(mode['kp'], 9)), tuple(np.round(mode['kd'], 9)),
                 round(float(mass), 9), None if com is None else tuple(np.round(com, 9)))
 
-    def reset():
-        arm.select_control_preset('track')
+    def reset(start='track'):
+        arm.select_control_preset(start)
         arm.set_payload(adapter_payload(0.))
 
     def adapter_payload(mass, com=None):
         from arm_control.execution.controller import PayloadValue
         return PayloadValue(mass, com) if com is not None else PayloadValue(mass)
 
-    def via_adapter(fields):
-        reset()
+    def via_adapter(fields, start='track'):
+        reset(start)
         result = adapter.apply(unpack_control_update(pack_control_update(**fields)))
         return observe(), ('refused' if result.refusals else 'applied')
 
-    def via_legacy(fields):
-        reset()
+    def via_legacy(fields, start='track'):
+        reset(start)
 
         def run():
             c.on_control(pack_control_update(**fields))
@@ -71,7 +71,8 @@ def cases(arm, runtime, scene, service):
     }
     rows = []
     for name, fields in same.items():
-        a, b = via_adapter(fields), via_legacy(fields)
+        start = 'float' if name == 'gains track' else 'track'  # a real transition, not the same-preset early return
+        a, b = via_adapter(fields, start), via_legacy(fields, start)
         assert a == b, (name, 'adapter', a, 'legacy', b)
         rows.append((name, 'same'))
     for name, (fields, note) in different.items():
@@ -81,7 +82,8 @@ def cases(arm, runtime, scene, service):
     # Direct facts behind the table: the adapter refuses without touching state, the legacy path applies or raises.
     a, _ = via_adapter(different['gains not a preset'][0])
     assert a[1] == tuple(np.round(p.kp, 9)), 'a refused gains request changed the state'
-    assert via_legacy(different['gains not a preset'][0])[1] == 'applied'
+    legacy_gains = via_legacy(different['gains not a preset'][0])
+    assert legacy_gains[1] == 'applied' and legacy_gains[0][1] == tuple(np.round(p.kp * 1.5, 9)), 'legacy did not apply'
     assert via_legacy(different['payload negative mass'][0])[0][3] == 0.
     assert via_legacy(different['payload None mass'][0])[1].startswith('raised')
     reset()
