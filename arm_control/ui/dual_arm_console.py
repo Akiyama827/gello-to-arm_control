@@ -615,7 +615,13 @@ class DualArmConsole:
                     pair_id = self.coordinator.active_pair_id
                     sample.update(
                         closure_v1=safe_closure_record(
-                            moving=True, arms=sample.get("arms"), common_time=None,
+                            moving=self._stationary_since is None,
+                            stationary_for_s=(None if self._stationary_since is None
+                                              else self.runtime.t - self._stationary_since),
+                            planned=getattr(self.motion, "cooperative_metrics", None),
+                            plan_ids=None if pair_id is None else
+                            {m.arm_id: m.plan_id for m in self.coordinator.pair_state(pair_id).members},
+                            arms=sample.get("arms"), common_time=None,
                             alignment=sample.get("feedback_alignment")),
                         mode=self.runtime.mode, closure=None,
                         pair_id=pair_id,
