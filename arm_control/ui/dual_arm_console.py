@@ -23,6 +23,7 @@ from arm_control.config import arm_joints, ee_frame, gripper_joints
 from arm_control import frames
 from arm_control.console_server import ConsoleServer, file_asset
 from arm_control.grasp_visual import VisualFK
+from arm_control.multi_arm.closure import safe_closure_record
 from arm_control.multi_arm.config import load_pair_config, scene_for_mode
 from arm_control.multi_arm.coordinator import BimanualCoordinator
 from arm_control.multi_arm.diagnostics import PairFaultTrace
@@ -550,7 +551,16 @@ class DualArmConsole:
                         # The plans are the identity the recorded chain joins
                         # on — a controller still holding a foreign plan must
                         # not read as this pair's selected reference.
+                        stationary = self._stationary_since
                         sample.update(
+                            closure_v1=safe_closure_record(
+                                moving=stationary is None,
+                                stationary_for_s=None if stationary is None else self.runtime.t - stationary,
+                                planned=getattr(self.motion, "cooperative_metrics", None),
+                                plan_ids=None if pair_id is None else
+                                {m.arm_id: m.plan_id for m in self.coordinator.pair_state(pair_id).members},
+                                arms=sample.get("arms"), common_time=closure,
+                                alignment=sample.get("feedback_alignment")),
                             mode=self.runtime.mode, closure=closure,
                             pair_id=pair_id,
                             lifecycle=self.coordinator.lifecycle.value,
@@ -604,6 +614,15 @@ class DualArmConsole:
                     sample = self.runtime.diagnostic_sample()
                     pair_id = self.coordinator.active_pair_id
                     sample.update(
+                        closure_v1=safe_closure_record(
+                            moving=self._stationary_since is None,
+                            stationary_for_s=(None if self._stationary_since is None
+                                              else self.runtime.t - self._stationary_since),
+                            planned=getattr(self.motion, "cooperative_metrics", None),
+                            plan_ids=None if pair_id is None else
+                            {m.arm_id: m.plan_id for m in self.coordinator.pair_state(pair_id).members},
+                            arms=sample.get("arms"), common_time=None,
+                            alignment=sample.get("feedback_alignment")),
                         mode=self.runtime.mode, closure=None,
                         pair_id=pair_id,
                         lifecycle=self.coordinator.lifecycle.value,

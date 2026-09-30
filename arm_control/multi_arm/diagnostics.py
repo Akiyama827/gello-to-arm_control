@@ -12,6 +12,7 @@ import math
 import numpy as np
 
 from arm_control import CONTROL_ROOT
+from arm_control.multi_arm.closure import ASSUMPTIONS as CLOSURE_ASSUMPTIONS
 
 
 def _json_values(value):
@@ -44,14 +45,18 @@ class PairFaultTrace:
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"{now:%Y%m%dT%H%M%S%fZ}-{self.session}.json"
         report = dict(
-            schema="arm_control.dual_fault/v1",
+            schema="arm_control.dual_fault/v2",
+            schema_version=2,
+            closure_schema="arm_control.closure/v1",  # samples carry `closure_v1` beside the older `closure`
+            closure_assumptions=list(CLOSURE_ASSUMPTIONS),
             observed_at_utc=now.isoformat(),
             reason=reason,
             session=self.session,
             timestamp_note=(
                 "PC receipt/tick times are not physical capture times. RT state "
-                "timestamps share a clock only when rt_host matches; publication "
-                "timestamps do not establish synchronized robot measurements."
+                "timestamps share a clock only when their attested clock_domain matches "
+                "(rt_host string equality is the fallback for unattested servers); "
+                "publication timestamps do not establish synchronized robot measurements."
             ),
             context=context,
             samples=list(self.samples) if samples is None else samples,
@@ -62,7 +67,7 @@ class PairFaultTrace:
         return path
 
 
-# The execution-chain links the dual_fault/v1 sample schema carries, in chain
+# The execution-chain links the dual_fault sample schema (v1 and v2) carries, in chain
 # order (CTRL-051). A lineage report is complete exactly when every link is
 # JOINED by identity, not when each field merely appears somewhere.
 LINE_LINKS = (
