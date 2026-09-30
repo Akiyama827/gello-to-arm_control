@@ -1,11 +1,18 @@
 """The same console `control` message through the legacy `ArmController.on_control` and through the SDK adapter.
 
-CTRL-053 gate (a) for wiring `ConsoleControlAdapter` into a graph. Each message starts from the same baseline ('track',
-payload 0, nothing running) and the resulting mode (law, kp, kd) and payload (mass, CoM) are recorded for both paths. The
-messages the console really sends (named gain presets, valid payloads) must give IDENTICAL state. Every other message is a
-documented, intended difference: the table below is the complete list, and the bench fails if a message moves between
-"same" and "different", or if a legacy path that raised now applies (or the reverse). It proves equivalence of the
-resulting state only; it does not touch a graph, a Dora node or hardware.
+CTRL-053 gate (a) for wiring `ConsoleControlAdapter` into a graph. Each message starts from a baseline ('track' or
+'float', payload 0, nothing running) and the resulting mode (law, kp, kd) and payload (mass, CoM) are recorded for both
+paths. The messages the console really sends (named gain presets, valid payloads) must give IDENTICAL state, and three
+documented differences (a non-preset gains request, negative payload mass, None payload mass) must stay different.
+
+Limits, stated plainly. Gains in both paths go through the same `ArmController.on_control` / `_set_gains` (the SDK's
+preset selection calls it), so the gains rows prove the adapter's preset mapping and the runtime's selection logic, not the
+gain application itself; the legacy gains apply is proven only by the direct assert on the non-preset request. The payload
+leg is independent up to `executor.set_payload`. Not covered: live executions and the same-preset gains cancel (Dora
+always cancels; the adapter only through `live()`, default none), pose_hold/Soft (the fake plant is not Soft-capable),
+partial gains and `gains={}`, payload during a live execution, a same-Soft re-request, `reason`, mixed or forwarded fields
+(arm/execute/cancel/hold/stop and their order), a real Dora send interleave, and any state beyond mode and executor payload
+(hold anchor, integral, controller_event, payload revision). No graph, Dora node or hardware is touched.
 """
 from pathlib import Path
 import sys
