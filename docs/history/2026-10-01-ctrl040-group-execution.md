@@ -86,3 +86,5 @@ a cancel has happened since; `group_leave` abandons an in-flight group COMMIT an
 state (a concurrent FAULTED/DONE stays); the killed-mid-write recovery is now really simulated.
 
 The bench case for it found a second cause in the same place: the tick's per-group locals (`group_done`, `group_tripped`, ...) were reset only when the tick observed `group_active` false, but a group that ends and a new one that joins within one tick interval is never seen as inactive, so the previous group's `group_done` carried over. The locals are now reset whenever the group id changes.
+
+Round-3 note (ACCEPT): if the ARM epoch is lost after a group COMMIT was released but before the RT selected it, the abandoned COMMIT gets no reply; the PC client falls back on its own session/epoch check or its retry (REF_IDENTITY), so a waiter can stall up to one ack timeout (2 s).
