@@ -12,6 +12,7 @@ import math
 import numpy as np
 
 from arm_control import CONTROL_ROOT
+from arm_control.multi_arm.closure import ASSUMPTIONS as CLOSURE_ASSUMPTIONS
 
 
 def _json_values(value):
@@ -47,6 +48,7 @@ class PairFaultTrace:
             schema="arm_control.dual_fault/v2",
             schema_version=2,
             closure_schema="arm_control.closure/v1",  # samples carry `closure_v1` beside the older `closure`
+            closure_assumptions=list(CLOSURE_ASSUMPTIONS),
             observed_at_utc=now.isoformat(),
             reason=reason,
             session=self.session,

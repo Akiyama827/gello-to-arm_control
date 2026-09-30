@@ -2,7 +2,7 @@
 import json
 import math
 
-from arm_control.multi_arm.closure import CLOSURE_SCHEMA, QUANTITIES, closure_record
+from arm_control.multi_arm.closure import ASSUMPTIONS, CLOSURE_SCHEMA, QUANTITIES, closure_record, safe_closure_record
 
 
 def alignment():
@@ -41,7 +41,15 @@ def main():
     # Every record is plain JSON with no NaN.
     for record in (full, empty, bad):
         json.dumps(record, allow_nan=False)
-    assert len(full["assumptions"]) == 4 and any("gates nothing" in x for x in full["assumptions"])
+    assert "assumptions" not in full and len(ASSUMPTIONS) == 4 and any("gates nothing" in x for x in ASSUMPTIONS)
+    assert "lead" in full["tracking"]["basis"]["time"] and full["window_basis"]
+    assert full["planned_reference"]["basis"]["plan_ids"] == {} and "join" in full["planned_reference"]["basis"]["note"]
+    # A diagnostic must never raise into the control tick: malformed input gives an error record, not an exception.
+    for bad_kw in (dict(arms={"a": None}), dict(arms={"a": dict(q_rt=["x"], q_cmd_rt=[1.])}),
+                   dict(planned="not a dict"), dict(common_time=(1.,), alignment=alignment())):
+        record = safe_closure_record(moving=True, **bad_kw)
+        assert record["schema"] == CLOSURE_SCHEMA and ("error" in record or "window" in record), record
+    assert "error" in safe_closure_record(moving=True, arms={"a": None})
     print("closure record: five quantities separate, absences explained, JSON-safe: PASS")
 
 

@@ -7,7 +7,8 @@ value):
 
   planned_reference     closure/path error of the PLAN itself (geometric, from the planner's validation)
   rt_selected_reference closure of the reference the RT actually selected and runs (native reference only)
-  tracking              per-arm tracking error: measured against the command/reference, per joint
+  tracking              per-arm tracking error: the largest absolute joint error (a single maximum per arm, no
+                        per-joint list and no TCP pose tracking yet) against the RT command and the PC command
   common_time_inferred  TCP agreement of the two arms inferred at a COMMON time from bracketed RT states
   physical              independent physical accuracy - present only when independently measured
 
@@ -24,7 +25,7 @@ import math
 
 CLOSURE_SCHEMA = "arm_control.closure/v1"
 QUANTITIES = ("planned_reference", "rt_selected_reference", "tracking", "common_time_inferred", "physical")
-ASSUMPTIONS = (
+ASSUMPTIONS = (  # persisted once per trace (`closure_assumptions`), not in every record
     "RT state timestamps are publication times on the RT host clock, not robot capture times",
     "common-time values are interpolated between two published states (no extrapolation) and only when "
     "both arms share one attested RT clock domain",
@@ -45,14 +46,19 @@ def _finite(x) -> bool:
     return x is not None and math.isfinite(float(x))
 
 
-def planned_reference(metrics) -> dict:
+def planned_reference(metrics, plan_ids=None) -> dict:
     if not metrics:
         return absent("no cooperative plan metrics for this motion")
     keys = ("closure_m", "closure_rad", "path_m", "path_rad")
     if not all(_finite(metrics.get(k)) for k in keys):
         return absent("plan metrics are missing or not finite")
     return present({k: float(metrics[k]) for k in keys}, frame="object/TCP, planning kinematics",
-                   model="planner world model", time="geometric maxima over the whole plan (no time base)")
+                   model="planner world model",
+                   time="maxima over the states the planner accepted while planning (a conservative sampled "
+                        "bound, not the exact maxima of the final trajectory); no time base",
+                   plan_ids=dict(plan_ids or {}),
+                   note="present whenever a cooperative preview is loaded, including before it executes: join "
+                        "on plan_ids and the sample's lifecycle")
 
 
 def rt_selected_reference(reference) -> dict:
@@ -85,7 +91,10 @@ def tracking(arms) -> dict:
     if not out or all(all(v is None for k, v in e.items() if k.startswith("vs_")) for e in out.values()):
         return absent("no measured state and command for any arm")
     return present(out, frame="joint space, per arm", model="none (raw joint values)",
-                   time="each arm's own latest published state (not time-aligned across arms)")
+                   time="each arm's own latest published state (not time-aligned across arms); vs_pc_command_rad "
+                        "compares that state with the command the PC computed THIS tick from it (one tick ahead), so "
+                        "it includes reference lead and is not a pure tracking error; vs_rt_command_rad uses the "
+                        "command the RT reports in the same packet")
 
 
 def common_time_inferred(errors, alignment) -> dict:
@@ -114,17 +123,27 @@ def physical(measurement) -> dict:
                    time=measurement.get("time"))
 
 
-def closure_record(*, moving: bool, stationary_for_s=None, planned=None, rt_reference=None, arms=None,
-                   common_time=None, alignment=None, independent=None) -> dict:
+def closure_record(*, moving: bool, stationary_for_s=None, planned=None, plan_ids=None, rt_reference=None,
+                   arms=None, common_time=None, alignment=None, independent=None) -> dict:
     """One tick's record. ``moving`` labels the window (motion vs stationary)."""
     return {
         "schema": CLOSURE_SCHEMA,
         "window": "motion" if moving else "stationary",
+        "window_basis": "console detector: all controller joint speeds below 0.01 rad/s, PC monotonic clock; "
+                        "reset (reads motion) on a mode switch",
         "stationary_for_s": None if moving or not _finite(stationary_for_s) else float(stationary_for_s),
-        "planned_reference": planned_reference(planned),
+        "planned_reference": planned_reference(planned, plan_ids),
         "rt_selected_reference": rt_selected_reference(rt_reference),
         "tracking": tracking(arms),
         "common_time_inferred": common_time_inferred(common_time, alignment),
         "physical": physical(independent),
-        "assumptions": list(ASSUMPTIONS),
     }
+
+
+def safe_closure_record(**kw) -> dict:
+    """closure_record that can never raise: a diagnostic must not stop the control tick. On any error the record
+    says so instead of carrying values."""
+    try:
+        return closure_record(**kw)
+    except Exception as exc:  # noqa: BLE001 - by design
+        return {"schema": CLOSURE_SCHEMA, "error": f"{type(exc).__name__}: {exc}"}

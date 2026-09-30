@@ -301,6 +301,16 @@ def check_virtual(app, action, wait, refinement):
     np.testing.assert_allclose([inferred_record["distance_m"], inferred_record["angle_rad"]], measured, atol=1e-12)
     assert record["common_time_inferred"]["basis"]["brackets"].keys() == alignment["brackets"].keys()
     assert record["tracking"]["value"].keys() == last["arms"].keys()
+    for arm, view in last["arms"].items():  # values, not just keys: max |q_rt - command| per arm
+        expected_rt = max(abs(a - b) for a, b in zip(view["q_rt"], view["q_cmd_rt"]))
+        expected_pc = max(abs(a - b) for a, b in zip(view["q_rt"], view["q_cmd_pc"]))
+        assert abs(record["tracking"]["value"][arm]["vs_rt_command_rad"] - expected_rt) < 1e-12, arm
+        assert abs(record["tracking"]["value"][arm]["vs_pc_command_rad"] - expected_pc) < 1e-12, arm
+    assert (record["window"] == "motion") == (record["stationary_for_s"] is None)
+    assert record["planned_reference"]["basis"]["plan_ids"] == last["pair_plans"] if record["planned_reference"]["value"] else True
+    assert trace["closure_assumptions"] and "assumptions" not in record
+    # every recorded sample carries a closure_v1 (including any recorded on an alignment fault)
+    assert all("closure_v1" in s for s in trace["samples"])
     assert record["rt_selected_reference"]["value"] is None and record["rt_selected_reference"]["absent"]
     assert record["physical"]["value"] is None and record["physical"]["absent"]
     assert measured[0] > .003 or measured[1] > np.deg2rad(2)
