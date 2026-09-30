@@ -454,7 +454,7 @@ struct ServerCtx {
   std::atomic<bool> group_enabled{false};
   std::atomic<bool> group_active{false};     // JOINed: the tick heartbeats
   std::atomic<bool> group_committed{false};  // COMMIT accepted: the tick enforces peers
-  std::atomic<uint64_t> group_id{0}, group_session{0};
+  std::atomic<uint64_t> group_id{0}, group_session{0}, group_my_deadline{0};
   std::atomic<uint32_t> group_epoch{0};
   std::atomic<uint32_t> group_event{0};
   // Armed-only mode selection (CAP_MODE_SELECT). The control thread publishes a

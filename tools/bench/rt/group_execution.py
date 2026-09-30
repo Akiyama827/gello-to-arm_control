@@ -91,9 +91,9 @@ class Member:
     def state(self):
         return self.link.latest_state()[0]
 
-    def upload(self):
+    def upload(self, seconds=3.0):
         self.ref_id += 1
-        return self.link.upload_reference(curve(), reference_id=self.ref_id)
+        return self.link.upload_reference(curve(seconds), reference_id=self.ref_id)
 
     def stop_pump(self):
         self.pump.stop.set()
@@ -169,6 +169,14 @@ def wait_for(fn, timeout=3.0):
     raise AssertionError("timeout")
 
 
+def retired(m):
+    """This member's LATEST reference (the one it committed) is retired: the state stream lags, so
+    "not running" is not enough right after a commit (it may still show the previous reference)."""
+    s = m.state()
+    return bool(s and s.reference and s.reference["reference_id"] == m.ref_id
+                and s.reference["status"] == p.REFERENCE_CANCELLED)
+
+
 def running(m):
     s = m.state()
     return bool(s and s.reference and s.reference["status"] == p.REFERENCE_RUNNING)
@@ -187,7 +195,7 @@ def happy(binary, tmp, skews):
         skews.append(abs(ra["selected_ns"] - rb["selected_ns"]) / 1e6)
         a.link.group_cancel(1, a.index, a.count)
         b.link.group_cancel(1, b.index, b.count)
-        wait_for(lambda: not running(a) and not running(b))
+        wait_for(lambda: retired(a) and retired(b))
         assert not a.state().faulted and not b.state().faulted
 
 
@@ -292,7 +300,7 @@ def peer_fault_then_new_group(binary, tmp):
     try:
         b.stop_pump()  # B's command stream goes quiet: CMD_LOST latches after --fault-ms
         e = event_of(a)
-        assert e["peer_verdict"] in (p.PEER_FAULTED, p.PEER_CANCELLED), e
+        assert e["peer_verdict"] == p.PEER_FAULTED, e  # the latch is mirrored, sticky, not overwritten
         wait_for(lambda: b.state().faulted)
         wait_for(lambda: not running(a))
         assert not a.state().faulted
@@ -340,6 +348,82 @@ def other_group_and_old_epoch(binary, tmp):
             raise AssertionError("wrong member index accepted")
 
 
+def retry_and_lost_reply(binary, tmp):
+    """The client resends an unanswered COMMIT after its ack timeout (2 s); a held group COMMIT must
+    absorb that retry instead of answering BUSY, and an identical resend after the answer is answered
+    again from the stored reply (a lost reply)."""
+    with pair(binary, tmp) as (a, b):
+        join_all((a, b), 20)
+        ua, ub = a.upload(), b.upload()
+        ra, rb = commit_both((a, b), 20, (ua, ub), delays=(0., 2.6), budget_ns=5_000_000_000)
+        assert isinstance(ra, dict) and isinstance(rb, dict), (ra, rb)
+        assert ra["result"] == rb["result"] == p.REF_OK
+        again = a.link.group_commit(ua, reference_id=a.ref_id, group_id=20, member_index=0,
+                                    budget_ns=5_000_000_000)
+        assert again["result"] == p.REF_OK and again["selected_ns"] == ra["selected_ns"], again
+        wait_for(lambda: running(a) and running(b))
+
+
+def plain_commit_after_group_abort(binary, tmp):
+    """After a group COMMIT is refused/aborted, an ordinary COMMIT on the same session is answered on
+    its own opcode and behaves as before (the group flag must not leak into it)."""
+    with pair(binary, tmp) as (a, b):
+        join_all((a, b), 21)
+        ua, _ = a.upload(), b.upload()
+        try:
+            a.link.group_commit(ua, reference_id=a.ref_id, group_id=21, member_index=0,
+                                budget_ns=BUDGET_NS)
+        except ReferenceRefused as exc:
+            assert exc.result == p.REF_LATE
+        else:
+            raise AssertionError("group commit without a peer was accepted")
+        u2 = a.upload()
+        reply = a.link.commit_reference(u2, reference_id=a.ref_id)
+        assert reply["operation"] == p.CTL_REFERENCE_COMMIT and reply["result"] == p.REF_OK, reply
+        wait_for(lambda: running(a))
+
+
+def finished_member_does_not_retire_peer(binary, tmp):
+    """Members finish at different times: a member whose reference ended (DONE) is final, may leave,
+    and does not cancel the group for a peer still running."""
+    with pair(binary, tmp) as (a, b):
+        join_all((a, b), 22)
+        ua, ub = a.upload(0.3), b.upload(3.0)
+        ra, rb = commit_both((a, b), 22, (ua, ub))
+        assert isinstance(ra, dict) and isinstance(rb, dict), (ra, rb)
+        wait_for(lambda: a.state().reference["status"] == p.REFERENCE_END, 3)
+        time.sleep(.1)
+        a.link.group_cancel(22, a.index, a.count)  # A is DONE: this only leaves the group
+        time.sleep(.4)
+        assert running(b), "a finished member's leave retired its peer"
+        assert not any(e["result"] == p.REF_GROUP_PEER for e in b.link.group_events)
+        b.link.group_cancel(22, b.index, b.count)
+
+
+def consecutive_groups_same_servers(binary, tmp):
+    """New groups right after cancelled ones on the same servers (both members committing at once):
+    the deadline is per group, nothing a previous group left behind refuses or shortens it."""
+    with pair(binary, tmp) as (a, b):
+        for gid in range(30, 42):
+            join_all((a, b), gid)
+            ua, ub = a.upload(), b.upload()
+            ra, rb = commit_both((a, b), gid, (ua, ub))
+            assert isinstance(ra, dict) and isinstance(rb, dict), (gid, ra, rb)
+            assert ra["result"] == rb["result"] == p.REF_OK and ra["deadline_ns"] == rb["deadline_ns"]
+            a.link.group_cancel(gid, a.index, a.count)
+            b.link.group_cancel(gid, b.index, b.count)
+            wait_for(lambda: retired(a) and retired(b))
+            a.link.group_events.clear()
+            b.link.group_events.clear()
+        try:
+            a.link.group_commit(1, reference_id=1, group_id=99, member_index=0,
+                                budget_ns=p.GROUP_MAX_BUDGET_NS + 1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("an over-long group budget was accepted on the wire")
+
+
 def main():
     binary = sys.argv[1] if len(sys.argv) > 1 else str(_ROOT / "rt/build/arm_rt_server")
     skews: list[float] = []
@@ -356,12 +440,17 @@ def main():
         peer_cancel(binary, tmp)
         peer_fault_then_new_group(binary, tmp)
         other_group_and_old_epoch(binary, tmp)
+        retry_and_lost_reply(binary, tmp)
+        plain_commit_after_group_abort(binary, tmp)
+        finished_member_does_not_retire_peer(binary, tmp)
+        consecutive_groups_same_servers(binary, tmp)
     print(f"selection skew between members (ms, fake RT, host clock): "
           f"min {min(skews):.3f} median {sorted(skews)[len(skews)//2]:.3f} max {max(skews):.3f} "
           f"over {len(skews)} runs")
     print("PASS: group execution: one deadline, per-member selection stamps, peer never commits, late "
           "commit, cancel after staging, peer process loss, peer cancel, peer fault then a new group, "
-          "second group / old epoch / wrong member refused")
+          "second group / old epoch / wrong member refused, COMMIT retry and lost reply, plain COMMIT after a group "
+          "abort, a finished member leaves without retiring its peer, consecutive groups on the same servers")
     return 0
 
 

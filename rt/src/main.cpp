@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "cannot open group segment %s\n", cfg.group_shm.c_str());
       return 2;
     }
-    ctx.group.write_slot(uint32_t(cfg.group_member), arm_rt::GS_NONE, 0, 0, 0);
+    ctx.group.reset_slot(uint32_t(cfg.group_member));  // a killed predecessor may have left it mid-write
     ctx.group_enabled.store(true);
   }
 

@@ -13,9 +13,14 @@ What was built
   (a contended write is retried on the next tick). No syscall, allocation or lock in the tick.
   The segment is scoped by `group_id` (PC-assigned, never reused): a slot from another group,
   including a fault left over from an earlier epoch, is `PEER_UNKNOWN`, never faulted or healthy.
-- Group deadline: the first member to commit sets one absolute deadline on the shared host clock
-  (`claim_deadline`), the others adopt it; an expired previous group's deadline is taken over.
-  It is checked at COMMIT (refused `REF_LATE` past it or with less than the minimum lead left) and by the
+- Group deadline: NOT shared state. Each member records its own proposed deadline (commit time +
+  budget) in its slot; the group deadline is the earliest deadline of any member committed for the
+  group (`group_deadline`), so the first committer sets it and the others converge on it, with no
+  shared header, no CAS race and nothing a dead process can leave wedged. (Round 1 of the review
+  found the first design, a CAS-claimed header pair, racy: two members committing together while an
+  older group held the record got REF_GROUP_REFUSED or adopted the old group's deadline.) The wire
+  bounds the budget at 10 s (`GROUP_MAX_BUDGET_NS`, a validity bound, not a timing constant). It is
+  checked at COMMIT (refused `REF_LATE` past it or with less than the minimum lead left) and by the
   waiting member; once both members have committed the release is unconditional.
 - Wire (additive, v7 negotiated path only): `CTL_GROUP_JOIN/COMMIT/CANCEL` and `CTL_GROUP_STATUS`
   (reply and unsolicited event), results `REF_GROUP_REFUSED`/`REF_GROUP_PEER`, HELLO ` g=1`. C++ and
@@ -47,3 +52,27 @@ Not done / not claimed
   written. Coordinator integration, PC-side group lifecycle and the report of start/progress skew per
   member are the next slice. Only first-revision references can be group-committed.
 - Deployed server binary hash changes; staged manifests must record it.
+
+Round-1 review (BLOCK) and fixes
+- `grp.is_commit` leaked past every abort path, so the next plain COMMIT was answered on the group
+  opcode (the arm moved while the PC saw a refusal); cleared in `group_leave`. Bench: plain COMMIT
+  after a group abort (killing the fix hangs the bench).
+- An identical group COMMIT retry (client resends after its 2 s ack timeout) got BUSY; now absorbed
+  while held and answered from the stored reply after completion. Bench: budget 5 s, peer commits at
+  2.6 s (the mutant fails with BUSY).
+- Deadline race: see above. Bench: 12 consecutive groups on the same servers, both committing at once.
+- Seqlock writer: a release fence after the entering CAS (weakly ordered CPUs); writes carry an
+  `allowed_from` state mask, so the tick's RUNNING/DONE/CANCELLED never overwrites a state recorded
+  meanwhile and FAULTED is sticky (not replaced by a peer-induced CANCELLED).
+- New state `GS_DONE` (reference ran to its end): final, peers ignore its heartbeat, and a member's
+  GROUP_CANCEL after DONE only leaves the group (does not retire the peer). Bench: 0.3 s vs 3 s references.
+- Group ops on a server without a group record are refused locally (`group_capable`); a killed
+  predecessor's odd sequence is recovered at start (`reset_slot`).
+- Known and not changed: a peer's slot writer is the non-real-time control thread, so a preempted
+  writer or four failed reads in one tick can trip a member spuriously (design "failed read =
+  unknown"); a member of a joined group is not prevented from plain COMMITs (design 3.1's reservation
+  rule is not implemented); after both members are committed a waiting member can still abort
+  REF_LATE within `min_lead` of the deadline (fails safe); a segment left behind by a killed
+  process persists in /dev/shm until unlinked; a leaked bench segment from an earlier session was
+  seen and not deleted; `GROUP_CANCEL` does not wait for the RT retire, so a BEGIN right after a
+  cancel can be refused REF_REVISION (the known CTRL-034 item 4a; the bench waits for the retire).

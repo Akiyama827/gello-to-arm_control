@@ -201,9 +201,14 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   // CTRL-040 group execution (only when the server was started with a group record).
   struct GroupCtl {
     bool joined=false, hold=false, is_commit=false;
-    uint64_t id=0, deadline_ns=0, last_cancelled=0;
+    uint64_t id=0, deadline_ns=0, my_deadline=0, last_cancelled=0;
     uint32_t epoch=0, count=0, index=0;
   } grp;
+  // The last group COMMIT request and its answer: an identical retry (the client resends after its ack
+  // timeout) is answered from here, or absorbed while the original is still held (plain COMMIT does the same).
+  ControlPacket gcommit_req{};
+  GroupStatusPayload gcommit_status{};
+  bool have_gcommit_status=false;
   auto group_reply=[&](uint64_t gid,uint32_t op,uint32_t result,uint32_t verdict,uint32_t seq) {
     GroupStatusPayload st{}; st.group_id=gid; st.operation=op; st.result=result;
     st.peer_verdict=verdict; st.deadline_ns=grp.joined?grp.deadline_ns:0;
@@ -211,16 +216,22 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
       const GroupSnapshot own=ctx.group.read_slot(uint32_t(ctx.cfg.group_member));
       st.state=own.ok?own.state:GS_NONE; st.selected_ns=own.ok?own.selected_ns:0;
     }
+    if(op==CTL_GROUP_COMMIT) { gcommit_status=st; have_gcommit_status=true; }
     ControlPacket a=make(CTL_GROUP_STATUS,0,nullptr,seq);
     a.version=REFERENCE_VERSION; std::memcpy(a.text,&st,sizeof(st));
     return send_frame(fd,a);
   };
-  // Leave the group: the slot ends CANCELLED (peers must see it) and the tick stops enforcing.
+  // Leave the group: the slot ends CANCELLED (peers must see it) and the tick stops enforcing. A member
+  // that already latched a fault keeps FAULTED (the record mirrors the latch); one that finished keeps DONE.
   auto group_leave=[&](GroupState final_state) {
     if(!grp.joined) return;
     ctx.group_committed.store(false); ctx.group_active.store(false);
-    ctx.group.write_slot(uint32_t(ctx.cfg.group_member),final_state,grp.id,session,grp.epoch);
-    grp.last_cancelled=grp.id; grp.joined=false; grp.hold=false;
+    const GroupSnapshot own=ctx.group.read_slot(uint32_t(ctx.cfg.group_member));
+    const bool keep=own.ok && own.group_id==grp.id && (own.state==GS_FAULTED || own.state==GS_DONE);
+    ctx.group.write_slot(uint32_t(ctx.cfg.group_member),keep?GroupState(own.state):final_state,
+                         grp.id,session,grp.epoch,keep?own.fault_code:0,keep?own.selected_ns:0,
+                         keep?own.deadline_ns:0);
+    grp.last_cancelled=grp.id; grp.joined=false; grp.hold=false; grp.is_commit=false;
   };
   // Retire whatever this member has staged, waiting or selected, as CTL_CANCEL_REFERENCE does.
   auto group_retire=[&]() {
@@ -261,6 +272,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
           if(v!=PEER_OK) { abort=true; verdict=v; }
           else if(peer.state<GS_COMMITTED) release=false;
         }
+        grp.deadline_ns=ctx.group.group_deadline(grp.index,grp.id,grp.my_deadline);  // earliest member deadline
         if(!abort && !release && gnow>=grp.deadline_ns) { abort=true; result=REF_LATE; }
         if(abort) {
           const uint64_t gid=grp.id;
@@ -462,12 +474,27 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
             uint32_t res=REF_OK;
             if(g.session_id!=session || g.arm_epoch!=ctx.arm_gen.load() || !ctx.armed.load()) res=REF_IDENTITY;
             else if(grp.joined && grp.id==g.group_id) {
-              const bool waiting=grp.hold; group_retire(); group_leave(GS_CANCELLED);
+              const GroupSnapshot own=ctx.group.read_slot(uint32_t(ctx.cfg.group_member));
+              const bool finished=own.ok && own.group_id==grp.id && own.state==GS_DONE;
+              const bool waiting=grp.hold;
+              if(!finished) group_retire();  // a finished member has nothing to retire: it just leaves
+              group_leave(GS_CANCELLED);
               if(waiting && !group_reply(g.group_id,CTL_GROUP_COMMIT,REF_GROUP_PEER,0,commit_frame.seq)) { lost=true; continue; }
             } else if(grp.last_cancelled!=g.group_id) res=REF_GROUP_REFUSED;
             sent=group_reply(g.group_id,rx.type,res,0,rx.seq);
           } else {
             GroupCommitPayload g; std::memcpy(&g,rx.text,sizeof(g));
+            const bool same_request=!std::memcmp(gcommit_req.text,rx.text,sizeof(rx.text));
+            if(same_request && commit_waiting && grp.is_commit) {  // original still held/in flight
+              commit_frame.seq=rx.seq; gcommit_req.seq=rx.seq; continue;
+            }
+            if(same_request && !commit_waiting && have_gcommit_status) {  // lost reply: answer again
+              ControlPacket again=make(CTL_GROUP_STATUS,0,nullptr,rx.seq);
+              again.version=REFERENCE_VERSION; std::memcpy(again.text,&gcommit_status,sizeof(gcommit_status));
+              if(!send_frame(fd,again)) lost=true;
+              continue;
+            }
+            gcommit_req=rx; have_gcommit_status=false;
             uint32_t res=REF_OK, verdict=0;
             const auto* admitted=upload?upload->admitted():nullptr;
             if(g.session_id!=session || g.arm_epoch!=ctx.arm_gen.load() || !ctx.armed.load()) res=REF_IDENTITY;
@@ -486,11 +513,13 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
                 if(v!=PEER_OK) { res=REF_GROUP_PEER; verdict=v; }
               }
               if(res==REF_OK) {
-                const uint64_t deadline=ctx.group.claim_deadline(g.group_id,gnow,g.budget_ns);
+                // The group deadline is the earliest member deadline (this one included): the first
+                // committer sets it, later ones adopt it. Checked HERE, at commit, not at selection.
+                const uint64_t mine=gnow+g.budget_ns;
+                const uint64_t deadline=ctx.group.group_deadline(grp.index,grp.id,mine);
                 const uint64_t lead=uint64_t(ctx.cfg.group_min_lead_ms*1e6);
-                if(!deadline) res=REF_GROUP_REFUSED;
-                else if(gnow>=deadline || deadline-gnow<lead) res=REF_LATE;  // checked at COMMIT, not at select
-                else grp.deadline_ns=deadline;
+                if(gnow>=deadline || deadline-gnow<lead) res=REF_LATE;
+                else { grp.my_deadline=mine; grp.deadline_ns=deadline; }
               }
             }
             if(res!=REF_OK) {
@@ -504,7 +533,8 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
               pending.cancel_generation=ctx.reference_cancel_generation.load();
               commit_frame=rx; commit_waiting=true; have_commit_reply=false;
               grp.hold=true; grp.is_commit=true;
-              ctx.group.write_slot(grp.index,GS_COMMITTED,grp.id,session,grp.epoch);
+              ctx.group_my_deadline.store(grp.my_deadline);
+              ctx.group.write_slot(grp.index,GS_COMMITTED,grp.id,session,grp.epoch,0,0,grp.my_deadline);
               ctx.group_committed.store(true,std::memory_order_release);
               continue;  // answered on release/abort/selection
             }

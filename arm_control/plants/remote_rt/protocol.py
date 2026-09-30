@@ -418,7 +418,8 @@ REF_OK, REF_MALFORMED, REF_IDENTITY, REF_BUSY, REF_REVISION = range(5)
 REF_INTEGRITY, REF_PREFIX, REF_LATE, REF_RETIRED, REF_NOT_ADMITTED = range(5, 10)
 REF_GROUP_REFUSED, REF_GROUP_PEER = 10, 11
 # CTRL-040 group states / peer verdicts (rt/include/arm_rt/group_record.hpp)
-GS_NONE, GS_STAGED, GS_READY, GS_COMMITTED, GS_RUNNING, GS_FAULTED, GS_CANCELLED = range(7)
+GS_NONE, GS_STAGED, GS_READY, GS_COMMITTED, GS_RUNNING, GS_FAULTED, GS_CANCELLED, GS_DONE = range(8)
+GROUP_MAX_BUDGET_NS = 10_000_000_000  # wire sanity bound, mirrors protocol.hpp
 PEER_OK, PEER_UNKNOWN, PEER_FAULTED, PEER_CANCELLED, PEER_STALE = range(5)
 
 # Names, exact little-endian field layout, trailing reserved bytes. No padding
@@ -499,11 +500,11 @@ def _validate_reference_body(op: int, p: dict) -> None:
     elif op == CTL_GROUP_COMMIT:
         require(all(p[k] for k in ('session_id', 'group_id', 'upload_id', 'reference_id',
                                    'arm_epoch', 'budget_ns')))
-        require(p['member_index'] < 4)
+        require(p['budget_ns'] <= GROUP_MAX_BUDGET_NS and p['member_index'] < 4)
     elif op == CTL_GROUP_STATUS:
         require(p['group_id'] and REF_OK <= p['result'] <= REF_GROUP_PEER)
         require(p['operation'] == 0 or CTL_GROUP_JOIN <= p['operation'] <= CTL_GROUP_CANCEL)
-        require(p['state'] <= GS_CANCELLED and p['peer_verdict'] <= PEER_STALE)
+        require(p['state'] <= GS_DONE and p['peer_verdict'] <= PEER_STALE)
         require(not p['reserved0'])
     elif op == CTL_REFERENCE_STATUS:
         require(REF_OK <= p['result'] <= REF_NOT_ADMITTED and not p['reserved0'])

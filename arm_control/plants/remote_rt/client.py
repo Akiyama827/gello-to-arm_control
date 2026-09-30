@@ -751,6 +751,8 @@ class RtBackend:
         """COMMIT for a group. Returns when this member's reference is SELECTED (reply
         ``selected_ns``, ``deadline_ns`` on the RT host clock); refused with the peer verdict if a
         peer is bad, the group deadline passed, or the group was cancelled while waiting."""
+        if not self.group_capable:
+            raise RtLinkError("server was not started with a group record")
         session_id, arm_epoch = self._reference_scope(session_id, arm_epoch)
         with self._upload_lock:
             return self._reference_exchange(
@@ -760,6 +762,8 @@ class RtBackend:
 
     def group_cancel(self, group_id: int, member_index: int, member_count: int, *,
                      session_id: int | None = None, arm_epoch: int | None = None) -> dict:
+        if not self.group_capable:
+            raise RtLinkError("server was not started with a group record")
         session_id, arm_epoch = self._reference_scope(session_id, arm_epoch)
         self._upload_cancel.set()  # interrupt an upload/COMMIT wait of this member first
         with self._upload_lock:

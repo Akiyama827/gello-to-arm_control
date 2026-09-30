@@ -148,7 +148,7 @@ void rt_loop(ServerCtx& ctx) {
   ReferenceCancel reference_cancel{};
   uint64_t reference_seen=0, cancel_seen=0;
   // CTRL-040: servo-tick side of group execution (bounded reads/writes only, see group_record.hpp).
-  bool group_stamp_pending=false, group_tripped=false, group_fault_mirrored=false;
+  bool group_stamp_pending=false, group_tripped=false, group_fault_mirrored=false, group_done=false;
   uint64_t group_stamp_ns=0;
   const uint64_t group_max_age_ns=uint64_t(ctx.cfg.group_peer_max_age_ms*1e6);
   ArmMode mode;
@@ -374,10 +374,12 @@ void rt_loop(ServerCtx& ctx) {
          ctx.group_committed.load(std::memory_order_acquire) &&
          ctx.group_epoch.load(std::memory_order_relaxed)==uint32_t(gen)) {
         // Stamp this member's selection on the shared host clock BEFORE the control thread is
-        // told (reference_done below); a contended write is retried on the next tick.
+        // told (reference_done below); a contended write is retried on the next tick. Only a
+        // COMMITTED slot may become RUNNING: a CANCELLED/FAULTED recorded meanwhile stays.
         group_stamp_ns=now; group_stamp_pending=true;
         if(ctx.group.try_write_slot(uint32_t(ctx.cfg.group_member),GS_RUNNING,
-              ctx.group_id.load(std::memory_order_relaxed),session,uint32_t(gen),0,now))
+              ctx.group_id.load(std::memory_order_relaxed),session,uint32_t(gen),0,now,
+              ctx.group_my_deadline.load(std::memory_order_relaxed),1u<<GS_COMMITTED)!=GroupSegment::CONTENDED)
           group_stamp_pending=false;
       }
       ctx.reference_result.store(result,std::memory_order_relaxed);
@@ -390,20 +392,31 @@ void rt_loop(ServerCtx& ctx) {
     ctx.reference_feedback.write(reference.info());
     if(ctx.group_enabled.load(std::memory_order_relaxed)) {
       if(!ctx.group_active.load(std::memory_order_acquire)) {
-        group_tripped=false; group_fault_mirrored=false; group_stamp_pending=false;
+        group_tripped=false; group_fault_mirrored=false; group_stamp_pending=false; group_done=false;
       } else if(armed && ctx.group_session.load(std::memory_order_relaxed)==session &&
                 ctx.group_epoch.load(std::memory_order_relaxed)==uint32_t(gen)) {
         const uint32_t me=uint32_t(ctx.cfg.group_member);
         const uint64_t gid=ctx.group_id.load(std::memory_order_relaxed);
+        const uint64_t my_deadline=ctx.group_my_deadline.load(std::memory_order_relaxed);
         ctx.group.heartbeat(me,now);
         if(group_stamp_pending &&
-           ctx.group.try_write_slot(me,GS_RUNNING,gid,session,uint32_t(gen),0,group_stamp_ns))
+           ctx.group.try_write_slot(me,GS_RUNNING,gid,session,uint32_t(gen),0,group_stamp_ns,my_deadline,
+                                    1u<<GS_COMMITTED)!=GroupSegment::CONTENDED)
           group_stamp_pending=false;
+        // The member's reference ran to its end: final. It no longer needs its peers and they no
+        // longer need its heartbeat (a group whose members finish at different times is not a fault).
+        if(!group_done && !group_tripped && ctx.group_committed.load(std::memory_order_acquire) &&
+           reference.info().status==REFERENCE_END &&
+           ctx.group.try_write_slot(me,GS_DONE,gid,session,uint32_t(gen),0,group_stamp_ns,my_deadline,
+                                    1u<<GS_RUNNING)!=GroupSegment::CONTENDED)
+          group_done=true;
+        // Mirrors the wire latch: sticky (nothing below overwrites FAULTED); it ends with the epoch.
         if(faulted && !group_fault_mirrored &&
            ctx.group.try_write_slot(me,GS_FAULTED,gid,session,uint32_t(gen),
-                                    ctx.fault_code.load(std::memory_order_relaxed),0))
-          group_fault_mirrored=true;  // mirrors the wire latch; DISARM clears the group with the epoch
-        if(ctx.group_committed.load(std::memory_order_acquire) && !group_tripped) {
+                                    ctx.fault_code.load(std::memory_order_relaxed),0,my_deadline,
+                                    ~(1u<<GS_DONE))!=GroupSegment::CONTENDED)
+          group_fault_mirrored=true;
+        if(ctx.group_committed.load(std::memory_order_acquire) && !group_tripped && !group_done) {
           bool bad=false; uint32_t verdict=0;
           for(uint32_t m=0;m<ctx.cfg.group_members && !bad;++m) {
             if(m==me) continue;
@@ -415,7 +428,9 @@ void rt_loop(ServerCtx& ctx) {
             // (retire, hold at the measured position, zero feedforward). No blocking, no syscall.
             group_tripped=true;
             if(reference.info().status==REFERENCE_RUNNING) { reference.retire(); holding=false; }
-            ctx.group.try_write_slot(me,GS_CANCELLED,gid,session,uint32_t(gen));
+            // Only a live slot becomes CANCELLED; a FAULTED/DONE/CANCELLED already there stays.
+            ctx.group.try_write_slot(me,GS_CANCELLED,gid,session,uint32_t(gen),0,0,my_deadline,
+                                     (1u<<GS_STAGED)|(1u<<GS_READY)|(1u<<GS_COMMITTED)|(1u<<GS_RUNNING));
             ctx.group_event.store(verdict+1,std::memory_order_release);
           }
         }

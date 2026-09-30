@@ -44,11 +44,12 @@ static void check_seqlock_consistency() {
   std::atomic<uint64_t> skipped{0};
   std::thread writer([&] {
     for (uint64_t k = 1; !stop.load(); k += 2)
-      w.write_slot(1, GroupState(1 + k % 6), k, k * 3, uint32_t(k * 7), uint32_t(k * 5), k * 11);
+      w.write_slot(1, GroupState(1 + k % 6), k, k * 3, uint32_t(k * 7), uint32_t(k * 5), k * 11, k * 13);
   });
   std::thread ticker([&] {
     for (uint64_t k = 2; !stop.load(); k += 2)
-      if (!w.try_write_slot(1, GroupState(1 + k % 6), k, k * 3, uint32_t(k * 7), uint32_t(k * 5), k * 11))
+      if (w.try_write_slot(1, GroupState(1 + k % 6), k, k * 3, uint32_t(k * 7), uint32_t(k * 5), k * 11,
+                           k * 13) != GroupSegment::WRITTEN)
         skipped.fetch_add(1);
   });
   uint64_t ok = 0, torn = 0, unread = 0;
@@ -59,7 +60,7 @@ static void check_seqlock_consistency() {
     if (s.group_id == 0) continue;  // before the first write
     const uint64_t k = s.group_id;
     if (s.session_id != k * 3 || s.arm_epoch != uint32_t(k * 7) || s.fault_code != uint32_t(k * 5) ||
-        s.selected_ns != k * 11 || s.state != 1 + k % 6)
+        s.selected_ns != k * 11 || s.deadline_ns != k * 13 || s.state != 1 + k % 6)
       ++torn;
   }
   stop = true;
@@ -93,6 +94,8 @@ static void check_verdicts() {
   assert(peer_verdict(c, 9, 2'000'000, age) == PEER_CANCELLED);
   GroupSnapshot n = p; n.state = GS_NONE;
   assert(peer_verdict(n, 9, 2'000'000, age) == PEER_UNKNOWN);
+  GroupSnapshot d = p; d.state = GS_DONE; d.heartbeat_ns = 1;
+  assert(peer_verdict(d, 9, 900'000'000, age) == PEER_OK);  // finished: stale heartbeat is fine
   GroupSnapshot z = p; z.heartbeat_ns = 0;
   assert(peer_verdict(z, 9, 2'000'000, age) == PEER_STALE);
   GroupSnapshot bad;  // unreadable
@@ -103,23 +106,51 @@ static void check_deadline() {
   const std::string name = shm_name("dl");
   GroupSegment a, b;
   assert(a.open(name, 2, true) && b.open(name, 2));
-  const uint64_t d = a.claim_deadline(7, 1'000, 500);
-  assert(d == 1'500);
-  assert(b.claim_deadline(7, 1'200, 999) == 1'500);  // adopted, never recomputed
-  assert(a.claim_deadline(8, 1'300, 500) == 0);      // a live group owns it
-  const uint64_t d2 = b.claim_deadline(8, 2'000, 500);  // group 7's deadline is past: taken over
-  assert(d2 == 2'500);
-  b.release_deadline(7);                              // not the owner: no effect
-  assert(a.claim_deadline(7, 2'100, 500) == 0);
-  b.release_deadline(8);
-  assert(a.claim_deadline(9, 2'100, 500) == 2'600);
-  // Two members racing to commit one group agree on one deadline.
-  a.release_deadline(9);
-  uint64_t r1 = 0, r2 = 0;
-  std::thread t1([&] { r1 = a.claim_deadline(11, 5'000, 700); });
-  std::thread t2([&] { r2 = b.claim_deadline(11, 5'003, 700); });
-  t1.join(); t2.join();
-  assert(r1 != 0 && r1 == r2 && (r1 == 5'700 || r1 == 5'703));
+  // The group deadline is a function of the slots: the earliest deadline of any member committed for
+  // this group. Nobody has committed: only the caller's own proposal counts.
+  assert(a.group_deadline(0, 7, 1'500) == 1'500);
+  assert(a.group_deadline(0, 7, 0) == 0);
+  // A commits at t=1000 with budget 500 (deadline 1500); B, committing later, adopts it.
+  a.write_slot(0, GS_COMMITTED, 7, 1, 1, 0, 0, 1'500);
+  assert(b.group_deadline(1, 7, 1'700) == 1'500);
+  assert(a.group_deadline(0, 7, 1'500) == 1'500);
+  // Both committed: both compute the same value whoever asks.
+  b.write_slot(1, GS_COMMITTED, 7, 2, 1, 0, 0, 1'700);
+  assert(a.group_deadline(0, 7, 1'500) == b.group_deadline(1, 7, 1'700) && a.group_deadline(0, 7, 1'500) == 1'500);
+  // The other order (B first): the earliest wins again.
+  a.write_slot(0, GS_COMMITTED, 7, 1, 1, 0, 0, 1'900);
+  assert(a.group_deadline(0, 7, 1'900) == 1'700);
+  // Another group's slots, uncommitted members and unwritten deadlines do not contribute.
+  assert(a.group_deadline(0, 8, 2'500) == 2'500);
+  b.write_slot(1, GS_STAGED, 7, 2, 1, 0, 0, 1'000);
+  assert(a.group_deadline(0, 7, 1'900) == 1'900);
+  // A finished member's deadline still counts (its group's clock does not move).
+  b.write_slot(1, GS_DONE, 7, 2, 1, 0, 0, 1'700);
+  assert(a.group_deadline(0, 7, 1'900) == 1'700);
+  // No shared header state: a dead writer cannot wedge a later group. A killed writer leaves an odd
+  // sequence; reset_slot recovers it, and a stale slot of an old group is invisible to a new one.
+  a.write_slot(0, GS_CANCELLED, 7, 1, 1);
+  assert(a.group_deadline(1, 9, 3'000) == 3'000);
+  a.unlink();
+}
+
+static void check_conditional_writes() {
+  const std::string name = shm_name("cond");
+  GroupSegment a;
+  assert(a.open(name, 2, true));
+  a.write_slot(0, GS_COMMITTED, 5, 1, 1);
+  const uint32_t from_committed = 1u << GS_COMMITTED;
+  assert(a.try_write_slot(0, GS_RUNNING, 5, 1, 1, 0, 42, 0, from_committed) == GroupSegment::WRITTEN);
+  // A CANCELLED recorded meanwhile is never overwritten by a tick's RUNNING/DONE stamp.
+  a.write_slot(0, GS_CANCELLED, 5, 1, 1);
+  assert(a.try_write_slot(0, GS_RUNNING, 5, 1, 1, 0, 43, 0, from_committed | (1u << GS_RUNNING)) ==
+         GroupSegment::REFUSED);
+  const GroupSnapshot s = a.read_slot(0);
+  assert(s.ok && s.state == GS_CANCELLED && s.selected_ns == 0);
+  // A predecessor killed mid-write leaves the sequence odd: reset_slot recovers, reads work again.
+  a.reset_slot(0);
+  const GroupSnapshot r = a.read_slot(0);
+  assert(r.ok && r.state == GS_NONE && r.heartbeat_ns == 0);
   a.unlink();
 }
 
@@ -151,6 +182,7 @@ int main() {
   check_seqlock_consistency();
   check_verdicts();
   check_deadline();
+  check_conditional_writes();
   check_cross_process();
   std::puts("group_record_selfcheck: PASS");
   return 0;

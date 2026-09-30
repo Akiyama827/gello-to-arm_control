@@ -42,6 +42,7 @@ enum GroupState : uint32_t {
   GS_RUNNING = 4,    // this member's reference is selected
   GS_FAULTED = 5,    // this member's wire latch is set
   GS_CANCELLED = 6,  // group cancelled by this member (or by the PC)
+  GS_DONE = 7,       // this member's reference ran to its end; final, needs no peer any more
 };
 
 // One value the seqlock protects. All fields are relaxed atomics so the concurrent read is
@@ -54,6 +55,7 @@ struct alignas(64) GroupSlot {
   std::atomic<uint64_t> group_id{0};
   std::atomic<uint64_t> session_id{0};
   std::atomic<uint64_t> selected_ns{0};  // server clock at this member's selection (0 = not yet)
+  std::atomic<uint64_t> deadline_ns{0};  // this member's proposed group deadline (its commit time + budget)
   // Written by the servo tick alone, read by peers: a lone 64-bit value needs no seqlock.
   alignas(64) std::atomic<uint64_t> heartbeat_ns{0};
 };
@@ -61,11 +63,6 @@ struct alignas(64) GroupSlot {
 struct GroupHeader {
   std::atomic<uint32_t> magic{0};
   std::atomic<uint32_t> members{0};
-  // Group deadline on the shared host clock: set once per group by the FIRST member to commit
-  // (claim_deadline), adopted by the others. group id is stored before the deadline, so
-  // deadline_ns == 0 with a matching id means "being set".
-  alignas(64) std::atomic<uint64_t> deadline_group_id{0};
-  std::atomic<uint64_t> deadline_ns{0};
 };
 
 struct GroupLayout {
@@ -77,7 +74,7 @@ struct GroupLayout {
 struct GroupSnapshot {
   bool ok = false;
   uint32_t state = GS_NONE, arm_epoch = 0, fault_code = 0;
-  uint64_t group_id = 0, session_id = 0, selected_ns = 0, heartbeat_ns = 0;
+  uint64_t group_id = 0, session_id = 0, selected_ns = 0, deadline_ns = 0, heartbeat_ns = 0;
 };
 
 enum PeerVerdict : uint32_t {
@@ -148,67 +145,76 @@ class GroupSegment {
 
   // ---- control-thread writers (non-RT) ------------------------------------------------------
   // One consistent replacement of a member's slot value (the heartbeat is separate). TWO threads
-  // of one server write its slot (control thread, servo tick), so the seqlock is entered by CAS:
-  // `try_write_slot` makes exactly one attempt (the tick: on false it retries next tick, never
-  // spins); `write_slot` retries until it gets in (control thread only).
-  bool try_write_slot(uint32_t member, GroupState state, uint64_t group_id, uint64_t session_id,
-                      uint32_t arm_epoch, uint32_t fault_code = 0, uint64_t selected_ns = 0) {
+  // of one server write its slot (control thread, servo tick), so the seqlock is entered by CAS.
+  // `try_write_slot` makes exactly one attempt (the tick: CONTENDED = retry next tick, never spin);
+  // `write_slot` retries until it gets in (control thread only). `allowed_from` is a bit mask of the
+  // slot states the write may replace; a write over any other state is REFUSED (and changes nothing),
+  // so the tick can never overwrite a CANCELLED/FAULTED/DONE the control thread or a peer decision
+  // just recorded.
+  enum WriteResult { WRITTEN, CONTENDED, REFUSED };
+  static constexpr uint32_t ANY_STATE = ~0u;
+  WriteResult try_write_slot(uint32_t member, GroupState state, uint64_t group_id, uint64_t session_id,
+                             uint32_t arm_epoch, uint32_t fault_code = 0, uint64_t selected_ns = 0,
+                             uint64_t deadline_ns = 0, uint32_t allowed_from = ANY_STATE) {
     GroupSlot& s = layout_->slots[member];
     uint32_t q = s.seq.load(std::memory_order_relaxed);
     if ((q & 1u) || !s.seq.compare_exchange_strong(q, q + 1, std::memory_order_acquire,
                                                    std::memory_order_relaxed))
-      return false;
+      return CONTENDED;
+    // The odd sequence number must be visible before any data store: a release fence after the CAS
+    // (a CAS alone does not order LATER stores before it on weakly ordered CPUs).
+    std::atomic_thread_fence(std::memory_order_release);
+    if (!((allowed_from >> s.state.load(std::memory_order_relaxed)) & 1u)) {
+      s.seq.store(q + 2, std::memory_order_release);  // unchanged data, sequence even again
+      return REFUSED;
+    }
     s.state.store(state, std::memory_order_relaxed);
     s.arm_epoch.store(arm_epoch, std::memory_order_relaxed);
     s.fault_code.store(fault_code, std::memory_order_relaxed);
     s.group_id.store(group_id, std::memory_order_relaxed);
     s.session_id.store(session_id, std::memory_order_relaxed);
     s.selected_ns.store(selected_ns, std::memory_order_relaxed);
+    s.deadline_ns.store(deadline_ns, std::memory_order_relaxed);
     s.seq.store(q + 2, std::memory_order_release);
-    return true;
+    return WRITTEN;
   }
-  void write_slot(uint32_t member, GroupState state, uint64_t group_id, uint64_t session_id,
-                  uint32_t arm_epoch, uint32_t fault_code = 0, uint64_t selected_ns = 0) {
-    while (!try_write_slot(member, state, group_id, session_id, arm_epoch, fault_code, selected_ns))
+  WriteResult write_slot(uint32_t member, GroupState state, uint64_t group_id, uint64_t session_id,
+                         uint32_t arm_epoch, uint32_t fault_code = 0, uint64_t selected_ns = 0,
+                         uint64_t deadline_ns = 0, uint32_t allowed_from = ANY_STATE) {
+    for (;;) {
+      const WriteResult r = try_write_slot(member, state, group_id, session_id, arm_epoch, fault_code,
+                                           selected_ns, deadline_ns, allowed_from);
+      if (r != CONTENDED) return r;
       std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
   }
   void clear_slot(uint32_t member) { write_slot(member, GS_NONE, 0, 0, 0); }
-
-  // First member to commit sets the group deadline (now + budget); later members adopt it.
-  // Returns 0 = refused (another live group holds the record, or it could not be read),
-  // otherwise the group's deadline in host-clock ns. A previous group whose deadline lies in
-  // the past is taken over.
-  uint64_t claim_deadline(uint64_t group_id, uint64_t now_ns, uint64_t budget_ns) {
-    GroupHeader& h = layout_->header;
-    for (int attempt = 0; attempt < 8; ++attempt) {
-      uint64_t owner = h.deadline_group_id.load(std::memory_order_acquire);
-      if (owner == group_id) {
-        for (int i = 0; i < 2000; ++i) {  // the setter is between two stores: microseconds
-          const uint64_t d = h.deadline_ns.load(std::memory_order_acquire);
-          if (d) return d;
-          usleep(1);
-        }
-        return 0;
-      }
-      if (owner != 0) {
-        const uint64_t d = h.deadline_ns.load(std::memory_order_acquire);
-        if (d == 0 || now_ns < d) return 0;  // a live group owns it
-      }
-      // Free (or expired): take it, publishing an unset deadline first.
-      if (h.deadline_group_id.compare_exchange_strong(owner, group_id, std::memory_order_acq_rel)) {
-        h.deadline_ns.store(0, std::memory_order_release);
-        const uint64_t deadline = now_ns + budget_ns;
-        h.deadline_ns.store(deadline, std::memory_order_release);
-        return deadline;
-      }
-    }
-    return 0;
+  // Process start only, when this server is the slot's sole writer: a predecessor killed inside a
+  // write leaves the sequence odd; force it even and empty the slot.
+  void reset_slot(uint32_t member) {
+    GroupSlot& s = layout_->slots[member];
+    const uint32_t q = s.seq.load(std::memory_order_relaxed);
+    s.seq.store((q | 1u) + 1, std::memory_order_release);
+    write_slot(member, GS_NONE, 0, 0, 0);
+    s.heartbeat_ns.store(0, std::memory_order_relaxed);
   }
-  void release_deadline(uint64_t group_id) {
-    GroupHeader& h = layout_->header;
-    uint64_t owner = group_id;
-    if (h.deadline_group_id.compare_exchange_strong(owner, 0, std::memory_order_acq_rel))
-      h.deadline_ns.store(0, std::memory_order_release);
+
+  // The group deadline is NOT shared state: it is a pure function of the members' slots. Each member
+  // records `deadline_ns` = its own commit time + budget; the group deadline is the earliest deadline of
+  // any member committed for this group. The first committer therefore sets it and the others converge
+  // on it, with no shared header, no CAS race and nothing a dead process can leave wedged. `mine` is this
+  // member's own proposed deadline (0 = it has not committed yet). Peers that are unreadable or in
+  // another group do not contribute (the commit-time peer check refuses those anyway).
+  uint64_t group_deadline(uint32_t self, uint64_t group_id, uint64_t mine) const {
+    uint64_t deadline = mine;
+    for (uint32_t m = 0; m < members_; ++m) {
+      if (m == self) continue;
+      const GroupSnapshot peer = read_slot(m);
+      if (!peer.ok || peer.group_id != group_id || peer.deadline_ns == 0) continue;
+      if (peer.state != GS_COMMITTED && peer.state != GS_RUNNING && peer.state != GS_DONE) continue;
+      if (deadline == 0 || peer.deadline_ns < deadline) deadline = peer.deadline_ns;
+    }
+    return deadline;
   }
 
   // ---- servo-tick operations (bounded, no syscalls) -----------------------------------------
@@ -228,6 +234,7 @@ class GroupSegment {
       out.group_id = s.group_id.load(std::memory_order_relaxed);
       out.session_id = s.session_id.load(std::memory_order_relaxed);
       out.selected_ns = s.selected_ns.load(std::memory_order_relaxed);
+      out.deadline_ns = s.deadline_ns.load(std::memory_order_relaxed);
       out.heartbeat_ns = s.heartbeat_ns.load(std::memory_order_relaxed);
       std::atomic_thread_fence(std::memory_order_acquire);
       if (s.seq.load(std::memory_order_relaxed) == a) {
@@ -265,6 +272,7 @@ inline PeerVerdict peer_verdict(const GroupSnapshot& peer, uint64_t group_id, ui
     return PEER_UNKNOWN;
   if (peer.state == GS_FAULTED) return PEER_FAULTED;
   if (peer.state == GS_CANCELLED) return PEER_CANCELLED;
+  if (peer.state == GS_DONE) return PEER_OK;  // finished: final, its heartbeat no longer matters
   if (peer.state == GS_NONE) return PEER_UNKNOWN;
   if (peer.heartbeat_ns == 0) return PEER_STALE;
   // A heartbeat "from the future" is the host clock read a moment apart: not stale.

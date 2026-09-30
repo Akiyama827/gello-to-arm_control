@@ -110,7 +110,7 @@ enum ReferenceCtl : uint16_t {
   CTL_REFERENCE_ABORT = 36, CTL_CANCEL_REFERENCE = 37,
   CTL_REFERENCE_STATUS = 38,
   // CTRL-040 group execution (additive; a server accepts these only when started with a group
-  // record and advertises `grp=1` in HELLO). First-revision references only.
+  // record and advertises `g=1` in HELLO). First-revision references only.
   CTL_GROUP_JOIN = 39, CTL_GROUP_COMMIT = 40, CTL_GROUP_CANCEL = 41,
   CTL_GROUP_STATUS = 42,  // server -> client: reply (operation = request opcode) or event (0)
 };
@@ -320,6 +320,9 @@ struct ReferenceRetirePayload {
   uint8_t reserved[80];             // 24
 };
 // CTRL-040. JOIN and CANCEL share one body.
+// Sanity bound on the group deadline budget (wire validity, not a timing value: the operator's
+// constants live in the server flags). Keeps `now + budget` from wrapping and bounds a held COMMIT.
+constexpr uint64_t GROUP_MAX_BUDGET_NS = 10'000'000'000ull;
 struct GroupMemberPayload {
   uint64_t session_id;              // 0
   uint64_t group_id;                // 8: PC-assigned, never reused
@@ -483,13 +486,13 @@ inline bool valid_reference_body(uint16_t type, const void* body) {
     case CTL_GROUP_COMMIT: {
       GroupCommitPayload p; std::memcpy(&p,body,sizeof(p));
       return p.session_id && p.group_id && p.upload_id && p.reference_id && p.arm_epoch &&
-        p.budget_ns && p.member_index<4 && zero_bytes(p.reserved,sizeof(p.reserved));
+        p.budget_ns && p.budget_ns<=GROUP_MAX_BUDGET_NS && p.member_index<4 && zero_bytes(p.reserved,sizeof(p.reserved));
     }
     case CTL_GROUP_STATUS: {
       GroupStatusPayload p; std::memcpy(&p,body,sizeof(p));
       return p.group_id && p.result<=REF_GROUP_PEER &&
         (p.operation==0 || (p.operation>=CTL_GROUP_JOIN && p.operation<=CTL_GROUP_CANCEL)) &&
-        p.state<=6 && p.peer_verdict<=4 && !p.reserved0 && zero_bytes(p.reserved,sizeof(p.reserved));
+        p.state<=7 && p.peer_verdict<=4 && !p.reserved0 && zero_bytes(p.reserved,sizeof(p.reserved));
     }
     default: return false;
   }
