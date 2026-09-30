@@ -345,8 +345,14 @@ def main(binary, remote=None):
                 mark = recorder.mark()
                 commit(rt, ref_id, np.array(rt.latest_state()[0].q), duration=2.0)
                 wait_for(lambda: not rt.latest_state()[0].holding, timeout=3)
-                running = [r for r in recorder.since(mark)
-                           if r['status'] == p.REFERENCE_RUNNING]
+                # The recorder is a separate 1 ms thread: the state can show the new
+                # reference running before it has appended a second RUNNING row (one
+                # row leaves no step to measure; seen in about 1 run in 8). Wait for
+                # enough rows; the step bound below then covers the whole window.
+                def running_rows():
+                    return [r for r in recorder.since(mark) if r['status'] == p.REFERENCE_RUNNING]
+                wait_for(lambda: len(running_rows()) >= 10, timeout=3)
+                running = running_rows()
                 steps = [abs(b['q_cmd'][0] - a['q_cmd'][0])
                          for a, b in zip(running, running[1:])]
                 # If the RETIRED reference had resumed, q_cmd would jump by
