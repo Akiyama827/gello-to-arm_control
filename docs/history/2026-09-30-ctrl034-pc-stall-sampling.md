@@ -17,3 +17,7 @@ After the fix: 40/40 sequential runs on `pc_stall.py`.
 
 Scope: harness only. No product code, control law, gain, limit or timing constant changed.
 The network gate is unaffected (it passed in every earlier round).
+
+## Review addendum
+
+The pre-fix test could also pass with nothing measured: in 13 of 76 passing S2b/S3 checks only 2-3 RUNNING rows, all still holding, were seen, so the max step was 0.0. A mutant that commits the new reference at the retired reference's position (~0.20 rad jump) passed S2b in 4 of 12 runs before the fix and failed 12 of 12 after it. Open, pre-existing: the resume bound (74 mrad) is loose against the ~39-57 mrad held-setpoint-to-measured jump; a tighter bound (first RUNNING q_cmd vs measured q at commit) belongs to a later card.
