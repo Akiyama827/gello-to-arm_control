@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from arm_control.execution.contract import Phase
+from arm_control.execution.contract import Phase, Start, TrajectoryRequest
 from arm_control.execution.stream import StreamOpen
 from arm_control.motion import JointTrajectory
 from arm_control.plants.remote_rt import protocol as rtp
@@ -111,6 +111,69 @@ def cases(arm, runtime, scene, service):
         blind.clear()
         until(lambda: arm.status(eid).phase is Phase.CANCELLED, 8)
         assert evidence(eid) in ('rt_epoch', 'rt_disarmed'), evidence(eid)
+        arm.select_control_preset('track')
+
+        # A planned (non-stream) native execution is held to the same rule.
+        def planned(rid):
+            q = arm.state().q
+            got = arm.execute(TrajectoryRequest(rid, 'fake', tuple(runtime.joints),
+                JointTrajectory([0., 1., 2.], [q, q+.001, q+.002], np.zeros((3, 3))),
+                model_token=scene.facts.model_token, start=Start.ON_ADMIT)).execution_id
+            until(lambda: arm.status(got).phase is Phase.APPLIED, 8)
+            return got
+        until(lambda: not h.busy, 5)
+        eid = planned('plan1')
+        arm.cancel(eid)
+        assert evidence(eid) in ('ack', 'rt_observed', 'rt_epoch', 'rt_disarmed'), evidence(eid)
+        until(lambda: not h.busy, 5)
+        eid = planned('plan2')
+        refuse.append(rtp.REF_BUSY)
+        blind.append(True)
+        try:
+            arm.cancel(eid, timeout_s=.5)
+        except TimeoutError:
+            pass  # the SDK reports it cannot confirm
+        time.sleep(.3)
+        # A refused CANCEL of a planned execution is reported as the RT refusing (FAULTED, the
+        # existing error path), never as a confirmed drop.
+        status = arm.status(eid)
+        assert status.phase is not Phase.CANCELLED, (status.phase, status.reason)
+        assert status.phase is Phase.FAULTED and 'refused' in status.reason or not status.terminal, status
+        blind.clear()
+        arm.disarm()
+        arm.arm()
+        arm.select_control_preset('track')
+
+        # DISARM: even with its ack delayed, a planned execution is CANCELLED only with a
+        # confirmation of the drop (the reference's CANCEL ack, or the RT state), never on the
+        # DISARM merely having been sent.
+        real_stop = link.safe_stop
+
+        def slow_stop(*args, **kwargs):
+            time.sleep(1.2)
+            return real_stop(*args, **kwargs)
+        link.safe_stop = slow_stop
+        try:
+            until(lambda: not h.busy, 5)
+            eid = planned('plan3')
+            try:
+                arm.disarm(timeout_s=.3)
+            except Exception:  # noqa: BLE001 - only the RT state below matters
+                pass
+            time.sleep(.6)
+            until(lambda: arm.status(eid).phase is Phase.CANCELLED, 8)
+            assert evidence(eid) in ('rt_disarmed', 'rt_epoch', 'ack', 'rt_observed'), evidence(eid)
+        finally:
+            link.safe_stop = real_stop
+        until(lambda: not link.latest_state()[0].armed, 8)
+
+        def rearm():
+            try:
+                arm.arm()
+            except Refused:  # the delayed DISARM is still being confirmed
+                return False
+            return True
+        until(rearm, 8)
         arm.select_control_preset('track')
 
         # A proof is not overwritten by a later failed cancel job.

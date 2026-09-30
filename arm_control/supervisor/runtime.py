@@ -811,10 +811,10 @@ class RobotRuntime:
     def _disarm(self, session: str) -> int:
         self._owns(session)
         for ex in list(self._executions.values()):
-            if ex.stream is not None and not ex.status.terminal:
+            if not ex.status.terminal and (ex.stream is not None or ex.completed_at is None):
+                # Also planned native executions: their CANCELLED waits for the RT to show
+                # the DISARM (rt_disarmed / rt_epoch), not for the request being sent.
                 self._cancel_execution(ex, "disarmed")
-            if not ex.status.terminal and ex.completed_at is None:
-                ex.cancel_reason = ex.cancel_reason or "disarmed"
         # The controller's own stop path: cancel the leg, then drop authority.
         # Always emits the controller's ``arm`` output, so a DISARM is always sent.
         self.controller.on_control(pack_control_update(cancel=True, arm=False, reason="disarm"))
@@ -941,6 +941,12 @@ class RobotRuntime:
                     self._receipt(ex, Phase.CANCELLED, reason)
                     self._settle_stream_attempts(ex, reason)
             ex.stream.pending = None
+        elif (not ex.status.terminal and ex.status.phase is not Phase.REQUESTED
+                and self._native is not None and self._native.key == ex.status.execution_id
+                and self._native.selection_requested):
+            # A planned native execution: the controller's own leg cancel is not the RT's
+            # confirmation either (see above).
+            ex.drop = (reason, self._native.id, self._native._session, self._native._epoch)
         self._retire_native(ex.status.execution_id)
         if self.controller.current_plan_id == ex.status.execution_id:
             self.controller.on_control(pack_control_update(
@@ -984,7 +990,8 @@ class RobotRuntime:
             if h is not None:
                 h.dropped.pop(ex.status.execution_id, None)
             self._receipt(ex, Phase.CANCELLED, reason, drop_confirmed=how)
-            self._settle_stream_attempts(ex, reason)
+            if ex.stream is not None:
+                self._settle_stream_attempts(ex, reason)
 
     def _drop_staged(self, ex: _Execution, reason: str) -> None:
         self._retire_native(ex.status.execution_id)
