@@ -400,6 +400,30 @@ def finished_member_does_not_retire_peer(binary, tmp):
         b.link.group_cancel(22, b.index, b.count)
 
 
+def group_after_finished_reference(binary, tmp):
+    """Enforcement must survive a previous reference that ended normally (its stale END must not read
+    as this group's DONE): a group after two references that ran to their end, then peer loss."""
+    with pair(binary, tmp) as (a, b):
+        join_all((a, b), 50)
+        ua, ub = a.upload(0.3), b.upload(0.3)
+        ra, rb = commit_both((a, b), 50, (ua, ub))
+        assert isinstance(ra, dict) and isinstance(rb, dict), (ra, rb)
+        wait_for(lambda: all(m.state().reference["status"] == p.REFERENCE_END for m in (a, b)), 3)
+        time.sleep(.1)
+        a.link.group_cancel(50, a.index, a.count)  # DONE: leaves only
+        b.link.group_cancel(50, b.index, b.count)
+        join_all((a, b), 51)
+        ua, ub = a.upload(3.0), b.upload(3.0)
+        ra, rb = commit_both((a, b), 51, (ua, ub))
+        assert isinstance(ra, dict) and isinstance(rb, dict), (ra, rb)
+        wait_for(lambda: running(a) and running(b))
+        b.proc.kill()  # by PID
+        b.proc.wait(3)
+        e = event_of(a)
+        assert e["peer_verdict"] == p.PEER_STALE, e
+        wait_for(lambda: not running(a))
+
+
 def consecutive_groups_same_servers(binary, tmp):
     """New groups right after cancelled ones on the same servers (both members committing at once):
     the deadline is per group, nothing a previous group left behind refuses or shortens it."""
@@ -443,6 +467,7 @@ def main():
         retry_and_lost_reply(binary, tmp)
         plain_commit_after_group_abort(binary, tmp)
         finished_member_does_not_retire_peer(binary, tmp)
+        group_after_finished_reference(binary, tmp)
         consecutive_groups_same_servers(binary, tmp)
     print(f"selection skew between members (ms, fake RT, host clock): "
           f"min {min(skews):.3f} median {sorted(skews)[len(skews)//2]:.3f} max {max(skews):.3f} "
@@ -450,7 +475,7 @@ def main():
     print("PASS: group execution: one deadline, per-member selection stamps, peer never commits, late "
           "commit, cancel after staging, peer process loss, peer cancel, peer fault then a new group, "
           "second group / old epoch / wrong member refused, COMMIT retry and lost reply, plain COMMIT after a group "
-          "abort, a finished member leaves without retiring its peer, consecutive groups on the same servers")
+          "abort, a finished member leaves without retiring its peer, consecutive groups on the same servers, enforcement after a normally finished reference")
     return 0
 
 

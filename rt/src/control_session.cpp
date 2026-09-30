@@ -226,11 +226,14 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   auto group_leave=[&](GroupState final_state) {
     if(!grp.joined) return;
     ctx.group_committed.store(false); ctx.group_active.store(false);
-    const GroupSnapshot own=ctx.group.read_slot(uint32_t(ctx.cfg.group_member));
-    const bool keep=own.ok && own.group_id==grp.id && (own.state==GS_FAULTED || own.state==GS_DONE);
-    ctx.group.write_slot(uint32_t(ctx.cfg.group_member),keep?GroupState(own.state):final_state,
-                         grp.id,session,grp.epoch,keep?own.fault_code:0,keep?own.selected_ns:0,
-                         keep?own.deadline_ns:0);
+    // A latched fault and a finished reference are final: the write only replaces a live state, so
+    // a FAULTED/DONE the tick records concurrently is never overwritten.
+    ctx.group.write_slot(uint32_t(ctx.cfg.group_member),final_state,grp.id,session,grp.epoch,0,0,0,
+                         (1u<<GS_STAGED)|(1u<<GS_READY)|(1u<<GS_COMMITTED)|(1u<<GS_RUNNING)|
+                         (1u<<GS_CANCELLED)|(1u<<GS_NONE));
+    // A group COMMIT still in flight to the RT is abandoned: its late result must not be answered
+    // (on either opcode).
+    if(grp.is_commit) commit_waiting=false;
     grp.last_cancelled=grp.id; grp.joined=false; grp.hold=false; grp.is_commit=false;
   };
   // Retire whatever this member has staged, waiting or selected, as CTL_CANCEL_REFERENCE does.
@@ -489,8 +492,12 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
               commit_frame.seq=rx.seq; gcommit_req.seq=rx.seq; continue;
             }
             if(same_request && !commit_waiting && have_gcommit_status) {  // lost reply: answer again
+              GroupStatusPayload stored=gcommit_status;
+              // A stored OK is stale if a cancel/retire has happened since (as plain COMMIT answers).
+              if(stored.result==REF_OK && (!grp.joined || pending.cancel_generation!=ctx.reference_cancel_generation.load()))
+                stored.result=REF_RETIRED;
               ControlPacket again=make(CTL_GROUP_STATUS,0,nullptr,rx.seq);
-              again.version=REFERENCE_VERSION; std::memcpy(again.text,&gcommit_status,sizeof(gcommit_status));
+              again.version=REFERENCE_VERSION; std::memcpy(again.text,&stored,sizeof(stored));
               if(!send_frame(fd,again)) lost=true;
               continue;
             }

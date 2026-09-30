@@ -148,6 +148,8 @@ static void check_conditional_writes() {
   const GroupSnapshot s = a.read_slot(0);
   assert(s.ok && s.state == GS_CANCELLED && s.selected_ns == 0);
   // A predecessor killed mid-write leaves the sequence odd: reset_slot recovers, reads work again.
+  a.test_leave_odd(0);
+  assert(!a.read_slot(0).ok);  // odd sequence: unreadable, and a normal write would spin forever
   a.reset_slot(0);
   const GroupSnapshot r = a.read_slot(0);
   assert(r.ok && r.state == GS_NONE && r.heartbeat_ns == 0);

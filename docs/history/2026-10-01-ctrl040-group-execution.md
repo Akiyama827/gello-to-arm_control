@@ -36,8 +36,8 @@ What was built
 - Client (`client.py`): `group_join/group_commit/group_cancel`, `group_capable`, `group_events`.
 
 Checks: `group_record_selfcheck` (ctest: setup and member-count refusal, seqlock consistency under two
-writers on one slot with a reader, verdicts, first-committer deadline with threads, cross-process
-visibility), `reference_protocol.py`, `tools/bench/rt/group_execution.py` (two fake servers: one
+writers on one slot with a reader, verdicts, group deadline as a function of the slots, cross-process
+visibility, conditional writes, recovery of an odd sequence), `reference_protocol.py`, `tools/bench/rt/group_execution.py` (two fake servers: one
 deadline and per-member stamps, peer never commits, late commit, cancel after staging, peer process
 loss by PID, peer cancel, peer fault then a NEW group, second group / other epoch / wrong member).
 The bench's timing values (`--group-peer-max-age-ms 40`, `--group-min-lead-ms 5`, budget 250 ms) are
@@ -76,3 +76,13 @@ Round-1 review (BLOCK) and fixes
   process persists in /dev/shm until unlinked; a leaked bench segment from an earlier session was
   seen and not deleted; `GROUP_CANCEL` does not wait for the RT retire, so a BEGIN right after a
   cancel can be refused REF_REVISION (the known CTRL-034 item 4a; the bench waits for the retire).
+
+Round-2 review (BLOCK) and fixes: a stale `REFERENCE_END` of the member's previous reference could set
+`group_done` (the DONE write was refused, but any non-CONTENDED result was treated as done), which turned
+peer enforcement off for every group that followed a normally finished reference (measured by the reviewer:
+peer killed, survivor still running 1 s later). `group_done` is now set only when the DONE write is
+WRITTEN. Bench `group_after_finished_reference`. Also: a replayed COMMIT reply is turned into REF_RETIRED if
+a cancel has happened since; `group_leave` abandons an in-flight group COMMIT and writes only over a live
+state (a concurrent FAULTED/DONE stays); the killed-mid-write recovery is now really simulated.
+
+The bench case for it found a second cause in the same place: the tick's per-group locals (`group_done`, `group_tripped`, ...) were reset only when the tick observed `group_active` false, but a group that ends and a new one that joins within one tick interval is never seen as inactive, so the previous group's `group_done` carried over. The locals are now reset whenever the group id changes.

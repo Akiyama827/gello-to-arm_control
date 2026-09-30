@@ -15,7 +15,8 @@
 // reused), with the writer's own session/arm epoch recorded. A reader that sees another group gets
 // PEER_UNKNOWN, never "healthy" and never "faulted".
 // The record mirrors the wire latch, not the fault journal (audit note): a member sets FAULTED when
-// its own latch is set and clears it exactly where the latch is cleared.
+// its own latch is set; FAULTED is sticky (no live-state write replaces it) and persists until the next
+// JOIN of that member overwrites the slot, scoped away meanwhile by the group id.
 #pragma once
 
 #include <fcntl.h>
@@ -187,6 +188,10 @@ class GroupSegment {
       if (r != CONTENDED) return r;
       std::atomic_signal_fence(std::memory_order_seq_cst);
     }
+  }
+  // Test seam only: leave a slot's sequence odd, as a writer killed mid-write does.
+  void test_leave_odd(uint32_t member) {
+    layout_->slots[member].seq.fetch_add(1, std::memory_order_release);
   }
   void clear_slot(uint32_t member) { write_slot(member, GS_NONE, 0, 0, 0); }
   // Process start only, when this server is the slot's sole writer: a predecessor killed inside a

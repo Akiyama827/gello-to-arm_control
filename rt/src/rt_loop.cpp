@@ -149,7 +149,7 @@ void rt_loop(ServerCtx& ctx) {
   uint64_t reference_seen=0, cancel_seen=0;
   // CTRL-040: servo-tick side of group execution (bounded reads/writes only, see group_record.hpp).
   bool group_stamp_pending=false, group_tripped=false, group_fault_mirrored=false, group_done=false;
-  uint64_t group_stamp_ns=0;
+  uint64_t group_stamp_ns=0, group_tick_id=0;
   const uint64_t group_max_age_ns=uint64_t(ctx.cfg.group_peer_max_age_ms*1e6);
   ArmMode mode;
   ModeSelectRequest mode_request{};
@@ -398,6 +398,12 @@ void rt_loop(ServerCtx& ctx) {
         const uint32_t me=uint32_t(ctx.cfg.group_member);
         const uint64_t gid=ctx.group_id.load(std::memory_order_relaxed);
         const uint64_t my_deadline=ctx.group_my_deadline.load(std::memory_order_relaxed);
+        if(gid!=group_tick_id) {
+          // A NEW group (ids are never reused): nothing of the previous group's tick state carries over,
+          // even if this tick never observed the gap between the two (group_active is level, not edge).
+          group_tick_id=gid;
+          group_tripped=false; group_fault_mirrored=false; group_stamp_pending=false; group_done=false;
+        }
         ctx.group.heartbeat(me,now);
         if(group_stamp_pending &&
            ctx.group.try_write_slot(me,GS_RUNNING,gid,session,uint32_t(gen),0,group_stamp_ns,my_deadline,
@@ -408,8 +414,8 @@ void rt_loop(ServerCtx& ctx) {
         if(!group_done && !group_tripped && ctx.group_committed.load(std::memory_order_acquire) &&
            reference.info().status==REFERENCE_END &&
            ctx.group.try_write_slot(me,GS_DONE,gid,session,uint32_t(gen),0,group_stamp_ns,my_deadline,
-                                    1u<<GS_RUNNING)!=GroupSegment::CONTENDED)
-          group_done=true;
+                                    1u<<GS_RUNNING)==GroupSegment::WRITTEN)
+          group_done=true;  // only WRITTEN: a REFUSED write means this END is a previous reference's
         // Mirrors the wire latch: sticky (nothing below overwrites FAULTED); it ends with the epoch.
         if(faulted && !group_fault_mirrored &&
            ctx.group.try_write_slot(me,GS_FAULTED,gid,session,uint32_t(gen),
