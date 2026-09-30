@@ -6,8 +6,10 @@ times. Separate RT hosts must not have their timestamps directly subtracted.
 
 from collections import deque
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
+import os
 
 import numpy as np
 
@@ -29,21 +31,87 @@ def _json_values(value):
     return value
 
 
+#: Capacity policy for persisted fault traces (CTRL-051): nothing is ever deleted automatically (a trace can be the only
+#: record of a real fault); when the directory holds more than ``RETAIN_FILES`` traces or ``RETAIN_BYTES`` bytes every save
+#: prints a visible warning, and the operator exports and prunes explicitly (``trace_export --prune``, dry-run by default).
+#: A trace is ~5 MB (500 samples). Adjustable defaults, not safety constants.
+RETAIN_FILES = 20
+RETAIN_BYTES = 256 * 2**20
+FAULT_DIR = ("dual_arm", "faults")
+
+
+def fault_root():
+    return CONTROL_ROOT.joinpath(".cache", *FAULT_DIR)
+
+
+def capacity_warning(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES):
+    """A message when the trace directory is over its capacity policy, else None. Never raises."""
+    try:
+        traces = [p for p in root.glob("*.json") if p.is_file()]
+        total = sum(p.stat().st_size for p in traces)
+    except OSError:
+        return None
+    if len(traces) > keep_files or total > keep_bytes:
+        return (f"{len(traces)} fault trace(s), {total / 2**20:.1f} MiB in {root} exceed the capacity policy "
+                f"({keep_files} files / {keep_bytes / 2**20:.0f} MiB): export and prune explicitly "
+                f"(python -m arm_control.multi_arm.trace_export --prune --yes); nothing is deleted automatically")
+    return None
+
+
+def prune_traces(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES, protect=None, dry_run=False):
+    """Remove the oldest ``*.json`` traces (and their ``.sha256`` sidecars) beyond the limits. Called only by an
+    explicit operator action. Never raises, never removes ``protect``; returns the names (that would be) removed.
+    Names begin with a UTC timestamp, so name order is age."""
+    removed = []
+    try:
+        traces = sorted(p for p in root.glob("*.json") if p.is_file())
+        sizes = {p: p.stat().st_size for p in traces}
+        total = sum(sizes.values())
+        for p in traces:
+            if len(traces) - len(removed) <= keep_files and total <= keep_bytes:
+                break
+            if protect is not None and p == protect:
+                continue
+            try:
+                if not dry_run:
+                    p.unlink()
+                    sidecar = p.with_name(p.name + ".sha256")
+                    if sidecar.exists():
+                        sidecar.unlink()
+                total -= sizes[p]
+                removed.append(p.name)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return removed
+
+
 class PairFaultTrace:
-    """Last 500 console ticks; no disk I/O or JSON encoding in record()."""
+    """Last 500 console ticks; no disk I/O or JSON encoding in record().
+
+    Overflow is explicit: the number of samples evicted from the bounded history is counted and written into the
+    persisted trace (``dropped_samples``), never silent. A trace is written atomically (temporary file, fsync, rename)
+    with a SHA-256 sidecar, so a full disk or a crash never leaves a partial file that looks complete, and old traces
+    are never removed by a save: exceeding the capacity policy prints a warning (``RETAIN_FILES`` / ``RETAIN_BYTES``).
+    """
 
     def __init__(self, session):
         self.session = session
         self.samples = deque(maxlen=500)
+        self.recorded = 0  # every sample ever recorded; recorded - len(samples) = evicted
 
     def record(self, sample):
         self.samples.append(sample)
+        self.recorded += 1
 
-    def save(self, reason, context, *, samples=None):
+    def save(self, reason, context, *, samples=None, root=None, recorded=None):
         now = datetime.now(timezone.utc)
-        root = CONTROL_ROOT / ".cache" / "dual_arm" / "faults"
+        root = fault_root() if root is None else root
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"{now:%Y%m%dT%H%M%S%fZ}-{self.session}.json"
+        kept = list(self.samples) if samples is None else samples
+        seen = self.recorded if recorded is None else recorded
         report = dict(
             schema="arm_control.dual_fault/v2",
             schema_version=2,
@@ -58,12 +126,33 @@ class PairFaultTrace:
                 "(rt_host string equality is the fallback for unattested servers); "
                 "publication timestamps do not establish synchronized robot measurements."
             ),
+            samples_kept=len(kept),
+            dropped_samples=max(0, seen - len(kept)),
+            retention=dict(keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES),
             context=context,
-            samples=list(self.samples) if samples is None else samples,
+            samples=kept,
         )
-        with path.open("x") as stream:
-            json.dump(_json_values(report), stream, allow_nan=False)
-            stream.write("\n")
+        payload = (json.dumps(_json_values(report), allow_nan=False) + "\n").encode()
+        digest = hashlib.sha256(payload).hexdigest()
+        partial = path.with_name(path.name + ".partial")
+        try:
+            with partial.open("xb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            sidecar = path.with_name(path.name + ".sha256")
+            sidecar.write_text(f"{digest}  {path.name}\n")
+            os.replace(partial, path)  # the trace appears whole or not at all
+        except BaseException:
+            for leftover in (partial, path.with_name(path.name + ".sha256")):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            raise
+        warning = capacity_warning(root)
+        if warning:
+            print(f"[fault trace] WARNING: {warning}", flush=True)
         return path
 
 
