@@ -431,12 +431,19 @@ class ReferenceHorizon:
         self._pending_since = time.monotonic()
         self._job = ('commit', self._worker.submit(commit))
 
+    def _record_drop(self, key, how):
+        """Remember how the RT's drop of ``key`` was confirmed. A proof is never downgraded
+        to 'unconfirmed'; the map is bounded (the runtime pops what it consumes)."""
+        if key is None or (how == 'unconfirmed' and self.dropped.get(key) not in (None, 'unconfirmed')):
+            return
+        self.dropped[key] = how
+        for stale in list(self.dropped)[:-16]:
+            del self.dropped[stale]
+
     def _note_drop(self, how):
         """A first-revision COMMIT that provably never selected: nothing to drop on the RT."""
-        if self._revision == 1 and self.key is not None:
-            self.dropped[self.key] = how
-            for stale in list(self.dropped)[:-16]:
-                del self.dropped[stale]
+        if self._revision == 1:
+            self._record_drop(self.key, how)
 
     def poll(self, state, received_at):
         """Once per PC control tick; takes one immutable feedback sample."""
@@ -478,9 +485,9 @@ class ReferenceHorizon:
                 self._cancel_job.result()
             except RtLinkError as exc:
                 self.error = str(exc)
-                self.dropped[self._cancel_key] = 'unconfirmed'
+                self._record_drop(self._cancel_key, 'unconfirmed')
             else:
-                self.dropped[self._cancel_key] = 'ack'
+                self._record_drop(self._cancel_key, 'ack')
                 # The one worker runs CANCEL after any COMMIT, so its ack settles
                 # a selection the PC never got to observe (RUNNING retired within
                 # ms of COMMIT). Without this the slot stays pending, busy blocks

@@ -96,7 +96,7 @@ class _Execution:
     first_seq: int | None = None
     epoch: int = 0
     cancel_reason: str | None = None
-    drop: tuple[str, int] | None = None  # (reason, RT reference id): cancel awaiting RT confirmation
+    drop: tuple | None = None  # (reason, RT reference id, session, ARM epoch): cancel awaiting RT confirmation
     completed_at: float | None = None  # feedback completion awaiting APPLIED
 
 
@@ -936,7 +936,7 @@ class RobotRuntime:
                     # The RT may hold this reference: CANCELLED means the drop was
                     # confirmed, so the receipt waits for the CANCEL/ABORT ack or for
                     # the RT itself to show the reference retired (_confirm_drops).
-                    ex.drop = (reason, h.id)
+                    ex.drop = (reason, h.id, h._session, h._epoch)
                 else:
                     self._receipt(ex, Phase.CANCELLED, reason)
                     self._settle_stream_attempts(ex, reason)
@@ -962,16 +962,22 @@ class RobotRuntime:
         for ex in list(self._executions.values()):
             if ex.drop is None or ex.status.terminal:
                 continue
-            reason, ref_id = ex.drop
+            reason, ref_id, session, epoch = ex.drop
             how = h.dropped.get(ex.status.execution_id) if h is not None else None
-            if how in ('unconfirmed', None):
-                ref = None if state is None else state.reference
-                if ref and ref['reference_id'] and (ref['reference_id'] > ref_id or (
+            if how in ('unconfirmed', None) and state is not None:
+                ref = state.reference
+                if state.session_id != session or state.arm_epoch != epoch:
+                    how = 'rt_epoch'  # every RT reference dies with its session/ARM epoch
+                elif not state.armed:
+                    how = 'rt_disarmed'  # a disarmed RT holds no reference
+                elif ref and ref['reference_id'] and (ref['reference_id'] > ref_id or (
                         ref['reference_id'] == ref_id
                         and ref['status'] not in (rtp.REFERENCE_RUNNING, rtp.REFERENCE_END))):
                     how = 'rt_observed'
                 else:
                     how = None
+            elif how == 'unconfirmed':
+                how = None
             if how is None:
                 continue
             ex.drop = None
@@ -1000,6 +1006,8 @@ class RobotRuntime:
                     self.now(), reason, evidence)
         ex.status = ex.status.apply(r)
         ex.receipts.append(r)
+        if phase.terminal:
+            ex.drop = None
         self._cv.notify_all()
 
     def _prune(self) -> None:

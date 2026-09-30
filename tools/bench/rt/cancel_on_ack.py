@@ -4,7 +4,9 @@ A stream whose reference the RT selected is cancelled while the CANCEL is refuse
 (a stand-in for a lost link) and the PC is not shown the RT's state. The execution
 must stay non-terminal, must not be reported CANCELLED however long it waits, and
 becomes CANCELLED (`drop_confirmed='rt_observed'`) only once the RT's own state shows
-the reference retired. A CANCEL that is acknowledged confirms it at once ('ack').
+the reference retired (its deadman, or the mode-change retire) or the ARM epoch/session
+has changed ('rt_epoch': every RT reference dies with it). A CANCEL that is acknowledged
+confirms it at once ('ack'). A proof is never downgraded to 'unconfirmed'.
 """
 from pathlib import Path
 import sys
@@ -83,6 +85,34 @@ def cases(arm, runtime, scene, service):
         except ReferenceRefused:
             pass  # already retired by the RT's deadman
         arm.select_control_preset('track')
+
+        # The refused CANCEL above left the PC silent past --fault-ms (CMD_LOST is
+        # latched): recover with DISARM/ARM, as an operator would.
+        arm.disarm()
+        arm.arm()
+        arm.select_control_preset('track')
+
+        # Refused CANCEL, no RT evidence, then a new ARM epoch: the old reference is gone
+        # with its epoch, so the drop is confirmed (it must not stay non-terminal forever).
+        eid = stream()
+        refuse.append(rtp.REF_BUSY)
+        blind.append(True)
+        arm.select_control_preset('float')
+        assert not arm.status(eid).terminal
+        arm.disarm()
+        arm.arm()
+        blind.clear()
+        until(lambda: arm.status(eid).phase is Phase.CANCELLED, 8)
+        assert evidence(eid) in ('rt_epoch', 'rt_disarmed'), evidence(eid)
+        arm.select_control_preset('track')
+
+        # A proof is not overwritten by a later failed cancel job.
+        h._record_drop('k', 'undispatched')
+        h._record_drop('k', 'unconfirmed')
+        assert h.dropped['k'] == 'undispatched'
+        h._record_drop(None, 'ack')
+        assert None not in h.dropped
+        h.dropped.pop('k')
     finally:
         link.cancel_reference, runtime._confirm_drops = real_cancel, confirm
     print('PASS: CANCELLED only on a confirmed drop: ACK, or the RT showing the reference retired; '
