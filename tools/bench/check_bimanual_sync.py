@@ -185,6 +185,23 @@ def check_feedback_alignment():
         assert exc.details["after_seq"] - exc.details["before_seq"] == 3
     else:
         raise AssertionError("operator's 20.525493 ms bracket was accepted")
+    # CTRL-041 clock domain: attested domains decide; the host string alone does not.
+    domain = ("mono", "a" * 12, "b" * 12)
+    for a in "ab":
+        links[a].clock_domain = domain
+    _, report = align_feedback(links, history(), now=20.01)
+    assert report["clock_domain"] == ":".join(domain)
+    links["b"].config.host = "another-name"  # same attested clock under another name: accepted
+    align_feedback(links, history(), now=20.01)
+    links["b"].clock_domain = ("mono", "a" * 12, "c" * 12)  # same host, rebooted: refused
+    refused(history(), "one RT clock domain")
+    links["b"].clock_domain = None  # attested on one arm only: refused
+    refused(history(), "one arm only")
+    links["b"].config.host = "same-host"
+    for a in "ab":
+        links[a].clock_domain = None  # both unattested: the host-string rule, labeled
+    _, report = align_feedback(links, history(), now=20.01)
+    assert report["clock_domain"] == "unattested"
     raw = history()
     raw["a"][-1][0].t_mono_ns += 30_000_000
     refused(raw, "publication skew")

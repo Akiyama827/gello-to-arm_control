@@ -91,6 +91,7 @@ C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 | `console_adapter.py` | regression | Console `control` messages (gain/Soft/payload) become SDK calls; named-preset parity, refusals reported, other fields forwarded. Not wired into any deployed graph (CTRL-053) |
 | `cancel_on_ack.py` | regression | A stream execution is CANCELLED only once the drop is confirmed (CANCEL/ABORT ack, COMMIT provably unsent, or the RT shows the reference retired); a refused CANCEL with no RT evidence stays non-terminal |
 | `lifecycle_states.py` | regression | Which signals distinguish armed-hold, executing, post-cancel hold reference, disarmed and re-armed for one arm (CTRL-021 transition input for CTRL-040) |
+| `clock_domain.py` | regression | HELLO `clk=mono:<host>:<boot>` (CTRL-041): keyed host+boot identity matches an independent HMAC, changes with boot id/host, absent when unreadable |
 | `envelope_age.py` | diagnostic | Timing collection helper |
 | `first_envelope_probe.py` | diagnostic | First-envelope collision investigation |
 | `first_envelope_trace.py` | diagnostic | Opt-in client timeline helper |

@@ -48,6 +48,15 @@ import numpy as np
 from arm_control.plants.remote_rt import protocol as rtp
 
 
+def parse_clock_domain(token: str) -> tuple[str, str, str] | None:
+    """``<host12>:<boot12>`` (lowercase hex) -> ('mono', host, boot); anything else, including a
+    token cut off by the HELLO size limit, is None (unattested), never a partial identity."""
+    parts = token.split(':')
+    if len(parts) == 2 and all(len(v) == 12 and all(c in '0123456789abcdef' for c in v) for v in parts):
+        return ('mono', *parts)
+    return None
+
+
 class RtLinkError(RuntimeError):
     """Server unreachable, refused, or speaking a different protocol."""
 
@@ -184,6 +193,9 @@ class RtBackend:
         self.joint_names = list(joint_names)
         self.n = len(joint_names)
         self.backend_name = ""
+        # HELLO clk=<host>:<boot> (CTRL-041): the RT host's keyed clock identity, or None
+        # (unattested: an older server, or one that could not read its host identity).
+        self.clock_domain: tuple[str, str, str] | None = None
         self._tcp: socket.socket | None = None
         self._udp: socket.socket | None = None
         self._rx_thread: threading.Thread | None = None
@@ -311,6 +323,7 @@ class RtBackend:
         self._active_mask = int(flags.get("active", str((1 << self.n) - 1)), 0)
         # Process-local RT setup: "ok" or the failed parts; older servers omit it.
         self.rt_setup = flags.get("rt", "unknown")
+        self.clock_domain = parse_clock_domain(flags.get("clk", ""))
         fault_ms = float(flags.get("fault_ms", 0) or 0)
         if self.config.max_fault_ms > 0 and fault_ms > self.config.max_fault_ms:
             raise RtLinkError(

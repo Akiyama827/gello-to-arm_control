@@ -97,6 +97,10 @@ struct ServerConfig {
   // deployment registry owns the per-instance fact and renders
   // --enable-reference; a bare launch keeps the streamed v5/v6 contract.
   bool enable_reference = false;
+  // Where the HELLO clock domain (CTRL-041) reads the host identity from. Flags exist so
+  // device-free checks can present two hosts, or one host across a reboot.
+  std::string machine_id_file = "/etc/machine-id";
+  std::string boot_id_file = "/proc/sys/kernel/random/boot_id";
   // Bind address for BOTH listeners. Default any: the box is dual-NIC (PC
   // direct link + robot LAN) and INADDR_ANY answers on the robot LAN too —
   // production units should pass --bind <direct-link-ip>.

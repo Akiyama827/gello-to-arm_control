@@ -20,6 +20,7 @@
 #include <optional>
 #include "reference_upload.hpp"
 
+#include "clock_domain.hpp"
 #include "server.hpp"
 
 namespace arm_rt {
@@ -150,14 +151,19 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   // extra key=value token, so existing clients ignore it.
   char hello[sizeof(ControlPacket{}.text)];
   char capability[24] = {};
+  char clock_domain[48] = {};  // " clk=<host12>:<boot12>" (CTRL-041), before rt= so a long rt= truncates first
   char rt_setup[48];
+  {
+    const std::string token = clock_domain_token(ctx.cfg.machine_id_file, ctx.cfg.boot_id_file);
+    if (!token.empty()) std::snprintf(clock_domain, sizeof(clock_domain), " %s", token.c_str());
+  }
   if (ctx.supports_pose_hold.load())
     std::snprintf(capability, sizeof(capability), " pose_hold=%u", POSE_HOLD_VERSION);
   rt_setup_names(ctx.rt_setup_failed.load(), rt_setup, sizeof(rt_setup));
   std::snprintf(hello, sizeof(hello),
-                "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s rt=%s",
+                "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s%s rt=%s",
                 ctx.backend_name, ctx.cfg.hold_ms, ctx.cfg.fault_ms,
-                ctx.active_mask.load(), capability, rt_setup);
+                ctx.active_mask.load(), capability, clock_domain, rt_setup);
   send_frame(fd, make(CTL_HELLO, uint32_t(ctx.backend_n.load()), hello));
   {
     ControlPacket idf = make(CTL_IDENTITY, uint32_t(ctx.backend_n.load()), nullptr);

@@ -62,6 +62,7 @@ void usage(const char* argv0) {
       "          [--dm-spec IF;ID:TYPE[:MST[:PMAX:VMAX:TMAX]],...] [--rt-priority N]\n"
       "          [--active-mask MASK] [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
       "          [--require-rt-setup] [--enable-reference]\n"
+      "          [--machine-id-file PATH] [--boot-id-file PATH]\n"
       "\n"
       "  --instance-id  provisioned arm instance id ([A-Za-z0-9_.-], <32 chars);\n"
       "             required for franka/dm. Commanders CLAIM it before ARM.\n"
@@ -142,6 +143,8 @@ int main(int argc, char** argv) {
       cfg.bind_addr = a.s_addr;
     }
     else if (!std::strcmp(argv[i], "--state-hz")) cfg.state_hz = std::atof(next("--state-hz"));
+    else if (!std::strcmp(argv[i], "--machine-id-file")) cfg.machine_id_file = next("--machine-id-file");
+    else if (!std::strcmp(argv[i], "--boot-id-file")) cfg.boot_id_file = next("--boot-id-file");
     else if (!std::strcmp(argv[i], "--hold-ms")) cfg.hold_ms = std::atof(next("--hold-ms"));
     else if (!std::strcmp(argv[i], "--fault-ms")) cfg.fault_ms = std::atof(next("--fault-ms"));
     else if (!std::strcmp(argv[i], "--slew")) cfg.slew = std::atof(next("--slew"));

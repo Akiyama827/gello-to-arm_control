@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 REGRESSIONS = (
     ("torque_cap", "torque_cap.py", "server"),
     ("check_two_instances", "check_two_instances.py", "server"),
+    ("clock_domain", "clock_domain.py", "server"),
     ("reference_numerics", "reference_numerics.py", "probe"),
     ("reference_protocol", "reference_protocol.py", "reference_protocol_selfcheck"),
     ("mode_select", "mode_select.py", "mode_select_selfcheck"),
