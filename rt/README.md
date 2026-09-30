@@ -88,6 +88,7 @@ C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 | `pending_commit_cancel.py` | regression | Cancel racing a pending stream COMMIT frees the slot (forced orderings) |
 | `selection_unresolved.py` | regression | A stuck pending selection is reported after 250 ms (receipt, CANCEL, hold); the control run starves to CMD_LOST |
 | `selection_expiry_precedence.py` | regression | A stall after COMMIT ends FAULTED `REFERENCE_EXPIRED`, not unresolved; no implicit hold |
+| `selection_unresolved_cancel.py` | regression | An unobserved pending selection is freed by the 250 ms rule even with a refused CANCEL, and a slow-acked operator cancel keeps its reason until the RT confirms the drop |
 | `console_adapter.py` | regression | Console `control` messages (gain/Soft/payload) become SDK calls; named-preset parity, refusals reported, other fields forwarded. Not wired into any deployed graph (CTRL-053) |
 | `cancel_on_ack.py` | regression | A stream execution is CANCELLED only once the drop is confirmed (CANCEL/ABORT ack, COMMIT provably unsent, or the RT shows the reference retired); a refused CANCEL with no RT evidence stays non-terminal |
 | `lifecycle_states.py` | regression | Which signals distinguish armed-hold, executing, post-cancel hold reference, disarmed and re-armed for one arm (CTRL-021 transition input for CTRL-040) |
