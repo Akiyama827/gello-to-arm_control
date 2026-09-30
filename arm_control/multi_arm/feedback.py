@@ -25,7 +25,16 @@ def align_feedback(links, histories, *, now, max_age_s=.05, max_interval_s=.02):
     """
     if len(links) != 2 or set(links) != set(histories):
         raise ValueError("paired feedback requires both arms")
-    if len({link.config.host for link in links.values()}) != 1:
+    # CTRL-041: an attested clock domain (host + boot identity from the RT HELLO) is the
+    # proof of one CLOCK_MONOTONIC; a host string only names where we connected. Cross-host
+    # mapping is not attempted: different or half-attested domains are refused.
+    domains = {a: getattr(link, "clock_domain", None) for a, link in links.items()}
+    if any(d is not None for d in domains.values()):
+        if any(d is None for d in domains.values()):
+            raise ValueError("paired feedback: RT clock domain is attested on one arm only")
+        if len(set(domains.values())) != 1:
+            raise ValueError("paired feedback requires one RT clock domain (host and boot)")
+    elif len({link.config.host for link in links.values()}) != 1:
         raise ValueError("paired feedback requires one RT host clock")
 
     def epoch(state):
@@ -104,6 +113,8 @@ def align_feedback(links, histories, *, now, max_age_s=.05, max_interval_s=.02):
         )
     return positions, dict(
         rt_host=next(iter(links.values())).config.host,
+        clock_domain=("unattested" if domains[next(iter(domains))] is None
+                      else ":".join(domains[next(iter(domains))])),
         t_mono_ns=target, latest_skew_s=(max(stamps) - target) * 1e-9,
         brackets=brackets,
     )

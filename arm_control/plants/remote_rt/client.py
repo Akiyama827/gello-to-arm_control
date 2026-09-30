@@ -184,6 +184,9 @@ class RtBackend:
         self.joint_names = list(joint_names)
         self.n = len(joint_names)
         self.backend_name = ""
+        # HELLO clk=mono:<host>:<boot> (CTRL-041): the RT host's keyed clock identity, or None
+        # (unattested: an older server, or one that could not read its host identity).
+        self.clock_domain: tuple[str, str, str] | None = None
         self._tcp: socket.socket | None = None
         self._udp: socket.socket | None = None
         self._rx_thread: threading.Thread | None = None
@@ -311,6 +314,10 @@ class RtBackend:
         self._active_mask = int(flags.get("active", str((1 << self.n) - 1)), 0)
         # Process-local RT setup: "ok" or the failed parts; older servers omit it.
         self.rt_setup = flags.get("rt", "unknown")
+        clk = flags.get("clk", "").split(":")
+        self.clock_domain = (tuple(clk) if len(clk) == 3 and clk[0] == "mono"
+                             and all(len(v) == 12 and all(c in "0123456789abcdef" for c in v)
+                                     for v in clk[1:]) else None)
         fault_ms = float(flags.get("fault_ms", 0) or 0)
         if self.config.max_fault_ms > 0 and fault_ms > self.config.max_fault_ms:
             raise RtLinkError(
