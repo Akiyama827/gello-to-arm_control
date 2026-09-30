@@ -62,9 +62,10 @@ class RtLinkError(RuntimeError):
 
 
 class ReferenceRefused(RtLinkError):
-    def __init__(self, operation: int, result: int):
+    def __init__(self, operation: int, result: int, reply: dict | None = None):
         super().__init__(f"reference operation {operation} refused: {result}")
         self.operation, self.result = operation, result
+        self.reply = reply or {}  # a group reply also carries the peer verdict and group state
 
 
 class ReferenceCancelledBeforeDispatch(RtLinkError):
@@ -196,6 +197,10 @@ class RtBackend:
         # HELLO clk=<host>:<boot> (CTRL-041): the RT host's keyed clock identity, or None
         # (unattested: an older server, or one that could not read its host identity).
         self.clock_domain: tuple[str, str, str] | None = None
+        # CTRL-040: the server was started with a group record (HELLO g=1); events are the server's
+        # unsolicited CTL_GROUP_STATUS reports (a peer fault/cancel/loss retired this member).
+        self.group_capable = False
+        self.group_events: deque = deque(maxlen=16)
         self._tcp: socket.socket | None = None
         self._udp: socket.socket | None = None
         self._rx_thread: threading.Thread | None = None
@@ -324,6 +329,7 @@ class RtBackend:
         # Process-local RT setup: "ok" or the failed parts; older servers omit it.
         self.rt_setup = flags.get("rt", "unknown")
         self.clock_domain = parse_clock_domain(flags.get("clk", ""))
+        self.group_capable = flags.get("g") == "1"
         fault_ms = float(flags.get("fault_ms", 0) or 0)
         if self.config.max_fault_ms > 0 and fault_ms > self.config.max_fault_ms:
             raise RtLinkError(
@@ -639,7 +645,7 @@ class RtBackend:
                     if _trace is not None:
                         _trace('commit_reply', time.monotonic(), reply['result'])
                     if reply['operation'] != operation or reply['result'] != rtp.REF_OK:
-                        raise ReferenceRefused(operation, reply["result"])
+                        raise ReferenceRefused(operation, reply["result"], reply)
                     return reply
             raise RtLinkError("no reference acknowledgement after exact retry")
         finally:
@@ -724,6 +730,44 @@ class RtBackend:
                 reference_id=reference_id, arm_epoch=arm_epoch, revision=revision,
                 expected_revision=expected_revision, protected_until=protected_until,
                 latest_phase=latest_phase, selection_budget_ns=selection_budget_ns)
+
+    # -- CTRL-040 group execution ------------------------------------------------------------
+    def group_join(self, group_id: int, member_index: int, member_count: int, *,
+                   session_id: int | None = None, arm_epoch: int | None = None) -> dict:
+        """Bind this member to ``group_id``. The reply carries the member's group state."""
+        if not self.group_capable:
+            raise RtLinkError("server was not started with a group record")
+        session_id, arm_epoch = self._reference_scope(session_id, arm_epoch)
+        with self._upload_lock:
+            self._upload_cancel.clear()  # a fresh group starts a fresh upload sequence
+            return self._reference_exchange(
+                rtp.CTL_GROUP_JOIN, _scope=(session_id, arm_epoch), session_id=session_id,
+                group_id=group_id, arm_epoch=arm_epoch, member_index=member_index,
+                member_count=member_count)
+
+    def group_commit(self, upload_id: int, *, reference_id: int, group_id: int, member_index: int,
+                     budget_ns: int, session_id: int | None = None,
+                     arm_epoch: int | None = None) -> dict:
+        """COMMIT for a group. Returns when this member's reference is SELECTED (reply
+        ``selected_ns``, ``deadline_ns`` on the RT host clock); refused with the peer verdict if a
+        peer is bad, the group deadline passed, or the group was cancelled while waiting."""
+        session_id, arm_epoch = self._reference_scope(session_id, arm_epoch)
+        with self._upload_lock:
+            return self._reference_exchange(
+                rtp.CTL_GROUP_COMMIT, _scope=(session_id, arm_epoch), session_id=session_id,
+                group_id=group_id, upload_id=upload_id, reference_id=reference_id,
+                budget_ns=budget_ns, arm_epoch=arm_epoch, member_index=member_index)
+
+    def group_cancel(self, group_id: int, member_index: int, member_count: int, *,
+                     session_id: int | None = None, arm_epoch: int | None = None) -> dict:
+        session_id, arm_epoch = self._reference_scope(session_id, arm_epoch)
+        self._upload_cancel.set()  # interrupt an upload/COMMIT wait of this member first
+        with self._upload_lock:
+            self._upload_cancel.clear()
+            return self._reference_exchange(
+                rtp.CTL_GROUP_CANCEL, _scope=(session_id, arm_epoch), session_id=session_id,
+                group_id=group_id, arm_epoch=arm_epoch, member_index=member_index,
+                member_count=member_count)
 
     def cancel_reference(self, reference_id: int, revision: int, *,
                          session_id: int | None = None, arm_epoch: int | None = None) -> None:
@@ -906,11 +950,14 @@ class RtBackend:
                 except ValueError:
                     pass
                 else:
-                    if op == rtp.CTL_REFERENCE_STATUS:
+                    if op == rtp.CTL_REFERENCE_STATUS or (
+                            op == rtp.CTL_GROUP_STATUS and reply['operation']):
                         with self._reference_cv:
                             if seq == self._reference_wait_seq:
                                 self._reference_reply = reply
                                 self._reference_cv.notify_all()
+                    elif op == rtp.CTL_GROUP_STATUS:
+                        self.group_events.append(dict(reply, received_at=time.monotonic()))
                     continue
             try:
                 msg = rtp.unpack_control(frame)

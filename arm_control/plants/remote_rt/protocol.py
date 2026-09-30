@@ -406,12 +406,20 @@ CTL_REFERENCE_COMMIT = 35
 CTL_REFERENCE_ABORT = 36
 CTL_CANCEL_REFERENCE = 37
 CTL_REFERENCE_STATUS = 38
+CTL_GROUP_JOIN = 39
+CTL_GROUP_COMMIT = 40
+CTL_GROUP_CANCEL = 41
+CTL_GROUP_STATUS = 42
 REFERENCE_HERMITE = 1
 REFERENCE_TERMINAL = 2
 REFERENCE_NONE, REFERENCE_RUNNING, REFERENCE_END = 0, 1, 2
 REFERENCE_UNDERFLOW, REFERENCE_CANCELLED = 3, 4
 REF_OK, REF_MALFORMED, REF_IDENTITY, REF_BUSY, REF_REVISION = range(5)
 REF_INTEGRITY, REF_PREFIX, REF_LATE, REF_RETIRED, REF_NOT_ADMITTED = range(5, 10)
+REF_GROUP_REFUSED, REF_GROUP_PEER = 10, 11
+# CTRL-040 group states / peer verdicts (rt/include/arm_rt/group_record.hpp)
+GS_NONE, GS_STAGED, GS_READY, GS_COMMITTED, GS_RUNNING, GS_FAULTED, GS_CANCELLED = range(7)
+PEER_OK, PEER_UNKNOWN, PEER_FAULTED, PEER_CANCELLED, PEER_STALE = range(5)
 
 # Names, exact little-endian field layout, trailing reserved bytes. No padding
 # is implicit; decoders check it rather than treating it as future extension.
@@ -431,6 +439,16 @@ _REFERENCE_LAYOUTS = {
     CTL_CANCEL_REFERENCE: ('session_id id arm_epoch revision', '<QQII', 80),
     CTL_REFERENCE_STATUS: (
         'upload_id reference_id revision result operation reserved0', '<QQIIII', 72),
+    CTL_GROUP_JOIN: (
+        'session_id group_id arm_epoch member_index member_count reserved0', '<QQIIII', 72),
+    CTL_GROUP_CANCEL: (
+        'session_id group_id arm_epoch member_index member_count reserved0', '<QQIIII', 72),
+    CTL_GROUP_COMMIT: (
+        'session_id group_id upload_id reference_id budget_ns arm_epoch member_index',
+        '<QQQQQII', 56),
+    CTL_GROUP_STATUS: (
+        'group_id deadline_ns selected_ns result operation state peer_verdict reserved0',
+        '<QQQIIIII', 60),
 }
 _REFERENCE_CMD_FMT = '<IHHIIQQQIIdII48d'
 _REFERENCE_STATE_TAIL_FMT = '<QIIddII48d'
@@ -474,6 +492,19 @@ def _validate_reference_body(op: int, p: dict) -> None:
     elif op in (CTL_REFERENCE_ABORT, CTL_CANCEL_REFERENCE):
         require(p['session_id'] and p['id'] and p['arm_epoch'])
         require(p['revision'] == 0 if op == CTL_REFERENCE_ABORT else p['revision'] > 0)
+    elif op in (CTL_GROUP_JOIN, CTL_GROUP_CANCEL):
+        require(all(p[k] for k in ('session_id', 'group_id', 'arm_epoch')))
+        require(2 <= p['member_count'] <= 4 and p['member_index'] < p['member_count'])
+        require(not p['reserved0'])
+    elif op == CTL_GROUP_COMMIT:
+        require(all(p[k] for k in ('session_id', 'group_id', 'upload_id', 'reference_id',
+                                   'arm_epoch', 'budget_ns')))
+        require(p['member_index'] < 4)
+    elif op == CTL_GROUP_STATUS:
+        require(p['group_id'] and REF_OK <= p['result'] <= REF_GROUP_PEER)
+        require(p['operation'] == 0 or CTL_GROUP_JOIN <= p['operation'] <= CTL_GROUP_CANCEL)
+        require(p['state'] <= GS_CANCELLED and p['peer_verdict'] <= PEER_STALE)
+        require(not p['reserved0'])
     elif op == CTL_REFERENCE_STATUS:
         require(REF_OK <= p['result'] <= REF_NOT_ADMITTED and not p['reserved0'])
         require(CTL_REFERENCE_BEGIN <= p['operation'] <= CTL_CANCEL_REFERENCE)

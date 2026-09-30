@@ -38,6 +38,7 @@
 #include "arm_rt/backend.hpp"
 #include "arm_rt/protocol.hpp"
 #include "arm_rt/mailbox.hpp"
+#include "arm_rt/group_record.hpp"
 #include "arm_rt/reference_selection.hpp"
 #include "arm_rt/mode_selection.hpp"
 
@@ -97,6 +98,14 @@ struct ServerConfig {
   // deployment registry owns the per-instance fact and renders
   // --enable-reference; a bare launch keeps the streamed v5/v6 contract.
   bool enable_reference = false;
+  // CTRL-040 group execution. OFF unless ALL of these are given: there are deliberately no
+  // default timing values (the operator approves them). `group_shm` names the POSIX segment
+  // both servers of the host open; member/members identify this server's slot.
+  std::string group_shm;
+  int group_member = -1;
+  uint32_t group_members = 0;
+  double group_peer_max_age_ms = 0;  // peer heartbeat older than this = peer lost
+  double group_min_lead_ms = 0;      // a group commit with less time left is refused
   // Where the HELLO clock domain (CTRL-041) reads the host identity from. Flags exist so
   // device-free checks can present two hosts, or one host across a reboot.
   std::string machine_id_file = "/etc/machine-id";
@@ -437,6 +446,17 @@ struct ServerCtx {
   std::atomic<uint64_t> reference_published{0}, reference_done{0};
   std::atomic<uint32_t> reference_result{REF_NOT_ADMITTED};
   std::atomic<uint64_t> reference_cancel_generation{0};
+  // CTRL-040 group execution. `group` is opened (mapped, prefaulted) before any thread starts.
+  // The control thread publishes the group binding; the servo tick heartbeats, mirrors the
+  // latch, stamps the selection and enforces the peer rules using only the bounded reads in
+  // group_record.hpp. `group_event` is the tick's report to the control thread (verdict + 1).
+  GroupSegment group;
+  std::atomic<bool> group_enabled{false};
+  std::atomic<bool> group_active{false};     // JOINed: the tick heartbeats
+  std::atomic<bool> group_committed{false};  // COMMIT accepted: the tick enforces peers
+  std::atomic<uint64_t> group_id{0}, group_session{0};
+  std::atomic<uint32_t> group_epoch{0};
+  std::atomic<uint32_t> group_event{0};
   // Armed-only mode selection (CAP_MODE_SELECT). The control thread publishes a
   // request at ACCEPTANCE (that is the fence); the RT loop confirms, refuses or
   // reports the ordering error. `mode_generation` is the CONFIRMED generation,

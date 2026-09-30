@@ -140,6 +140,10 @@ add_executable(clock_domain_selfcheck src/clock_domain_selfcheck.cpp)
 target_include_directories(clock_domain_selfcheck PRIVATE include)
 target_link_libraries(clock_domain_selfcheck PRIVATE OpenSSL::Crypto)
 target_compile_options(clock_domain_selfcheck PRIVATE -UNDEBUG)
+add_executable(group_record_selfcheck src/group_record_selfcheck.cpp)
+target_include_directories(group_record_selfcheck PRIVATE include)
+target_link_libraries(group_record_selfcheck PRIVATE Threads::Threads)
+target_compile_options(group_record_selfcheck PRIVATE -UNDEBUG)
 add_executable(reference_upload_selfcheck src/reference_upload_selfcheck.cpp)
 target_include_directories(reference_upload_selfcheck PRIVATE include)
 target_link_libraries(reference_upload_selfcheck PRIVATE OpenSSL::Crypto)
@@ -184,7 +188,7 @@ if(BUILD_TESTING)
       torque_cap_selfcheck dm_command_selfcheck franka_backend_selfcheck
       fault_journal_selfcheck gap_diagnostic_selfcheck ipc_selfcheck
       dm_backend_selfcheck reference_protocol_selfcheck reference_upload_selfcheck
-      reference_selection_selfcheck clock_domain_selfcheck
+      reference_selection_selfcheck clock_domain_selfcheck group_record_selfcheck
       mode_select_selfcheck mode_select_session_selfcheck
       stale_envelope_scope_selfcheck
       controller_selfcheck)

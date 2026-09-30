@@ -63,6 +63,16 @@ int main(int argc,char**) {
   ReferenceReplyPayload r{}; r.upload_id=2; r.reference_id=3; r.revision=6;
   r.result=REF_PREFIX; r.operation=CTL_REFERENCE_COMMIT;
   control("REPLY",CTL_REFERENCE_STATUS,r);
+  GroupMemberPayload gm{}; gm.session_id=123; gm.group_id=77; gm.arm_epoch=4;
+  gm.member_index=1; gm.member_count=2;
+  control("GJOIN",CTL_GROUP_JOIN,gm);
+  control("GCANCEL",CTL_GROUP_CANCEL,gm);
+  GroupCommitPayload gc{}; gc.session_id=123; gc.group_id=77; gc.upload_id=2; gc.reference_id=3;
+  gc.budget_ns=250000000; gc.arm_epoch=4; gc.member_index=1;
+  control("GCOMMIT",CTL_GROUP_COMMIT,gc);
+  GroupStatusPayload gs{}; gs.group_id=77; gs.deadline_ns=5000000000ull; gs.selected_ns=4999000000ull;
+  gs.result=REF_GROUP_PEER; gs.operation=CTL_GROUP_COMMIT; gs.state=6; gs.peer_verdict=2;
+  control("GSTATUS",CTL_GROUP_STATUS,gs);
   ReferenceCommandPacket d{}; d.magic=MAGIC_CMD; d.version=REFERENCE_VERSION;
   d.n=7; d.seq=42; d.arm_epoch=4; d.t_mono_ns=123456789; d.session_id=123;
   d.reference_id=3; d.revision=6; d.age_us=100; d.phase=1.25;
