@@ -88,3 +88,32 @@ state (a concurrent FAULTED/DONE stays); the killed-mid-write recovery is now re
 The bench case for it found a second cause in the same place: the tick's per-group locals (`group_done`, `group_tripped`, ...) were reset only when the tick observed `group_active` false, but a group that ends and a new one that joins within one tick interval is never seen as inactive, so the previous group's `group_done` carried over. The locals are now reset whenever the group id changes.
 
 Round-3 note (ACCEPT): if the ARM epoch is lost after a group COMMIT was released but before the RT selected it, the abandoned COMMIT gets no reply; the PC client falls back on its own session/epoch check or its retry (REF_IDENTITY), so a waiter can stall up to one ack timeout (2 s).
+
+## PC driver and approved constants (2026-10-01)
+Constants approved for offline use and as the coordinator's defaults: `PEER_MAX_AGE` 30 ms, `MIN_LEAD` 10 ms
+(server flags), `BUDGET` 150 ms, `H` 350 ms (PC). No unit file may pass `--group-*` until (a) a real FR3-host servo
+tick-gap measurement in an operator hardware session and (b) the CTRL-042 decision on holding the survivor.
+`arm_control/multi_arm/group.py` (`GroupCoordinator`, `GroupStartRecord`, `GroupStartError`): JOIN every member, upload,
+COMMIT all at once with one budget; the start record's skew is built from the RT selection stamps (RT host clock) and the
+PC send skew is a separate, labelled number; refuses (before any RT contact) fewer than two members, members without a
+group record, members on different or half-attested RT clock domains, references shorter than H. Not wired into
+`RemoteHardware`, the supervisor or the console (they run the streamed / per-arm supervisor paths); a group-aware
+supervisor or SDK extension would change the execution contract and is a separate, unapproved decision (CTRL-053).
+Bench `group_coordinator.py` runs the servers with the approved flags. Measured (fake servers): RT selection skew
+0.4-1.6 ms; a killed peer is enforced on the survivor's state stream after 33-36 ms and reported to its client after
+30.6 ms. The first version of the bench measured the REPORT at ~100 ms: the control thread polled at 100 ms when idle;
+it now polls at 1 ms while joined to a group (enforcement in the tick was always ~31 ms). Not measured: the FR3 host.
+
+Round-1 review of the driver (BLOCK, fixed): cleanup ran only on an `RtLinkError`, so any other exception (a reference the RT
+refuses at upload, an error while building the record) left members joined (a later group refused at JOIN) or running (reproduced:
+both references running 0.3 s later); `start()` now cancels the group on ANY exception and validates knot/joint counts before any RT
+contact. `GroupStartError.members` now lists every member's outcome, including a member that was selected before a peer failed. A
+started group stays joined until `cancel(group_id)` (a DONE member just leaves): documented in the module docstring. The docstring's
+"provably one clock domain" is corrected (an all-unattested group is accepted and labelled; the shared record already confines a group
+to one host). The bench's report-latency threshold is tightened to 60 ms (the old 100 ms bound did not reliably fail on the pre-change
+100 ms idle control poll: 1 in 3 on the old binary), and a failure-path case was added.
+
+Round 2 of the driver review (ACCEPT): `cancel()` now catches any exception per member (a failing member cannot stop the others) and
+`start()` attaches `cancel_errors` to the exception it re-raises when a member's cancel failed (the caller can tell that a member may
+still be joined); a bench case injects an exception AFTER a member was selected and checks that both end stopped and free. A start right
+after such a cancel can still be refused by BEGIN (the known CTRL-034 item 4a) until the RT has retired the old reference: the bench waits.
