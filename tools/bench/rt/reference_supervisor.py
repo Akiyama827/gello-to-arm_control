@@ -205,7 +205,7 @@ def main(binary, remote=None):
             ex = runtime.submit("test", req)
             until(lambda: Phase.APPLIED in runtime.status(ex.execution_id).reached)
             runtime.cancel("test", ex.execution_id)
-            assert runtime.status(ex.execution_id).phase is Phase.CANCELLED
+            until(lambda: runtime.status(ex.execution_id).phase is Phase.CANCELLED)  # on the drop's confirmation
             time.sleep(0.3)
             assert runtime.authority().lifecycle is Lifecycle.ARMED, runtime.authority()
             state, _ = runtime.link.latest_state()
@@ -291,7 +291,7 @@ def main(binary, remote=None):
             runtime.link._reference_exchange = exchange
             time.sleep(0.1)
             state, _ = runtime.link.latest_state()
-            assert runtime.status(ex.execution_id).phase is Phase.CANCELLED
+            until(lambda: runtime.status(ex.execution_id).phase is Phase.CANCELLED)  # on the drop's confirmation
             # Cancelling this unselected upload ABORTs only that candidate. The
             # previous terminal endpoint stays selected: an END reference is
             # stationary, so decision (a) never retires it (retirement on
@@ -544,7 +544,7 @@ def main(binary, remote=None):
             runtime.close_session("test")
             until(lambda: runtime.status(ex.execution_id).terminal)
             time.sleep(0.2)
-            assert runtime.status(ex.execution_id).phase is Phase.CANCELLED
+            until(lambda: runtime.status(ex.execution_id).phase is Phase.CANCELLED)  # on the drop's confirmation
             assert runtime.authority().lifecycle is Lifecycle.ARMED, runtime.authority()
             print(
                 "PASS deadline in-flight refusal, supersession race, underflow/new-admission recovery, old-epoch rejection, owner loss"

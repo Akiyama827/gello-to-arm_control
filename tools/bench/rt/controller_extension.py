@@ -67,7 +67,7 @@ def cases(arm, runtime, scene, service):
     refusal(lambda: arm.select_control_preset('soft'))  # running, invalid Soft costs nothing
     assert not arm.status(running.execution_id).terminal
     arm.select_control_preset('float')
-    assert arm.status(running.execution_id).phase is Phase.CANCELLED
+    until(lambda: arm.status(running.execution_id).phase is Phase.CANCELLED)  # on the RT's confirmation
     before_soft = arm.controller_state()
     refusal(lambda: arm.select_control_preset('soft'))
     assert arm.controller_state() == before_soft
