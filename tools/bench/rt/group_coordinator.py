@@ -133,9 +133,30 @@ def failure_paths_leave_nothing_joined(binary, tmp):
         # Nothing stayed joined: a NEW group starts at once, and its outcome lists every member.
         record = c.start(9, {"arm0": curve(1.0), "arm1": curve(1.0)}, {"arm0": 2, "arm1": 2})  # ids never reused
         assert record.deadline_agreed
-        # An unexpected exception while collecting the result: both members retired, none left running.
         c.cancel(9)
         wait_for(lambda: not running(a) and not running(b))
+        # An unexpected exception AFTER a member was selected (a proxy performs the real group COMMIT for
+        # arm0, so it is running, then raises): both members end stopped and free for a new group.
+        real_commit = a.link.group_commit
+
+        def commit_then_boom(*args, **kwargs):
+            real_commit(*args, **kwargs)
+            raise KeyError('after selection')
+        a.link.group_commit = commit_then_boom
+        try:
+            c.start(10, {"arm0": curve(2.0), "arm1": curve(2.0)}, {"arm0": 3, "arm1": 3})
+        except (KeyError, GroupStartError):
+            pass
+        else:
+            raise AssertionError("the injected error vanished")
+        a.link.group_commit = real_commit
+        # Nothing runs any more; give the RT a moment to finish retiring (a start right after a cancel can be
+        # refused by BEGIN while the RT still holds the old reference: the known CTRL-034 item 4a).
+        wait_for(lambda: not running(a) and not running(b))
+        time.sleep(.3)
+        record = c.start(11, {"arm0": curve(1.0), "arm1": curve(1.0)}, {"arm0": 4, "arm1": 4})
+        assert record.deadline_agreed
+        c.cancel(11)
 
 
 def short_reference_and_clock_domains(binary, tmp):

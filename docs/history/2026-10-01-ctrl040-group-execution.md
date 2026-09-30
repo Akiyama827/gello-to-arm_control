@@ -112,3 +112,8 @@ started group stays joined until `cancel(group_id)` (a DONE member just leaves):
 "provably one clock domain" is corrected (an all-unattested group is accepted and labelled; the shared record already confines a group
 to one host). The bench's report-latency threshold is tightened to 60 ms (the old 100 ms bound did not reliably fail on the pre-change
 100 ms idle control poll: 1 in 3 on the old binary), and a failure-path case was added.
+
+Round 2 of the driver review (ACCEPT): `cancel()` now catches any exception per member (a failing member cannot stop the others) and
+`start()` attaches `cancel_errors` to the exception it re-raises when a member's cancel failed (the caller can tell that a member may
+still be joined); a bench case injects an exception AFTER a member was selected and checks that both end stopped and free. A start right
+after such a cancel can still be refused by BEGIN (the known CTRL-034 item 4a) until the RT has retired the old reference: the bench waits.

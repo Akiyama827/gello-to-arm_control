@@ -146,9 +146,11 @@ class GroupCoordinator:
         count = len(self.names)
         try:
             return self._start(group_id, trajectories, reference_ids, domain, count)
-        except BaseException:
+        except BaseException as original:
             # Whatever went wrong (not only a link error), no member is left joined or running.
-            self.cancel(group_id)
+            errors = self.cancel(group_id)
+            if errors:  # the caller must be able to tell that a member may still be joined
+                original.cancel_errors = errors
             raise
 
     def _start(self, group_id, trajectories, reference_ids, domain, count) -> GroupStartRecord:
@@ -201,8 +203,8 @@ class GroupCoordinator:
         for index, name in enumerate(self.names):
             try:
                 self.links[name].group_cancel(group_id, index, count)
-            except RtLinkError as exc:
-                errors[name] = str(exc)
+            except Exception as exc:  # noqa: BLE001 - a failing member must not stop the others
+                errors[name] = f"{type(exc).__name__}: {exc}"
         return errors
 
     def events(self) -> dict:
