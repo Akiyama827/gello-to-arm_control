@@ -1109,11 +1109,16 @@ class RobotRuntime:
         ex = self._executions.get(h.key)
         if ex is not None and ex.stream is not None and not ex.status.terminal:
             s = ex.stream
-            attempt = self._stream_attempts.get((s.owner, s.pending))
-            if attempt is not None:  # selection_state stays PENDING: structurally uncertain
-                attempt.status = replace(attempt.status, phase=Phase.FAULTED, at=self.now(),
-                                         reason=reason)
-            failure = Phase.REJECTED if ex.status.phase is Phase.ADMITTED else Phase.FAULTED
+            # REJECTED means "never moved"; the RT may have selected this candidate, so an
+            # ADMITTED execution is CANCELLED (dropped; holds if it had been selected),
+            # and one already SELECTED is FAULTED. The reason carries the cause.
+            failure = Phase.CANCELLED if ex.status.phase is Phase.ADMITTED else Phase.FAULTED
+            for rid in (s.selected, s.pending):
+                attempt = self._stream_attempts.get((s.owner, rid)) if rid is not None else None
+                if attempt is not None and not attempt.status.phase.terminal:
+                    # selection_state stays as is: structurally uncertain, never claimed refused
+                    phase = failure if attempt.status.request_id == s.selected else Phase.CANCELLED
+                    attempt.status = replace(attempt.status, phase=phase, at=self.now(), reason=reason)
             self._receipt(ex, failure, reason, reference_id=h.id, reference_revision=h.revision)
             s.pending = s.anchor = None
             self._native_pending = None

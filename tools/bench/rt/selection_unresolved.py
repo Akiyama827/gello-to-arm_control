@@ -58,7 +58,7 @@ def cases(arm, runtime, scene, service):
     until(lambda: arm.status(eid).terminal, 5)
     took = time.monotonic() - started
     status = arm.status(eid)
-    assert status.phase is Phase.REJECTED and 'selection unresolved' in status.reason, status
+    assert status.phase is Phase.CANCELLED and 'selection unresolved' in status.reason, status
     assert time.monotonic() - h._pending_since >= reference.SELECTION_UNRESOLVED_S
     assert took < 3., took  # reported by ~250 ms plus polling, not left to CMD_LOST
     assert {'pending', 'unresolved'} <= seen, seen  # the slot was reported, not left pending

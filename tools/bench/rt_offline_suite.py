@@ -34,6 +34,7 @@ REGRESSIONS = (
     ("controller_extension", "controller_extension.py", "reference_runtime_selfcheck"),
     ("pending_commit_cancel", "pending_commit_cancel.py", "reference_runtime_selfcheck"),
     ("selection_unresolved", "selection_unresolved.py", "reference_runtime_selfcheck"),
+    ("selection_expiry_precedence", "selection_expiry_precedence.py", "reference_runtime_selfcheck"),
 )
 
 

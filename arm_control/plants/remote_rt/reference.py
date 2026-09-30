@@ -513,7 +513,10 @@ class ReferenceHorizon:
             # reaches here — and do NOT plan a continuation implicitly.
             self.error = 'REFERENCE_EXPIRED'
             self.dump_diagnostics('REFERENCE_EXPIRED')
-        if (self.stream and self.candidate_selection == 'pending' and self._pending_since is not None
+        # Evidence recorded in this same poll wins: an expired reference is reported
+        # as REFERENCE_EXPIRED (never healed by an implicit hold), not as unresolved.
+        if (self.stream and self.candidate_selection == 'pending' and not self.error
+                and self._pending_since is not None
                 and time.monotonic() - self._pending_since > SELECTION_UNRESOLVED_S):
             # The slot leaves 'pending' here, so it can never again suppress commands.
             # The RT may or may not have selected: the caller cancels and reports it.
