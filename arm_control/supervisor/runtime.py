@@ -941,6 +941,12 @@ class RobotRuntime:
                     self._receipt(ex, Phase.CANCELLED, reason)
                     self._settle_stream_attempts(ex, reason)
             ex.stream.pending = None
+        elif (not ex.status.terminal and ex.status.phase is not Phase.REQUESTED
+                and self._native is not None and self._native.key == ex.status.execution_id
+                and self._native.selection_requested):
+            # A planned native execution: the controller's own leg cancel is not the RT's
+            # confirmation either (see above).
+            ex.drop = (reason, self._native.id, self._native._session, self._native._epoch)
         self._retire_native(ex.status.execution_id)
         if self.controller.current_plan_id == ex.status.execution_id:
             self.controller.on_control(pack_control_update(
@@ -984,7 +990,8 @@ class RobotRuntime:
             if h is not None:
                 h.dropped.pop(ex.status.execution_id, None)
             self._receipt(ex, Phase.CANCELLED, reason, drop_confirmed=how)
-            self._settle_stream_attempts(ex, reason)
+            if ex.stream is not None:
+                self._settle_stream_attempts(ex, reason)
 
     def _drop_staged(self, ex: _Execution, reason: str) -> None:
         self._retire_native(ex.status.execution_id)
