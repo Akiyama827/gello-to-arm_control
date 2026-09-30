@@ -264,6 +264,13 @@ times, interpolation brackets, captured grasps and the planned trajectories.
 Receipt and RT publication times are not
 synchronized physical capture times. Preserve the report before clearing the
 cache; a planner pass alone does not qualify measured tracking or synchronization.
+Each report is written whole (atomic rename) with a SHA-256 sidecar, states how many
+ticks were evicted from the 500-tick window (`dropped_samples`), and carries the five
+closure quantities per tick (`closure_v1`). Nothing deletes reports automatically; over
+20 files or 256 MiB every save warns. Verify and export with
+`python -m arm_control.multi_arm.trace_export --verify` and `--dest DIR`; prune only
+after exporting: `--prune --yes --confirm-exported DIR` (dry run without `--yes`).
+Reports written before sidecars existed show as `legacy` and export normally.
 
 For a setup with a shared object:
 

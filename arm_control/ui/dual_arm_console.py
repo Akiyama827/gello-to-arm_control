@@ -408,10 +408,11 @@ class DualArmConsole:
             # Entries are detached copies, never modified after record(). The
             # writer takes no console lock and cannot delay stop or shutdown.
             samples = list(self._trace.samples)
+            recorded = self._trace.recorded
 
             def write():
                 try:
-                    self.fault_trace = str(self._trace.save(reason, context, samples=samples))
+                    self.fault_trace = str(self._trace.save(reason, context, samples=samples, recorded=recorded))
                     print(f"[dual_console] fault trace: {self.fault_trace}", flush=True)
                 except Exception as exc:
                     print(f"[dual_console] fault trace could not be saved: {exc}", flush=True)
