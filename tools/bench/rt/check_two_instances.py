@@ -83,6 +83,8 @@ def main() -> int:
                     probe.connect(("127.0.0.1", PORTS[name][1]))
                     break
                 except OSError:
+                    server = servers[list(PORTS).index(name)]
+                    assert server.poll() is None, f"{name} exited: {server.stdout.read()}"
                     assert time.monotonic() < deadline, f"{name} did not come up"
                     time.sleep(0.05)
                 finally:
