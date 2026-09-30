@@ -437,6 +437,10 @@ class ReferenceHorizon:
                     if kind == 'commit' and isinstance(exc, (ReferenceRefused, _NotDispatched)):
                         self.candidate_selection = 'refused'
                         self.candidate_result = exc.result if isinstance(exc, ReferenceRefused) else p.REF_LATE
+                    elif kind == 'commit' and isinstance(exc, ReferenceCancelledBeforeDispatch):
+                        # COMMIT never left this host: proof of non-selection, so
+                        # the slot does not wait for the queued ABORT/CANCEL.
+                        self.candidate_selection = 'not_requested'
                     # A timeout after COMMIT never proves nonselection. Continue
                     # observing the old selected reference, without freeing slot.
                     if kind != 'commit' and kind != 'abort':
@@ -694,8 +698,12 @@ class ReferenceHorizon:
                         raise
                 if not unselected and selected_revision:
                     # An undispatched replacement leaves the selected revision running.
-                    self.link.cancel_reference(identity, selected_revision,
-                                               session_id=session, arm_epoch=epoch)
+                    try:
+                        self.link.cancel_reference(identity, selected_revision,
+                                                   session_id=session, arm_epoch=epoch)
+                    except ReferenceRefused as exc:
+                        if exc.result not in (p.REF_REVISION, p.REF_RETIRED):
+                            raise  # reported as an error; the slot is already settled
                 return
             try:
                 self.link.cancel_reference(identity, revision, session_id=session, arm_epoch=epoch)
