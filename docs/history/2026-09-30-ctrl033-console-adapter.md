@@ -4,9 +4,10 @@
 message fields (gains, pose_hold/Soft, payload) into SDK calls (`select_control_preset`,
 `set_payload`), so the SDK is the single owner of mode and load. Everything else
 (arm, execute, cancel, hold, stop, reason, cancel_plan_id) is returned in `forward` as an
-ordered list of small updates. Fields are walked in `ArmController.on_control` order
-(arm, payload, execute, gains, pose_hold, cancel, hold, stop) and each is applied
-independently, as on that path (a refused payload does not undo a preset change).
+ordered list of small updates. Payload, gains and Soft are applied independently in `on_control` relative order (a
+refused payload does not undo a preset change). SDK calls take effect during `apply()`;
+forwarded groups only when the caller sends them, so arm/execute in the same message land
+after them (Dora does them first). The console never sends mixed messages.
 
 - Gains resolve only against the named non-Soft presets (exact kp/kd); a non-preset
   gain is refused, not approximated. Soft matches the canonicalized spec minus `id`.
@@ -14,7 +15,7 @@ independently, as on that path (a refused payload does not undo a preset change)
   mass) come back as refusal strings; nothing is swallowed.
 - **Differences from the Dora path (round-1 review; intentional, not "no change"):**
   (1) gains/Soft must be an exact named preset: partial or non-preset gains are refused;
-  `gains={}`/`None` are ignored as on Dora. (2) Payload during a live execution is
+  `gains={}`/`None`/`{kp: None, kd: None}` are ignored as on Dora. (2) Payload during a live execution is
   refused (SDK rule); Dora applied it. The console sends payload on every attachment
   change, so once wired this is operator-visible. (3) A same-preset gains request
   cancels the executions given by the caller's `live()` (Dora cancels a running leg on
@@ -31,3 +32,8 @@ independently, as on that path (a refused payload does not undo a preset change)
 - Bench `tools/bench/rt/console_adapter.py`: the fake plant is not Soft-capable, so
   the Soft case checks that the SDK's own refusal text is returned; a successful Soft
   selection through the adapter is not exercised offline.
+
+**CTRL-053 gates (from review):** wiring needs (a) a differential bench that feeds the same
+message through `ArmController.on_control` and the adapter, (b) a real `live()` supplier
+(the default cancels nothing), (c) a `send` interleave if mixed messages ever appear, and
+(d) a note that same-preset gains block up to 2 s per live execution in a Dora handler.

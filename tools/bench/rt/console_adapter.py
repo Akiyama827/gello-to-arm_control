@@ -121,9 +121,13 @@ def cases(arm, runtime, scene, service):
     mixed = adapter.apply(console(arm=True, gains=dict(kp=p.kp.tolist(), kd=p.kd.tolist()),
                                   payload={'mass_kg': 0.}))
     assert mixed.forward == ({'arm': True},) and mixed.applied == ('payload', 'track'), mixed
-    partial = adapter.apply(console(gains=dict(kp=presets['float'].kp.tolist(), kd=p.kd.tolist()),
-                                    payload={'mass_kg': -1.}))
-    assert partial.applied == () and len(partial.refusals) == 2, partial  # independent, none applied here
+    independent = adapter.apply(console(gains=dict(kp=presets['float'].kp.tolist(),
+                                                   kd=presets['float'].kd.tolist()),
+                                        payload={'mass_kg': -1.}))
+    assert independent.applied == ('float',) and len(independent.refusals) == 1, independent
+    assert state().preset_id == 'float'  # the refused payload did not undo the preset
+    assert adapter.apply(console(gains=dict(kp=None, kd=None))) == adapter.apply(console())
+    adapter.apply(console(gains=dict(kp=p.kp.tolist(), kd=p.kd.tolist())))
     print('PASS: console gain/Soft/payload updates become SDK calls with named-preset parity; '
           'refusals are reported; other fields are forwarded unchanged')
 

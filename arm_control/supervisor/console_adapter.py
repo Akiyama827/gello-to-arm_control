@@ -4,11 +4,14 @@ The console (`arm_console`) emits one Dora ``control`` topic: arm, execute, canc
 hold, stop, and also gains, Soft (`pose_hold`) and payload. Gain/Soft/payload change
 the controller's *mode and load*, which ``controller/1`` on the supervisor owns
 (named presets resolved once by :mod:`arm_control.control.presets`; Soft validation,
-cancel-before-change and payload identity in the runtime). This adapter walks an
-update in ``ArmController.on_control`` order (arm, payload, execute, gains, pose_hold,
-cancel, hold, stop): gain/Soft/payload become SDK calls, every other field is returned
-in ``Applied.forward`` as an ordered list of small updates for the caller to send.
-Each field is applied independently, as on that path (no all-or-nothing).
+cancel-before-change and payload identity in the runtime). Gain/Soft/payload become SDK
+calls, applied independently (no all-or-nothing) in ``on_control`` relative order
+(payload, gains, pose_hold); every other field is returned in ``Applied.forward`` as an
+ordered list of small updates (arm, execute, cancel, hold, stop). The SDK calls take
+effect DURING ``apply()`` and the forwarded groups only when the caller sends them
+afterwards, so arm/execute in the same message land AFTER payload/gains/Soft (Dora
+does them first). The console never sends mixed messages; a real ``send`` interleave
+is a CTRL-053 item.
 
 Intended differences from the Dora path (not "no change"; see the history note):
   * gains/Soft must be exactly a named preset (the console only sends its own);
@@ -18,7 +21,8 @@ Intended differences from the Dora path (not "no change"; see the history note):
     re-capture the measured pose, the Dora path does.
 A same-preset gains request cancels the live executions given by ``live()`` (the Dora
 path cancels a running leg on any gains message). Malformed fields come back as
-refusal strings; nothing raises. It holds one ``ArmClient``: no new authority.
+refusal strings, as is an SDK timeout; ``live()`` must not raise. A same-preset gains
+request blocks up to the SDK cancel wait (2 s) per live execution. It holds one ``ArmClient``: no new authority.
 """
 from dataclasses import dataclass, field
 
@@ -103,8 +107,8 @@ class ConsoleControlAdapter:
                         self.arm.cancel(execution_id, 'gains changed mid-leg')
                 self.arm.select_control_preset(name)
                 applied.append(name)
-            except Refused as exc:
-                refusals.append(f'preset {name}: {exc}')
+            except (Refused, TimeoutError) as exc:
+                refusals.append(f'preset {name}: {exc!r}' if isinstance(exc, TimeoutError) else f'preset {name}: {exc}')
 
         forwarded('arm')
         if 'payload' in update:
@@ -116,7 +120,7 @@ class ConsoleControlAdapter:
                 refusals.append(f'payload: {exc}')
         forwarded('execute')
         gains = update.get('gains') or {}
-        if gains:
+        if any(gains.get(k) is not None for k in ('kp', 'kd')) if isinstance(gains, dict) else gains:
             select(self.preset_for_gains(gains), 'gains', soft=False)
         if 'pose_hold' in update:
             select(self.preset_for_soft(update['pose_hold']), 'Soft request', soft=True)
