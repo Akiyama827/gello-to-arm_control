@@ -26,6 +26,7 @@ _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import socket
 import subprocess
 import time
 
@@ -35,10 +36,17 @@ from arm_control.plants.remote_rt import protocol as rtp
 from arm_control.plants.remote_rt.client import RtBackend, RtConfig, RtLinkError, RtObserver
 
 JOINTS = [f"fr3_joint{i}" for i in range(1, 8)]
-PORTS = {"fr3_1": (48900, 48901), "fr3_2": (48920, 48921)}
+PORTS: dict[str, tuple[int, int]] = {}  # ephemeral, chosen per run (fixed ports raced other checks)
+
+
+def free_port(kind: int) -> int:
+    with socket.socket(socket.AF_INET, kind) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def spawn(binary: str, instance: str) -> subprocess.Popen:
+    PORTS[instance] = (free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM))
     udp, tcp = PORTS[instance]
     return subprocess.Popen(
         [binary, "--backend", "fake", "--n", "7", "--instance-id", instance,
@@ -64,10 +72,21 @@ def stream(arms: dict[str, RtBackend], targets: dict[str, np.ndarray], seconds: 
 
 def main() -> int:
     binary = sys.argv[1] if len(sys.argv) > 1 else str(_ROOT / "rt/build/arm_rt_server")
-    servers = [spawn(binary, name) for name in PORTS]
+    servers = [spawn(binary, name) for name in ("fr3_1", "fr3_2")]
     arms: dict[str, RtBackend] = {}
     try:
-        time.sleep(0.4)
+        for name in PORTS:  # readiness, not a fixed sleep: wait until each server accepts
+            deadline = time.monotonic() + 10
+            while True:
+                probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    probe.connect(("127.0.0.1", PORTS[name][1]))
+                    break
+                except OSError:
+                    assert time.monotonic() < deadline, f"{name} did not come up"
+                    time.sleep(0.05)
+                finally:
+                    probe.close()
         # Swapped configuration: the fr3_1 config aimed at fr3_2's ports.
         try:
             RtBackend(config("fr3_1", "fr3_2"), JOINTS).open()
