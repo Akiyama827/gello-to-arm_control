@@ -151,6 +151,7 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   // extra key=value token, so existing clients ignore it.
   char hello[sizeof(ControlPacket{}.text)];
   char capability[24] = {};
+  const char* group_cap = ctx.group_enabled.load() ? " g=1" : "";
   char clock_domain[48] = {};  // " clk=<host12>:<boot12>" (CTRL-041), before rt= so a long rt= truncates first
   char rt_setup[48];
   {
@@ -161,9 +162,9 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
     std::snprintf(capability, sizeof(capability), " pose_hold=%u", POSE_HOLD_VERSION);
   rt_setup_names(ctx.rt_setup_failed.load(), rt_setup, sizeof(rt_setup));
   std::snprintf(hello, sizeof(hello),
-                "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s%s rt=%s",
+                "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s%s%s rt=%s",
                 ctx.backend_name, ctx.cfg.hold_ms, ctx.cfg.fault_ms,
-                ctx.active_mask.load(), capability, clock_domain, rt_setup);
+                ctx.active_mask.load(), capability, group_cap, clock_domain, rt_setup);
   send_frame(fd, make(CTL_HELLO, uint32_t(ctx.backend_n.load()), hello));
   {
     ControlPacket idf = make(CTL_IDENTITY, uint32_t(ctx.backend_n.load()), nullptr);
@@ -197,10 +198,96 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   ModeSelectInfo mode_info{};
   uint64_t mode_ticket=0, mode_deadline_ns=0;
   bool mode_outstanding=false, mode_pending_sent=false;
+  // CTRL-040 group execution (only when the server was started with a group record).
+  struct GroupCtl {
+    bool joined=false, hold=false, is_commit=false;
+    uint64_t id=0, deadline_ns=0, my_deadline=0, last_cancelled=0;
+    uint32_t epoch=0, count=0, index=0;
+  } grp;
+  // The last group COMMIT request and its answer: an identical retry (the client resends after its ack
+  // timeout) is answered from here, or absorbed while the original is still held (plain COMMIT does the same).
+  ControlPacket gcommit_req{};
+  GroupStatusPayload gcommit_status{};
+  bool have_gcommit_status=false;
+  auto group_reply=[&](uint64_t gid,uint32_t op,uint32_t result,uint32_t verdict,uint32_t seq) {
+    GroupStatusPayload st{}; st.group_id=gid; st.operation=op; st.result=result;
+    st.peer_verdict=verdict; st.deadline_ns=grp.joined?grp.deadline_ns:0;
+    if(ctx.group_enabled.load()) {
+      const GroupSnapshot own=ctx.group.read_slot(uint32_t(ctx.cfg.group_member));
+      st.state=own.ok?own.state:GS_NONE; st.selected_ns=own.ok?own.selected_ns:0;
+    }
+    if(op==CTL_GROUP_COMMIT) { gcommit_status=st; have_gcommit_status=true; }
+    ControlPacket a=make(CTL_GROUP_STATUS,0,nullptr,seq);
+    a.version=REFERENCE_VERSION; std::memcpy(a.text,&st,sizeof(st));
+    return send_frame(fd,a);
+  };
+  // Leave the group: the slot ends CANCELLED (peers must see it) and the tick stops enforcing. A member
+  // that already latched a fault keeps FAULTED (the record mirrors the latch); one that finished keeps DONE.
+  auto group_leave=[&](GroupState final_state) {
+    if(!grp.joined) return;
+    ctx.group_committed.store(false); ctx.group_active.store(false);
+    // A latched fault and a finished reference are final: the write only replaces a live state, so
+    // a FAULTED/DONE the tick records concurrently is never overwritten.
+    ctx.group.write_slot(uint32_t(ctx.cfg.group_member),final_state,grp.id,session,grp.epoch,0,0,0,
+                         (1u<<GS_STAGED)|(1u<<GS_READY)|(1u<<GS_COMMITTED)|(1u<<GS_RUNNING)|
+                         (1u<<GS_CANCELLED)|(1u<<GS_NONE));
+    // A group COMMIT still in flight to the RT is abandoned: its late result must not be answered
+    // (on either opcode).
+    if(grp.is_commit) commit_waiting=false;
+    grp.last_cancelled=grp.id; grp.joined=false; grp.hold=false; grp.is_commit=false;
+  };
+  // Retire whatever this member has staged, waiting or selected, as CTL_CANCEL_REFERENCE does.
+  auto group_retire=[&]() {
+    if(grp.hold) { commit_waiting=false; grp.hold=false; if(upload) upload->abort(pending.request.upload_id); return; }
+    const auto* candidate=upload?upload->candidate_identity():nullptr;
+    uint64_t retire_id=selection.reference_id;
+    if(candidate) retire_id=std::max(retire_id,candidate->reference_id);
+    if(commit_waiting) retire_id=std::max(retire_id,pending.request.reference_id);
+    if(!retire_id) return;
+    const uint64_t generation=ctx.reference_cancel_generation.load()+1;
+    ctx.reference_cancel.write(ReferenceCancel{session,retire_id,generation,grp.epoch,selection.revision});
+    ctx.reference_cancel_generation.store(generation,std::memory_order_release);
+    if(upload) upload->discard();
+  };
   ControlPacket rx;
   size_t have = 0;
-  while (!ctx.shutdown.load()) {
+  bool lost = false;  // a reply inside the opcode switch could not be sent: end the session
+  while (!ctx.shutdown.load() && !lost) {
     ctx.reference_feedback.read(selection);
+    if(grp.joined) {
+      // The ARM epoch ended (DISARM/fault/new epoch): the group ends with it.
+      if(!ctx.armed.load() || ctx.arm_gen.load()!=grp.epoch) {
+        const bool waiting=grp.hold; group_retire(); group_leave(GS_CANCELLED);
+        if(waiting && !group_reply(grp.last_cancelled,CTL_GROUP_COMMIT,REF_IDENTITY,0,commit_frame.seq)) break;
+      } else if(const uint32_t ev=ctx.group_event.exchange(0)) {
+        // The servo tick judged a peer bad and already retired this member's reference.
+        const bool waiting=commit_waiting; group_retire(); group_leave(GS_CANCELLED);
+        commit_waiting=false;
+        if(!group_reply(grp.last_cancelled,waiting?uint32_t(CTL_GROUP_COMMIT):0u,REF_GROUP_PEER,ev-1,waiting?commit_frame.seq:0)) break;
+      } else if(grp.hold) {
+        const uint64_t gnow=mono_ns();
+        const uint64_t max_age=uint64_t(ctx.cfg.group_peer_max_age_ms*1e6);
+        bool release=true, abort=false; uint32_t verdict=0, result=REF_GROUP_PEER;
+        for(uint32_t m=0;m<grp.count;++m) {
+          if(m==grp.index) continue;
+          const GroupSnapshot peer=ctx.group.read_slot(m);
+          const PeerVerdict v=peer_verdict(peer,grp.id,gnow,max_age);
+          if(v!=PEER_OK) { abort=true; verdict=v; }
+          else if(peer.state<GS_COMMITTED) release=false;
+        }
+        grp.deadline_ns=ctx.group.group_deadline(grp.index,grp.id,grp.my_deadline);  // earliest member deadline
+        if(!abort && !release && gnow>=grp.deadline_ns) { abort=true; result=REF_LATE; }
+        if(abort) {
+          const uint64_t gid=grp.id;
+          group_retire(); group_leave(GS_CANCELLED);
+          if(!group_reply(gid,CTL_GROUP_COMMIT,result,verdict,commit_frame.seq)) break;
+        } else if(release) {
+          grp.hold=false;
+          ctx.reference_in.write(pending);
+          ctx.reference_published.store(pending.ticket,std::memory_order_release);
+        }
+      }
+    }
     // Bounded wait for the RT mode-selection acknowledgement. Never blocks the
     // servo and never blocks this socket: we keep polling and answer when the
     // ticket completes, or report PENDING once and keep reconciling.
@@ -226,14 +313,23 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
       if(!send_frame(fd, mode_reply(CTL_MODE_STATUS,r,mode_frame.seq))) break;
       mode_pending_sent=true;
     }
-    if(commit_waiting && ctx.reference_done.load(std::memory_order_acquire)==pending.ticket) {
+    if(commit_waiting && !grp.hold && ctx.reference_done.load(std::memory_order_acquire)==pending.ticket) {
       commit_reply.result=ctx.reference_result.load(std::memory_order_relaxed);
+      if(grp.is_commit) {
+        // A group COMMIT is answered on the group opcode, with this member's selection stamp.
+        const uint64_t gid=grp.id;
+        if(commit_reply.result!=REF_OK) { group_retire(); group_leave(GS_CANCELLED); }
+        commit_waiting=false; have_commit_reply=false; grp.is_commit=false;
+        if(commit_reply.result==REF_OK && upload) upload->discard();
+        if(!group_reply(gid,CTL_GROUP_COMMIT,commit_reply.result,0,commit_frame.seq)) break;
+      } else {
       ControlPacket answer=make(CTL_REFERENCE_STATUS,0,nullptr,commit_frame.seq);
       answer.version=REFERENCE_VERSION;
       std::memcpy(answer.text,&commit_reply,sizeof(commit_reply));
       if(!send_frame(fd,answer)) break;
       commit_waiting=false; have_commit_reply=true;
       if(commit_reply.result==REF_OK && upload) upload->discard();
+      }
     }
     ServerCtx::FaultNotice notice;
     if (ctx.pending_fault_notice(notice)) {
@@ -354,6 +450,104 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
             upload->discard(); last_cancel=c; result=REF_OK;
           }
           break;
+        }
+        case CTL_GROUP_JOIN: case CTL_GROUP_CANCEL: case CTL_GROUP_COMMIT: {
+          if(!ctx.group_enabled.load()) { result=REF_NOT_ADMITTED; break; }
+          const uint64_t gnow=mono_ns();
+          bool sent=true;
+          if(rx.type==CTL_GROUP_JOIN) {
+            GroupMemberPayload g; std::memcpy(&g,rx.text,sizeof(g));
+            uint32_t res=REF_OK;
+            if(g.session_id!=session || g.arm_epoch!=ctx.arm_gen.load() || !ctx.armed.load()) res=REF_IDENTITY;
+            else if(ctx.fault.load() || ctx.latch_state.load()==ServerCtx::LATCH_SET) res=REF_GROUP_REFUSED;
+            else if(g.member_index!=uint32_t(ctx.cfg.group_member) || g.member_count!=ctx.cfg.group_members) res=REF_GROUP_REFUSED;
+            else if(grp.joined && grp.id!=g.group_id) res=REF_GROUP_REFUSED;
+            else if(!grp.joined) {
+              grp=GroupCtl{}; grp.joined=true; grp.id=g.group_id; grp.epoch=g.arm_epoch;
+              grp.count=g.member_count; grp.index=g.member_index;
+              ctx.group_id.store(g.group_id); ctx.group_session.store(session);
+              ctx.group_epoch.store(g.arm_epoch); ctx.group_event.store(0);
+              ctx.group.write_slot(grp.index,GS_STAGED,g.group_id,session,g.arm_epoch);
+              ctx.group.heartbeat(grp.index,gnow);
+              ctx.group_active.store(true,std::memory_order_release);
+            }
+            sent=group_reply(g.group_id,rx.type,res,0,rx.seq);
+          } else if(rx.type==CTL_GROUP_CANCEL) {
+            GroupMemberPayload g; std::memcpy(&g,rx.text,sizeof(g));
+            uint32_t res=REF_OK;
+            if(g.session_id!=session || g.arm_epoch!=ctx.arm_gen.load() || !ctx.armed.load()) res=REF_IDENTITY;
+            else if(grp.joined && grp.id==g.group_id) {
+              const GroupSnapshot own=ctx.group.read_slot(uint32_t(ctx.cfg.group_member));
+              const bool finished=own.ok && own.group_id==grp.id && own.state==GS_DONE;
+              const bool waiting=grp.hold;
+              if(!finished) group_retire();  // a finished member has nothing to retire: it just leaves
+              group_leave(GS_CANCELLED);
+              if(waiting && !group_reply(g.group_id,CTL_GROUP_COMMIT,REF_GROUP_PEER,0,commit_frame.seq)) { lost=true; continue; }
+            } else if(grp.last_cancelled!=g.group_id) res=REF_GROUP_REFUSED;
+            sent=group_reply(g.group_id,rx.type,res,0,rx.seq);
+          } else {
+            GroupCommitPayload g; std::memcpy(&g,rx.text,sizeof(g));
+            const bool same_request=!std::memcmp(gcommit_req.text,rx.text,sizeof(rx.text));
+            if(same_request && commit_waiting && grp.is_commit) {  // original still held/in flight
+              commit_frame.seq=rx.seq; gcommit_req.seq=rx.seq; continue;
+            }
+            if(same_request && !commit_waiting && have_gcommit_status) {  // lost reply: answer again
+              GroupStatusPayload stored=gcommit_status;
+              // A stored OK is stale if a cancel/retire has happened since (as plain COMMIT answers).
+              if(stored.result==REF_OK && (!grp.joined || pending.cancel_generation!=ctx.reference_cancel_generation.load()))
+                stored.result=REF_RETIRED;
+              ControlPacket again=make(CTL_GROUP_STATUS,0,nullptr,rx.seq);
+              again.version=REFERENCE_VERSION; std::memcpy(again.text,&stored,sizeof(stored));
+              if(!send_frame(fd,again)) lost=true;
+              continue;
+            }
+            gcommit_req=rx; have_gcommit_status=false;
+            uint32_t res=REF_OK, verdict=0;
+            const auto* admitted=upload?upload->admitted():nullptr;
+            if(g.session_id!=session || g.arm_epoch!=ctx.arm_gen.load() || !ctx.armed.load()) res=REF_IDENTITY;
+            else if(!grp.joined || grp.id!=g.group_id || g.member_index!=grp.index) res=REF_GROUP_REFUSED;
+            else if(ctx.fault.load() || ctx.latch_state.load()==ServerCtx::LATCH_SET) res=REF_GROUP_REFUSED;
+            else if(mode_outstanding || commit_waiting) res=REF_BUSY;
+            else if(!admitted || admitted->identity.upload_id!=g.upload_id ||
+                    admitted->identity.reference_id!=g.reference_id ||
+                    admitted->identity.revision!=1 || admitted->identity.expected_revision!=0) res=REF_NOT_ADMITTED;
+            else {
+              // Every peer must be a live, uncancelled member of THIS group.
+              const uint64_t max_age=uint64_t(ctx.cfg.group_peer_max_age_ms*1e6);
+              for(uint32_t m=0;m<grp.count && res==REF_OK;++m) {
+                if(m==grp.index) continue;
+                const PeerVerdict v=peer_verdict(ctx.group.read_slot(m),grp.id,gnow,max_age);
+                if(v!=PEER_OK) { res=REF_GROUP_PEER; verdict=v; }
+              }
+              if(res==REF_OK) {
+                // The group deadline is the earliest member deadline (this one included): the first
+                // committer sets it, later ones adopt it. Checked HERE, at commit, not at selection.
+                const uint64_t mine=gnow+g.budget_ns;
+                const uint64_t deadline=ctx.group.group_deadline(grp.index,grp.id,mine);
+                const uint64_t lead=uint64_t(ctx.cfg.group_min_lead_ms*1e6);
+                if(gnow>=deadline || deadline-gnow<lead) res=REF_LATE;
+                else { grp.my_deadline=mine; grp.deadline_ns=deadline; }
+              }
+            }
+            if(res!=REF_OK) {
+              if(grp.joined && grp.id==g.group_id && res==REF_LATE) group_leave(GS_CANCELLED);
+              sent=group_reply(g.group_id,rx.type,res,verdict,rx.seq);
+            } else {
+              ReferenceCommitPayload cp{}; cp.session_id=g.session_id; cp.upload_id=g.upload_id;
+              cp.reference_id=g.reference_id; cp.arm_epoch=g.arm_epoch; cp.expected_revision=0; cp.revision=1;
+              pending={}; pending.admitted=*admitted; pending.request=cp;
+              pending.ticket=ctx.reference_published.load()+1;
+              pending.cancel_generation=ctx.reference_cancel_generation.load();
+              commit_frame=rx; commit_waiting=true; have_commit_reply=false;
+              grp.hold=true; grp.is_commit=true;
+              ctx.group_my_deadline.store(grp.my_deadline);
+              ctx.group.write_slot(grp.index,GS_COMMITTED,grp.id,session,grp.epoch,0,0,grp.my_deadline);
+              ctx.group_committed.store(true,std::memory_order_release);
+              continue;  // answered on release/abort/selection
+            }
+          }
+          if(!sent) lost=true;
+          continue;
         }
         default: break;
       }
@@ -670,6 +864,16 @@ void control_thread(ServerCtx& ctx) {
     std::printf("[rt] control client connected (session %016llx)\n",
                 (unsigned long long)session);
     serve_client(ctx, client, session);
+    if (ctx.group_enabled.load()) {
+      // The session's group (if any) ends with it: peers must see CANCELLED, not silence.
+      ctx.group_committed.store(false);
+      ctx.group_active.store(false);
+      if (ctx.group_id.load()) {
+        ctx.group.write_slot(uint32_t(ctx.cfg.group_member), GS_CANCELLED, ctx.group_id.load(),
+                             ctx.group_session.load(), ctx.group_epoch.load());
+        ctx.group_id.store(0);
+      }
+    }
     std::printf("[rt] control client disconnected\n");
   }
   close(fd);

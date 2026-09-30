@@ -36,6 +36,15 @@ def golden() -> dict[str, bytes]:
     ctl('CANCEL', p.CTL_CANCEL_REFERENCE, session_id=123, id=3, arm_epoch=4, revision=6)
     ctl('REPLY', p.CTL_REFERENCE_STATUS, upload_id=2, reference_id=3, revision=6,
         result=p.REF_PREFIX, operation=p.CTL_REFERENCE_COMMIT)
+    ctl('GJOIN', p.CTL_GROUP_JOIN, session_id=123, group_id=77, arm_epoch=4, member_index=1,
+        member_count=2)
+    ctl('GCANCEL', p.CTL_GROUP_CANCEL, session_id=123, group_id=77, arm_epoch=4,
+        member_index=1, member_count=2)
+    ctl('GCOMMIT', p.CTL_GROUP_COMMIT, session_id=123, group_id=77, upload_id=2, reference_id=3,
+        budget_ns=250000000, arm_epoch=4, member_index=1)
+    ctl('GSTATUS', p.CTL_GROUP_STATUS, group_id=77, deadline_ns=5000000000, selected_ns=4999000000,
+        result=p.REF_GROUP_PEER, operation=p.CTL_GROUP_COMMIT, state=p.GS_CANCELLED,
+        peer_verdict=p.PEER_FAULTED)
     out['DYNAMIC'] = p.pack_reference_command(
         n=7, seq=42, arm_epoch=4, t_mono_ns=123456789, session_id=123,
         reference_id=3, revision=6, age_us=100, phase=1.25, valid_for_us=20000,

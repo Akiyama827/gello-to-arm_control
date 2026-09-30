@@ -109,6 +109,10 @@ enum ReferenceCtl : uint16_t {
   CTL_REFERENCE_SEAL = 34, CTL_REFERENCE_COMMIT = 35,
   CTL_REFERENCE_ABORT = 36, CTL_CANCEL_REFERENCE = 37,
   CTL_REFERENCE_STATUS = 38,
+  // CTRL-040 group execution (additive; a server accepts these only when started with a group
+  // record and advertises `g=1` in HELLO). First-revision references only.
+  CTL_GROUP_JOIN = 39, CTL_GROUP_COMMIT = 40, CTL_GROUP_CANCEL = 41,
+  CTL_GROUP_STATUS = 42,  // server -> client: reply (operation = request opcode) or event (0)
 };
 enum ReferenceStatus : uint32_t {
   REFERENCE_NONE = 0, REFERENCE_RUNNING = 1, REFERENCE_END = 2,
@@ -118,6 +122,8 @@ enum ReferenceResult : uint32_t {
   REF_OK = 0, REF_MALFORMED = 1, REF_IDENTITY = 2, REF_BUSY = 3,
   REF_REVISION = 4, REF_INTEGRITY = 5, REF_PREFIX = 6, REF_LATE = 7,
   REF_RETIRED = 8, REF_NOT_ADMITTED = 9,
+  REF_GROUP_REFUSED = 10,  // group precondition failed (latch, other group, identity)
+  REF_GROUP_PEER = 11,     // a peer faulted/cancelled/went stale, or the group deadline passed
 };
 constexpr uint32_t REFERENCE_HERMITE = 1u << 0;
 constexpr uint32_t REFERENCE_TERMINAL = 1u << 1;
@@ -313,6 +319,40 @@ struct ReferenceRetirePayload {
   uint32_t revision;                // 20: 0 for ABORT; selected/pending for CANCEL
   uint8_t reserved[80];             // 24
 };
+// CTRL-040. JOIN and CANCEL share one body.
+// Sanity bound on the group deadline budget (wire validity, not a timing value: the operator's
+// constants live in the server flags). Keeps `now + budget` from wrapping and bounds a held COMMIT.
+constexpr uint64_t GROUP_MAX_BUDGET_NS = 10'000'000'000ull;
+struct GroupMemberPayload {
+  uint64_t session_id;              // 0
+  uint64_t group_id;                // 8: PC-assigned, never reused
+  uint32_t arm_epoch;               // 16
+  uint32_t member_index;            // 20
+  uint32_t member_count;            // 24
+  uint32_t reserved0;               // 28
+  uint8_t reserved[72];             // 32
+};
+struct GroupCommitPayload {
+  uint64_t session_id;              // 0
+  uint64_t group_id;                // 8
+  uint64_t upload_id;               // 16: the sealed first-revision upload
+  uint64_t reference_id;            // 24
+  uint64_t budget_ns;               // 32: group deadline = first committer's now + budget
+  uint32_t arm_epoch;               // 40
+  uint32_t member_index;            // 44
+  uint8_t reserved[56];             // 48
+};
+struct GroupStatusPayload {
+  uint64_t group_id;                // 0
+  uint64_t deadline_ns;             // 8: group deadline on the RT host clock, 0 = none yet
+  uint64_t selected_ns;             // 16: this member's selection stamp (host clock), 0 = none
+  uint32_t result;                  // 24: ReferenceResult
+  uint32_t operation;               // 28: request opcode, 0 for an unsolicited event
+  uint32_t state;                   // 32: GroupState (group_record.hpp)
+  uint32_t peer_verdict;            // 36: PeerVerdict of the peer that decided the outcome
+  uint32_t reserved0;               // 40
+  uint8_t reserved[60];             // 44
+};
 struct ReferenceReplyPayload {
   uint64_t upload_id;               // 0
   uint64_t reference_id;            // 8
@@ -377,6 +417,8 @@ static_assert(sizeof(ReferenceStatePacket) + 8 + 40 <= 1500, "IPv6 UDP MTU");
 static_assert(offsetof(ReferenceBeginPayload, arm_epoch) == 64, "begin offset");
 static_assert(offsetof(ReferenceCommitPayload, protected_until) == 40, "commit offset");
 static_assert(offsetof(ReferenceCommandPacket, tau_ff) == 64, "envelope offset");
+static_assert(sizeof(GroupMemberPayload)==104 && sizeof(GroupCommitPayload)==104 &&
+              sizeof(GroupStatusPayload)==104, "group payloads fill the control text");
 static_assert(offsetof(ReferenceStatePacket, q_ref) == 928, "reference state offset");
 
 inline bool zero_bytes(const void* data, size_t size) {
@@ -385,7 +427,7 @@ inline bool zero_bytes(const void* data, size_t size) {
   return true;
 }
 inline bool reference_opcode(uint16_t type) {
-  return type >= CTL_REFERENCE_BEGIN && type <= CTL_REFERENCE_STATUS;
+  return type >= CTL_REFERENCE_BEGIN && type <= CTL_GROUP_STATUS;
 }
 inline bool valid_reference_body(uint16_t type, const void* body) {
   // Copy packed payloads before inspecting them: no aliasing/lifetime assumptions.
@@ -435,6 +477,22 @@ inline bool valid_reference_body(uint16_t type, const void* body) {
       return p.result<=REF_NOT_ADMITTED && p.operation>=CTL_REFERENCE_BEGIN &&
         p.operation<=CTL_CANCEL_REFERENCE && !p.reserved0 &&
         zero_bytes(p.reserved,sizeof(p.reserved));
+    }
+    case CTL_GROUP_JOIN: case CTL_GROUP_CANCEL: {
+      GroupMemberPayload p; std::memcpy(&p,body,sizeof(p));
+      return p.session_id && p.group_id && p.arm_epoch && p.member_count>=2 && p.member_count<=4 &&
+        p.member_index<p.member_count && !p.reserved0 && zero_bytes(p.reserved,sizeof(p.reserved));
+    }
+    case CTL_GROUP_COMMIT: {
+      GroupCommitPayload p; std::memcpy(&p,body,sizeof(p));
+      return p.session_id && p.group_id && p.upload_id && p.reference_id && p.arm_epoch &&
+        p.budget_ns && p.budget_ns<=GROUP_MAX_BUDGET_NS && p.member_index<4 && zero_bytes(p.reserved,sizeof(p.reserved));
+    }
+    case CTL_GROUP_STATUS: {
+      GroupStatusPayload p; std::memcpy(&p,body,sizeof(p));
+      return p.group_id && p.result<=REF_GROUP_PEER &&
+        (p.operation==0 || (p.operation>=CTL_GROUP_JOIN && p.operation<=CTL_GROUP_CANCEL)) &&
+        p.state<=7 && p.peer_verdict<=4 && !p.reserved0 && zero_bytes(p.reserved,sizeof(p.reserved));
     }
     default: return false;
   }

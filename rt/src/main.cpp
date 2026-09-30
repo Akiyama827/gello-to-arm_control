@@ -63,6 +63,8 @@ void usage(const char* argv0) {
       "          [--active-mask MASK] [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
       "          [--require-rt-setup] [--enable-reference]\n"
       "          [--machine-id-file PATH] [--boot-id-file PATH]\n"
+      "          [--group-shm NAME --group-member K --group-members N\n"
+      "           --group-peer-max-age-ms MS --group-min-lead-ms MS]\n"
       "\n"
       "  --instance-id  provisioned arm instance id ([A-Za-z0-9_.-], <32 chars);\n"
       "             required for franka/dm. Commanders CLAIM it before ARM.\n"
@@ -145,6 +147,11 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--state-hz")) cfg.state_hz = std::atof(next("--state-hz"));
     else if (!std::strcmp(argv[i], "--machine-id-file")) cfg.machine_id_file = next("--machine-id-file");
     else if (!std::strcmp(argv[i], "--boot-id-file")) cfg.boot_id_file = next("--boot-id-file");
+    else if (!std::strcmp(argv[i], "--group-shm")) cfg.group_shm = next("--group-shm");
+    else if (!std::strcmp(argv[i], "--group-member")) cfg.group_member = std::atoi(next("--group-member"));
+    else if (!std::strcmp(argv[i], "--group-members")) cfg.group_members = uint32_t(std::atoi(next("--group-members")));
+    else if (!std::strcmp(argv[i], "--group-peer-max-age-ms")) cfg.group_peer_max_age_ms = std::atof(next("--group-peer-max-age-ms"));
+    else if (!std::strcmp(argv[i], "--group-min-lead-ms")) cfg.group_min_lead_ms = std::atof(next("--group-min-lead-ms"));
     else if (!std::strcmp(argv[i], "--hold-ms")) cfg.hold_ms = std::atof(next("--hold-ms"));
     else if (!std::strcmp(argv[i], "--fault-ms")) cfg.fault_ms = std::atof(next("--fault-ms"));
     else if (!std::strcmp(argv[i], "--slew")) cfg.slew = std::atof(next("--slew"));
@@ -239,6 +246,28 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--ee-mass must be 0..3 kg (got %.3f) — kg, not grams\n",
                  cfg.ee_mass);
     return 2;
+  }
+
+  // Group execution is all-or-nothing and has no default timing constants.
+  const bool any_group = !cfg.group_shm.empty() || cfg.group_member >= 0 || cfg.group_members ||
+                         cfg.group_peer_max_age_ms > 0 || cfg.group_min_lead_ms > 0;
+  if (any_group) {
+    if (cfg.group_shm.empty() || cfg.group_shm[0] != '/' || cfg.group_members < 2 ||
+        cfg.group_members > arm_rt::GROUP_MAX_MEMBERS || cfg.group_member < 0 ||
+        uint32_t(cfg.group_member) >= cfg.group_members || cfg.group_peer_max_age_ms <= 0 ||
+        cfg.group_min_lead_ms <= 0 || !cfg.enable_reference) {
+      std::fprintf(stderr, "group execution needs --enable-reference and ALL of --group-shm /NAME, "
+                           "--group-member K < --group-members N (2..%u), "
+                           "--group-peer-max-age-ms > 0, --group-min-lead-ms > 0\n",
+                   arm_rt::GROUP_MAX_MEMBERS);
+      return 2;
+    }
+    if (!ctx.group.open(cfg.group_shm, cfg.group_members)) {
+      std::fprintf(stderr, "cannot open group segment %s\n", cfg.group_shm.c_str());
+      return 2;
+    }
+    ctx.group.reset_slot(uint32_t(cfg.group_member));  // a killed predecessor may have left it mid-write
+    ctx.group_enabled.store(true);
   }
 
   g_ctx = &ctx;
