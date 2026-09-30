@@ -2,7 +2,7 @@
 
     python -m arm_control.multi_arm.trace_export --verify [--root DIR]
     python -m arm_control.multi_arm.trace_export --dest DIR [--root DIR] [--include-unverified]
-    python -m arm_control.multi_arm.trace_export --prune [--keep-files N] [--yes] [--root DIR]
+    python -m arm_control.multi_arm.trace_export --prune [--keep-files N] [--yes --confirm-exported DIR] [--root DIR]
 
 Reads the fault-trace directory and does not modify it, except for an explicit ``--prune --yes --confirm-exported DIR`` (dry run
 without ``--yes``; only traces with a byte-identical copy in DIR are deleted), the only way traces are ever deleted. A trace is verified when its SHA-256 sidecar matches its bytes,
@@ -43,7 +43,10 @@ def verify(path: Path) -> dict:
             # parsed and it is data: report it as legacy, export it, and never lose it to a "failed verification".
             info["sha256"] = _digest(path)
             report = json.loads(path.read_text())
-            if isinstance(report, dict) and str(report.get("schema", "")).startswith("arm_control.dual_fault/"):
+            if isinstance(report, dict) and ("samples_kept" in report or "retention" in report):
+                # this code always writes a sidecar with these keys: a missing one means it was removed, not legacy
+                info["problem"] = "sidecar missing for a trace written with one (removed or tampered)"
+            elif isinstance(report, dict) and str(report.get("schema", "")).startswith("arm_control.dual_fault/"):
                 info.update(ok=True, legacy=True, problem="no sha256 sidecar (written before sidecars existed)",
                             reason=report.get("reason"), observed_at_utc=report.get("observed_at_utc"),
                             samples_kept=len(report.get("samples", [])), schema=report.get("schema"))
@@ -124,16 +127,22 @@ def main(argv=None) -> int:
             print("--keep-files must be >= 0")
             return 2
         only = None
-        if args.yes:
-            if args.confirm_exported is None:
-                print("refusing to delete: give --confirm-exported DIR (a directory holding byte-identical exported copies)")
-                return 2
-            only = {p.name for p in root.glob(TRACE_GLOB)
-                    if (args.confirm_exported / p.name).is_file() and _digest(args.confirm_exported / p.name) == _digest(p)}
+        if args.yes and args.confirm_exported is None:
+            print("refusing to delete: give --confirm-exported DIR (a directory holding byte-identical exported copies)")
+            return 2
+        if args.confirm_exported is not None:  # the dry run shows what the real run would delete
+            only = {p.name for p in root.glob(TRACE_GLOB) if p.is_file() and not p.is_symlink()
+                    and (args.confirm_exported / p.name).is_file() and _digest(args.confirm_exported / p.name) == _digest(p)}
         names = prune_traces(root, keep_files=args.keep_files, dry_run=not args.yes, only=only)
         print(("removed " if args.yes else "would remove ") + f"{len(names)} trace(s): {names}")
         return 0
+    if not root.is_dir():
+        print(f"not a directory: {root}")
+        return 2
     if args.dest is not None:
+        if args.dest.exists() and not args.dest.is_dir():
+            print(f"--dest is not a directory: {args.dest}")
+            return 2
         manifest = export(root, args.dest, include_unverified=args.include_unverified)
         bad = [t for t in manifest["traces"] if not t["ok"]]
         print(f"exported {sum(t['exported'] for t in manifest['traces'])} trace(s) to {args.dest}; "

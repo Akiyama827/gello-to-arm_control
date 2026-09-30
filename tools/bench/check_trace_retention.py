@@ -2,6 +2,7 @@
 import errno
 import hashlib
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -134,6 +135,34 @@ def main():
         lying.write_text(json.dumps(dict(schema="arm_control.dual_fault/v2", samples_kept=5, samples=[1])))
         (sub / (lying.name + ".sha256")).write_text(hashlib.sha256(lying.read_bytes()).hexdigest() + "  " + lying.name + "\n")
         assert "samples_kept" in trace_export.verify(lying)["problem"]
+        # a trace written by this code whose sidecar was deleted is BAD, not legacy
+        stripped = sub / "20200104T000000000000Z-stripped.json"
+        stripped.write_text(json.dumps(dict(schema="arm_control.dual_fault/v2", samples_kept=1, samples=[1])))
+        assert not trace_export.verify(stripped)["ok"] and "sidecar" in trace_export.verify(stripped)["problem"]
+        stripped.unlink()
+        # prune deletes only traces with a byte-identical copy; the dry run predicts exactly that
+        exp, cnt = Path(tmp) / "exp_prune", Path(tmp) / "cnt_prune"
+        shutil.copytree(sub, exp)
+        cnt.mkdir()
+        for p in sub.glob("2*.json"):
+            shutil.copy(p, cnt / p.name)
+        victim = sorted(cnt.glob("2*.json"))[0]
+        victim.write_text(victim.read_text() + " ")  # one confirmation copy differs
+        base = ["--prune", "--keep-files", "0", "--root", str(sub), "--confirm-exported", str(cnt)]
+        import io
+        from contextlib import redirect_stdout
+        def run(extra):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = trace_export.main(base + extra)
+            return rc, buf.getvalue()
+        rc, dry = run([])
+        assert victim.name not in dry and dry.startswith("would remove")
+        before = {p.name for p in sub.glob("2*.json")}
+        rc, real = run(["--yes"])
+        after = {p.name for p in sub.glob("2*.json")}
+        assert after == {victim.name} and before - after == set(before) - {victim.name}, (before, after)
+        assert trace_export.main(["--verify", "--root", str(Path(tmp) / "nonexistent")]) == 2
         # an export directory used as a root: its manifest is not a trace; a crash leftover is listed as incomplete
         out = Path(tmp) / "out"
         trace_export.export(sub, out)
