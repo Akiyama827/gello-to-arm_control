@@ -44,47 +44,69 @@ def fault_root():
     return CONTROL_ROOT.joinpath(".cache", *FAULT_DIR)
 
 
+TRACE_GLOB = "2*.json"  # timestamped traces only: an EXPORT_MANIFEST.json in the directory is not a trace
+
+
+def _traces(root):
+    return sorted(p for p in root.glob(TRACE_GLOB) if p.is_file() and not p.is_symlink())
+
+
 def capacity_warning(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES):
     """A message when the trace directory is over its capacity policy, else None. Never raises."""
     try:
-        traces = [p for p in root.glob("*.json") if p.is_file()]
-        total = sum(p.stat().st_size for p in traces)
+        traces = _traces(root)
+        total = sum(p.stat().st_size for p in traces) + sum(p.stat().st_size for p in root.glob("*.partial"))
     except OSError:
         return None
     if len(traces) > keep_files or total > keep_bytes:
         return (f"{len(traces)} fault trace(s), {total / 2**20:.1f} MiB in {root} exceed the capacity policy "
                 f"({keep_files} files / {keep_bytes / 2**20:.0f} MiB): export and prune explicitly "
-                f"(python -m arm_control.multi_arm.trace_export --prune --yes); nothing is deleted automatically")
+                f"(export first: python -m arm_control.multi_arm.trace_export --dest DIR; then --prune --yes --confirm-exported DIR); "
+                f"nothing is deleted automatically")
     return None
 
 
-def prune_traces(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES, protect=None, dry_run=False):
+def prune_traces(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES, protect=None, dry_run=False, only=None):
     """Remove the oldest ``*.json`` traces (and their ``.sha256`` sidecars) beyond the limits. Called only by an
-    explicit operator action. Never raises, never removes ``protect``; returns the names (that would be) removed.
+    explicit operator action. Never raises, never removes ``protect`` and, when ``only`` is given, nothing outside that
+    set of names; returns the names (that would be) removed.
     Names begin with a UTC timestamp, so name order is age."""
     removed = []
     try:
-        traces = sorted(p for p in root.glob("*.json") if p.is_file())
+        traces = _traces(root)
         sizes = {p: p.stat().st_size for p in traces}
         total = sum(sizes.values())
         for p in traces:
             if len(traces) - len(removed) <= keep_files and total <= keep_bytes:
                 break
-            if protect is not None and p == protect:
+            if (protect is not None and p == protect) or (only is not None and p.name not in only):
                 continue
             try:
                 if not dry_run:
                     p.unlink()
+                total -= sizes[p]  # the trace is gone from here on, whatever happens to its sidecar
+                removed.append(p.name)
+                if not dry_run:
                     sidecar = p.with_name(p.name + ".sha256")
                     if sidecar.exists():
                         sidecar.unlink()
-                total -= sizes[p]
-                removed.append(p.name)
             except OSError:
                 continue
     except OSError:
         pass
     return removed
+
+
+def _fsync_dir(root):
+    """Make the rename durable (best effort: a failure here does not undo a completed write)."""
+    try:
+        fd = os.open(root, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 class PairFaultTrace:
@@ -135,16 +157,26 @@ class PairFaultTrace:
         payload = (json.dumps(_json_values(report), allow_nan=False) + "\n").encode()
         digest = hashlib.sha256(payload).hexdigest()
         partial = path.with_name(path.name + ".partial")
+        sidecar = path.with_name(path.name + ".sha256")
+        created = []  # only what THIS call created is ever cleaned up (a name collision must not destroy another trace)
         try:
             with partial.open("xb") as stream:
+                created.append(partial)
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            sidecar = path.with_name(path.name + ".sha256")
-            sidecar.write_text(f"{digest}  {path.name}\n")
+            with sidecar.open("x") as stream:  # exclusive: never replaces another trace's sidecar
+                created.append(sidecar)
+                stream.write(f"{digest}  {path.name}\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            if path.exists():
+                raise FileExistsError(str(path))  # never replace an existing trace
             os.replace(partial, path)  # the trace appears whole or not at all
+            created.remove(partial)
+            _fsync_dir(root)
         except BaseException:
-            for leftover in (partial, path.with_name(path.name + ".sha256")):
+            for leftover in created:
                 try:
                     leftover.unlink()
                 except OSError:

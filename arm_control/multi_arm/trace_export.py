@@ -4,8 +4,8 @@
     python -m arm_control.multi_arm.trace_export --dest DIR [--root DIR] [--include-unverified]
     python -m arm_control.multi_arm.trace_export --prune [--keep-files N] [--yes] [--root DIR]
 
-Reads the fault-trace directory and does not modify it, except for an explicit ``--prune --yes`` (dry-run without
-``--yes``), the only way traces are ever deleted. A trace is verified when its SHA-256 sidecar matches its bytes,
+Reads the fault-trace directory and does not modify it, except for an explicit ``--prune --yes --confirm-exported DIR`` (dry run
+without ``--yes``; only traces with a byte-identical copy in DIR are deleted), the only way traces are ever deleted. A trace is verified when its SHA-256 sidecar matches its bytes,
 it parses as ``arm_control.dual_fault`` JSON and its recorded ``samples_kept`` equals the number of samples it holds.
 ``--dest`` copies the verified traces (and their sidecars) plus ``EXPORT_MANIFEST.json`` (name, size, sha256, reason,
 observed time, samples kept, dropped samples) into a directory that must not exist or must be empty; files are created
@@ -21,7 +21,7 @@ from pathlib import Path
 import shutil
 import sys
 
-from arm_control.multi_arm.diagnostics import RETAIN_FILES, fault_root, prune_traces
+from arm_control.multi_arm.diagnostics import RETAIN_FILES, TRACE_GLOB, fault_root, prune_traces
 
 
 def _digest(path: Path) -> str:
@@ -34,12 +34,21 @@ def _digest(path: Path) -> str:
 
 def verify(path: Path) -> dict:
     """One trace's verdict. Never raises for a bad file: the problem is the result."""
-    info = {"name": path.name, "ok": False, "problem": None}
+    info = {"name": path.name, "ok": False, "legacy": False, "problem": None}
     try:
         info["size"] = path.stat().st_size
         sidecar = path.with_name(path.name + ".sha256")
         if not sidecar.is_file():
-            info["problem"] = "no sha256 sidecar"
+            # A trace written before sidecars existed (real fault records): it cannot be hash-verified, but it can be
+            # parsed and it is data: report it as legacy, export it, and never lose it to a "failed verification".
+            info["sha256"] = _digest(path)
+            report = json.loads(path.read_text())
+            if isinstance(report, dict) and str(report.get("schema", "")).startswith("arm_control.dual_fault/"):
+                info.update(ok=True, legacy=True, problem="no sha256 sidecar (written before sidecars existed)",
+                            reason=report.get("reason"), observed_at_utc=report.get("observed_at_utc"),
+                            samples_kept=len(report.get("samples", [])), schema=report.get("schema"))
+            else:
+                info["problem"] = "no sha256 sidecar and not a dual_fault trace"
             return info
         recorded = sidecar.read_text().split()[0]
         info["sha256"] = _digest(path)
@@ -47,6 +56,9 @@ def verify(path: Path) -> dict:
             info["problem"] = "sha256 does not match the sidecar (modified or truncated)"
             return info
         report = json.loads(path.read_text())
+        if not isinstance(report, dict) or not isinstance(report.get("samples", []), list):
+            info["problem"] = "not a trace object with a samples list"
+            return info
         if not str(report.get("schema", "")).startswith("arm_control.dual_fault/"):
             info["problem"] = f"unknown schema {report.get('schema')!r}"
             return info
@@ -57,13 +69,17 @@ def verify(path: Path) -> dict:
         info.update(ok=True, reason=report.get("reason"), observed_at_utc=report.get("observed_at_utc"),
                     samples_kept=held, dropped_samples=report.get("dropped_samples"),
                     schema=report.get("schema"))
-    except (OSError, ValueError, IndexError) as exc:
+    except (OSError, ValueError, IndexError, TypeError, AttributeError) as exc:
         info["problem"] = f"{type(exc).__name__}: {exc}"
     return info
 
 
 def list_traces(root: Path) -> list[dict]:
-    return [verify(p) for p in sorted(root.glob("*.json")) if p.is_file()]
+    infos = [verify(p) for p in sorted(root.glob(TRACE_GLOB)) if p.is_file() and not p.is_symlink()]
+    # A crash between writing and renaming leaves *.partial / orphan sidecars: never a trace, but say so.
+    for p in sorted(root.glob("*.partial")):
+        infos.append({"name": p.name, "ok": False, "legacy": False, "problem": "incomplete write (crash leftover)"})
+    return infos
 
 
 def export(root: Path, dest: Path, *, include_unverified: bool = False) -> dict:
@@ -100,10 +116,21 @@ def main(argv=None) -> int:
     ap.add_argument("--prune", action="store_true", help="remove the oldest traces beyond the capacity policy")
     ap.add_argument("--keep-files", type=int, default=RETAIN_FILES)
     ap.add_argument("--yes", action="store_true", help="actually delete (default is a dry run)")
+    ap.add_argument("--confirm-exported", type=Path, help="with --prune --yes: only traces with a byte-identical copy in this directory are deleted")
     args = ap.parse_args(argv)
     root = fault_root() if args.root is None else args.root
     if args.prune:
-        names = prune_traces(root, keep_files=args.keep_files, dry_run=not args.yes)
+        if args.keep_files < 0:
+            print("--keep-files must be >= 0")
+            return 2
+        only = None
+        if args.yes:
+            if args.confirm_exported is None:
+                print("refusing to delete: give --confirm-exported DIR (a directory holding byte-identical exported copies)")
+                return 2
+            only = {p.name for p in root.glob(TRACE_GLOB)
+                    if (args.confirm_exported / p.name).is_file() and _digest(args.confirm_exported / p.name) == _digest(p)}
+        names = prune_traces(root, keep_files=args.keep_files, dry_run=not args.yes, only=only)
         print(("removed " if args.yes else "would remove ") + f"{len(names)} trace(s): {names}")
         return 0
     if args.dest is not None:
@@ -114,7 +141,8 @@ def main(argv=None) -> int:
         return 1 if bad and not args.include_unverified else 0
     infos = list_traces(root)
     for info in infos:
-        print(("OK   " if info["ok"] else "BAD  ") + info["name"] + ("" if info["ok"] else f"  {info['problem']}"))
+        mark = "LEG  " if info.get("legacy") else "OK   " if info["ok"] else "BAD  "
+        print(mark + info["name"] + ("" if info["ok"] and not info.get("legacy") else f"  {info['problem']}"))
     print(f"{len(infos)} trace(s), {sum(not i['ok'] for i in infos)} failed verification")
     return 1 if any(not i["ok"] for i in infos) else 0
 

@@ -82,6 +82,85 @@ def main():
             else:
                 raise AssertionError(f"export accepted {unsafe}")
         assert trace_export.main(["--root", str(root), "--verify"]) == 1  # one bad trace: non-zero
+        # 4b. Round-1 review hardening.
+        sub = Path(tmp) / "hard"
+        t = diagnostics.PairFaultTrace("h")
+        t.record(dict(index=1))
+        # crash between writing and renaming: the final name never exists, nothing is left that looks like a trace
+        with patch.object(diagnostics.os, "replace", side_effect=OSError("simulated crash before rename")):
+            try:
+                t.save("crash", {}, root=sub)
+            except OSError:
+                pass
+        assert not list(sub.glob("*.json")) and not list(sub.glob("*.partial")) and not list(sub.glob("*.sha256"))
+        # ENOSPC while writing the sidecar: nothing left behind
+        real_open = Path.open
+
+        def failing_sidecar(self, mode="r", *a, **k):
+            if self.name.endswith(".sha256") and "x" in mode:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_open(self, mode, *a, **k)
+        with patch.object(Path, "open", failing_sidecar):
+            try:
+                t.save("sidecar full", {}, root=sub)
+            except OSError:
+                pass
+        assert not any(sub.iterdir())
+        # a name collision (same session, same microsecond) never damages the committed trace
+        frozen = diagnostics.datetime.now(diagnostics.timezone.utc)
+        with patch.object(diagnostics, "datetime") as fake_dt:
+            fake_dt.now.return_value = frozen
+            first_trace = t.save("first", {}, root=sub)
+            good = digest_tree(sub)
+            try:
+                t.save("third", {}, root=sub)
+            except FileExistsError:
+                pass
+            else:
+                raise AssertionError("a colliding save replaced a committed trace")
+        assert digest_tree(sub) == good and trace_export.verify(first_trace)["ok"]
+        # legacy trace (no sidecar): parses, is reported as legacy, exported, never a "failed verification"
+        legacy = sub / "20200101T000000000000Z-legacy.json"
+        legacy.write_text(json.dumps(dict(schema="arm_control.dual_fault/v1", reason="old", samples=[{"a": 1}])))
+        info = trace_export.verify(legacy)
+        assert info["ok"] and info["legacy"] and "sidecar" in info["problem"]
+        # a valid JSON that is not a trace, with a matching sidecar, is a reported problem, never an exception
+        odd = sub / "20200102T000000000000Z-odd.json"
+        odd.write_text("[1, 2]")
+        (sub / (odd.name + ".sha256")).write_text(hashlib.sha256(odd.read_bytes()).hexdigest() + "  " + odd.name + "\n")
+        assert not trace_export.verify(odd)["ok"]
+        # samples_kept must equal the samples present
+        lying = sub / "20200103T000000000000Z-lying.json"
+        lying.write_text(json.dumps(dict(schema="arm_control.dual_fault/v2", samples_kept=5, samples=[1])))
+        (sub / (lying.name + ".sha256")).write_text(hashlib.sha256(lying.read_bytes()).hexdigest() + "  " + lying.name + "\n")
+        assert "samples_kept" in trace_export.verify(lying)["problem"]
+        # an export directory used as a root: its manifest is not a trace; a crash leftover is listed as incomplete
+        out = Path(tmp) / "out"
+        trace_export.export(sub, out)
+        assert all(i["name"] != "EXPORT_MANIFEST.json" for i in trace_export.list_traces(out))
+        assert (out / "20200101T000000000000Z-legacy.json").is_file()  # the legacy trace was exported
+        (sub / "20990101T000000000000Z-x.json.partial").write_bytes(b"{")
+        assert any(i["problem"] == "incomplete write (crash leftover)" for i in trace_export.list_traces(sub))
+        # export never overwrites (exclusive create)
+        real_open2 = Path.open
+        modes = []
+
+        def spy(self, mode="r", *a, **k):
+            modes.append(mode)
+            return real_open2(self, mode, *a, **k)
+        with patch.object(Path, "open", spy):
+            trace_export.export(sub, Path(tmp) / "out2")
+        assert "wb" not in modes and "xb" in modes
+        # prune: refuses without confirmation, deletes only byte-identical exported copies, rejects a negative count
+        assert trace_export.main(["--root", str(sub), "--prune", "--keep-files", "0", "--yes"]) == 2
+        assert trace_export.main(["--root", str(sub), "--prune", "--keep-files", "-1"]) == 2
+        before = sorted(p.name for p in sub.glob("2*.json"))
+        assert trace_export.main(["--root", str(sub), "--prune", "--keep-files", "0", "--yes",
+                                  "--confirm-exported", str(Path(tmp) / "empty-none")]) == 0
+        assert sorted(p.name for p in sub.glob("2*.json")) == before, "deleted traces that were never exported"
+        assert trace_export.main(["--root", str(sub), "--prune", "--keep-files", "0", "--yes",
+                                  "--confirm-exported", str(out)]) == 0
+        assert not [p for p in sub.glob("2*.json") if (out / p.name).is_file()], "an exported trace survived the prune"
         # 5. The module opens no transport: importing it pulls in no plant, SDK or device module.
         code = ("import sys, arm_control.multi_arm.trace_export;"
                 "bad=[m for m in sys.modules if m.startswith(('arm_control.plants','arm_control.sdk','arm_control.supervisor'))];"
