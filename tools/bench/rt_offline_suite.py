@@ -36,6 +36,7 @@ REGRESSIONS = (
     ("selection_unresolved", "selection_unresolved.py", "reference_runtime_selfcheck"),
     ("selection_expiry_precedence", "selection_expiry_precedence.py", "reference_runtime_selfcheck"),
     ("console_adapter", "console_adapter.py", "reference_runtime_selfcheck"),
+    ("cancel_on_ack", "cancel_on_ack.py", "reference_runtime_selfcheck"),
 )
 
 

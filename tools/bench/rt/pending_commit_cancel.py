@@ -108,6 +108,12 @@ def cases(arm, runtime, scene, service):
         release.set()
         holding.clear()
 
+    def dropped(eid, how):
+        # CANCELLED means the drop was confirmed, never merely requested.
+        until(lambda: arm.status(eid).phase is Phase.CANCELLED, 8)
+        got = arm.receipts(eid)[-1].evidence.get('drop_confirmed')
+        assert got in how, (eid, got, how)
+
     def recovered(name, expected_calls, cleanup=None):
         until(lambda: not h.busy, 5)
         assert retire_calls == expected_calls, (name, retire_calls)
@@ -147,9 +153,10 @@ def cases(arm, runtime, scene, service):
     retire_calls.clear()
     gate_retire()
     arm.select_control_preset('float')
-    assert arm.status(eid).phase is Phase.CANCELLED
+    assert arm.status(eid).phase is not Phase.CANCELLED  # COMMIT not yet proven undispatched
     token.go.set()
     settled_before_retire()
+    dropped(eid, ('undispatched',))  # proof from the failed COMMIT job, before any ack
     recovered('before_dispatch', ['abort_reference_upload'])
 
     # Ordering 2: COMMIT is being sent when the cancel lands. The gate sits in
@@ -176,9 +183,10 @@ def cases(arm, runtime, scene, service):
         retire_calls.clear()
         blind.set()
         arm.select_control_preset('float')
-        assert arm.status(eid).phase is Phase.CANCELLED
+        assert arm.status(eid).phase is not Phase.CANCELLED  # COMMIT in flight: RT may select
         resume.set()
         until(lambda: h._job is None and h._cancel_job is None, 5)
+        dropped(eid, ('ack', 'rt_observed'))
         blind.clear()
         recovered('in_transport', ['cancel_reference'])
     finally:
@@ -212,16 +220,22 @@ def cases(arm, runtime, scene, service):
         retire_calls.clear()
         gate_retire()
         arm.select_control_preset('float')  # cancels the stream, revision 1 selected
-        assert arm.status(eid).phase is Phase.CANCELLED
+        assert arm.status(eid).phase is not Phase.CANCELLED  # revision 1 still selected on the RT
         token.go.set()
         settled_before_retire()
         def cleanup():
             if script is not None:
-                real_cancel(h.id, 1)  # the scripted refusal never reached the RT
+                try:
+                    real_cancel(h.id, 1)  # the scripted refusal never reached the RT
+                except ReferenceRefused:
+                    pass  # the RT already retired it (its deadman fired)
         try:
             recovered(name, ['abort_reference_upload', 'cancel_reference'], cleanup)
         finally:
             refuse.clear()
+        # ack: CANCEL(1) acknowledged or tolerated; a refused CANCEL is unconfirmed until
+        # the RT itself shows the reference retired (envelopes stopped, deadman).
+        dropped(eid, ('rt_observed',) if script == rtp.REF_BUSY else ('ack',))
         if script is None or script in (rtp.REF_REVISION, rtp.REF_RETIRED):
             assert not errors, (name, errors)
         else:

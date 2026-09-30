@@ -96,6 +96,7 @@ class _Execution:
     first_seq: int | None = None
     epoch: int = 0
     cancel_reason: str | None = None
+    drop: tuple[str, int] | None = None  # (reason, RT reference id): cancel awaiting RT confirmation
     completed_at: float | None = None  # feedback completion awaiting APPLIED
 
 
@@ -920,24 +921,64 @@ class RobotRuntime:
         return ex.status
 
     def _cancel_execution(self, ex: _Execution, reason: str) -> None:
+        if ex.drop is not None:
+            return  # already cancelled, waiting for the RT to confirm the drop
         ex.cancel_reason = reason
         ex.completed_at = None
         if ex.stream is not None:
             ex.stream.anchor = None
+            h = self._native
             if ex.status.phase is Phase.REQUESTED:
                 self._receipt(ex, Phase.REJECTED, reason)
+                self._settle_stream_attempts(ex, reason)
             elif not ex.status.terminal:
-                self._receipt(ex, Phase.CANCELLED, reason)
-            for (owner, _), attempt in self._stream_attempts.items():
-                if owner == ex.stream.owner and attempt.status.execution_id == ex.status.execution_id:
-                    phase = Phase.REJECTED if attempt.status.phase is Phase.REQUESTED else Phase.CANCELLED
-                    attempt.status = replace(attempt.status, phase=phase, at=self.now(), reason=reason)
+                if h is not None and h.key == ex.status.execution_id and h.selection_requested:
+                    # The RT may hold this reference: CANCELLED means the drop was
+                    # confirmed, so the receipt waits for the CANCEL/ABORT ack or for
+                    # the RT itself to show the reference retired (_confirm_drops).
+                    ex.drop = (reason, h.id)
+                else:
+                    self._receipt(ex, Phase.CANCELLED, reason)
+                    self._settle_stream_attempts(ex, reason)
             ex.stream.pending = None
         self._retire_native(ex.status.execution_id)
         if self.controller.current_plan_id == ex.status.execution_id:
             self.controller.on_control(pack_control_update(
                 cancel=True, reason=reason, cancel_plan_id=ex.status.execution_id))
         self._pump_controller()
+
+    def _settle_stream_attempts(self, ex: _Execution, reason: str) -> None:
+        for (owner, _), attempt in self._stream_attempts.items():
+            if owner == ex.stream.owner and attempt.status.execution_id == ex.status.execution_id:
+                phase = Phase.REJECTED if attempt.status.phase is Phase.REQUESTED else Phase.CANCELLED
+                attempt.status = replace(attempt.status, phase=phase, at=self.now(), reason=reason)
+
+    def _confirm_drops(self, state) -> None:
+        """Write the CANCELLED receipt of executions whose RT drop is now confirmed:
+        the CANCEL/ABORT was acknowledged (or COMMIT provably never selected), or the
+        RT's own state shows the reference retired or replaced. An unconfirmed drop
+        stays non-terminal; nothing is claimed."""
+        h = self._native
+        for ex in list(self._executions.values()):
+            if ex.drop is None or ex.status.terminal:
+                continue
+            reason, ref_id = ex.drop
+            how = h.dropped.get(ex.status.execution_id) if h is not None else None
+            if how in ('unconfirmed', None):
+                ref = None if state is None else state.reference
+                if ref and ref['reference_id'] and (ref['reference_id'] > ref_id or (
+                        ref['reference_id'] == ref_id
+                        and ref['status'] not in (rtp.REFERENCE_RUNNING, rtp.REFERENCE_END))):
+                    how = 'rt_observed'
+                else:
+                    how = None
+            if how is None:
+                continue
+            ex.drop = None
+            if h is not None:
+                h.dropped.pop(ex.status.execution_id, None)
+            self._receipt(ex, Phase.CANCELLED, reason, drop_confirmed=how)
+            self._settle_stream_attempts(ex, reason)
 
     def _drop_staged(self, ex: _Execution, reason: str) -> None:
         self._retire_native(ex.status.execution_id)
@@ -1041,6 +1082,8 @@ class RobotRuntime:
             reason = event.get("reason") or ""
             if event["ok"]:
                 ex.completed_at = time.monotonic()
+            elif ex.drop is not None:
+                pass  # the controller's own cancel is not the RT's confirmation
             elif ex.cancel_reason is not None:
                 self._receipt(ex, Phase.CANCELLED, ex.cancel_reason)
             elif ex.status.phase is Phase.ADMITTED:
@@ -1067,7 +1110,7 @@ class RobotRuntime:
                     self._receipt(ex, Phase.FAULTED, "completed on feedback without plant "
                                                      "acceptance evidence")
                 continue
-            if phase in (Phase.REQUESTED,) or current == eid:
+            if phase in (Phase.REQUESTED,) or current == eid or ex.drop is not None:
                 continue
             if ex.cancel_reason is not None:
                 self._receipt(ex, Phase.CANCELLED, ex.cancel_reason)
@@ -1133,6 +1176,7 @@ class RobotRuntime:
             h.poll(state, rx)
         except SelectionUnresolved as exc:
             self._selection_unresolved(h, str(exc))
+        self._confirm_drops(state)
         old_end = (h.observed is not None and h.observed_point is not None
                    and h.observed['status'] == rtp.REFERENCE_END
                    and h.observed['reference_id'] != h.id)

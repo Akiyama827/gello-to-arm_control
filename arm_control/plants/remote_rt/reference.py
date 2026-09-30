@@ -71,6 +71,8 @@ class ReferenceHorizon:
         self._stage_ready = False
         self.selection_requested = False
         self._commit_undispatched = False
+        self.dropped = {}  # key -> how the RT's drop was confirmed, or 'unconfirmed'
+        self._cancel_key = None
         self.error = ''
         self.point = None
         self.feedback = None
@@ -429,6 +431,13 @@ class ReferenceHorizon:
         self._pending_since = time.monotonic()
         self._job = ('commit', self._worker.submit(commit))
 
+    def _note_drop(self, how):
+        """A first-revision COMMIT that provably never selected: nothing to drop on the RT."""
+        if self._revision == 1 and self.key is not None:
+            self.dropped[self.key] = how
+            for stale in list(self.dropped)[:-16]:
+                del self.dropped[stale]
+
     def poll(self, state, received_at):
         """Once per PC control tick; takes one immutable feedback sample."""
         if self._schedstat_error is not None and not self._schedstat_warning_emitted:
@@ -447,10 +456,12 @@ class ReferenceHorizon:
                     if kind == 'commit' and isinstance(exc, (ReferenceRefused, _NotDispatched)):
                         self.candidate_selection = 'refused'
                         self.candidate_result = exc.result if isinstance(exc, ReferenceRefused) else p.REF_LATE
+                        self._note_drop('refused')
                     elif kind == 'commit' and isinstance(exc, ReferenceCancelledBeforeDispatch):
                         # COMMIT never left this host: proof of non-selection, so
                         # the slot does not wait for the queued ABORT/CANCEL.
                         self.candidate_selection = 'not_requested'
+                        self._note_drop('undispatched')
                     # A timeout after COMMIT never proves nonselection. Continue
                     # observing the old selected reference, without freeing slot.
                     if kind != 'commit' and kind != 'abort':
@@ -467,7 +478,9 @@ class ReferenceHorizon:
                 self._cancel_job.result()
             except RtLinkError as exc:
                 self.error = str(exc)
+                self.dropped[self._cancel_key] = 'unconfirmed'
             else:
+                self.dropped[self._cancel_key] = 'ack'
                 # The one worker runs CANCEL after any COMMIT, so its ack settles
                 # a selection the PC never got to observe (RUNNING retired within
                 # ms of COMMIT). Without this the slot stays pending, busy blocks
@@ -738,6 +751,7 @@ class ReferenceHorizon:
                                                session_id=session, arm_epoch=epoch)
 
         self._stage_ready = False
+        self._cancel_key = self.key
         self._cancel_job = self._worker.submit(retire)
 
     def close(self):

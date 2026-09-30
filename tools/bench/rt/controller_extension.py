@@ -113,12 +113,14 @@ def cases(arm, runtime, scene, service):
         assert arm.stream_revision(eid, 'pending').selection_state is SelectionState.PENDING
         refusal(lambda: arm.set_payload(PayloadValue(0)))
         arm.select_control_preset('float')
-        assert arm.status(eid).phase is Phase.CANCELLED
+        # COMMIT is in flight: the RT may select, so the drop is not yet confirmed
+        # and CANCELLED (a confirmed drop) is not claimed.
+        assert arm.status(eid).phase is not Phase.CANCELLED
     finally:
         resume.set()
         runtime.link.commit_reference = commit
     until(lambda: not runtime._native.busy)
-    assert arm.status(eid).phase is Phase.CANCELLED
+    until(lambda: arm.status(eid).phase is Phase.CANCELLED)
     arm.set_payload(PayloadValue(.5))
     arm.select_control_preset('track')
     loaded = stream('loaded', 3)
