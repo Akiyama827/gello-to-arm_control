@@ -97,6 +97,11 @@ def cases(arm, runtime, scene, service):
     entered, resume = threading.Event(), threading.Event()
     commit = runtime.link.commit_reference
     def delayed(*args, **kwargs):
+        if not runtime._native.stream:
+            # The runtime also commits its own measured-hold references. Under
+            # load one can reach this gate before the stream is approved (the
+            # attempt is still NOT_REQUESTED); only the stream's COMMIT is held.
+            return commit(*args, **kwargs)
         entered.set()
         assert resume.wait(2.)
         return commit(*args, **kwargs)

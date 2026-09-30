@@ -58,6 +58,10 @@ class ReferenceRefused(RtLinkError):
         self.operation, self.result = operation, result
 
 
+class ReferenceCancelledBeforeDispatch(RtLinkError):
+    """Local proof that a cancel arrived first and COMMIT was never sent."""
+
+
 def epoch_reached(value: int, target: int) -> bool:
     """32-bit generation comparison with wraparound (value >= target)."""
     return ((int(value) - int(target)) & 0xFFFFFFFF) < 0x80000000
@@ -597,6 +601,11 @@ class RtBackend:
         try:
             for attempt in range(2):  # one exact retry; never a bulk enqueue
                 if self._upload_cancel.is_set() or self._stop.is_set():
+                    if attempt == 0 and operation == rtp.CTL_REFERENCE_COMMIT:
+                        # Local proof the RT never saw COMMIT (unlike an
+                        # interruption after the send, which is uncertain).
+                        raise ReferenceCancelledBeforeDispatch(
+                            "COMMIT cancelled before dispatch")
                     raise RtLinkError("reference upload interrupted by lifecycle")
                 if _scope is not None:
                     self._reference_scope(*_scope)
@@ -692,8 +701,10 @@ class RtBackend:
                          arm_epoch: int | None = None, selection_budget_ns: int = 0,
                          _trace=None) -> dict:
         session_id, arm_epoch = self._reference_scope(session_id, arm_epoch)
+        # No clear here: this attempt's upload cleared the flag, so a set flag is
+        # a cancel that arrived since. _reference_exchange sees it under this
+        # lock, before COMMIT is sent.
         with self._upload_lock:
-            self._upload_cancel.clear()
             return self._reference_exchange(
                 rtp.CTL_REFERENCE_COMMIT, _scope=(session_id, arm_epoch), _trace=_trace,
                 session_id=session_id, upload_id=upload_id,

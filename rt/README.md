@@ -85,6 +85,7 @@ C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 | `check_two_instances.py` | regression | Two fake instance isolation |
 | `constrained_cpu.py` | diagnostic | Loaded timing matrix runner |
 | `controller_extension.py` | regression | Controller preset/payload transitions |
+| `pending_commit_cancel.py` | regression | Cancel racing a pending stream COMMIT frees the slot (forced orderings) |
 | `envelope_age.py` | diagnostic | Timing collection helper |
 | `first_envelope_probe.py` | diagnostic | First-envelope collision investigation |
 | `first_envelope_trace.py` | diagnostic | Opt-in client timeline helper |

@@ -32,6 +32,7 @@ REGRESSIONS = (
     ("stream_supervisor", "stream_supervisor.py", "reference_runtime_selfcheck"),
     ("streamed_hold", "streamed_hold.py", "server"),
     ("controller_extension", "controller_extension.py", "reference_runtime_selfcheck"),
+    ("pending_commit_cancel", "pending_commit_cancel.py", "reference_runtime_selfcheck"),
 )
 
 
