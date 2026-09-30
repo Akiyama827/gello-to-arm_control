@@ -292,6 +292,17 @@ def check_virtual(app, action, wait, refinement):
     inferred = app.kin.objects({a: np.asarray(s["q"]) for a, s in alignment["brackets"].items()})
     measured = pose_error(*inferred.values())
     np.testing.assert_allclose(last["closure"], measured, atol=1e-12)
+    # CTRL-041: the trace is schema v2 and carries the five closure quantities separately.
+    assert trace["schema"] == "arm_control.dual_fault/v2" and trace["schema_version"] == 2
+    assert trace["closure_schema"] == "arm_control.closure/v1"
+    record = last["closure_v1"]
+    assert record["schema"] == "arm_control.closure/v1" and record["window"] in ("motion", "stationary")
+    inferred_record = record["common_time_inferred"]["value"]
+    np.testing.assert_allclose([inferred_record["distance_m"], inferred_record["angle_rad"]], measured, atol=1e-12)
+    assert record["common_time_inferred"]["basis"]["brackets"].keys() == alignment["brackets"].keys()
+    assert record["tracking"]["value"].keys() == last["arms"].keys()
+    assert record["rt_selected_reference"]["value"] is None and record["rt_selected_reference"]["absent"]
+    assert record["physical"]["value"] is None and record["physical"]["absent"]
     assert measured[0] > .003 or measured[1] > np.deg2rad(2)
     assert all(s["state_seq"] and s["state_t_mono_ns"] and s["q_cmd_rt"] is not None
                and s["q_cmd_pc"] is not None for s in last["arms"].values())

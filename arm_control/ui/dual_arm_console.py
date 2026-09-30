@@ -23,6 +23,7 @@ from arm_control.config import arm_joints, ee_frame, gripper_joints
 from arm_control import frames
 from arm_control.console_server import ConsoleServer, file_asset
 from arm_control.grasp_visual import VisualFK
+from arm_control.multi_arm.closure import closure_record
 from arm_control.multi_arm.config import load_pair_config, scene_for_mode
 from arm_control.multi_arm.coordinator import BimanualCoordinator
 from arm_control.multi_arm.diagnostics import PairFaultTrace
@@ -550,7 +551,14 @@ class DualArmConsole:
                         # The plans are the identity the recorded chain joins
                         # on — a controller still holding a foreign plan must
                         # not read as this pair's selected reference.
+                        stationary = self._stationary_since
                         sample.update(
+                            closure_v1=closure_record(
+                                moving=stationary is None,
+                                stationary_for_s=None if stationary is None else self.runtime.t - stationary,
+                                planned=getattr(self.motion, "cooperative_metrics", None),
+                                arms=sample.get("arms"), common_time=closure,
+                                alignment=sample.get("feedback_alignment")),
                             mode=self.runtime.mode, closure=closure,
                             pair_id=pair_id,
                             lifecycle=self.coordinator.lifecycle.value,
