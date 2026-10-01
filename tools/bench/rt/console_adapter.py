@@ -14,6 +14,7 @@ import numpy as np
 from arm_control.contracts.motion import pack_control_update, unpack_control_update
 from arm_control.execution.contract import Start, TrajectoryRequest
 from arm_control.motion import JointTrajectory
+from arm_control.sdk import Refused
 from arm_control.supervisor.console_adapter import ConsoleControlAdapter
 from controller_extension import configure
 from reference_supervisor import until
@@ -128,6 +129,66 @@ def cases(arm, runtime, scene, service):
     assert state().preset_id == 'float'  # the refused payload did not undo the preset
     assert adapter.apply(console(gains=dict(kp=None, kd=None))) == adapter.apply(console())
     adapter.apply(console(gains=dict(kp=p.kp.tolist(), kd=p.kd.tolist())))
+    # Gate (b): a real live() supplier. LiveExecutions tracks what this client started and drops finished ones.
+    import time
+    from arm_control.supervisor.console_adapter import LiveExecutions
+    arm.select_control_preset('track')
+    tracker = LiveExecutions(arm)
+    q = arm.state().q
+    run = tracker.track(arm.execute(TrajectoryRequest(
+        'tracked', 'fake', tuple(runtime.joints),
+        JointTrajectory([0., 1., 2.], [q, q+.001, q+.002], np.zeros((3, 3))),
+        model_token=scene.facts.model_token, start=Start.ON_ADMIT)).execution_id)
+    until(lambda: arm.status(run).phase is Phase.APPLIED, 5)
+    assert tracker() == [run]
+    result = Adapter(arm, presets, live=tracker).apply(console(gains=dict(kp=p.kp.tolist(), kd=p.kd.tolist())))
+    assert result.applied == ('track',) and arm.status(run).phase is Phase.CANCELLED, result
+    assert tracker() == [], 'a finished execution stayed in the live set'
+
+    class Unreachable:
+        def status(self, execution_id):
+            raise Refused('supervisor unreachable')
+    ghost = LiveExecutions(Unreachable())
+    ghost.track('x')
+    assert ghost() == ['x'], 'an execution whose end cannot be shown was dropped from the live set'
+
+    # Gate (d): the cancel wait is bounded by one budget per apply(); an exhausted budget does NOT change the law.
+    until(lambda: not runtime._native.busy, 5)
+    q = arm.state().q
+    run = arm.execute(TrajectoryRequest(
+        'budget', 'fake', tuple(runtime.joints),
+        JointTrajectory([0., 1., 2.], [q, q+.001, q+.002], np.zeros((3, 3))),
+        model_token=scene.facts.model_token, start=Start.ON_ADMIT)).execution_id
+    until(lambda: arm.status(run).phase is Phase.APPLIED, 5)
+    t0 = time.monotonic()
+    result = Adapter(arm, presets, live=lambda: [run], cancel_budget_s=0.).apply(
+        console(gains=dict(kp=p.kp.tolist(), kd=p.kd.tolist())))
+    assert not result.applied and 'budget' in result.refusals[0], result
+    assert time.monotonic() - t0 < 1. and not arm.status(run).terminal, 'a refused budget still cancelled the leg'
+    arm.cancel(run)
+
+    # Gate (c): with send(), a mixed message keeps the on_control order (arm, payload, execute, gains, cancel, hold,
+    # stop); without it the groups come back for the caller. A raising send is reported and the rest still runs.
+    log = []
+    real_set_payload, real_select = arm.set_payload, arm.select_control_preset
+    arm.set_payload = lambda *a, **k: (log.append('payload'), real_set_payload(*a, **k))[1]
+    arm.select_control_preset = lambda *a, **k: (log.append('gains'), real_select(*a, **k))[1]
+    try:
+        arm.select_control_preset('float')
+        log.clear()
+        sent = adapter.apply(console(stop=True, cancel=True, execute=5, hold=True, arm=True, reason='r',
+                                     payload={'mass_kg': 0.}, gains=dict(kp=p.kp.tolist(), kd=p.kd.tolist())),
+                             send=lambda group: log.append(next(k for k in group if k != 'reason')))
+        assert sent.forward == () and sent.applied == ('payload', 'track'), sent
+        assert log == ['arm', 'payload', 'execute', 'gains', 'cancel', 'hold', 'stop'], log
+        def boom(group):
+            raise RuntimeError('down')
+        failed = adapter.apply(console(arm=True, payload={'mass_kg': 0.}, stop=True), send=boom)
+        assert failed.applied == ('payload',) and len(failed.refusals) == 2, failed
+    finally:
+        arm.set_payload, arm.select_control_preset = real_set_payload, real_select
+    # Gate (e), what the fake plant can show: a payload during a live execution is refused with the SDK's reason
+    # (asserted above); a same-Soft re-request is refused only on a Soft-capable plant: NOT exercised here.
     print('PASS: console gain/Soft/payload updates become SDK calls with named-preset parity; '
           'refusals are reported; other fields are forwarded unchanged')
 

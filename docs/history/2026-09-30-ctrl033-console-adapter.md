@@ -37,3 +37,10 @@ after them (Dora does them first). The console never sends mixed messages.
 message through `ArmController.on_control` and the adapter, (b) a real `live()` supplier
 (the default cancels nothing), (c) a `send` interleave if mixed messages ever appear, and
 (d) a note that same-preset gains block up to 2 s per live execution in a Dora handler.
+
+## CTRL-053 gates (b)-(e), 2026-10-01
+
+- (b) `LiveExecutions(arm)` is the `live()` supplier: it tracks the executions this client starts (`track(id)`) and returns those still not terminal; an execution whose status cannot be read counts as running. The supervisor has no list-executions op, so an execution another client started is not seen (there is one claimed session).
+- (c) `apply(update, send=...)` sends each forwarded group at its `on_control` position (arm, payload, execute, gains, Soft, cancel, hold, stop); a raising `send` is reported as a refusal and the rest still runs. Without `send`, behaviour is unchanged.
+- (d) `cancel_budget_s` (default 2 s) bounds the total cancel wait per `apply`. When it runs out the preset is NOT selected (a law is never changed under a running leg) and a refusal says so.
+- (e) payload during a live execution is refused with the SDK's reason (asserted). A same-Soft re-request is refused by the adapter, but this is NOT exercised: the fake plant is not Soft-capable. It stays unproven until a Soft-capable plant (hardware or sim) runs it.
