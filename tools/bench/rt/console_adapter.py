@@ -187,6 +187,7 @@ def cases(arm, runtime, scene, service):
         def __init__(self, real):
             self.real, self.timeouts = real, []
         def controller_state(self):
+            time.sleep(.3)  # time spent inside apply() before the first cancel must not count against the budget
             return self.real.controller_state()
         def cancel(self, execution_id, reason='', timeout_s=2.):
             self.timeouts.append(round(timeout_s, 1))
@@ -194,10 +195,41 @@ def cases(arm, runtime, scene, service):
         def select_control_preset(self, name):
             raise AssertionError('the preset was selected after the budget ran out')
     slow = SlowArm(arm)
-    time.sleep(.3)  # time before the first cancel must not count against the budget
     result = Adapter(slow, presets, live=lambda: ['a', 'b'], cancel_budget_s=.2).apply(
         console(gains=dict(kp=p.kp.tolist(), kd=p.kd.tolist())))
     assert slow.timeouts == [.2] and 'after 1 cancel' in result.refusals[0], (slow.timeouts, result)
+
+    # A real ArmClient.cancel raises TimeoutError when the leg is not terminal in time: reported with the count.
+    class TimingOutArm(SlowArm):
+        def cancel(self, execution_id, reason='', timeout_s=2.):
+            self.timeouts.append(execution_id)
+            if execution_id == 'b':
+                raise TimeoutError('b still applied')
+    to = TimingOutArm(arm)
+    result = Adapter(to, presets, live=lambda: ['a', 'b', 'c']).apply(
+        console(gains=dict(kp=p.kp.tolist(), kd=p.kd.tolist())))
+    assert to.timeouts == ['a', 'b'] and '1 earlier cancel' in result.refusals[0] and not result.applied, result
+
+    # apply() never raises SupervisorError: payload, controller_state and select all become refusals; later groups go on.
+    class Failing:
+        def __init__(self, where):
+            self.where = where
+        def controller_state(self):
+            if self.where == 'state':
+                raise SupervisorError('connection closed')
+            return arm.controller_state()
+        def set_payload(self, payload):
+            raise SupervisorError('connection closed')
+        def select_control_preset(self, name):
+            raise SupervisorError('connection closed')
+    for where in ('state', 'select'):
+        sent_groups = []
+        result = Adapter(Failing(where), presets).apply(
+            console(gains=dict(kp=presets['float'].kp.tolist(), kd=presets['float'].kd.tolist()), stop=True),
+            send=sent_groups.append)
+        assert result.refusals and not result.applied and sent_groups == [{'stop': True}], (where, result, sent_groups)
+    result = Adapter(Failing('select'), presets).apply(console(payload={'mass_kg': 0.}, stop=True), send=sent_groups.append)
+    assert result.refusals[0].startswith('payload:') and not result.applied, result
 
     # Gate (c): with send(), a mixed message keeps the on_control order (arm, payload, execute, gains, cancel, hold,
     # stop); without it the groups come back for the caller. A raising send is reported and the rest still runs.
@@ -219,7 +251,7 @@ def cases(arm, runtime, scene, service):
         assert failed.applied == ('payload',) and len(failed.refusals) == 2, failed
     finally:
         arm.set_payload, arm.select_control_preset = real_set_payload, real_select
-    # Gate (e), what the fake plant can show: a payload during a live execution is refused with the SDK's reason
+    # Gate (e), what the fake plant can show: a payload while an execution is current (a staged ON_RELEASE one) is refused with the SDK's reason
     # (asserted above); a same-Soft re-request is refused only on a Soft-capable plant: NOT exercised here.
     print('PASS: console gain/Soft/payload updates become SDK calls with named-preset parity; '
           'refusals are reported; other fields are forwarded unchanged')

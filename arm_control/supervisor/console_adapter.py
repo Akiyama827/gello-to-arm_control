@@ -21,8 +21,9 @@ Intended differences from the Dora path (not "no change"; see the history note):
     re-capture the measured pose, the Dora path does.
 A same-preset gains request cancels the live executions given by ``live()`` (the Dora
 path cancels a running leg on any gains message). Malformed fields come back as
-refusal strings, as is an SDK timeout; ``live()`` must not raise. A same-preset gains
-request blocks up to the SDK cancel wait (2 s) per live execution. It holds one ``ArmClient``: no new authority.
+refusal strings, as is an SDK timeout or a lost connection; ``live()`` must not raise (for SDK errors). A same-preset
+gains request waits for its cancels up to ``cancel_budget_s`` in total (approximate: one channel call can run past it).
+It holds one ``ArmClient``: no new authority.
 """
 from dataclasses import dataclass, field
 import threading
@@ -75,6 +76,8 @@ class LiveExecutions:
         return execution_id
 
     def __call__(self) -> list:
+        # ponytail: the lock is held across the status calls, so a concurrent track() waits for the sweep (worst case
+        # N x the channel timeout); single-threaded use is the norm.
         with self._lock:
             alive = []
             for execution_id in self._ids:
@@ -85,7 +88,7 @@ class LiveExecutions:
                     # the supervisor forgot it (it retains a bounded number): it is over, not running
                     if 'unknown execution' not in str(exc):
                         alive.append(execution_id)
-                except (SupervisorError, TimeoutError, OSError):
+                except (SupervisorError, TimeoutError, OSError, ValueError, KeyError):
                     alive.append(execution_id)  # cannot show it ended: treat as running (the safe side)
             self._ids = alive
             return list(alive)
@@ -165,11 +168,18 @@ class ConsoleControlAdapter:
                             refusals.append(f'preset {name}: cancel budget {self.cancel_budget_s} s exhausted after '
                                             f'{cancelled} cancel(s); the remaining legs were not cancelled')
                             return
-                        self.arm.cancel(execution_id, 'gains changed mid-leg', timeout_s=left)
+                        try:
+                            self.arm.cancel(execution_id, 'gains changed mid-leg', timeout_s=left)
+                        except TimeoutError as exc:
+                            # the cancel WAS sent; its leg is not yet terminal. Report what was done.
+                            refusals.append(f'preset {name}: cancel of {execution_id} not confirmed in time '
+                                            f'({exc}); {cancelled} earlier cancel(s) done, its own cancel pending, '
+                                            'the remaining legs were not cancelled')
+                            return
                         cancelled += 1
                 self.arm.select_control_preset(name)
                 applied.append(name)
-            except (SupervisorError, TimeoutError, OSError) as exc:
+            except (SupervisorError, TimeoutError, OSError, ValueError, KeyError) as exc:  # garbled reply: ValueError/KeyError
                 refusals.append(f'preset {name}: {exc!r}' if not isinstance(exc, Refused) else f'preset {name}: {exc}')
 
         forwarded('arm')
@@ -178,7 +188,7 @@ class ConsoleControlAdapter:
             try:
                 self.arm.set_payload(PayloadValue(float(body.get('mass_kg', 0.0)), body.get('com_ee')))
                 applied.append('payload')
-            except (SupervisorError, OSError, TimeoutError, ValueError, TypeError, AttributeError) as exc:
+            except (SupervisorError, OSError, TimeoutError, ValueError, TypeError, AttributeError, KeyError) as exc:
                 refusals.append(f'payload: {exc}')
         forwarded('execute')
         gains = update.get('gains') or {}
