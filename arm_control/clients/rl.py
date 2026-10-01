@@ -50,6 +50,14 @@ class StepWindow:
     def step(self, q_target, window_s: float, *, intervention=lambda: False) -> StepResult:
         if self.session is None or self.session.closed:
             raise NeedsOperator('no open episode stream: call reset() (the client never restarts one on its own)')
+        start = self.clock()
+        try:
+            return self._step(q_target, window_s, intervention)
+        except (SupervisorError, TimeoutError, OSError) as exc:  # infrastructure error mid-step: truncated, never raised
+            self.report.notes.append(f'step aborted: {exc!r}')
+            return self._result(start, 'refused', reason=repr(exc))
+
+    def _step(self, q_target, window_s, intervention):
         rid = request_id('step')
         start = self.clock()
         ended = self.session.view().execution
@@ -65,8 +73,8 @@ class StepWindow:
         kind = note_outcome(self.report, rid, status)
         outcome, reason = None, ''
         while outcome is None and self.clock() - start < window_s:
-            if kind == 'refused':
-                outcome, reason = 'refused', status.reason
+            if kind in ('refused', 'ended'):
+                outcome, reason = ('refused' if kind == 'refused' else 'not_selected'), status.reason
             elif intervention():
                 outcome = 'intervention'
             else:
@@ -84,7 +92,7 @@ class StepWindow:
         if outcome is None:
             status = self.arm.stream_revision(self.session.execution_id, rid)
             kind = note_outcome(self.report, rid, status)
-            outcome = 'completed' if kind == 'selected' else 'refused' if kind == 'refused' else 'not_selected'
+            outcome = 'completed' if kind == 'selected' else 'refused' if kind == 'refused' else 'not_selected'  # ended: too
             reason = status.reason
         selected = None if self.session.closed else self.session.view().selected_revision
         return self._result(start, outcome, reason=reason, selected=selected)

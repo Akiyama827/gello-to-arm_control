@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from arm_control.clients.common import Report, StreamContext, StreamSession, note_outcome, request_id
+from arm_control.clients.common import NeedsOperator, Report, StreamContext, StreamSession, note_outcome, request_id
 from arm_control.sdk import SupervisorError
 
 
@@ -40,18 +40,24 @@ class ActionChunkClient:
 
     def start(self) -> int:
         """Open a stream; chunks produced before this call (an older generation) are late forever."""
-        self.cancel('restart')
+        if not self.cancel('restart'):
+            raise NeedsOperator('previous stream not confirmed cancelled; not opening a second one')
         self.generation += 1
         self.session = StreamSession(self.arm, self.ctx, hold_s=self.hold_s)
         self.inflight = self.waiting = None
         self._sent_obs_ns = -1
         return self.generation
 
-    def cancel(self, reason: str = 'cancelled') -> None:
-        if self.session is not None:
-            self.session.close(reason)
-        self.session, self.inflight, self.waiting = None, None, None
+    def cancel(self, reason: str = 'cancelled') -> bool:
+        """True when the stream cancel was confirmed (or there was none). Otherwise the session is kept so ``cancel`` can
+        be retried, a note says so, and ``start()`` refuses to open a second stream."""
         self.generation += 1  # a response to anything requested before now can no longer land
+        self.inflight, self.waiting = None, None
+        if self.session is not None and not self.session.close(reason):
+            self.report.notes.append(f'CANCEL NOT CONFIRMED: {self.session.last_error}; retry cancel()')
+            return False
+        self.session = None
+        return True
 
     def _knots(self, chunk: Chunk):
         values = np.asarray(chunk.values, dtype=float)
@@ -141,9 +147,10 @@ class ActionChunkClient:
                     return self.report  # try again on the next pump
                 except (SupervisorError, OSError) as exc:  # e.g. history pruned: the fate is unknown, do not stay stuck
                     self.report.notes.append(f'{chunk_id}: revision status unavailable ({exc!r}); fate unknown')
-                    kind = 'refused'
-                    self.report.refused.append((chunk_id, 'fate unknown'))
-                if kind not in ('refused', 'selected'):
+                    self.report.unknown.append(chunk_id)
+                    kind = 'selected'  # conservative: it may have been selected, so nothing older may follow it
+                
+                if kind not in ('refused', 'selected', 'ended'):
                     return self.report
                 if kind == 'selected':
                     self._sent_obs_ns = max(self._sent_obs_ns, observed_ns)  # only what the RT selected is "sent"

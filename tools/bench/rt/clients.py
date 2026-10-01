@@ -13,11 +13,12 @@ import sys
 import numpy as np
 
 from arm_control.clients.chunks import ActionChunkClient, Chunk
-from arm_control.clients.common import NeedsOperator, StreamContext
+from arm_control.clients.common import NeedsOperator, Report, StreamContext, classify, note_outcome, resolved
 from arm_control.clients.planner import run_reviewed
 from arm_control.clients.rl import StepWindow
 from arm_control.clients.teleop import DeadmanTeleop
 from arm_control.execution.contract import Lifecycle, Phase, Start, TrajectoryRequest
+from arm_control.execution.stream import RevisionStatus, SelectionState
 from arm_control.motion import JointTrajectory
 from arm_control.sdk import Refused
 from controller_extension import configure
@@ -135,7 +136,51 @@ def cases(arm, runtime, scene, service):
     finally:
         arm.stream_revision = real_rev
     assert client.inflight is None and any('fate unknown' in n for n in client.report.notes), client.report
-    assert ('lost', 'fate unknown') in client.report.refused
+    assert 'lost' in client.report.unknown and 'lost' not in client.report.refused
+    # a revision that expires or is cancelled after admission is resolved (not stuck in flight) and not selected
+    at = arm.now()
+
+    def revision_status(phase, selection):
+        return RevisionStatus('e', 'r', 1, None, phase, selection, at, 'why')
+    for phase in (Phase.EXPIRED, Phase.CANCELLED, Phase.SUPERSEDED):
+        for selection in (SelectionState.NOT_REQUESTED, SelectionState.PENDING):
+            assert classify(revision_status(phase, selection)) == 'ended' and resolved(revision_status(phase, selection))
+    assert classify(revision_status(Phase.ADMITTED, SelectionState.PENDING)) == 'admitted'
+    assert classify(revision_status(Phase.REQUESTED, SelectionState.NOT_REQUESTED)) == 'pending'
+    folded = Report()
+    note_outcome(folded, 'x', revision_status(Phase.EXPIRED, SelectionState.NOT_REQUESTED))
+    assert folded.refused and not folded.admitted and not folded.selected
+    # an unreadable revision (fate unknown) is reported separately and nothing older may follow it
+    until(lambda: client.pump() and client.inflight is None, 8)
+    idle()  # the previous (unreadable) revision may still hold the supervisor's candidate slot
+    unknown_obs = arm.now()
+    verdict = client.submit(chunk('maybe', observed_at=unknown_obs))
+    assert verdict == 'sent', (verdict, client.report.late[-2:], client.report.refused[-2:], client.inflight)
+    real_rev2 = arm.stream_revision
+    arm.stream_revision = lambda *a, **k: (_ for _ in ()).throw(Refused('revision history unavailable'))
+    try:
+        client.pump()
+    finally:
+        arm.stream_revision = real_rev2
+    assert 'maybe' in client.report.unknown and 'maybe' not in client.report.refused
+    assert client.submit(chunk('retro', observed_at=replace(unknown_obs, ns=unknown_obs.ns - 1))) == 'late'
+    # an unconfirmed cancel is reported and keeps the session; start() then refuses to open a second stream
+    real_cancel2 = arm.cancel
+    arm.cancel = lambda *a, **k: (_ for _ in ()).throw(TimeoutError('link stall'))
+    try:
+        assert client.cancel('operator') is False
+        assert any('CANCEL NOT CONFIRMED' in n for n in client.report.notes) and client.session is not None
+        try:
+            client.start()
+        except NeedsOperator:
+            pass
+        else:
+            raise AssertionError('start() opened a second stream over an unconfirmed one')
+    finally:
+        arm.cancel = real_cancel2
+    assert client.cancel('operator') is True and client.session is None
+    generation = client.start()
+    until(lambda: arm.stream_state(client.session.execution_id).selected_revision == 1, 8)
     # a response for the previous generation, after cancel: dropped, and the session is not restarted
     stale = chunk('after-cancel')
     until(lambda: client.pump() and client.inflight is None, 8)
@@ -184,6 +229,29 @@ def cases(arm, runtime, scene, service):
     finally:
         arm.revise_stream = real_revise
     tele_r.session.close('done')
+    idle()
+    # the supervisor ended the stream under us: 'expired', not 'busy'/'refused' forever
+    tele_e = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
+                           clock=lambda: clock[0])
+    tele_e.start()
+    until(lambda: arm.stream_state(tele_e.session.execution_id).selected_revision == 1, 8)
+    assert tele_e.command(target, held=True) == 'requested'
+    arm.cancel(tele_e.session.execution_id)
+    assert tele_e.command(target, held=True) == 'expired'
+    idle()
+    # a pending revision whose status is unreadable (history pruned) is a reported unknown, not 'busy' forever
+    tele_u = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
+                           clock=lambda: clock[0])
+    tele_u.start()
+    until(lambda: arm.stream_state(tele_u.session.execution_id).selected_revision == 1, 8)
+    assert tele_u.command(target, held=True) == 'requested'
+    real_rev3 = arm.stream_revision
+    arm.stream_revision = lambda *a, **k: (_ for _ in ()).throw(Refused('revision history unavailable'))
+    try:
+        assert tele_u._settle() is False and tele_u.report.unknown
+    finally:
+        arm.stream_revision = real_rev3
+    tele_u.session.close('done')
     idle()
     # a heartbeat older than the timeout stops the arm even when tick() was never called (command's own check);
     # a second instance on the same ArmClient reuses no request id
@@ -241,6 +309,29 @@ def cases(arm, runtime, scene, service):
     far = env.step(np.asarray(arm.state().q) + 50., .3)
     assert far.outcome == 'refused' and far.truncated and not far.terminated, far
     assert not [a for a, _ in env.report.refused if a not in env.report.requested], env.report
+    until(lambda: not h.busy and runtime._stream_job is None, 8)
+    real_rev4 = arm.stream_revision
+    arm.stream_revision = lambda eid, rid: replace(real_rev4(eid, rid), selection_state=SelectionState.PENDING,
+                                                   phase=Phase.ADMITTED)
+    try:
+        unselected = env.step(np.asarray(arm.state().q) + .002, .3)
+    finally:
+        arm.stream_revision = real_rev4
+    assert unselected.outcome == 'not_selected' and unselected.truncated and not unselected.terminated, unselected
+    until(lambda: not h.busy and runtime._stream_job is None, 8)
+    arm.stream_revision = lambda eid, rid: replace(real_rev4(eid, rid), selection_state=SelectionState.REFUSED)
+    try:
+        early = env.step(np.asarray(arm.state().q) + .002, 3.)
+    finally:
+        arm.stream_revision = real_rev4
+    assert early.outcome == 'refused' and early.elapsed_s < 1.5, early  # not held to the end of the window
+    until(lambda: not h.busy and runtime._stream_job is None, 8)
+    arm.stream_revision = lambda *a, **k: (_ for _ in ()).throw(Refused('revision history unavailable'))
+    try:
+        broken = env.step(np.asarray(arm.state().q) + .002, .3)
+    finally:
+        arm.stream_revision = real_rev4
+    assert broken.truncated and broken.outcome in ('refused', 'not_selected'), broken  # never raised
     until(lambda: not h.busy and runtime._stream_job is None, 8)
     stopped = env.step(np.asarray(arm.state().q) + .002, 5., intervention=lambda: True)
     assert stopped.outcome == 'intervention' and stopped.elapsed_s < 1., stopped

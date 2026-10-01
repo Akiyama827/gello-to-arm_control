@@ -38,6 +38,7 @@ class Report:
     requested: list = field(default_factory=list)
     admitted: list = field(default_factory=list)
     selected: list = field(default_factory=list)
+    unknown: list = field(default_factory=list)   # fate unreadable (e.g. history pruned): neither confirmed nor refused
     refused: list = field(default_factory=list)   # (id, reason)
     replaced: list = field(default_factory=list)  # accepted by the client, superseded before it was sent
     late: list = field(default_factory=list)      # dropped as too old or for a closed session
@@ -100,11 +101,14 @@ def request_id(prefix: str) -> str:
 
 
 def classify(status) -> str:
-    """'refused', 'selected', 'admitted' or 'pending' for one revision status."""
+    """'refused', 'selected', 'ended', 'admitted' or 'pending' for one revision status. 'ended': admitted, then
+    expired/cancelled/superseded without the RT selecting it."""
     if status.phase is Phase.REJECTED or status.selection_state is SelectionState.REFUSED:
         return 'refused'
     if status.selection_state is SelectionState.SELECTED:
         return 'selected'
+    if status.phase.terminal:
+        return 'ended'
     if status.phase is not Phase.REQUESTED:
         return 'admitted'
     return 'pending'
@@ -112,12 +116,16 @@ def classify(status) -> str:
 
 def resolved(status) -> bool:
     """A revision attempt that no longer needs polling."""
-    return classify(status) in ('refused', 'selected')
+    return classify(status) in ('refused', 'selected', 'ended')
 
 
 def note_outcome(report, action_id, status) -> str:
     """Fold one polled revision status into ``report`` (each fact once); returns its classification."""
     kind = classify(status)
+    if kind == 'ended':
+        if all(a != action_id for a, _ in report.refused):
+            report.refused.append((action_id, f'ended without selection: {status.phase.value} {status.reason}'.strip()))
+        return kind
     if kind == 'refused':
         if all(a != action_id for a, _ in report.refused):
             report.refused.append((action_id, status.reason or 'revision refused'))
