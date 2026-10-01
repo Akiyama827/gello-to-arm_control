@@ -171,7 +171,7 @@ class ConsoleControlAdapter:
                         try:
                             self.arm.cancel(execution_id, 'gains changed mid-leg', timeout_s=left)
                         except TimeoutError as exc:
-                            # the cancel WAS sent; its leg is not yet terminal. Report what was done.
+                            # the cancel was requested (it may only be queued); its leg is not yet terminal. Report what was done.
                             refusals.append(f'preset {name}: cancel of {execution_id} not confirmed in time '
                                             f'({exc}); {cancelled} earlier cancel(s) done, its own cancel pending, '
                                             'the remaining legs were not cancelled')
