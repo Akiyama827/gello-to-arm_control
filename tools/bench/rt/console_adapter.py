@@ -14,7 +14,7 @@ import numpy as np
 from arm_control.contracts.motion import pack_control_update, unpack_control_update
 from arm_control.execution.contract import Start, TrajectoryRequest
 from arm_control.motion import JointTrajectory
-from arm_control.sdk import Refused
+from arm_control.sdk import Refused, SupervisorError
 from arm_control.supervisor.console_adapter import ConsoleControlAdapter
 from controller_extension import configure
 from reference_supervisor import until
@@ -152,6 +152,20 @@ def cases(arm, runtime, scene, service):
     ghost.track('x')
     assert ghost() == ['x'], 'an execution whose end cannot be shown was dropped from the live set'
 
+    class Dead:
+        def status(self, execution_id):
+            raise SupervisorError('connection closed')
+    dead = LiveExecutions(Dead())
+    dead.track('y')
+    assert dead() == ['y']  # a lost connection never makes live() raise
+
+    class Forgotten:
+        def status(self, execution_id):
+            raise Refused(f'unknown execution {execution_id!r}')
+    forgotten = LiveExecutions(Forgotten())
+    forgotten.track('old')
+    assert forgotten() == [], 'an execution the supervisor forgot stayed live forever'
+
     # Gate (d): the cancel wait is bounded by one budget per apply(); an exhausted budget does NOT change the law.
     until(lambda: not runtime._native.busy, 5)
     q = arm.state().q
@@ -166,6 +180,24 @@ def cases(arm, runtime, scene, service):
     assert not result.applied and 'budget' in result.refusals[0], result
     assert time.monotonic() - t0 < 1. and not arm.status(run).terminal, 'a refused budget still cancelled the leg'
     arm.cancel(run)
+
+    # A positive budget is spent from the first cancel and passed on as the cancel timeout; when a slow cancel uses
+    # it up, the remaining legs are not cancelled and the refusal says how many were.
+    class SlowArm:
+        def __init__(self, real):
+            self.real, self.timeouts = real, []
+        def controller_state(self):
+            return self.real.controller_state()
+        def cancel(self, execution_id, reason='', timeout_s=2.):
+            self.timeouts.append(round(timeout_s, 1))
+            time.sleep(.3)
+        def select_control_preset(self, name):
+            raise AssertionError('the preset was selected after the budget ran out')
+    slow = SlowArm(arm)
+    time.sleep(.3)  # time before the first cancel must not count against the budget
+    result = Adapter(slow, presets, live=lambda: ['a', 'b'], cancel_budget_s=.2).apply(
+        console(gains=dict(kp=p.kp.tolist(), kd=p.kd.tolist())))
+    assert slow.timeouts == [.2] and 'after 1 cancel' in result.refusals[0], (slow.timeouts, result)
 
     # Gate (c): with send(), a mixed message keeps the on_control order (arm, payload, execute, gains, cancel, hold,
     # stop); without it the groups come back for the caller. A raising send is reported and the rest still runs.

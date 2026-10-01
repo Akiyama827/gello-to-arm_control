@@ -10,7 +10,8 @@ calls, applied independently (no all-or-nothing) in ``on_control`` relative orde
 ordered list of small updates (arm, execute, cancel, hold, stop). The SDK calls take
 effect DURING ``apply()`` and the forwarded groups only when the caller sends them
 afterwards, so arm/execute in the same message land AFTER payload/gains/Soft (Dora
-does them first) unless the caller passes ``send`` (CTRL-053 gate c), which sends each group at its on_control position. The console never sends mixed messages.
+does them first) unless the caller passes ``send`` (CTRL-053 gate c), which sends each
+group at its on_control position. The console never sends mixed messages.
 
 Intended differences from the Dora path (not "no change"; see the history note):
   * gains/Soft must be exactly a named preset (the console only sends its own);
@@ -24,12 +25,13 @@ refusal strings, as is an SDK timeout; ``live()`` must not raise. A same-preset 
 request blocks up to the SDK cancel wait (2 s) per live execution. It holds one ``ArmClient``: no new authority.
 """
 from dataclasses import dataclass, field
+import threading
 import time
 
 import numpy as np
 
 from arm_control.execution.controller import PayloadValue
-from arm_control.sdk import Refused
+from arm_control.sdk import Refused, SupervisorError
 
 MODE_FIELDS = ('gains', 'pose_hold', 'payload')
 # on_control order; a reason travels with the group that uses it.
@@ -65,30 +67,38 @@ class LiveExecutions:
     """
 
     def __init__(self, arm):
-        self.arm, self._ids = arm, []
+        self.arm, self._ids, self._lock = arm, [], threading.Lock()
 
     def track(self, execution_id: str) -> str:
-        self._ids.append(execution_id)
+        with self._lock:
+            self._ids.append(execution_id)
         return execution_id
 
     def __call__(self) -> list:
-        alive = []
-        for execution_id in self._ids:
-            try:
-                if not self.arm.status(execution_id).terminal:
-                    alive.append(execution_id)
-            except (Refused, TimeoutError):
-                alive.append(execution_id)  # cannot show it ended: treat as running (the safe side)
-        self._ids = alive
-        return list(alive)
+        with self._lock:
+            alive = []
+            for execution_id in self._ids:
+                try:
+                    if not self.arm.status(execution_id).terminal:
+                        alive.append(execution_id)
+                except Refused as exc:
+                    # the supervisor forgot it (it retains a bounded number): it is over, not running
+                    if 'unknown execution' not in str(exc):
+                        alive.append(execution_id)
+                except (SupervisorError, TimeoutError, OSError):
+                    alive.append(execution_id)  # cannot show it ended: treat as running (the safe side)
+            self._ids = alive
+            return list(alive)
 
 
 class ConsoleControlAdapter:
     def __init__(self, arm, presets, live=lambda: (), cancel_budget_s: float = 2.0):
         """``arm``: a claimed ArmClient; ``presets``: control.presets.resolve_presets(...);
         ``live``: execution ids currently running, cancelled by a same-preset gains request (use
-        :class:`LiveExecutions`); ``cancel_budget_s``: the total time one ``apply`` may spend waiting for those
-        cancels (gate d). If it runs out the preset is NOT selected: a law is never changed under a running leg."""
+        :class:`LiveExecutions`); ``cancel_budget_s``: the total time one ``apply`` may spend waiting for the
+        same-preset gains cancels, counted from the first cancel (gate d). If it runs out the request is refused and
+        the legs not yet cancelled keep running (earlier ones stay cancelled); the changed-preset path is not bounded
+        by it (the supervisor cancels without waiting and switches at once)."""
         self.arm, self.presets, self.live = arm, presets, live
         self.cancel_budget_s = cancel_budget_s
 
@@ -121,7 +131,7 @@ class ConsoleControlAdapter:
         ``forward`` comes back empty. Without it the groups are returned for the caller to send afterwards. A
         ``send`` that raises does not stop the remaining steps; its error is reported as a refusal."""
         refusals, applied, forward = [], [], []
-        deadline = time.monotonic() + self.cancel_budget_s
+        deadline = []  # set at the first cancel
 
         def forwarded(*keys):
             group = {k: update[k] for k in keys if k in update}
@@ -146,17 +156,21 @@ class ConsoleControlAdapter:
                         refusals.append(f'preset {name}: already selected; the SDK cannot '
                                         're-capture the measured pose')
                         return
+                    cancelled = 0
                     for execution_id in self.live():
-                        left = deadline - time.monotonic()
+                        if not deadline:
+                            deadline.append(time.monotonic() + self.cancel_budget_s)
+                        left = deadline[0] - time.monotonic()
                         if left <= 0:
-                            refusals.append(f'preset {name}: cancel budget {self.cancel_budget_s} s exhausted; '
-                                            'the law was not changed under a running leg')
+                            refusals.append(f'preset {name}: cancel budget {self.cancel_budget_s} s exhausted after '
+                                            f'{cancelled} cancel(s); the remaining legs were not cancelled')
                             return
                         self.arm.cancel(execution_id, 'gains changed mid-leg', timeout_s=left)
+                        cancelled += 1
                 self.arm.select_control_preset(name)
                 applied.append(name)
-            except (Refused, TimeoutError) as exc:
-                refusals.append(f'preset {name}: {exc!r}' if isinstance(exc, TimeoutError) else f'preset {name}: {exc}')
+            except (SupervisorError, TimeoutError, OSError) as exc:
+                refusals.append(f'preset {name}: {exc!r}' if not isinstance(exc, Refused) else f'preset {name}: {exc}')
 
         forwarded('arm')
         if 'payload' in update:
@@ -164,7 +178,7 @@ class ConsoleControlAdapter:
             try:
                 self.arm.set_payload(PayloadValue(float(body.get('mass_kg', 0.0)), body.get('com_ee')))
                 applied.append('payload')
-            except (Refused, ValueError, TypeError, AttributeError) as exc:
+            except (SupervisorError, OSError, TimeoutError, ValueError, TypeError, AttributeError) as exc:
                 refusals.append(f'payload: {exc}')
         forwarded('execute')
         gains = update.get('gains') or {}
