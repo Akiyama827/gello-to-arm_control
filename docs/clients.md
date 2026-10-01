@@ -1,14 +1,14 @@
 # Application clients (CTRL-052)
 
 `arm_control/clients/` holds four thin clients over `ArmClient` (stdlib + numpy; the backend never imports it, checked by
-`tools/bench/rt/clients.py`). Run them against fake endpoints: `python tools/bench/rt/clients.py <reference_runtime_selfcheck>`.
+`tools/bench/rt/clients.py`). Run them against fake endpoints: `cd tools/bench/rt && PYTHONPATH=../../..:. python clients.py <build>/reference_runtime_selfcheck` (or `tools/bench/rt_offline_suite.py`).
 
 | Client | Contract |
 |---|---|
 | `planner.run_reviewed` | submit a reviewed `TrajectoryRequest`, release it only if it starts on release, wait; a timeout leaves it running |
 | `chunks.ActionChunkClient` | a policy's chunks, spliced from the supervisor's anchor |
-| `teleop.DeadmanTeleop` | setpoints while the deadman is held and fresh; release or a stale heartbeat CANCELS the stream (the executor holds); never re-arms |
-| `rl.StepWindow` | `step(q_target, window_s)` reports actual elapsed time and `completed/intervention/refused/expired/faulted`; `terminated` is always False (task success is project-owned); `reset()` raises `NeedsOperator` unless the robot is armed and unfaulted and never re-arms, homes, opens the Hand, discards calibration or restarts a stream |
+| `teleop.DeadmanTeleop` | setpoints while the deadman is held and fresh; each step's horizon is at most the deadman timeout (a longer move is shortened and noted), so a stalled calling loop leaves at most one timeout of committed travel; with a live loop, release or a stale heartbeat CANCELS the stream (the executor holds), an unconfirmed cancel is retried and reported (`stop_failed`); returns `busy` while the previous revision is unresolved; never re-arms; a Hermite step that ends at rest peaks near 1.5x its average speed |
+| `rl.StepWindow` | `step(q_target, window_s)` reports actual elapsed time and `completed` (the RT selected the revision) `/intervention/refused/not_selected/expired/faulted`; an intervention returns early but does NOT stop the arm; `terminated` is always False (task success is project-owned); `reset()` raises `NeedsOperator` unless the robot is armed and unfaulted and never re-arms, homes, opens the Hand, discards calibration or restarts a stream |
 
 ## Action chunks
 
@@ -22,11 +22,19 @@ is reported.
 
 ## What a `Report` says
 
-`admitted`: high-level actions the supervisor accepted. `selected_revision`: the revision the RT has actually selected, which
-is what governs motion. A buffered action can be admitted and never selected.
+Three separate facts per high-level action: `requested` (sent), `admitted` (the supervisor's trusted admission accepted it:
+the reply to a revision only says REQUESTED, admission is asynchronous, so the clients poll the revision), `selected` (the RT
+selected it, which is what governs motion). A refusal after the request is in `refused`. `selected_revision` is the stream's
+current revision. Planner requests are admitted synchronously.
+
+## Timing
+
+A chunk is spliced at the supervisor's splice anchor (the earliest the RT can take it), not at its `observed_at`: actions
+already overtaken by inference latency are not skipped, so a policy must account for its delay. The horizon of a chunk is
+`len * dt_s` and is bounded by the supervisor's stream policy (`max_future_s`).
 
 ## Not done
 
-LeRobot and OpenPI boundaries (project-owned, optional extras, under `Control/`), a normalization map, and the control-profile
+"Limit changes visible in execution reports and datasets" (the supervisor refusal reason is reported, nothing is clipped, but there is no dataset record), LeRobot and OpenPI boundaries (project-owned, optional extras, under `Control/`), a normalization map, and the control-profile
 field in a recorded dataset. These need a real policy interface to adapt and are not built here. No hardware run; a real run
 needs the corresponding capability gate.

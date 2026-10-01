@@ -19,6 +19,7 @@ from arm_control.clients.rl import StepWindow
 from arm_control.clients.teleop import DeadmanTeleop
 from arm_control.execution.contract import Lifecycle, Phase, Start, TrajectoryRequest
 from arm_control.motion import JointTrajectory
+from arm_control.sdk import Refused
 from controller_extension import configure
 from reference_supervisor import until
 from stream_races import main
@@ -65,7 +66,8 @@ def cases(arm, runtime, scene, service):
     assert client.submit(chunk('c2')) == 'waiting' and client.submit(chunk('c3')) == 'waiting'
     assert client.report.replaced == ['c2'], client.report  # bounded: one waiting, the newer replaces it
     until(lambda: client.pump() and client.inflight is None and client.waiting is None, 8)
-    assert client.report.admitted[:2] == ['c1', 'c3'] and client.report.selected_revision >= 2, client.report
+    assert client.report.admitted[:2] == ['c1', 'c3'] and client.report.selected[:2] == ['c1', 'c3'], client.report
+    assert client.report.requested[:2] == ['c1', 'c3'] and client.report.selected_revision >= 2, client.report
     # a response requested before a restart is late even though a session is open (generation rule alone)
     old_generation = chunk('prev')
     generation = client.start()
@@ -74,19 +76,70 @@ def cases(arm, runtime, scene, service):
     # nothing sent in this session yet, so only the age rule can drop this one
     assert client.submit(chunk('old', age=5.)) == 'late'
     assert client.submit(chunk('fresh')) == 'sent'
+    n_before = len(client.report.requested)
     # older observation than what was sent, wrong joints, wrong units, delta without base: nothing reaches the RT
-    n_admitted = len(client.report.admitted)
+    n_requested = n_before
     assert client.submit(chunk('older', observed_at=replace(now, ns=now.ns - 1))) == 'late'
     assert client.submit(chunk('names', joints=tuple(reversed(ctx.joints)))) == 'refused'
     assert client.submit(chunk('units', units='deg')) == 'refused'
     assert client.submit(chunk('delta', mode='delta')) == 'refused'
-    assert len(client.report.admitted) == n_admitted
+    assert len(client.report.requested) == n_requested
     assert [c for c, _ in client.report.late] == ['prev', 'old', 'older'], client.report.late
+    # a delta chunk composes on base_q (arithmetic), is sent and the RT selects it
+    base_q = np.asarray(arm.state().q)
+    delta = chunk('delta-ok', mode='delta', base_q=tuple(base_q), values=np.full((2, 3), .001),
+                  observed_at=arm.now())
+    assert np.allclose(client._knots(delta), base_q + .001)
+    until(lambda: client.pump() and client.inflight is None, 8)
+    assert client.submit(delta) == 'sent'
+    until(lambda: client.pump() and 'delta-ok' in client.report.selected, 8)
+    # an async admission refusal is reported as refused, never as admitted or selected
+    until(lambda: client.pump() and client.inflight is None, 8)
+    far = chunk('far', values=np.asarray(arm.state().q)[None, :] + 50., observed_at=arm.now())
+    assert client.submit(far) == 'sent'
+    until(lambda: client.pump() and client.inflight is None, 8)
+    assert 'far' in client.report.requested and 'far' not in client.report.admitted + client.report.selected
+    assert any(c == 'far' for c, _ in client.report.refused), client.report
+    # Hermite construction: anchor velocity at the first knot, central differences inside, 127-knot cap
+    seen = {}
+    real_revise, real_anchor = arm.revise_stream, arm.stream_anchor
+    arm.stream_anchor = lambda eid: seen.setdefault('anchor', replace(real_anchor(eid), qd=(.01, .02, .03)))
+    arm.revise_stream = lambda rev: (seen.__setitem__('rev', rev), real_revise(rev))[1]
+    try:
+        until(lambda: client.pump() and client.inflight is None, 8)
+        knots = np.asarray(arm.state().q) + np.array([[.001, 0, 0], [.002, 0, 0], [.004, 0, 0]])
+        client.session.revise('hermite', knots, .5)
+    finally:
+        arm.revise_stream, arm.stream_anchor = real_revise, real_anchor
+    sfx = seen['rev'].suffix
+    assert np.allclose(sfx.velocities[0], seen['anchor'].qd) and sfx.times[0] == seen['anchor'].cut_phase
+    assert np.allclose(sfx.velocities[1], (sfx.positions[2] - sfx.positions[0]) / 1.0)
+    assert np.allclose(sfx.velocities[2], (sfx.positions[3] - sfx.positions[1]) / 1.0)
+    assert np.allclose(sfx.velocities[3], 0.)
+    try:
+        client.session.revise('too-long', np.zeros((128, 3)), .1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('128 knots + anchor exceeds stream capacity but was accepted')
+    # revision status unreadable (history pruned): the in-flight slot is released and the fate is reported unknown
+    until(lambda: client.pump() and client.inflight is None, 8)
+    assert client.submit(chunk('lost', observed_at=arm.now())) == 'sent'
+    real_rev = arm.stream_revision
+
+    def pruned(*a, **k):
+        raise Refused('revision history unavailable')
+    arm.stream_revision = pruned
+    try:
+        client.pump()
+    finally:
+        arm.stream_revision = real_rev
+    assert client.inflight is None and any('fate unknown' in n for n in client.report.notes), client.report
+    assert ('lost', 'fate unknown') in client.report.refused
     # a response for the previous generation, after cancel: dropped, and the session is not restarted
     stale = chunk('after-cancel')
     until(lambda: client.pump() and client.inflight is None, 8)
     client.cancel('operator')
-    assert stream_phase(client.session) if client.session else True
     assert client.submit(stale) == 'late' and client.session is None
     idle()
     assert arm.authority().lifecycle is Lifecycle.ARMED  # cancelling a stream never disarms
@@ -98,7 +151,11 @@ def cases(arm, runtime, scene, service):
     tele.start()
     until(lambda: arm.stream_state(tele.session.execution_id).selected_revision == 1, 8)
     target = np.asarray(arm.state().q) + .003
-    assert tele.command(target, held=True) == 'moved' and tele.report.admitted == ['teleop-1']
+    assert tele.command(target, held=True) == 'requested' and len(tele.report.requested) == 1
+    # a second command while the first is unresolved is 'busy' or 'requested', never an exception; refusal is reported
+    assert tele.command(target, held=True) in ('busy', 'requested')
+    until(lambda: not tele._settle(), 8)
+    assert tele.report.admitted and tele.report.selected, tele.report
     clock[0] += .1
     assert tele.tick() is None
     clock[0] += .5  # the GUI stalled: no heartbeat past the timeout
@@ -112,6 +169,65 @@ def cases(arm, runtime, scene, service):
     until(lambda: stream_phase(tele.session) is Phase.CANCELLED, 8)
     assert arm.authority().lifecycle is Lifecycle.ARMED
     idle()
+    # a supervisor refusal of the revision itself (slot unavailable) is returned as 'refused', never raised
+    tele_r = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
+                           clock=lambda: clock[0])
+    tele_r.start()
+    until(lambda: arm.stream_state(tele_r.session.execution_id).selected_revision == 1, 8)
+    real_revise = arm.revise_stream
+
+    def busy(rev):
+        raise Refused('stream candidate slot unavailable')
+    arm.revise_stream = busy
+    try:
+        assert tele_r.command(target, held=True) == 'refused' and tele_r.report.refused
+    finally:
+        arm.revise_stream = real_revise
+    tele_r.session.close('done')
+    idle()
+    # a heartbeat older than the timeout stops the arm even when tick() was never called (command's own check);
+    # a second instance on the same ArmClient reuses no request id
+    tele2 = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
+                          clock=lambda: clock[0])
+    tele2.start()
+    until(lambda: arm.stream_state(tele2.session.execution_id).selected_revision == 1, 8)
+    assert tele2.command(target, held=True) == 'requested' and tele2.report.requested[0] != tele.report.requested[0]
+    until(lambda: not tele2._settle(), 8)
+    clock[0] += 1.
+    assert tele2.command(target, held=True) == 'expired'
+    until(lambda: stream_phase(tele2.session) is Phase.CANCELLED, 8)
+    idle()
+    # a far setpoint commits at most one deadman timeout of travel; a stop that is not confirmed is retried and said so
+    tele3 = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
+                          clock=lambda: clock[0])
+    tele3.start()
+    until(lambda: arm.stream_state(tele3.session.execution_id).selected_revision == 1, 8)
+    recorded = {}
+    real_revise = arm.revise_stream
+    arm.revise_stream = lambda rev: (recorded.__setitem__('rev', rev), real_revise(rev))[1]
+    try:
+        assert tele3.command(np.asarray(arm.state().q) + 2., held=True) == 'requested'
+    finally:
+        arm.revise_stream = real_revise
+    horizon = recorded['rev'].suffix.times[-1] - recorded['rev'].suffix.times[0]
+    assert horizon <= .3 + 1e-9 and any('limited' in n for n in tele3.report.notes), (horizon, tele3.report.notes)
+    real_cancel = arm.cancel
+    calls = []
+
+    def flaky_cancel(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError('link stall')
+        return real_cancel(*a, **k)
+    arm.cancel = flaky_cancel
+    try:
+        clock[0] += 1.
+        assert tele3.tick() == 'stop_failed' and not tele3.session.closed
+        assert any('STOP NOT CONFIRMED' in n for n in tele3.report.notes)
+        assert tele3.tick() == 'expired' and tele3.session.closed  # retried
+    finally:
+        arm.cancel = real_cancel
+    idle()
 
     # -- RL step-window ---------------------------------------------------------------------------------------------
     env = StepWindow(arm, ctx, hold_s=6.)
@@ -120,6 +236,12 @@ def cases(arm, runtime, scene, service):
     result = env.step(np.asarray(arm.state().q) + .002, .3)
     assert result.outcome == 'completed' and result.elapsed_s >= .3 and not result.terminated and not result.truncated, result
     assert result.selected_revision >= 2, result
+    # a step the supervisor refuses AFTER admission is 'refused', never 'completed'; a second episode object on the
+    # same ArmClient reuses no request id
+    far = env.step(np.asarray(arm.state().q) + 50., .3)
+    assert far.outcome == 'refused' and far.truncated and not far.terminated, far
+    assert not [a for a, _ in env.report.refused if a not in env.report.requested], env.report
+    until(lambda: not h.busy and runtime._stream_job is None, 8)
     stopped = env.step(np.asarray(arm.state().q) + .002, 5., intervention=lambda: True)
     assert stopped.outcome == 'intervention' and stopped.elapsed_s < 1., stopped
     try:
@@ -137,6 +259,12 @@ def cases(arm, runtime, scene, service):
         pass
     else:
         raise AssertionError('a closed episode was silently restarted')
+    idle()
+    env2 = StepWindow(arm, ctx, hold_s=6.)  # a second episode object on the same ArmClient: no request id is reused
+    env2.reset()
+    until(lambda: arm.stream_state(env2.session.execution_id).selected_revision == 1, 8)
+    assert env2.step(np.asarray(arm.state().q) + .002, .3).outcome == 'completed'
+    env2.session.close('done')
     idle()
     arm.disarm()
     try:

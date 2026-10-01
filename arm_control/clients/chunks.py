@@ -13,9 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from arm_control.clients.common import Report, StreamContext, StreamSession, resolved
-from arm_control.execution.contract import Phase
-from arm_control.execution.stream import SelectionState
+from arm_control.clients.common import Report, StreamContext, StreamSession, note_outcome, request_id
 from arm_control.sdk import SupervisorError
 
 
@@ -38,7 +36,7 @@ class ActionChunkClient:
             raise ValueError('max_age_s must be positive (it is the caller\'s deadline, there is no default)')
         self.arm, self.ctx, self.max_age_s, self.hold_s = arm, ctx, max_age_s, hold_s
         self.generation, self.session, self.report = 0, None, Report()
-        self.inflight, self.waiting, self._sent_obs_ns, self._seq = None, None, -1, 0
+        self.inflight, self.waiting, self._sent_obs_ns = None, None, -1
 
     def start(self) -> int:
         """Open a stream; chunks produced before this call (an older generation) are late forever."""
@@ -90,25 +88,23 @@ class ActionChunkClient:
             return 'refused', f'cannot age the observation: {exc!r}'
         if age > self.max_age_s:
             return 'late', f'observation {age:.3f} s old, deadline {self.max_age_s} s'
-        if chunk.observed_at.ns < self._sent_obs_ns:
+        newest = max(self._sent_obs_ns, self.inflight[2] if self.inflight else -1)
+        if chunk.observed_at.ns < newest:
             return 'late', 'older than the observation of what was already sent'
         return None
 
     def _send(self, chunk: Chunk) -> None:
         try:
             knots = self._knots(chunk)
-            self._seq += 1
-            request_id = f'{chunk.chunk_id}.{self._seq}'
-            status = self.session.revise(request_id, knots, chunk.dt_s)
+            rid = request_id(chunk.chunk_id)
+            status = self.session.revise(rid, knots, chunk.dt_s)
         except (ValueError, SupervisorError, TimeoutError, OSError) as exc:
             self.report.refused.append((chunk.chunk_id, str(exc)))
             return
-        if status.phase is Phase.REJECTED or status.selection_state is SelectionState.REFUSED:
-            self.report.refused.append((chunk.chunk_id, status.reason or 'revision refused'))
+        self.report.requested.append(chunk.chunk_id)
+        if note_outcome(self.report, chunk.chunk_id, status) == 'refused':
             return
-        self.report.admitted.append(chunk.chunk_id)
-        self._sent_obs_ns = chunk.observed_at.ns
-        self.inflight = (chunk.chunk_id, request_id)
+        self.inflight = (chunk.chunk_id, rid, chunk.observed_at.ns)
 
     def submit(self, chunk: Chunk) -> str:
         """'sent', 'waiting', 'late' or 'refused'. Never blocks on the robot."""
@@ -138,11 +134,19 @@ class ActionChunkClient:
                 self.session.closed, self.inflight, self.waiting = True, None, None  # not restarted from here
                 return self.report
             if self.inflight is not None:
+                chunk_id, rid, observed_ns = self.inflight
                 try:
-                    if not resolved(self.arm.stream_revision(self.session.execution_id, self.inflight[1])):
-                        return self.report
-                except (SupervisorError, TimeoutError, OSError):
+                    kind = note_outcome(self.report, chunk_id, self.arm.stream_revision(self.session.execution_id, rid))
+                except TimeoutError:
+                    return self.report  # try again on the next pump
+                except (SupervisorError, OSError) as exc:  # e.g. history pruned: the fate is unknown, do not stay stuck
+                    self.report.notes.append(f'{chunk_id}: revision status unavailable ({exc!r}); fate unknown')
+                    kind = 'refused'
+                    self.report.refused.append((chunk_id, 'fate unknown'))
+                if kind not in ('refused', 'selected'):
                     return self.report
+                if kind == 'selected':
+                    self._sent_obs_ns = max(self._sent_obs_ns, observed_ns)  # only what the RT selected is "sent"
                 self.inflight = None
             if self.inflight is None and self.waiting is not None:
                 chunk, self.waiting = self.waiting, None

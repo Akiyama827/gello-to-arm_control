@@ -12,7 +12,8 @@ def run_reviewed(arm, request, *, timeout_s: float) -> tuple[Report, object]:
     if status.phase is Phase.REJECTED:
         report.refused.append((request.request_id, status.reason))
         return report, status
-    report.admitted.append(request.request_id)
+    report.requested.append(request.request_id)
+    report.admitted.append(request.request_id)  # execute() returns after admission: this reply IS the admission
     if request.start is Start.ON_RELEASE and status.phase is Phase.ADMITTED:
         status = arm.release(status.execution_id)
     try:
