@@ -41,6 +41,7 @@ REGRESSIONS = (
     ("selection_unresolved_cancel", "selection_unresolved_cancel.py", "reference_runtime_selfcheck"),
     ("console_adapter", "console_adapter.py", "reference_runtime_selfcheck"),
     ("console_differential", "console_differential.py", "reference_runtime_selfcheck"),
+    ("clients", "clients.py", "reference_runtime_selfcheck"),
     ("cancel_on_ack", "cancel_on_ack.py", "reference_runtime_selfcheck"),
     ("lifecycle_states", "lifecycle_states.py", "reference_runtime_selfcheck"),
 )
