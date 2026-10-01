@@ -3,7 +3,7 @@
 A policy answers a past observation after an unknown delay. The rules here:
 * a chunk names its joints, units (rad), composition (absolute, or delta on the observation's ``base_q``) and the
   supervisor-clock ``observed_at`` of the observation it used; none of that is guessed or silently reordered;
-* a response older than ``max_age_s``, older than the observation of what was already sent, or from before the last
+* a response older than ``max_age_s``, older than the observation of what the RT already selected (or an in-flight chunk, or one whose fate is unknown), or from before the last
   ``cancel()``/``start()`` is DROPPED (reported as late); a closed session is never restarted by a late response;
 * at most one revision is in flight and one chunk waits; a newer chunk replaces the waiting one (reported as replaced);
 * every chunk is spliced from the supervisor's anchor, so the committed prefix is never rewritten;
@@ -37,6 +37,7 @@ class ActionChunkClient:
         self.arm, self.ctx, self.max_age_s, self.hold_s = arm, ctx, max_age_s, hold_s
         self.generation, self.session, self.report = 0, None, Report()
         self.inflight, self.waiting, self._sent_obs_ns = None, None, -1
+        self.cancel_pending = False
 
     def start(self) -> int:
         """Open a stream; chunks produced before this call (an older generation) are late forever."""
@@ -54,9 +55,10 @@ class ActionChunkClient:
         self.generation += 1  # a response to anything requested before now can no longer land
         self.inflight, self.waiting = None, None
         if self.session is not None and not self.session.close(reason):
+            self.cancel_pending = True  # no chunk may move the arm on a stream the operator tried to stop
             self.report.notes.append(f'CANCEL NOT CONFIRMED: {self.session.last_error}; retry cancel()')
             return False
-        self.session = None
+        self.session, self.cancel_pending = None, False
         return True
 
     def _knots(self, chunk: Chunk):
@@ -73,6 +75,8 @@ class ActionChunkClient:
 
     def _check(self, chunk: Chunk):
         """None if the chunk may be sent, else ('late'|'refused', reason)."""
+        if self.cancel_pending:
+            return 'late', 'a cancel is outstanding (not confirmed): the stream is being stopped'
         if self.session is None or self.session.closed:
             return 'late', 'no open session (a late response does not restart one)'
         if chunk.generation != self.generation:
@@ -149,7 +153,7 @@ class ActionChunkClient:
                     self.report.notes.append(f'{chunk_id}: revision status unavailable ({exc!r}); fate unknown')
                     self.report.unknown.append(chunk_id)
                     kind = 'selected'  # conservative: it may have been selected, so nothing older may follow it
-                
+
                 if kind not in ('refused', 'selected', 'ended'):
                     return self.report
                 if kind == 'selected':

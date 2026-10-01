@@ -2,10 +2,12 @@
 
 Each setpoint is spliced from the supervisor's anchor and its HORIZON never exceeds ``deadman_timeout_s`` (a longer move is
 shortened toward the target and noted in ``report.notes``; the loop repeats the command). That bounds the time one step
-commits, not the stall behaviour of the calling loop: the anchor lies a lead ahead of now (the supervisor's commit lead and
-candidate age), so a stalled loop leaves roughly that lead plus one step of motion before the executor holds the last
-reference, and travel is measured from the measured pose, not from the anchor. Joint speed is an average (a cubic Hermite
-step peaks above it); the supervisor's admission enforces the real limits. When the loop is alive, a released deadman or a
+commits, not the stall behaviour of the calling loop. A step is spliced at the selected reference's next eligible whole-segment
+cut, which can be well ahead of now (about the open curve's middle knot for the first step), and travel is measured from the
+measured pose, not from that cut. If the loop stalls, the arm continues to that cut plus one step, then the stream faults
+(REFERENCE_UNDERFLOW): the RT holds the measured pose with no PC feedforward (docs/ARCHITECTURE.md), the next ``command()``
+is refused and then returns 'expired', and motion needs a new admission. Joint speed is an average (a cubic Hermite step
+peaks above it); the supervisor's admission enforces the real limits. When the loop is alive, a released deadman or a
 heartbeat older than the timeout CANCELS the stream (the executor holds); ``tick()`` must be called at the loop rate. If the
 cancel is not confirmed the session stays open and ``command``/``tick`` retry and say so ('stop_failed'). The module defines
 no timeout (a required argument), never re-arms, and the supervisor's admission still checks every revision.

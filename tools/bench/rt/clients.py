@@ -8,6 +8,7 @@ infrastructure truncation, and reset() refuses (NeedsOperator) instead of re-arm
 from dataclasses import replace
 from pathlib import Path
 import subprocess
+import time
 import sys
 
 import numpy as np
@@ -150,6 +151,20 @@ def cases(arm, runtime, scene, service):
     folded = Report()
     note_outcome(folded, 'x', revision_status(Phase.EXPIRED, SelectionState.NOT_REQUESTED))
     assert folded.refused and not folded.admitted and not folded.selected
+    # a REAL expiry after admission (the RT never reports ready): resolved, reported, the waiting chunk moves on,
+    # teleop is not 'busy' forever
+    idle()
+    real_stage = h.stage_suffix
+    h.stage_suffix = lambda *a, **k: None
+    try:
+        assert client.submit(chunk('stuck', observed_at=arm.now())) == 'sent'
+        stuck_rid = client.inflight[1]
+        until(lambda: arm.stream_revision(client.session.execution_id, stuck_rid).phase is Phase.EXPIRED, 12)
+        assert client.submit(chunk('next', observed_at=arm.now())) == 'waiting'
+    finally:
+        h.stage_suffix = real_stage
+    until(lambda: client.pump() and client.inflight is None or client.inflight and client.inflight[0] != 'stuck', 8)
+    assert any(c == 'stuck' and 'ended without selection' in why for c, why in client.report.refused), client.report
     # an unreadable revision (fate unknown) is reported separately and nothing older may follow it
     until(lambda: client.pump() and client.inflight is None, 8)
     idle()  # the previous (unreadable) revision may still hold the supervisor's candidate slot
@@ -170,6 +185,8 @@ def cases(arm, runtime, scene, service):
     try:
         assert client.cancel('operator') is False
         assert any('CANCEL NOT CONFIRMED' in n for n in client.report.notes) and client.session is not None
+        assert client.submit(chunk('during-cancel', generation=client.generation, observed_at=arm.now())) == 'late'
+        assert client.report.late[-1][0] == 'during-cancel' and 'outstanding' in client.report.late[-1][1]
         try:
             client.start()
         except NeedsOperator:
@@ -253,6 +270,47 @@ def cases(arm, runtime, scene, service):
         arm.stream_revision = real_rev3
     tele_u.session.close('done')
     idle()
+    # a REAL expiry for teleop: not 'busy' forever
+    idle()
+    tele_x = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
+                           clock=lambda: clock[0])
+    tele_x.start()
+    until(lambda: arm.stream_state(tele_x.session.execution_id).selected_revision == 1, 8)
+    h.stage_suffix = lambda *a, **k: None
+    try:
+        assert tele_x.command(np.asarray(arm.state().q) + .003, held=True) == 'requested'
+        until(lambda: arm.stream_revision(tele_x.session.execution_id, tele_x.pending[1]).phase is Phase.EXPIRED, 12)
+    finally:
+        h.stage_suffix = real_stage
+    outs = []
+    for _ in range(3):
+        outs.append(tele_x.command(np.asarray(arm.state().q) + .003, held=True))
+        clock[0] += .01
+        time.sleep(.1)
+    assert 'busy' not in outs, outs
+    tele_x.session.close('done')
+    idle()
+    # start() never opens a second stream over one whose stop was not confirmed
+    tele_s = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
+                           clock=lambda: clock[0])
+    tele_s.start()
+    until(lambda: arm.stream_state(tele_s.session.execution_id).selected_revision == 1, 8)
+    real_cancel5 = arm.cancel
+    arm.cancel = lambda *a, **k: (_ for _ in ()).throw(TimeoutError('link stall'))
+    try:
+        clock[0] += 1.
+        assert tele_s.tick() == 'stop_failed'
+        try:
+            tele_s.start()
+        except NeedsOperator:
+            pass
+        else:
+            raise AssertionError('teleop.start() opened a second stream over an unconfirmed stop')
+    finally:
+        arm.cancel = real_cancel5
+    clock[0] += 1.
+    assert tele_s.tick() == 'expired'
+    idle()
     # a heartbeat older than the timeout stops the arm even when tick() was never called (command's own check);
     # a second instance on the same ArmClient reuses no request id
     tele2 = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
@@ -331,7 +389,20 @@ def cases(arm, runtime, scene, service):
         broken = env.step(np.asarray(arm.state().q) + .002, .3)
     finally:
         arm.stream_revision = real_rev4
-    assert broken.truncated and broken.outcome in ('refused', 'not_selected'), broken  # never raised
+    assert broken.truncated and broken.outcome == 'unknown' and env.report.unknown, broken  # never raised; sent => unknown
+    until(lambda: not h.busy and runtime._stream_job is None, 8)
+    # the reply to the revision is lost AFTER it was sent: 'unknown' (motion may have happened), never 'refused'
+    real_revise2 = arm.revise_stream
+
+    def lost_reply(rev):
+        real_revise2(rev)
+        raise TimeoutError('reply lost')
+    arm.revise_stream = lost_reply
+    try:
+        lost = env.step(np.asarray(arm.state().q) + .002, .3)
+    finally:
+        arm.revise_stream = real_revise2
+    assert lost.outcome == 'unknown' and lost.truncated and env.report.unknown, lost
     until(lambda: not h.busy and runtime._stream_job is None, 8)
     stopped = env.step(np.asarray(arm.state().q) + .002, 5., intervention=lambda: True)
     assert stopped.outcome == 'intervention' and stopped.elapsed_s < 1., stopped
@@ -357,6 +428,20 @@ def cases(arm, runtime, scene, service):
     assert env2.step(np.asarray(arm.state().q) + .002, .3).outcome == 'completed'
     env2.session.close('done')
     idle()
+    real_cancel6 = arm.cancel
+    arm.cancel = lambda *a, **k: (_ for _ in ()).throw(TimeoutError('link stall'))
+    try:
+        env2.session = env.session  # an open, unconfirmable previous episode stream
+        env.session.closed = False
+        try:
+            env.reset()
+        except NeedsOperator:
+            pass
+        else:
+            raise AssertionError('reset() opened a new stream over one it could not cancel')
+    finally:
+        arm.cancel = real_cancel6
+    env.session.closed = True
     arm.disarm()
     try:
         env.reset()
