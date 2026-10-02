@@ -131,6 +131,7 @@ class BimanualCoordinator:
         # (Each arm's age is computed against a clock read taken after that arm's own state.)
         states = self.arm_states()
         now = self._clock()
+        states = {a: s.with_observation(now=now) for a, s in states.items()}  # one age basis for every arm
         for a, s in states.items():
             if not isinstance(s.session_id, str) or not s.session_id:
                 raise ValueError(f"{a}: controller session unknown")

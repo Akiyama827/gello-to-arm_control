@@ -113,9 +113,13 @@ class FakeArm:
 
     def __init__(self):
         self.statuses, self.fault, self.errors, self.executions = {}, None, {}, 0
-        self.age_s, self.disarmed = .001, False
+        self.age_s, self.disarmed, self.by_request, self.first_now_delay = .001, False, {}, 0.
+        self.hold_on_error = False
 
     def now(self):
+        if self.first_now_delay:
+            delay, self.first_now_delay = self.first_now_delay, 0.
+            time.sleep(delay)
         return Stamp(time.monotonic_ns(), Clock.PC, 'pc:fake')
 
     def state(self):
@@ -137,13 +141,18 @@ class FakeArm:
         return self.statuses[execution_id]
 
     def execute(self, request):
-        if 'execute' in self.errors:
-            raise self.errors['execute']
+        error = self.errors.get('execute')
+        if request.request_id in self.by_request and not (error and not self.hold_on_error):
+            return self.statuses[self.by_request[request.request_id]]  # idempotent by request id, as the supervisor is
+        if error and not self.hold_on_error:
+            raise error
         self.executions += 1
         self.last_request = request
         eid = f'e{self.executions}'
         status = type('S', (), dict(execution_id=eid, phase=Phase.ADMITTED, terminal=False, reason=''))()
-        self.statuses[eid] = status
+        self.statuses[eid], self.by_request[request.request_id] = status, eid
+        if error:  # the supervisor took it but the reply was lost
+            raise error
         return status
 
     def release(self, execution_id):
@@ -177,7 +186,8 @@ def unit_cases():
                                           completion=dict(vel_tol=.02, goal_q=[0., 0., 0.], residual_max=.01)))
     request, dropped = plan_request(with_completion, 'fake', ('j1', 'j2', 'j3'))
     assert request.completion.vel_tol == .02 and request.completion.residual_max == .01 and dropped == ['cartesian_poses']
-    for name, bad in (('empty kp', dict(with_completion, kp=np.array([]))), ('ungated', dict(with_completion, gated=False)),
+    for name, bad in (('empty kp and kd', dict(with_completion, kp=np.array([]), kd=np.array([]))),
+                      ('empty kp', dict(with_completion, kp=np.array([]))), ('ungated', dict(with_completion, gated=False)),
                       ('unknown field', dict(with_completion, extra=1)),
                       ('cartesian', dict(with_completion, cartesian=dict(task_R=np.eye(3))))):
         try:
@@ -211,6 +221,32 @@ def unit_cases():
     assert handle.dropped == {'u2': ['cartesian_poses']}, handle.dropped
     handle.cancel('x', plan_id='u2')
     handle.poll_events()
+    # a slow first supervisor call does not bias the clock offset for the handle's life
+    slow = FakeArm()
+    slow.first_now_delay = .3
+    slow_handle = SdkArmHandle(slow, 'fake', model_token='tok')
+    observed = slow_handle.state().observed_at
+    assert abs(time.monotonic() - observed) < .05, (time.monotonic() - observed)  # observed_at tracks the real clock
+    # a released plan whose execution the supervisor forgot is a failed leg, not silence; a changed fault reason repeats
+    fresh = SdkArmHandle(arm, 'fake', model_token='tok')
+    fresh.stage(plan_for_fake('f1'))
+    fresh.poll_events()
+    fresh.execute('f1:fake')
+    arm.statuses.pop(arm.by_request['f1:fake'])
+    lost = [e for e in fresh.poll_events() if e['kind'] == 'leg_result']
+    assert lost and lost[0]['ok'] is False and 'outcome unknown' in lost[0]['reason'], lost
+    arm.fault = 'first reason'
+    assert len([e for e in fresh.poll_events() if e['kind'] == 'fault']) == 1
+    arm.fault = 'second reason'  # a changed reason without a recovery in between is a new event
+    assert len([e for e in fresh.poll_events() if e['kind'] == 'fault']) == 1
+    arm.fault = None
+    fresh.poll_events()
+    # at most 64 executions are remembered for lookups
+    for i in range(70):
+        fresh.stage(plan_for_fake(f'c{i}'))
+        fresh.cancel('x', plan_id=f'c{i}:fake')
+    fresh.poll_events()
+    assert len(fresh._executions) <= 64, len(fresh._executions)
     # an execution the supervisor forgot is not 'loaded' (state stays usable), and a pruned plan costs nothing later
     handle.stage(plan)
     handle.execute('u1:fake')
@@ -221,9 +257,33 @@ def unit_cases():
     handle.stage(plan_for_fake('u3'))
     assert handle.poll_events()[-1]['reason'].startswith('staging outcome unknown')
     arm.errors.clear()
-    handle.cancel('x', plan_id='u3:fake')
+    handle.cancel('x', plan_id='u3:fake')  # resubmits the same request (idempotent), then cancels it: truthful
     cleared = [e for e in handle.poll_events() if e['kind'] == 'plan_cleared']
-    assert cleared and cleared[0]['ok'] is False, cleared
+    assert cleared and cleared[0]['ok'] is True, cleared
+    assert arm.statuses[arm.by_request['u3:fake']].phase is Phase.CANCELLED
+    # the supervisor took the plan but the reply was lost: the cancel finds it by request id and cancels it
+    arm.errors['execute'], arm.hold_on_error = SupervisorError('connection closed before the reply'), True
+    handle.stage(plan_for_fake('u3b'))
+    assert arm.by_request['u3b:fake'] and not arm.statuses[arm.by_request['u3b:fake']].terminal
+    arm.errors.clear()
+    arm.hold_on_error = False
+    held_before = arm.executions
+    handle.cancel('x', plan_id='u3b:fake')
+    assert arm.executions == held_before, 'resubmitting created a second execution'
+    assert arm.statuses[arm.by_request['u3b:fake']].phase is Phase.CANCELLED
+    assert [e for e in handle.poll_events() if e['kind'] == 'plan_cleared'][-1]['ok'] is True
+    # a cancel that cannot reach the supervisor is NOT confirmed, and a refusal (not an unknown outcome) is cleared
+    arm.errors['execute'] = SupervisorError('closed')
+    handle.stage(plan_for_fake('u3c'))
+    handle.poll_events()
+    handle.cancel('x', plan_id='u3c:fake')
+    assert [e for e in handle.poll_events() if e['kind'] == 'plan_cleared'][-1]['ok'] is False
+    arm.errors['execute'] = Refused('not now')
+    handle.stage(plan_for_fake('u3d'))
+    handle.poll_events()
+    handle.cancel('x', plan_id='u3d:fake')
+    assert [e for e in handle.poll_events() if e['kind'] == 'plan_cleared'][-1]['ok'] is True
+    arm.errors.clear()
     # a cancel the supervisor did not confirm is reported as not cleared; a confirmed one as cleared
     handle.stage(plan_for_fake('u4'))
     handle.poll_events()
