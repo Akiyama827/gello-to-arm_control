@@ -42,6 +42,7 @@ REGRESSIONS = (
     ("console_adapter", "console_adapter.py", "reference_runtime_selfcheck"),
     ("console_differential", "console_differential.py", "reference_runtime_selfcheck"),
     ("clients", "clients.py", "reference_runtime_selfcheck"),
+    ("sdk_channel", "sdk_channel.py", "server"),
     ("cancel_on_ack", "cancel_on_ack.py", "reference_runtime_selfcheck"),
     ("lifecycle_states", "lifecycle_states.py", "reference_runtime_selfcheck"),
 )
