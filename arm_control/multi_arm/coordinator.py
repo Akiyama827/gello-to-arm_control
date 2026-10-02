@@ -127,8 +127,10 @@ class BimanualCoordinator:
         self._listeners.append(listener)
 
     def _states(self) -> dict[str, ArmControlState]:
+        # States first, then `now`: a sample received while the arms were being read is not 'from the future'.
+        # (Each arm's age is computed against a clock read taken after that arm's own state.)
+        states = self.arm_states()
         now = self._clock()
-        states = self.arm_states(now=now)
         for a, s in states.items():
             if not isinstance(s.session_id, str) or not s.session_id:
                 raise ValueError(f"{a}: controller session unknown")

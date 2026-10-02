@@ -6,7 +6,9 @@ Each arm has its own fake RT server and its own supervisor process; the bimanual
 ``ArmClient`` handles. Checks: a pair stages, releases and completes (both executions COMPLETED); a pair cancelled while
 running is CANCELLED on both arms with the cancels confirmed; a member the supervisor path cannot carry (Cartesian-impedance
 plan) rejects the pair and the partner's staged plan is cleared; a plan for another model is refused before anything is
-staged. Fake RT only: nothing here is a timing or hardware claim (no group start yet, so release skew is the PC's).
+staged (by the coordinator, and by the supervisor when the handle is called directly); a failing leg (disarm mid-flight)
+faults the pair and cancels the partner. Unit cases cover conversion fidelity, observed_at, pruning, a lost staging reply and
+repeated fault events. Fake RT only: nothing here is a timing or hardware claim (no group start yet, so release skew is the PC's).
 """
 from __future__ import annotations
 
@@ -31,7 +33,10 @@ from arm_control.multi_arm.coordinator import BimanualCoordinator  # noqa: E402
 from arm_control.multi_arm.supervised import SdkArmHandle  # noqa: E402
 from arm_control.multi_arm.types import ArmPlan, BimanualPlan, PairLifecycle  # noqa: E402
 from arm_control.execution.contract import Phase  # noqa: E402
-from arm_control.sdk import ArmClient  # noqa: E402
+from arm_control.sdk import ArmClient, Refused, SupervisorError  # noqa: E402
+from arm_control.execution.contract import (  # noqa: E402
+    Authority, Clock, Fault, Lifecycle, RobotIdentity, RobotState, Stamp, Start, Validity)
+from arm_control.multi_arm.supervised import plan_body, plan_request  # noqa: E402
 
 ARMS = ('arm_a', 'arm_b')
 
@@ -100,10 +105,157 @@ def pump_until(coordinator, predicate, timeout=15.):
     raise AssertionError(f'timed out in {coordinator.lifecycle}: {coordinator.state().pair.to_payload()}')
 
 
+class FakeArm:
+    """Just enough ArmClient for the handle's logic: scripted statuses, errors and a controllable clock."""
+    extensions = {}
+    session = 'fake-session'
+    identity = RobotIdentity('fake', ('j1', 'j2', 'j3'), 'fake')
+
+    def __init__(self):
+        self.statuses, self.fault, self.errors, self.executions = {}, None, {}, 0
+        self.age_s, self.disarmed = .001, False
+
+    def now(self):
+        return Stamp(time.monotonic_ns(), Clock.PC, 'pc:fake')
+
+    def state(self):
+        now = time.monotonic_ns()
+        return RobotState('fake', Validity.VALID, q=np.zeros(3), dq=np.zeros(3),
+                          source=Stamp(now - int(self.age_s * 1e9), Clock.RT_HOST, 'rt:fake'),
+                          received=Stamp(now - int(self.age_s * 1e9), Clock.PC, 'pc:fake'))
+
+    def authority(self):
+        if self.fault:
+            return Authority(Lifecycle.FAULTED, 's', 1, fault=Fault('plant', self.fault, 'rt', 1))
+        return Authority(Lifecycle.CLAIMED if self.disarmed else Lifecycle.ARMED, 's', 1)
+
+    def status(self, execution_id):
+        if 'status' in self.errors:
+            raise self.errors['status']
+        if execution_id not in self.statuses:
+            raise Refused(f'unknown execution {execution_id!r}')
+        return self.statuses[execution_id]
+
+    def execute(self, request):
+        if 'execute' in self.errors:
+            raise self.errors['execute']
+        self.executions += 1
+        self.last_request = request
+        eid = f'e{self.executions}'
+        status = type('S', (), dict(execution_id=eid, phase=Phase.ADMITTED, terminal=False, reason=''))()
+        self.statuses[eid] = status
+        return status
+
+    def release(self, execution_id):
+        return self.statuses[execution_id]
+
+    def cancel(self, execution_id, reason='cancelled', timeout_s=2.):
+        if 'cancel' in self.errors:
+            raise self.errors['cancel']
+        status = type('S', (), dict(execution_id=execution_id, phase=Phase.CANCELLED, terminal=True, reason=reason))()
+        self.statuses[execution_id] = status
+        return status
+
+
+def plan_for_fake(plan_id):
+    return ArmPlan('fake', f'{plan_id}:fake', pack_plan(
+        plan_id=f'{plan_id}:fake', phase='x', gated=True, times=[0., 1.], positions=np.zeros((2, 3)),
+        velocities=np.zeros((2, 3)), kp=[100.] * 3, kd=[20.] * 3, model_token='tok'))
+
+
+def unit_cases():
+    """Handle logic that a short real run cannot reach: conversion fidelity, observed_at against the coordinator clock,
+    pruning of forgotten executions, fault events that repeat, and a staging reply that was lost."""
+    plan = plan_for_fake('u1')
+    body = plan_body(plan.payload)
+    request, dropped = plan_request(body, 'fake', ('j1', 'j2', 'j3'))
+    assert request.start is Start.ON_RELEASE and request.model_token == 'tok' and request.request_id == 'u1:fake'
+    assert np.allclose(request.gains.kp, 100.) and np.allclose(request.gains.kd, 20.) and dropped == []
+    with_completion = plan_body(pack_plan(plan_id='u2', phase='x', gated=True, times=[0., 1.], positions=np.zeros((2, 3)),
+                                          velocities=np.zeros((2, 3)), kp=[1.] * 3, kd=[1.] * 3, model_token='tok',
+                                          cartesian_poses=np.zeros((2, 7)),
+                                          completion=dict(vel_tol=.02, goal_q=[0., 0., 0.], residual_max=.01)))
+    request, dropped = plan_request(with_completion, 'fake', ('j1', 'j2', 'j3'))
+    assert request.completion.vel_tol == .02 and request.completion.residual_max == .01 and dropped == ['cartesian_poses']
+    for name, bad in (('empty kp', dict(with_completion, kp=np.array([]))), ('ungated', dict(with_completion, gated=False)),
+                      ('unknown field', dict(with_completion, extra=1)),
+                      ('cartesian', dict(with_completion, cartesian=dict(task_R=np.eye(3))))):
+        try:
+            plan_request(bad, 'fake', ('j1', 'j2', 'j3'))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'not refused: {name}')
+
+    arm = FakeArm()
+    handle = SdkArmHandle(arm, 'fake', model_token='tok')
+    # observed_at is the sample's reception time on the coordinator's clock: never after a clock read taken once the
+    # state has been read (the coordinator now reads `now` after the states), and the age is never negative.
+    for _ in range(200):
+        state = handle.state()
+        after = time.monotonic()
+        assert state.observed_at is not None and state.observed_at <= after, (state.observed_at, after)
+        assert state.state_age_sec is not None and state.state_age_sec >= 0.
+    # a faulted or disarmed robot is not ready; a fault freezes and carries its reason; a dropped field is recorded
+    arm.disarmed = True
+    assert handle.state().armed is False and handle.state().ready is False
+    arm.disarmed = False
+    arm.fault = 'plant fault'
+    faulted = handle.state()
+    assert faulted.frozen is True and faulted.fault_reason and 'plant fault' in faulted.fault_reason, faulted
+    arm.fault = None
+    handle.poll_events()
+    handle.stage(ArmPlan('fake', 'u2', pack_plan(
+        plan_id='u2', phase='x', gated=True, times=[0., 1.], positions=np.zeros((2, 3)), velocities=np.zeros((2, 3)),
+        kp=[1.] * 3, kd=[1.] * 3, model_token='tok', cartesian_poses=np.zeros((2, 7)))))
+    assert handle.dropped == {'u2': ['cartesian_poses']}, handle.dropped
+    handle.cancel('x', plan_id='u2')
+    handle.poll_events()
+    # an execution the supervisor forgot is not 'loaded' (state stays usable), and a pruned plan costs nothing later
+    handle.stage(plan)
+    handle.execute('u1:fake')
+    arm.statuses.clear()
+    assert handle.state().running_plan_id is None and not handle._plans
+    # a staging reply that was lost: not staged, and the cancel is NOT confirmed as cleared
+    arm.errors['execute'] = SupervisorError('connection closed before the reply')
+    handle.stage(plan_for_fake('u3'))
+    assert handle.poll_events()[-1]['reason'].startswith('staging outcome unknown')
+    arm.errors.clear()
+    handle.cancel('x', plan_id='u3:fake')
+    cleared = [e for e in handle.poll_events() if e['kind'] == 'plan_cleared']
+    assert cleared and cleared[0]['ok'] is False, cleared
+    # a cancel the supervisor did not confirm is reported as not cleared; a confirmed one as cleared
+    handle.stage(plan_for_fake('u4'))
+    handle.poll_events()
+    arm.errors['cancel'] = TimeoutError('link stall')
+    handle.cancel('x', plan_id='u4:fake')
+    assert handle.poll_events()[-1]['ok'] is False
+    arm.errors.clear()
+    handle.cancel('x', plan_id='u4:fake')
+    assert handle.poll_events()[-1]['ok'] is True
+    # a fault is an event each time it happens, not once per handle
+    arm.fault = 'overload'
+    assert [e['kind'] for e in handle.poll_events()] == ['fault']
+    assert handle.poll_events() == []
+    arm.fault = None
+    handle.poll_events()
+    arm.fault = 'overload again'
+    assert [e['kind'] for e in handle.poll_events()] == ['fault']
+    arm.fault = None
+    # an unreachable supervisor is a state with a reason, not an exception out of the coordinator's pump
+    arm.errors['status'] = SupervisorError('closed')
+    handle.stage(plan_for_fake('u5'))
+    arm.errors['execute'] = None
+    arm.errors.pop('execute')
+    state = handle.state()
+    assert state.fault_reason is None or 'unreachable' in state.fault_reason
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--server', required=True)
     args = parser.parse_args()
+    unit_cases()
     tmp = Path(tempfile.mkdtemp(prefix='dual_supervisor_'))
     procs, clients = [], []
     try:
@@ -141,7 +293,7 @@ def main():
         state = coordinator.pair_state('p1')
         assert coordinator.lifecycle is PairLifecycle.COMPLETE and state.ok(), state.to_payload()
         for n in ARMS:
-            eid = handles[n]._plans[f'p1:{n}']['execution']
+            eid = handles[n].execution_of(f'p1:{n}')
             assert arms[n].status(eid).phase is Phase.COMPLETED, (n, arms[n].status(eid))
         assert state.release_skew_sec is not None  # the PC's release skew, labelled as such (no RT group start here)
 
@@ -154,7 +306,7 @@ def main():
         pump_until(coordinator, lambda: not coordinator.pair_state('p2').cancellation_pending)
         assert coordinator.lifecycle is PairLifecycle.CANCELLED
         for n in ARMS:
-            eid = handles[n]._plans[f'p2:{n}']['execution']
+            eid = handles[n].execution_of(f'p2:{n}')
             assert arms[n].status(eid).phase is Phase.CANCELLED, (n, arms[n].status(eid))
 
         assert not [e for e in seen if e['kind'] == 'leg_result' and e['plan_id'].startswith('p2')], seen
@@ -165,9 +317,9 @@ def main():
         pump_until(coordinator, lambda: coordinator.lifecycle.terminal and not coordinator.pair_state('p3').cancellation_pending)
         assert coordinator.lifecycle is PairLifecycle.REJECTED and 'Cartesian' in coordinator.pair_state('p3').reason, \
             coordinator.pair_state('p3').to_payload()
-        eid = handles[a]._plans['p3:' + a]['execution']
+        eid = handles[a].execution_of('p3:' + a)
         assert arms[a].status(eid).phase is Phase.CANCELLED, arms[a].status(eid)
-        assert 'p3:' + b not in handles[b]._plans
+        assert handles[b].execution_of('p3:' + b) is None
 
         # A plan for another model is refused before anything is staged.
         bad = plan_for(arms[b], 'p4', b, 'some-other-model', -.05)
@@ -178,7 +330,17 @@ def main():
             assert 'model token' in str(exc), exc
         else:
             raise AssertionError('a plan for another model was staged')
-        assert 'p4:' + a not in handles[a]._plans
+        assert handles[a].execution_of('p4:' + a) is None
+        # Many consecutive pairs (the stale-state fault the reviewer saw after ~25 pairs): short moves, all complete.
+        for i in range(30):
+            plans = [plan_for(arms[n], f'm{i}', n, tokens[n], .004 if n == a else -.004, duration=.2) for n in ARMS]
+            coordinator.stage_pair(BimanualPlan(f'm{i}', *plans))
+            pump_until(coordinator, lambda: coordinator.lifecycle is PairLifecycle.READY)
+            coordinator.execute_pair(f'm{i}')
+            pump_until(coordinator, lambda: coordinator.lifecycle.terminal)
+            assert coordinator.lifecycle is PairLifecycle.COMPLETE, (i, coordinator.pair_state(f'm{i}').to_payload())
+        assert len(handles[a]._plans) <= 1, 'ended plans were not pruned'
+
         # A leg that fails mid-flight faults the pair and the partner is cancelled: the result is not always ok.
         for n in ARMS:
             arms[n].arm() if arms[n].authority().lifecycle.value != 'armed' else None
@@ -192,8 +354,15 @@ def main():
             coordinator.pair_state('p5').to_payload()
         failed = [e for e in seen if e['kind'] == 'leg_result' and e['plan_id'] == 'p5:' + b]
         assert failed and failed[0]['ok'] is False, seen
-        print('PASS: two supervisors, one pair coordinator over SdkArmHandle: pair completes, mid-flight cancel confirmed '
-              'on both arms, an uncarriable member rejects the pair and clears its partner, a foreign model is refused')
+        # Supervisor-side model enforcement, past the coordinator's own check: the handle stages a plan for another model.
+        other = plan_for(arms[a], 'p6', a, 'some-other-model', .05)
+        handles[a].stage(other)
+        refusal = [e for e in handles[a].poll_events() if e['kind'] == 'plan_staged'][-1]
+        assert refusal['ok'] is False and 'model' in refusal['reason'], refusal
+        print('PASS: unit cases (conversion, observed_at, pruning, lost staging reply, fault events); two supervisors, one pair '
+              'coordinator over SdkArmHandle: pair completes, mid-flight cancel confirmed on both arms, an uncarriable '
+              'member rejects the pair and clears its partner, a foreign model is refused by the coordinator and by the '
+              'supervisor, a failing leg faults the pair')
     finally:
         for client in clients:
             client.close()

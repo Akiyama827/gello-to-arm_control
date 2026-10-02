@@ -12,6 +12,10 @@ supervisors, one per arm, through the SDK. ``SdkArmHandle`` is the seam:
 * ``state()`` is built from measured SDK state only (unknown stays ``None``, never zero). ``model_token`` is the
   planning bundle token the caller passes in: the supervisor enforces the same token at admission.
 
+Not detected here: a supervisor restart (``session_id`` is the client's connection session, constant for the handle's
+life; a restart shows up as a closed channel, 'supervisor unreachable' and a faulted pair) and a changed model
+(``model_token`` is what the caller passes; the supervisor's admission is the only enforcement). ``stopped`` is always False.
+
 What stays out: the Hand/gripper and collision world (project composition, per the card), Soft (the SDK path needs a
 Soft-capable plant: ``set_mode('soft')`` is refused), arbitrary gains (only named presets, through the console adapter),
 and timing across arms (a pair's start skew belongs to the CTRL-040 group execution, not to this handle). The calls
@@ -26,7 +30,7 @@ import numpy as np
 from arm_control.execution.contract import Completion, JointGains, Lifecycle, Phase, Start, TrajectoryRequest, Validity
 from arm_control.motion import JointTrajectory
 from arm_control.multi_arm.types import ArmControlState
-from arm_control.sdk import SupervisorError
+from arm_control.sdk import Refused, SupervisorError
 
 _PLAN_KEYS = {'schema', 'plan_id', 'phase', 'gated', 'times', 'positions', 'velocities', 'kp', 'kd', 'cartesian_poses',
               'cartesian', 'completion', 'model_token'}
@@ -56,6 +60,8 @@ def plan_request(body: dict, instance_id: str, joint_names, *, start=Start.ON_RE
     completion = None if spec is None else Completion(
         vel_tol=float(spec['vel_tol']), goal_q=spec.get('goal_q'), residual_max=spec.get('residual_max'))
     kp, kd = np.asarray(body['kp'], dtype=float), np.asarray(body['kd'], dtype=float)
+    if kp.size != kd.size:
+        raise ValueError('kp and kd must come together and match (an empty kp is not "use the profile gains")')
     request = TrajectoryRequest(
         str(body['plan_id']), instance_id, tuple(joint_names),
         JointTrajectory(body['times'], body['positions'], body['velocities']),
@@ -69,10 +75,17 @@ class SdkArmHandle:
                  arm_timeout_s: float = 5.0):
         self._arm, self._id, self._token, self._presets = arm, arm_id, model_token, presets
         self._clock, self._arm_timeout = clock, float(arm_timeout_s)
-        self._plans: dict[str, dict] = {}     # plan_id -> {'execution': id, 'released': bool, 'reported': bool}
+        self._plans: dict[str, dict] = {}     # LIVE plans only: plan_id -> {'execution', 'released', 'reported'}
+        self._executions: dict[str, str] = {}  # plan_id -> execution id, the last 64 (for lookups after a plan ended)
+        self._unknown_stage: set[str] = set()  # plan ids whose staging reply was lost: the supervisor may hold them
         self._events: list[dict] = []
         self._fault_reported = False
         self.dropped: dict[str, list] = {}
+        # The coordinator clock vs the supervisor's PC clock, estimated from a read taken BEFORE the supervisor's stamp
+        # (so the offset errs toward older samples): observed_at is the sample's reception time on the coordinator's
+        # clock, never a fresh read, which could be later than the coordinator's own `now`.
+        before = self._clock()
+        self._offset = before - arm.now().ns / 1e9
 
     @property
     def arm_id(self) -> str:
@@ -87,10 +100,14 @@ class SdkArmHandle:
 
     def poll_events(self) -> list[dict]:
         """New events: results of terminal executions and robot faults, then everything queued by stage/cancel."""
-        for plan_id, record in self._plans.items():
+        for plan_id, record in list(self._plans.items()):
             if record['released'] and not record['reported']:
                 try:
                     status = self._arm.status(record['execution'])
+                except Refused as exc:
+                    if 'unknown execution' in str(exc):  # the supervisor forgot it (bounded retention): over
+                        self._plans.pop(plan_id)
+                    continue
                 except (SupervisorError, TimeoutError, OSError):
                     continue
                 if status.terminal:
@@ -101,7 +118,9 @@ class SdkArmHandle:
             authority = self._arm.authority()
         except (SupervisorError, TimeoutError, OSError):
             authority = None
-        if authority is not None and authority.fault is not None and not self._fault_reported:
+        if authority is not None and authority.fault is None:
+            self._fault_reported = False  # recovered: the next fault is a new event
+        elif authority is not None and not self._fault_reported:
             self._fault_reported = True
             self._event('fault', ok=False, reason=str(authority.fault))
         events, self._events = self._events, []
@@ -110,32 +129,40 @@ class SdkArmHandle:
     # -- state --------------------------------------------------------------------------------------------
     def _loaded(self):
         """The plan id the supervisor currently holds for this handle and whether it is running."""
-        for plan_id, record in self._plans.items():
+        for plan_id, record in list(self._plans.items()):
             try:
                 status = self._arm.status(record['execution'])
+            except Refused as exc:
+                if 'unknown execution' in str(exc):  # forgotten by the supervisor: not loaded, prune it
+                    self._plans.pop(plan_id)
+                    continue
+                return plan_id, record['released']
             except (SupervisorError, TimeoutError, OSError):
                 return plan_id, record['released']
             if not status.terminal:
                 return plan_id, record['released'] and status.phase is not Phase.ADMITTED
+            if record['reported'] or not record['released']:
+                self._plans.pop(plan_id)  # an ended plan costs nothing from here on
         return None, False
 
+    def execution_of(self, plan_id: str):
+        """The execution id of a plan this handle staged (the last 64), for lookups after the plan ended."""
+        return self._executions.get(plan_id)
+
     def state(self) -> ArmControlState:
-        now = self._clock()  # read FIRST: observed_at must not be later than a coordinator reading taken before this call
         try:
             robot, authority, stamp = self._arm.state(), self._arm.authority(), self._arm.now()
+            plan_id, running = self._loaded()
+            law = self._arm.controller_state().law if self._arm.extensions.get('controller') == 1 else 'joint'
         except (SupervisorError, TimeoutError, OSError) as exc:
             return ArmControlState(self._id, session_id=self._arm.session, model_token=self._token,
                                    fault_reason=f'supervisor unreachable: {exc}')
         measured = robot.validity is Validity.VALID and robot.q is not None and robot.dq is not None
-        age = None
+        age = observed = None
         if robot.received is not None and (robot.received.clock, robot.received.domain) == (stamp.clock, stamp.domain):
             age = max(0.0, (stamp.ns - robot.received.ns) / 1e9)
-        plan_id, running = self._loaded()
-        law = None
-        if self._arm.extensions.get('controller') == 1:
-            law = self._arm.controller_state().law
-        else:
-            law = 'joint'  # no controller/1: the supervisor only runs its joint law
+            observed = robot.received.ns / 1e9 + self._offset
+        # no controller/1: the supervisor only runs its joint law
         return ArmControlState(
             self._id, position=robot.q if measured else None, velocity=robot.dq if measured else None,
             armed=authority.lifecycle is Lifecycle.ARMED, ready=measured and authority.lifecycle is Lifecycle.ARMED,
@@ -143,7 +170,7 @@ class SdkArmHandle:
             frozen=authority.lifecycle is Lifecycle.FAULTED,
             fault_reason=None if authority.fault is None else str(authority.fault),
             session_id=self._arm.session, model_token=self._token,
-            observed_at=now - age if measured and age is not None else None,
+            observed_at=observed if measured and age is not None else None,
             state_age_sec=age if measured and age is not None else None)
 
     # -- plans --------------------------------------------------------------------------------------------
@@ -154,16 +181,22 @@ class SdkArmHandle:
                 raise ValueError('plan_id does not match the member plan id')
             request, dropped = plan_request(body, self._arm.identity.instance_id, self._arm.identity.joint_names)
             status = self._arm.execute(request)
-        except (ValueError, KeyError, TypeError) as exc:
+        except (ValueError, KeyError, TypeError, Refused) as exc:  # nothing taken: a true refusal
             self._event('plan_staged', plan.plan_id, False, f'refused: {exc}')
             return
-        except SupervisorError as exc:
-            self._event('plan_staged', plan.plan_id, False, f'refused: {exc}')
+        except (SupervisorError, TimeoutError, OSError) as exc:
+            # no usable reply: the supervisor may hold the gated plan. Reported as not staged, and a cancel of it is
+            # NOT confirmed as cleared (see cancel), so the pair is not left believing nothing is loaded.
+            self._unknown_stage.add(plan.plan_id)
+            self._event('plan_staged', plan.plan_id, False, f'staging outcome unknown: {exc}')
             return
         if status.phase is Phase.REJECTED or status.terminal:
             self._event('plan_staged', plan.plan_id, False, f'{status.phase.value}: {status.reason}')
             return
         self._plans[plan.plan_id] = dict(execution=status.execution_id, released=False, reported=False)
+        self._executions[plan.plan_id] = status.execution_id
+        for old in list(self._executions)[:-64]:
+            self._executions.pop(old)
         if dropped:
             self.dropped[plan.plan_id] = dropped
         self._event('plan_staged', plan.plan_id, True)
@@ -172,7 +205,10 @@ class SdkArmHandle:
         record = self._plans.get(plan_id)
         if record is None:
             raise ValueError(f'{plan_id}: no such staged plan')
-        self._arm.release(record['execution'])  # a refusal raises Refused to the coordinator (aborts the pair)
+        # Ownership/unknown-id/start-mode problems raise Refused (the coordinator aborts the pair). A selection refusal
+        # (not armed, expired) comes back as a REJECTED/EXPIRED execution and surfaces as a failed leg_result, which the
+        # coordinator's _poll after execute() sees before it releases the partner.
+        self._arm.release(record['execution'])
         record['released'] = True
 
     def cancel(self, reason: str = '', *, plan_id: str | None = None) -> None:
@@ -182,7 +218,11 @@ class SdkArmHandle:
             if record is None:
                 # nothing by that id is loaded: cleared (as the in-process controller answers) unless another plan is
                 other = self._loaded()[0]
-                self._event('plan_cleared', pid or '', other is None, '' if other is None else 'another plan is loaded')
+                if pid in self._unknown_stage:
+                    self._event('plan_cleared', pid, False, 'staging outcome unknown: the supervisor may still hold it')
+                else:
+                    self._event('plan_cleared', pid or '', other is None,
+                                '' if other is None else 'another plan is loaded')
                 continue
             try:
                 status = self._arm.cancel(record['execution'], reason or 'cancelled')
