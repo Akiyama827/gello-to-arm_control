@@ -38,7 +38,8 @@ class Report:
     requested: list = field(default_factory=list)
     admitted: list = field(default_factory=list)
     selected: list = field(default_factory=list)
-    unknown: list = field(default_factory=list)   # fate unreadable (e.g. history pruned): neither confirmed nor refused
+    unknown: list = field(default_factory=list)   # the fate WAS unknown at some point (no reply / unreadable status); the id
+    # may later also appear in ``selected`` or ``refused`` once it is learned, and may be listed more than once
     refused: list = field(default_factory=list)   # (id, reason)
     replaced: list = field(default_factory=list)  # accepted by the client, superseded before it was sent
     late: list = field(default_factory=list)      # dropped as too old or for a closed session

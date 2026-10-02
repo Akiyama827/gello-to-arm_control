@@ -86,14 +86,26 @@ class SocketChannel:
             if not reply.endswith(b"\n"):
                 self._close()
                 raise SupervisorError(f"{op}: supervisor closed the connection")
-        msg = json.loads(reply)
-        if msg.get("id") != rid:
-            raise SupervisorError(f"{op}: reply out of order")
-        if msg["ok"]:
-            return msg["result"]
-        error = {"refused": Refused, "timeout": TimeoutError}.get(msg.get("kind"),
-                                                                  SupervisorError)
-        raise error(msg["error"])
+            # The request has been sent, so a reply that cannot be read leaves its outcome UNKNOWN to the caller: report
+            # it as a SupervisorError (the same class as a lost reply), never a ValueError a caller could take for
+            # "refused", and drop the channel (its framing can no longer be trusted).
+            try:
+                msg = json.loads(reply)
+                reply_id, ok = msg.get("id"), msg["ok"]
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                self._close()
+                raise SupervisorError(f"{op}: malformed reply ({type(exc).__name__}); outcome unknown") from exc
+            if reply_id != rid:
+                self._close()
+                raise SupervisorError(f"{op}: reply out of order; outcome unknown")
+        if ok:
+            try:
+                return msg["result"]
+            except KeyError as exc:
+                self._close()
+                raise SupervisorError(f"{op}: reply without a result; outcome unknown") from exc
+        error = {"refused": Refused, "timeout": TimeoutError}.get(msg.get("kind"), SupervisorError)
+        raise error(msg.get("error", "unspecified error"))
 
     def _close(self) -> None:
         if self._sock is not None:

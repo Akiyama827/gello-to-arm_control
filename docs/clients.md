@@ -24,7 +24,7 @@ is reported.
 
 Three separate facts per high-level action: `requested` (sent), `admitted` (the supervisor's trusted admission accepted it:
 the reply to a revision only says REQUESTED, admission is asynchronous, so the clients poll the revision), `selected` (the RT
-selected it, which is what governs motion). A refusal after the request, or an expiry/cancel after admission without selection, is in `refused`; a revision whose status could not be read, or whose reply was lost (chunks and teleop: the revision stays in flight, `submit` still says `sent`, teleop `command` returns `unknown`), is in `unknown` (and counts as possibly sent for the ordering rule). `selected_revision` is the stream's
+selected it, which is what governs motion). A refusal after the request, or an expiry/cancel after admission without selection, is in `refused`; a revision whose status could not be read, or whose reply was lost (chunks and teleop: the revision stays in flight, `submit` still says `sent`, teleop `command` returns `unknown`), is in `unknown` (its fate was unknown at some point; the id may later also be in `selected` or `refused`, and may be listed twice) (and counts as possibly sent for the ordering rule). `selected_revision` is the stream's
 current revision. Planner requests are admitted synchronously.
 
 ## Timing
