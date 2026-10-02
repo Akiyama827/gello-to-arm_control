@@ -17,7 +17,7 @@ import time
 import numpy as np
 
 from arm_control.clients.common import NeedsOperator, Report, StreamContext, StreamSession, note_outcome, request_id
-from arm_control.sdk import SupervisorError
+from arm_control.sdk import Refused, SupervisorError
 
 
 class DeadmanTeleop:
@@ -63,7 +63,8 @@ class DeadmanTeleop:
 
     def command(self, q_target, *, held: bool) -> str:
         """'requested' (sent; see ``report`` for admitted/selected), 'busy' (the previous revision is unresolved: nothing
-        sent), 'released' / 'expired' (stopped), 'stop_failed' (stop NOT confirmed, retry), or 'refused'."""
+        sent), 'released' / 'expired' (stopped), 'stop_failed' (stop NOT confirmed, retry), 'unknown' (no reply to the revision: it may have been selected, the next
+        command settles it) or 'refused'."""
         if self.session is None or self.session.closed:
             return 'expired'
         if not held:
@@ -92,9 +93,19 @@ class DeadmanTeleop:
                 self.report.notes.append('target limited to one deadman timeout of travel')
             rid = request_id('teleop')
             status = self.session.revise(rid, (q_now + delta)[None, :], dt)
-        except (ValueError, SupervisorError, TimeoutError, OSError) as exc:
+        except (Refused, ValueError) as exc:  # the supervisor answered, or nothing was sent: a true refusal
             self.report.refused.append((rid or 'teleop', str(exc)))
             return 'refused'
+        except (SupervisorError, TimeoutError, OSError) as exc:
+            if rid is None:  # failed before a revision existed (state read): nothing was sent
+                self.report.refused.append(('teleop', str(exc)))
+                return 'refused'
+            # no usable reply: the revision may have been admitted and selected; the next command settles it
+            self.report.requested.append(rid)
+            self.report.unknown.append(rid)
+            self.report.notes.append(f'{rid}: no reply to the revision ({exc!r}); fate unknown')
+            self.pending = (rid, rid)
+            return 'unknown'
         self.report.requested.append(rid)
         if note_outcome(self.report, rid, status) == 'refused':
             return 'refused'

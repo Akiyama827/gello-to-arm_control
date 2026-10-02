@@ -8,7 +8,6 @@ infrastructure truncation, and reset() refuses (NeedsOperator) instead of re-arm
 from dataclasses import replace
 from pathlib import Path
 import subprocess
-import time
 import sys
 
 import numpy as np
@@ -21,7 +20,7 @@ from arm_control.clients.teleop import DeadmanTeleop
 from arm_control.execution.contract import Lifecycle, Phase, Start, TrajectoryRequest
 from arm_control.execution.stream import RevisionStatus, SelectionState
 from arm_control.motion import JointTrajectory
-from arm_control.sdk import Refused
+from arm_control.sdk import Refused, SupervisorError
 from controller_extension import configure
 from reference_supervisor import until
 from stream_races import main
@@ -165,6 +164,24 @@ def cases(arm, runtime, scene, service):
         h.stage_suffix = real_stage
     until(lambda: client.pump() and client.inflight is None or client.inflight and client.inflight[0] != 'stuck', 8)
     assert any(c == 'stuck' and 'ended without selection' in why for c, why in client.report.refused), client.report
+    # the reply to a revision is lost AFTER the supervisor took it: still 'sent' (in flight, fate unknown), an older
+    # observation is late, and pump() later finds it selected
+    idle()
+    until(lambda: client.pump() and client.inflight is None and client.waiting is None, 12)  # drain: 'next' may still be in flight
+    lost_obs = arm.now()
+    real_revise3 = arm.revise_stream
+
+    def lost_reply_chunk(rev):
+        real_revise3(rev)
+        raise SupervisorError('connection closed before the reply')
+    arm.revise_stream = lost_reply_chunk
+    try:
+        assert client.submit(chunk('lostreply', observed_at=lost_obs)) == 'sent'
+    finally:
+        arm.revise_stream = real_revise3
+    assert 'lostreply' in client.report.unknown and client.inflight is not None and 'lostreply' not in client.report.refused
+    assert client.submit(chunk('beforelost', observed_at=replace(lost_obs, ns=lost_obs.ns - 1))) == 'late'
+    until(lambda: client.pump() and 'lostreply' in client.report.selected, 8)
     # an unreadable revision (fate unknown) is reported separately and nothing older may follow it
     until(lambda: client.pump() and client.inflight is None, 8)
     idle()  # the previous (unreadable) revision may still hold the supervisor's candidate slot
@@ -198,6 +215,8 @@ def cases(arm, runtime, scene, service):
     assert client.cancel('operator') is True and client.session is None
     generation = client.start()
     until(lambda: arm.stream_state(client.session.execution_id).selected_revision == 1, 8)
+    assert client.cancel_pending is False and client.submit(chunk('after-retry', observed_at=arm.now())) == 'sent'
+    until(lambda: client.pump() and client.inflight is None, 8)
     # a response for the previous generation, after cancel: dropped, and the session is not restarted
     stale = chunk('after-cancel')
     until(lambda: client.pump() and client.inflight is None, 8)
@@ -270,6 +289,26 @@ def cases(arm, runtime, scene, service):
         arm.stream_revision = real_rev3
     tele_u.session.close('done')
     idle()
+    # the reply to a teleop revision is lost after the supervisor took it: 'unknown', then settled by the next command
+    tele_l = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
+                           clock=lambda: clock[0])
+    tele_l.start()
+    until(lambda: arm.stream_state(tele_l.session.execution_id).selected_revision == 1, 8)
+    real_revise4 = arm.revise_stream
+
+    def lost_reply_tele(rev):
+        real_revise4(rev)
+        raise SupervisorError('connection closed before the reply')
+    arm.revise_stream = lost_reply_tele
+    try:
+        assert tele_l.command(target, held=True) == 'unknown'
+    finally:
+        arm.revise_stream = real_revise4
+    assert tele_l.report.unknown and not tele_l.report.refused, tele_l.report
+    until(lambda: not tele_l._settle(), 8)
+    assert tele_l.report.selected == tele_l.report.unknown, tele_l.report
+    tele_l.session.close('done')
+    idle()
     # a REAL expiry for teleop: not 'busy' forever
     idle()
     tele_x = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
@@ -283,10 +322,12 @@ def cases(arm, runtime, scene, service):
     finally:
         h.stage_suffix = real_stage
     outs = []
-    for _ in range(3):
+
+    def again():
         outs.append(tele_x.command(np.asarray(arm.state().q) + .003, held=True))
         clock[0] += .01
-        time.sleep(.1)
+        return outs[-1] == 'requested'
+    until(again, 10)  # a transient 'slot unavailable' refusal may come first; never 'busy' forever
     assert 'busy' not in outs, outs
     tele_x.session.close('done')
     idle()
@@ -396,13 +437,22 @@ def cases(arm, runtime, scene, service):
 
     def lost_reply(rev):
         real_revise2(rev)
-        raise TimeoutError('reply lost')
+        raise SupervisorError('reply lost')
     arm.revise_stream = lost_reply
     try:
         lost = env.step(np.asarray(arm.state().q) + .002, .3)
     finally:
         arm.revise_stream = real_revise2
     assert lost.outcome == 'unknown' and lost.truncated and env.report.unknown, lost
+    until(lambda: not h.busy and runtime._stream_job is None, 8)
+    # the next step fails BEFORE anything is sent: 'refused', not a stale 'unknown' (the flag is per step)
+    real_state = arm.stream_state
+    arm.stream_state = lambda *a, **k: (_ for _ in ()).throw(SupervisorError('link down'))
+    try:
+        presend = env.step(np.asarray(arm.state().q) + .002, .3)
+    finally:
+        arm.stream_state = real_state
+    assert presend.outcome == 'refused' and presend.truncated, presend
     until(lambda: not h.busy and runtime._stream_job is None, 8)
     stopped = env.step(np.asarray(arm.state().q) + .002, 5., intervention=lambda: True)
     assert stopped.outcome == 'intervention' and stopped.elapsed_s < 1., stopped
@@ -431,7 +481,6 @@ def cases(arm, runtime, scene, service):
     real_cancel6 = arm.cancel
     arm.cancel = lambda *a, **k: (_ for _ in ()).throw(TimeoutError('link stall'))
     try:
-        env2.session = env.session  # an open, unconfirmable previous episode stream
         env.session.closed = False
         try:
             env.reset()

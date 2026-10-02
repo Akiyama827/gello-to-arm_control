@@ -3,9 +3,10 @@
 ``step(q_target, window_s)`` splices one absolute target reached over the window, waits for the window and reports the
 ACTUAL elapsed time and the outcome. ``completed`` means the RT selected the revision and the window elapsed; a
 revision the supervisor refused (at once or after admission) is ``refused``, an infrastructure error after the revision may
-have been sent is ``unknown`` (it is in ``report.unknown``: motion may have happened) and one still unselected at the end is
+have been sent (conservatively, from just before the splice anchor is read) is ``unknown`` (it is in ``report.unknown``: motion may have happened) and one still unselected at the end is
 ``not_selected``, both truncations. Task success and task termination are the project's: ``terminated`` is always False.
-An ``intervention`` returns early but does NOT stop or hold the arm (it keeps moving toward the target): the caller
+A non-finite ``q_target`` raises ``ValueError``; an infrastructure error before anything was sent is ``refused`` with its
+reason (not in ``report.refused``). An ``intervention`` returns early but does NOT stop or hold the arm (it keeps moving toward the target): the caller
 decides to cancel. ``reset()`` checks the robot is in a state the policy may continue from and otherwise raises
 :class:`NeedsOperator`: it never re-arms, homes, opens the Hand, discards calibration or restarts a cancelled stream.
 """

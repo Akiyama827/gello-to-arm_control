@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from arm_control.clients.common import NeedsOperator, Report, StreamContext, StreamSession, note_outcome, request_id
-from arm_control.sdk import SupervisorError
+from arm_control.sdk import Refused, SupervisorError
 
 
 @dataclass(frozen=True)
@@ -104,12 +104,20 @@ class ActionChunkClient:
         return None
 
     def _send(self, chunk: Chunk) -> None:
+        rid = request_id(chunk.chunk_id)
         try:
             knots = self._knots(chunk)
-            rid = request_id(chunk.chunk_id)
             status = self.session.revise(rid, knots, chunk.dt_s)
-        except (ValueError, SupervisorError, TimeoutError, OSError) as exc:
+        except (Refused, ValueError) as exc:  # the supervisor answered, or nothing was sent: a true refusal
             self.report.refused.append((chunk.chunk_id, str(exc)))
+            return
+        except (SupervisorError, TimeoutError, OSError) as exc:
+            # no usable reply: the revision may have been admitted and selected (a lost reply). Keep it in flight so
+            # the ordering rule holds and pump() finds out; the fate is 'unknown' until it does.
+            self.report.requested.append(chunk.chunk_id)
+            self.report.unknown.append(chunk.chunk_id)
+            self.report.notes.append(f'{chunk.chunk_id}: no reply to the revision ({exc!r}); fate unknown')
+            self.inflight = (chunk.chunk_id, rid, chunk.observed_at.ns)
             return
         self.report.requested.append(chunk.chunk_id)
         if note_outcome(self.report, chunk.chunk_id, status) == 'refused':
