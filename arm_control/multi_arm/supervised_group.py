@@ -6,6 +6,11 @@ second one) and drives JOIN, stage, COMMIT_GROUP and CANCEL through them. The st
 :class:`~arm_control.multi_arm.group.GroupStartRecord` built from the RT's own selection stamps; the PC barrier skew stays a
 separate, differently labelled number.
 
+`pc_commit_sent`/`pc_reply_received` of a member are the times of its `group_release` RPC (the supervisor uploads and
+COMMITs after that), so `pc_send_skew_sec` is the release RPC skew, not the COMMIT send skew. A group COMMIT ignores the
+request's `admit_by` beyond the pre-dispatch check; the RT may select up to `budget_s` after it. The supervisor refuses a
+budget above half the RT acknowledgement timeout.
+
 Differences from the direct-link coordinator, stated plainly: references are uploaded by each supervisor AFTER release (the
 supervisor stages, then COMMITs), so members reach COMMIT_GROUP at slightly different times and the RT's rendezvous budget
 must cover that spread (a member that commits more than ``budget_s`` before its peer is refused ``REF_LATE``); the budget and
@@ -116,6 +121,8 @@ class SdkGroupCoordinator:
                 if name in replies:
                     continue
                 reply = self.arms[name].group_report(executions[name])
+                if reply and reply.get('group_id') not in (None, group_id):
+                    continue  # an answer for another group is not ours (never filed under this one)
                 if reply:
                     replies[name] = reply
                     continue
@@ -123,7 +130,8 @@ class SdkGroupCoordinator:
                 if status.terminal:  # rejected/expired before the RT answered
                     replies[name] = dict(error=f'{status.phase.value}: {status.reason}')
             time.sleep(0.005)
-        bad = {n: r.get('error', 'no reply') for n, r in replies.items() if 'selected_ns' not in r}
+        bad = {n: r.get('error', 'no reply') + (f" peer_verdict={r['reply'].get('peer_verdict')}" if r.get('reply') else '')
+               for n, r in replies.items() if 'selected_ns' not in r}
         bad.update({n: 'no reply within the budget' for n in self.names if n not in replies})
         if bad:
             raise GroupStartError(f'group {group_id} did not start', bad)

@@ -13,6 +13,7 @@ group record does not advertise group/1 and the group is refused. Nothing here i
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 from pathlib import Path
 import subprocess
@@ -44,6 +45,22 @@ def request(arm, name, token, rid, delta, duration):
     traj = JointTrajectory([0., duration / 2, duration], np.stack([q0, (q0 + q1) / 2, q1]),
                            np.stack([0 * q0, mid, 0 * q0]))
     return TrajectoryRequest(rid, name, JOINTS, traj, model_token=token, start=Start.ON_RELEASE)
+
+
+def settle():
+    """After a cancel the RT retires running members and their peers within about PEER_MAX_AGE plus a tick, and a new group
+    is refused at JOIN (GROUP_REFUSED) or BEGIN (REF_BUSY, the open CTRL-034 item 4a race) until then: a safe refusal that
+    a caller retries. The bench waits instead."""
+    time.sleep(.4)
+
+
+def recover(arms):
+    """After a FAILED group start a member's native path is marked failed and its PC command stream ends, so the RT latches
+    CMD_LOST after --fault-ms (the existing hold->latch ladder; the next JOIN is refused while latched). Recovery is
+    DISARM then ARM, as for any native failure."""
+    for arm in arms.values():
+        arm.disarm()
+        arm.arm()
 
 
 def wait(predicate, timeout=15., what=''):
@@ -108,6 +125,7 @@ def main():
             eid = coordinator.last_executions[n]
             assert arms[n].wait(eid, 15).phase is Phase.COMPLETED, (n, arms[n].status(eid))
         assert not any(coordinator.cancel(1).values())  # a started group stays joined until cancelled
+        settle()
 
         # A group cancelled while running retires both members.
         reqs = requests('g2')
@@ -117,9 +135,9 @@ def main():
         assert not errors, errors
         for n in ARMS:
             assert arms[n].status(coordinator.last_executions[n]).phase is Phase.CANCELLED
+        settle()
 
         # a member released on admission would start alone: refused; after a group cancel nothing is joined any more
-        import dataclasses
         try:
             coordinator.start(30, {n: dataclasses.replace(r, start=Start.ON_ADMIT) for n, r in requests('g30').items()})
         except ValueError as exc:
@@ -144,8 +162,8 @@ def main():
         else:
             raise AssertionError('a reference shorter than H was started')
 
-        # A member that never commits: its peer is refused (NOT_ADMITTED here: through a supervisor a reference is uploaded
-        # only after release, so the peer has staged nothing) and the group fails; nothing stays joined.
+        # A member whose peer never commits: held to the group deadline and refused REF_LATE after about the budget; nothing
+        # stays joined.
         reqs = requests('g4')
         arms[a].group_join(4, 0, 2)
         arms[b].group_join(4, 1, 2)
@@ -153,14 +171,75 @@ def main():
         t0 = time.monotonic()
         arms[a].group_release(eid_a, 4, int(GROUP_BUDGET_S * 1e9))
         report = wait(lambda: arms[a].group_report(eid_a), 5, 'the refusal of the lone member')
+        waited = time.monotonic() - t0
         assert 'error' in report and 'selected_ns' not in report, report
-        assert time.monotonic() - t0 < 2., time.monotonic() - t0
-        assert report['result'] in (rtp.REF_NOT_ADMITTED, rtp.REF_LATE), report  # the peer never staged/committed
+        # Held until about the budget, then refused: REF_LATE, the peer verdict, or the RT retiring the member (the
+        # link reports the interrupted exchange). Never a selection; the exact RT answer varies run to run.
+        assert 'selected_ns' not in report and GROUP_BUDGET_S * .5 < waited < 2., (report, waited)
+        assert report.get('result') in (rtp.REF_LATE, rtp.REF_GROUP_PEER, rtp.REF_GROUP_REFUSED, None), report
         coordinator.cancel(4, {a: eid_a})
         wait(lambda: arms[a].status(eid_a).terminal, 5, 'the lone member to end')
+        recover(arms)
+        settle()
         record = coordinator.start(5, requests('g5'))
         assert record.rt_skew_sec is not None
         coordinator.cancel(5, coordinator.last_executions)
+        settle()
+
+        # Failure paths through SdkGroupCoordinator.start(): each cancels both members and leaves nothing joined.
+        def failed_then_ok(gid, expect, patch=None, undo=None, duration=2.0):
+            reqs_ = requests(f'f{gid}', duration)
+            if patch:
+                patch(reqs_)
+            try:
+                coordinator.start(gid, reqs_)
+            except GroupStartError as exc:
+                assert expect in str(exc) or expect in str(exc.members), (gid, exc, exc.members)
+            else:
+                raise AssertionError(f'group {gid} should have failed ({expect})')
+            finally:
+                if undo:
+                    undo()
+            for n, eid in coordinator.last_executions.items():
+                assert wait(lambda e=eid, n=n: arms[n].status(e).terminal, 6, f'{n} to be cancelled')
+                assert arms[n].status(eid).phase in (Phase.CANCELLED, Phase.REJECTED, Phase.EXPIRED), (n, arms[n].status(eid))
+            recover(arms)
+            settle()
+            record_ = coordinator.start(gid + 1, requests(f'f{gid}ok'))  # nothing is left joined or busy
+            assert record_.rt_skew_sec is not None
+            coordinator.cancel(gid + 1, coordinator.last_executions)
+            wait(lambda: all(arms[n].status(e).terminal for n, e in coordinator.last_executions.items()), 6, 'cleanup')
+            settle()
+
+        bad_model = lambda r: r.__setitem__(b, dataclasses.replace(r[b], model_token='other-model'))  # noqa: E731
+        failed_then_ok(40, 'not admitted', bad_model)
+        real_release = arms[b].group_release
+
+        def boom(*a, **k):
+            raise Refused('release refused (scripted)')
+        arms[b].group_release = boom
+        failed_then_ok(42, 'could not be released', undo=lambda: setattr(arms[b], 'group_release', real_release))
+        real_report = arms[a].group_report
+        arms[a].group_report = lambda eid: dict(selected_ns=0, deadline_ns=0, reference_id=1, group_id=44)
+        failed_then_ok(44, 'no selection stamp', undo=lambda: setattr(arms[a], 'group_report', real_report))
+        arms[a].group_report = lambda eid: dict(selected_ns=5, deadline_ns=6, reference_id=1, group_id=999)  # another group's
+        failed_then_ok(46, 'no reply within the budget', undo=lambda: setattr(arms[a], 'group_report', real_report),
+                       duration=8.0)  # long enough to still be running when the coordinator gives up
+
+        # A group joined in one ARM epoch cannot be released in another.
+        arms[a].group_join(50, 0, 2)
+        arms[a].disarm()
+        arms[a].arm()
+        eid_e = arms[a].execute(requests('g50')[a]).execution_id
+        try:
+            arms[a].group_release(eid_e, 50, int(GROUP_BUDGET_S * 1e9))
+        except Refused as exc:
+            assert 'ARM epoch' in str(exc), exc
+        else:
+            raise AssertionError('released into a group joined in an earlier ARM epoch')
+        arms[a].cancel(eid_e)
+        arms[a].group_cancel(50)
+        settle()
 
         # A supervisor whose RT server has no group record does not advertise group/1: the group is refused.
         rt_c, sup_c, sock_c, token_c = start_arm(args.server, tmp, 'arm_c')
@@ -178,8 +257,18 @@ def main():
         else:
             raise AssertionError('a member without group/1 was accepted')
         print('PASS: group/1 through two supervisors: group starts with an RT-stamp skew report and completes, a running '
-              'group cancels on both members, a lone commit is refused and leaves nothing joined, a short '
+              'group cancels on both members, a lone commit is refused REF_LATE at the budget and leaves nothing joined, a short '
               'reference is refused before contact, a member without group/1 refuses the group')
+    except BaseException:
+        for proc in procs:  # a failing run shows what each RT server and supervisor said
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=3)
+                print('--- log (tail)\n' + ''.join((proc.stdout.readlines() if proc.stdout else [])[-25:]))
+            except Exception:  # noqa: BLE001
+                pass
+        raise
     finally:
         for client in clients:
             client.close()

@@ -723,13 +723,30 @@ class RobotRuntime:
 
     # -- group/1: CTRL-040 RT group execution, through this supervisor's one RT session ----------------
     def group_join(self, session: str, group_id: int, member_index: int, member_count: int) -> dict:
-        return self._call(self._group_join, session, group_id, member_index, member_count)
+        # The RT exchange runs on the CALLER's thread, never on the 100 Hz loop (it can wait for an ack); the loop only
+        # checks ownership and records the result.
+        self._call(self._group_check, session)
+        try:
+            reply = self.link.group_join(group_id, member_index, member_count)
+        except RtLinkError as exc:
+            raise Refused(f'group join refused: {exc} {getattr(exc, "reply", None) or ""}') from exc
+        epoch = self._call(self._group_set, session, (group_id, member_index, member_count))
+        domain = getattr(self.link, 'clock_domain', None)
+        return dict(clock_domain=None if domain is None else ':'.join(domain), state=reply.get('state'),
+                    arm_epoch=epoch, reference_limit=rtp.MAX_REFERENCE_KNOTS)
 
     def group_release(self, session: str, execution_id: str, group_id: int, budget_ns: int) -> ExecutionStatus:
         return self._call(self._group_release_op, session, execution_id, group_id, budget_ns)
 
     def group_cancel(self, session: str, group_id: int) -> dict:
-        return self._call(self._group_cancel, session, group_id)
+        joined = self._call(self._group_take, session, group_id)  # forget the group first: nothing more is released
+        if joined is None:
+            return dict(cancelled=False, reason='not joined')
+        try:
+            self.link.group_cancel(group_id, joined[1], joined[2])  # on the caller's thread, see group_join
+        except RtLinkError as exc:
+            raise Refused(f'group cancel not confirmed: {exc} {getattr(exc, "reply", None) or ""}') from exc
+        return dict(cancelled=True)
 
     def group_report(self, execution_id: str) -> dict:
         """The RT's group COMMIT reply for this execution (``selected_ns``, ``deadline_ns``, ``reference_id``), its
@@ -737,37 +754,42 @@ class RobotRuntime:
         with self._cv:
             return dict(self._group_reports.get(execution_id, {}))
 
-    def group_events(self) -> list:
-        """Unsolicited RT group reports (a peer fault/cancel/loss retired this member), drained."""
+    def group_events(self, session: str) -> list:
+        """Unsolicited RT group reports (a peer fault/cancel/loss retired this member), drained. Owner only: another
+        client must not take the owner's events."""
+        self._call(self._group_check, session)
         out = []
         events = getattr(self.link, 'group_events', None)
         while events:
             out.append(dict(events.popleft()))
         return out
 
-    def _group_join(self, session, group_id, member_index, member_count):
+    def _group_check(self, session):
         self._owns(session)
         if self._native is None or not getattr(self.link, 'group_capable', False):
             raise Refused('the RT server has no group record (group/1 is unavailable)')
-        try:
-            reply = self.link.group_join(group_id, member_index, member_count)
-        except RtLinkError as exc:
-            raise Refused(f'group join refused: {exc}') from exc
-        self._group = (group_id, member_index, member_count)
-        domain = getattr(self.link, 'clock_domain', None)
-        return dict(clock_domain=None if domain is None else ':'.join(domain), state=reply.get('state'),
-                    reference_limit=rtp.MAX_REFERENCE_KNOTS)
+
+    def _group_set(self, session, joined):
+        self._owns(session)
+        self._group = (*joined, self._authority.arm_epoch)
+        return self._authority.arm_epoch
 
     def _group_release_op(self, session, execution_id, group_id, budget_ns):
         self._owns(session)
         if self._group is None or self._group[0] != group_id:
             raise Refused('join the group before releasing a member')
-        if not 0 < budget_ns <= rtp.GROUP_MAX_BUDGET_NS:
-            raise Refused('budget must be positive and within the wire bound')
+        ack_ns = int(float(self.link.config.ack_timeout_s) * 1e9)
+        if not 0 < budget_ns <= min(rtp.GROUP_MAX_BUDGET_NS, ack_ns // 2):
+            raise Refused('budget must be positive and at most half the RT acknowledgement timeout (the COMMIT_GROUP wait)')
+        if self._group[3] != self._authority.arm_epoch:
+            self._group = None
+            raise Refused('the ARM epoch changed since the group was joined: join again')
         ex = self._get(execution_id)
         if ex.stream is not None or ex.request.start is not Start.ON_RELEASE:
             raise Refused('a group member is a planned ON_RELEASE execution')
         self._group_release[execution_id] = (group_id, self._group[1], int(budget_ns))
+        while len(self._group_release) > 16:
+            self._group_release.pop(next(iter(self._group_release)))
         self._group_reports.pop(execution_id, None)
         try:
             return self._release(session, execution_id)
@@ -775,18 +797,13 @@ class RobotRuntime:
             self._group_release.pop(execution_id, None)
             raise
 
-    def _group_cancel(self, session, group_id):
+    def _group_take(self, session, group_id):
         self._owns(session)
         if self._group is None or self._group[0] != group_id:
-            return dict(cancelled=False, reason='not joined')
-        _, index, count = self._group
-        self._group = None
+            return None
+        joined, self._group = self._group, None
         self._group_release.clear()
-        try:
-            self.link.group_cancel(group_id, index, count)
-        except RtLinkError as exc:
-            raise Refused(f'group cancel not confirmed: {exc}') from exc
-        return dict(cancelled=True)
+        return joined
 
     def status(self, execution_id: str, *, wait_s: float = 0.0) -> ExecutionStatus:
         """Current status; with ``wait_s`` waits (bounded) for a terminal one."""
@@ -1288,8 +1305,9 @@ class RobotRuntime:
             # decision from THIS state sample, with its original sample time.
             # The sender may repeat it but never make its age look younger.
             self._publish_measured_reference_hold(state, rx, h.feedback, h.point)
-        if h.group_reply is not None and h.key is not None:  # the RT's COMMIT_GROUP answer, whatever happens next
-            self._group_reports[h.key] = dict(h.group_reply, reference_id=h.id)
+        if h.group_reply is not None and h.key is not None and h.group_reply.get('key') == h.key:
+            # the RT's COMMIT_GROUP answer for THIS execution, whatever happens next
+            self._group_reports[h.key] = {k: v for k, v in h.group_reply.items() if k != 'key'} | dict(reference_id=h.id)
             for stale in list(self._group_reports)[:-32]:
                 del self._group_reports[stale]
         if self._stream_step():

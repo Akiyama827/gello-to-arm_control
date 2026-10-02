@@ -75,7 +75,7 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
         if op == 'group_report':
             return runtime.group_report(str(args['execution_id']))
         if op == 'group_events':
-            return runtime.group_events()
+            return runtime.group_events(session)
     if op == "now":
         return enc(runtime.now())
     if op == "state":
