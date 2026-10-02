@@ -52,6 +52,16 @@ def default_socket_path(instance_id: str) -> Path:
     return Path(base) / "arm_control" / f"{instance_id}.sock"
 
 
+def _dec(decoder, value):
+    """Decode a supervisor reply. The request has already been sent, so a reply that parsed as JSON but does not fit the
+    contract (unknown enum, missing or extra field) leaves the outcome UNKNOWN: SupervisorError, never the ValueError,
+    KeyError or TypeError a caller could take for 'refused / nothing sent'."""
+    try:
+        return decoder(value)
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise SupervisorError(f"unreadable reply ({type(exc).__name__}: {exc}); outcome unknown") from exc
+
+
 class SocketChannel:
     """Newline-delimited JSON request/response over the supervisor's socket.
     One outstanding request at a time; a timeout closes the channel, since
@@ -85,26 +95,29 @@ class SocketChannel:
                 raise SupervisorError(f"{op}: {exc}") from exc
             if not reply.endswith(b"\n"):
                 self._close()
-                raise SupervisorError(f"{op}: supervisor closed the connection")
+                raise SupervisorError(f"{op}: supervisor closed the connection"
+                                      + (" (or sent an oversize reply)" if len(reply) > MAX_MESSAGE else ""))
             # The request has been sent, so a reply that cannot be read leaves its outcome UNKNOWN to the caller: report
             # it as a SupervisorError (the same class as a lost reply), never a ValueError a caller could take for
             # "refused", and drop the channel (its framing can no longer be trusted).
             try:
                 msg = json.loads(reply)
                 reply_id, ok = msg.get("id"), msg["ok"]
-            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
                 self._close()
                 raise SupervisorError(f"{op}: malformed reply ({type(exc).__name__}); outcome unknown") from exc
-            if reply_id != rid:
+            if reply_id != rid or type(reply_id) is not int:
                 self._close()
                 raise SupervisorError(f"{op}: reply out of order; outcome unknown")
-        if ok:
-            try:
+            if ok is True:
+                if "result" not in msg:
+                    self._close()
+                    raise SupervisorError(f"{op}: reply without a result; outcome unknown")
                 return msg["result"]
-            except KeyError as exc:
+            if ok is not False:
                 self._close()
-                raise SupervisorError(f"{op}: reply without a result; outcome unknown") from exc
-        error = {"refused": Refused, "timeout": TimeoutError}.get(msg.get("kind"), SupervisorError)
+                raise SupervisorError(f"{op}: malformed reply (ok={ok!r}); outcome unknown")
+            error = {"refused": Refused, "timeout": TimeoutError}.get(msg.get("kind"), SupervisorError)
         raise error(msg.get("error", "unspecified error"))
 
     def _close(self) -> None:
@@ -127,41 +140,45 @@ class ArmClient:
         self.timeout_s = float(timeout_s)
         self._channel = channel or SocketChannel(
             socket_path or default_socket_path(instance_id), timeout_s=timeout_s)
-        hello = self._channel.call("hello")
-        if hello["contract_version"] != CONTRACT_VERSION:
-            self.close()
-            raise SupervisorError(f"supervisor implements contract "
-                                  f"v{hello['contract_version']}, SDK v{CONTRACT_VERSION}")
-        self.identity = codec.identity_from(hello["identity"])
-        if self.identity.instance_id != instance_id:
-            self.close()
-            raise SupervisorError(f"supervisor serves {self.identity.instance_id!r}, "
-                                  f"not {instance_id!r}")
-        self.capabilities = codec.capabilities_from(hello["capabilities"])
-        self.session: str = hello["session"]
-        self.extensions = dict(hello.get("extensions") or {})
+        try:
+            hello = self._channel.call("hello")
+            if hello["contract_version"] != CONTRACT_VERSION:
+                raise SupervisorError(f"supervisor implements contract "
+                                      f"v{hello['contract_version']}, SDK v{CONTRACT_VERSION}")
+            self.identity = _dec(codec.identity_from, hello["identity"])
+            if self.identity.instance_id != instance_id:
+                raise SupervisorError(f"supervisor serves {self.identity.instance_id!r}, "
+                                      f"not {instance_id!r}")
+            self.capabilities = _dec(codec.capabilities_from, hello["capabilities"])
+            self.session: str = hello["session"]
+            self.extensions = dict(hello.get("extensions") or {})
+        except (SupervisorError, KeyError, TypeError, AttributeError, ValueError) as exc:
+            self.close()  # never leak the socket from a failed handshake
+            if isinstance(exc, SupervisorError):
+                raise
+            raise SupervisorError(f"unreadable hello ({type(exc).__name__}: {exc})") from exc
 
     # -- observation and time --------------------------------------------------
     def now(self) -> Stamp:
         """The supervisor's clock, the one ``admit_by`` must use."""
-        return codec.stamp_from(self._channel.call("now"))
+        return _dec(codec.stamp_from, self._channel.call("now"))
 
     def deadline(self, seconds: float) -> Stamp:
         now = self.now()
         return Stamp(now.ns + int(seconds * 1e9), Clock.PC, now.domain)
 
     def state(self) -> RobotState:
-        return codec.state_from(self._channel.call("state"))
+        return _dec(codec.state_from, self._channel.call("state"))
 
     def authority(self) -> Authority:
-        return codec.authority_from(self._channel.call("authority"))
+        return _dec(codec.authority_from, self._channel.call("authority"))
 
     # -- ownership and authority -----------------------------------------------
     def claim(self) -> Authority:
-        return codec.authority_from(self._channel.call("claim"))
+        return _dec(codec.authority_from, self._channel.call("claim"))
 
     def unclaim(self) -> Authority:
-        return codec.authority_from(self._channel.call("unclaim"))
+        return _dec(codec.authority_from, self._channel.call("unclaim"))
 
     def arm(self, timeout_s: float = 5.0) -> Authority:
         """ARM and wait (bounded) until the controller is ready to execute."""
@@ -178,7 +195,7 @@ class ArmClient:
             got = self._channel.call("await_authority", wait_s=WAIT_SLICE_S, gen=gen,
                                      armed=armed, wait_for_s=min(WAIT_SLICE_S, max(left, 0.0)))
             if got["settled"]:
-                return codec.authority_from(got["authority"])
+                return _dec(lambda g: codec.authority_from(g["authority"]), got)
             if left <= 0:
                 raise TimeoutError(f"{'ARM' if armed else 'DISARM'} not confirmed within "
                                    f"{timeout_s}s; check authority()")
@@ -187,13 +204,13 @@ class ArmClient:
     def execute(self, request: TrajectoryRequest) -> ExecutionStatus:
         """Submit; returns once admitted or refused (``status.phase``). Motion
         proceeds in the supervisor; follow it with ``status``/``wait``."""
-        return codec.status_from(self._channel.call("submit", request=codec.encode(request)))
+        return _dec(codec.status_from, self._channel.call("submit", request=codec.encode(request)))
 
     def release(self, execution_id: str) -> ExecutionStatus:
-        return codec.status_from(self._channel.call("release", execution_id=execution_id))
+        return _dec(codec.status_from, self._channel.call("release", execution_id=execution_id))
 
     def status(self, execution_id: str) -> ExecutionStatus:
-        return codec.status_from(self._channel.call("status", execution_id=execution_id))
+        return _dec(codec.status_from, self._channel.call("status", execution_id=execution_id))
 
     def wait(self, execution_id: str, timeout_s: float) -> ExecutionStatus:
         """Block until terminal, at most ``timeout_s``; TimeoutError otherwise.
@@ -201,7 +218,7 @@ class ArmClient:
         deadline = time.monotonic() + timeout_s
         while True:
             left = deadline - time.monotonic()
-            status = codec.status_from(self._channel.call(
+            status = _dec(codec.status_from, self._channel.call(
                 "status", wait_s=WAIT_SLICE_S, execution_id=execution_id,
                 wait_for_s=min(WAIT_SLICE_S, max(left, 0.0))))
             if status.terminal:
@@ -217,7 +234,7 @@ class ArmClient:
         return self.wait(execution_id, timeout_s)
 
     def receipts(self, execution_id: str) -> tuple[Receipt, ...]:
-        return tuple(codec.receipt_from(r) for r in
+        return tuple(_dec(codec.receipt_from, r) for r in
                      self._channel.call("receipts", execution_id=execution_id))
 
     # -- negotiated controller/1 -----------------------------------------------
@@ -227,17 +244,17 @@ class ArmClient:
         return self._channel.call(op, **args)
 
     def controller_presets(self):
-        return tuple(codec.preset_from(p) for p in self._controller_call('controller_presets'))
+        return tuple(_dec(codec.preset_from, p) for p in self._controller_call('controller_presets'))
 
     def controller_state(self):
-        return codec.controller_state_from(self._controller_call('controller_state'))
+        return _dec(codec.controller_state_from, self._controller_call('controller_state'))
 
     def select_control_preset(self, preset_id: str):
-        return codec.controller_state_from(self._controller_call(
+        return _dec(codec.controller_state_from, self._controller_call(
             'controller_select', preset_id=preset_id))
 
     def set_payload(self, payload):
-        return codec.payload_state_from(self._controller_call(
+        return _dec(codec.payload_state_from, self._controller_call(
             'controller_payload', payload=codec.encode(payload)))
 
     # -- negotiated stream/1 ----------------------------------------------------
@@ -248,24 +265,24 @@ class ArmClient:
 
     def open_stream(self, request):
         """Returns REQUESTED; trusted admission continues asynchronously."""
-        return codec.stream_view_from(self._stream_call('stream_open', request=codec.encode(request)))
+        return _dec(codec.stream_view_from, self._stream_call('stream_open', request=codec.encode(request)))
 
     def stream_state(self, execution_id):
         """Pure observation; never acquires a splice challenge."""
-        return codec.stream_view_from(self._stream_call('stream_state', execution_id=execution_id))
+        return _dec(codec.stream_view_from, self._stream_call('stream_state', execution_id=execution_id))
 
     def stream_anchor(self, execution_id):
-        return codec.anchor_from(self._stream_call('stream_anchor', execution_id=execution_id))
+        return _dec(codec.anchor_from, self._stream_call('stream_anchor', execution_id=execution_id))
 
     def revise_stream(self, request):
-        return codec.revision_status_from(self._stream_call('stream_revise', request=codec.encode(request)))
+        return _dec(codec.revision_status_from, self._stream_call('stream_revise', request=codec.encode(request)))
 
     def stream_revision(self, execution_id, request_id):
-        return codec.revision_status_from(self._stream_call(
+        return _dec(codec.revision_status_from, self._stream_call(
             'stream_revision', execution_id=execution_id, request_id=request_id))
 
     def abort_stream_revision(self, execution_id, request_id):
-        return codec.revision_status_from(self._stream_call(
+        return _dec(codec.revision_status_from, self._stream_call(
             'stream_abort', execution_id=execution_id, request_id=request_id))
 
     # -- lifetime ----------------------------------------------------------------
