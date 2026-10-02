@@ -41,11 +41,11 @@ from arm_control.multi_arm.supervised import plan_body, plan_request  # noqa: E4
 ARMS = ('arm_a', 'arm_b')
 
 
-def start_arm(server, tmp: Path, name: str):
+def start_arm(server, tmp: Path, name: str, extra_args=()):
     udp, tcp = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
     rt = subprocess.Popen([server, '--backend', 'fake', '--n', '3', '--instance-id', name, '--joint-names',
                            ','.join(JOINTS), '--udp-port', str(udp), '--tcp-port', str(tcp), '--hold-ms', '100',
-                           '--fault-ms', '600', '--enable-reference'],
+                           '--fault-ms', '600', '--enable-reference', *extra_args],
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.monotonic() + 10
     while not tcp_listening(tcp):

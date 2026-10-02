@@ -109,6 +109,9 @@ class ReferenceHorizon:
         self._schedstat_first_timeslices = None
         self._schedstat_last_timeslices = None
         self._schedstat_stagnant_loops = 0
+        # CTRL-040 group COMMIT (set by the supervisor just before approve(); consumed by it): (group_id, member_index,
+        # budget_ns). ``group_reply`` is what the RT answered (selected_ns/deadline_ns on its clock, or the refusal).
+        self.group = self.group_reply = None
         self._envelope_thread.start()
 
     def _schedstat_sample(self):
@@ -388,6 +391,7 @@ class ReferenceHorizon:
         session, epoch = self._session, self._epoch
         deadline = self._selection_deadline_ns if revision == 1 or self.stream else None
         latest = self._latest_phase if self.stream else cut
+        group, self.group, self.group_reply = self.group, None, None
         observed_phase = None if self.point is None else self.point.time
 
         def commit():
@@ -414,6 +418,9 @@ class ReferenceHorizon:
                     raise _NotDispatched('no selected phase for revision deadline')
                 phase_deadline = min(latest, observed_phase + budget / 1e9)
                 budget = 0
+            if group is not None:  # one shared budget; the RT's group rendezvous aligns the members' selection
+                return self.link.group_commit(upload, reference_id=identity, group_id=group[0],
+                                              member_index=group[1], budget_ns=group[2])
             # RT anchors the duration at SEAL, which precedes receipt of its
             # ACK and this PC budget calculation. This can refuse early but
             # cannot grant extra network/queue time or compare host clocks.
@@ -475,11 +482,15 @@ class ReferenceHorizon:
                         self.candidate_selection = 'not_requested'
                 if kind == 'commit' and isinstance(exc, ReferenceRefused) and self._revision == 1:
                     self.selection_requested = False  # RT proved it did not select
+                if kind == 'commit' and isinstance(exc, (ReferenceRefused, _NotDispatched)):
+                    self.group_reply = dict(error=str(exc), result=getattr(exc, 'result', None))
                 if not self._interrupt.is_set() and not self.stream:
                     self.error = str(exc)
             else:
                 if kind == 'stage' and not self._interrupt.is_set():
                     self._upload, self._stage_ready = result, True
+                if kind == 'commit' and isinstance(result, dict) and 'selected_ns' in result:
+                    self.group_reply = dict(result)
         if self._cancel_job is not None and self._cancel_job.done():
             try:
                 self._cancel_job.result()

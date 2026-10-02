@@ -61,6 +61,21 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
         if op in methods:
             extra = [str(args['request_id'])] if op in ('stream_revision', 'stream_abort') else []
             return enc(getattr(runtime, methods[op])(session, str(args['execution_id']), *extra))
+    if op.startswith('group_'):
+        if runtime.extensions.get('group') != 1:
+            raise Refused('group/1 is unavailable')
+        if op == 'group_join':
+            return runtime.group_join(session, int(args['group_id']), int(args['member_index']),
+                                      int(args['member_count']))
+        if op == 'group_release':
+            return enc(runtime.group_release(session, str(args['execution_id']), int(args['group_id']),
+                                             int(args['budget_ns'])))
+        if op == 'group_cancel':
+            return runtime.group_cancel(session, int(args['group_id']))
+        if op == 'group_report':
+            return runtime.group_report(str(args['execution_id']))
+        if op == 'group_events':
+            return runtime.group_events()
     if op == "now":
         return enc(runtime.now())
     if op == "state":

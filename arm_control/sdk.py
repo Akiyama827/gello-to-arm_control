@@ -285,6 +285,34 @@ class ArmClient:
         return _dec(codec.revision_status_from, self._stream_call(
             'stream_abort', execution_id=execution_id, request_id=request_id))
 
+    # -- negotiated group/1 (CTRL-040 RT group execution through this arm's supervisor) -------------------------
+    def _group_call(self, op, **args):
+        if self.extensions.get('group') != 1:
+            raise Refused('supervisor does not advertise group/1')
+        return self._channel.call(op, **args)
+
+    def group_join(self, group_id: int, member_index: int, member_count: int) -> dict:
+        """Bind this arm to the RT group; the reply names the RT clock domain (None: unattested)."""
+        return self._group_call('group_join', group_id=group_id, member_index=member_index,
+                                member_count=member_count)
+
+    def group_release(self, execution_id: str, group_id: int, budget_ns: int):
+        """Release a staged ON_RELEASE execution through COMMIT_GROUP; selection is observed asynchronously
+        (``group_report``). All members commit within ``budget_ns`` of each other or the RT refuses the group."""
+        return _dec(codec.status_from, self._group_call('group_release', execution_id=execution_id,
+                                                        group_id=group_id, budget_ns=budget_ns))
+
+    def group_report(self, execution_id: str) -> dict:
+        """``selected_ns``/``deadline_ns``/``reference_id`` once the RT selected it, ``error`` if it refused, ``{}``
+        while pending. Times are on the RT host clock."""
+        return self._group_call('group_report', execution_id=execution_id)
+
+    def group_cancel(self, group_id: int) -> dict:
+        return self._group_call('group_cancel', group_id=group_id)
+
+    def group_events(self) -> list:
+        return list(self._group_call('group_events'))
+
     # -- lifetime ----------------------------------------------------------------
     def close(self) -> None:
         """Ends this session: ownership, if held, is released by the supervisor
