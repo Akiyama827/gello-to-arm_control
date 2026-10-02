@@ -111,6 +111,10 @@ def main() -> int:
                                       str(ROOT / "tools/bench/check_sdk_supervisor.py"),
                                       "--server", server, *extra],
                                logs=logs, env=env, timeout=180))
+        results.append(run("dual_supervisor", [sys.executable,
+                                               str(ROOT / "tools/bench/check_dual_supervisor.py"),
+                                               "--server", server],
+                           logs=logs, env=env, timeout=180))
         binaries = {
             "server": server,
             "probe": str(build / "reference_probe.so"),
