@@ -66,7 +66,13 @@ def start_arm(server, tmp: Path, name: str, extra_args=()):
     with cfg.open('a') as f:
         f.write('model: ' + json.dumps(dict(token=token, bundle_id='fixture', revision=1, gravity=gravity)) + '\n')
     sock = workdir / f'{name}.sock'
-    sup = subprocess.Popen([sys.executable, '-m', 'arm_control.supervisor.service', '--config', str(cfg),
+    entry = [sys.executable, '-m', 'arm_control.supervisor.service']
+    if os.environ.get('SUPERVISOR_FAULTHANDLER'):  # SIGUSR1 dumps every thread's stack into the supervisor's log
+        entry = [sys.executable, '-c', 'import faulthandler, signal, runpy, sys; '
+                 'faulthandler.register(signal.SIGUSR1, all_threads=True); '
+                 'sys.argv[0] = "arm_control.supervisor.service"; '
+                 'runpy.run_module("arm_control.supervisor.service", run_name="__main__")']
+    sup = subprocess.Popen([*entry, '--config', str(cfg),
                             '--socket', str(sock)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                            env=dict(os.environ))
     deadline = time.monotonic() + 30

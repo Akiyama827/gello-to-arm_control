@@ -20,9 +20,16 @@ drives two or more supervisors and returns the same `GroupStartRecord` as the di
 - After a cancel, a new group is refused at JOIN (GROUP_REFUSED) or at BEGIN (REF_BUSY, the open CTRL-034 item 4a race) until
   the RT has retired the running members and their peers (about PEER_MAX_AGE plus a tick): a safe refusal the caller
   retries after a short settle; the bench waits 0.4 s.
-- A FAILED group start leaves each member's native path marked failed (existing `_native_failed` behaviour for any refused
-  native COMMIT): the supervisor stops commanding, the RT latches CMD_LOST after `--fault-ms`, and the next JOIN is refused
-  while latched. Recovery is DISARM then ARM, the existing hold→latch ladder. A group CANCEL of running members does not
-  latch (the supervisor stages the measured hold).
+- **OPEN: cancelling RUNNING group members can latch an arm.** The RT retires the peer's reference; the supervisor's
+  measured-hold BEGIN is then refused while the RT still holds the old reference (the open CTRL-034 item 4a race), so that
+  arm's PC command stream is silent and the RT latches CMD_LOST after `--fault-ms`. Measured in the bench about 1 run in 5
+  (always the second arm); recovery is DISARM then ARM (the existing hold→latch ladder). This is a survivor-semantics /
+  RT-side question (CTRL-042), not fixed here, and it makes a routine group cancel on hardware unacceptable until decided.
+  What this slice does fix: a group start that fails with no running member (a lone refused COMMIT_GROUP) latches nothing (the
+  bench asserts no fault for longer than `--fault-ms`); `group_cancel` cancels the executions released for the group, so a
+  member cannot fall back to a plain COMMIT and start alone; a cancel the RT did not confirm can be retried; a join whose
+  outcome is uncertain stays recorded so a cancel still reaches the RT; a hold upload disturbed by a group cancel is
+  re-staged, not treated as a native failure. The group RPCs may block their connection thread up to the link's
+  acknowledgement timeouts (longer than the service's 1 s wait bound).
 - Not a qualification: fake RT only, approved constants as defaults, no unit file may pass `--group-*` until the FR3-host
   tick-gap measurement and the CTRL-042 decision. Bench: `tools/bench/check_dual_group.py`.
