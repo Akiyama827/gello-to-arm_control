@@ -759,6 +759,11 @@ class RobotRuntime:
             while h is not None and h.busy and time.monotonic() < end:
                 time.sleep(0.005)
             self.link.group_cancel(group_id, joined[1], joined[2])  # on the caller's thread, see group_join
+        except ReferenceRefused as exc:
+            if exc.result == rtp.REF_GROUP_REFUSED:  # the RT answered that it is not in this group: nothing to retry
+                return dict(cancelled=False, reason='the RT is not in this group')
+            self._call(self._group_restore, session, joined)
+            raise Refused(f'group cancel not confirmed: {exc} {getattr(exc, "reply", None) or ""}') from exc
         except RtLinkError as exc:
             self._call(self._group_restore, session, joined)  # not confirmed: a retry must reach the RT again
             raise Refused(f'group cancel not confirmed: {exc} {getattr(exc, "reply", None) or ""}') from exc
@@ -789,9 +794,9 @@ class RobotRuntime:
 
     def _group_set(self, session, joined):
         self._owns(session)
-        if self._group is not None and self._group[0] != joined[0]:
+        if self._group is not None and self._group[0] != joined[0] and self._group[3] == self._authority.arm_epoch:
             # The RT holds one group record: with an uncertain exchange a second group would leave it unknown which one
-            # the RT is in. Cancel the first.
+            # the RT is in. Cancel the first. (A group from an earlier ARM epoch is stale: it cannot be released any more.)
             raise Refused(f'group join refused: already joined to group {self._group[0]}: cancel it before joining another')
         previous, self._group = self._group, (*joined, self._authority.arm_epoch)
         return self._authority.arm_epoch, previous
@@ -838,7 +843,7 @@ class RobotRuntime:
             # No measured hold is staged until the RT CANCEL has been sent (group_cancel clears this; the deadline is only
             # a bound if it never gets to).
             now = time.monotonic()
-            self._group_cancelling = now + 2 * float(self.link.config.ack_timeout_s)
+            self._group_cancelling = now + 2.0 + 2 * float(self.link.config.ack_timeout_s)  # the busy wait plus the exchange
             # The re-stage grace starts here, not after the RT reply: a caller-thread delay after the reply must not
             # let the RT's retire of a standing hold be taken for a native failure.
             self._group_hold_grace = self._group_cancelling + 1.0

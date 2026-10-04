@@ -248,7 +248,7 @@ def main():
         try:
             arms[a].group_join(71, 0, 2)
         except Refused as exc:
-            assert 'refused' in str(exc), exc
+            assert 'already joined to group 70' in str(exc), exc  # refused by the supervisor, before any RT contact
         else:
             raise AssertionError('a second group was joined')
         eid_j = arms[a].execute(requests('g70')[a]).execution_id
@@ -264,6 +264,29 @@ def main():
         recover(arms)  # a lone COMMIT_GROUP whose peer never joined fails fast; this contrived flow is not a latch claim
         arms[a].group_join(73, 0, 2)  # joinable again
         arms[a].group_cancel(73)
+        settle()
+
+        # A JOIN that never reached the RT (disarmed) leaves a record the RT does not know: cancelling it must clear the
+        # record (the RT answers GROUP_REFUSED), and an ARM epoch change makes it stale for a join of another group.
+        arms[a].disarm()
+        try:
+            arms[a].group_join(90, 0, 2)
+        except Refused:
+            pass
+        else:
+            raise AssertionError('joined while disarmed')
+        arms[a].arm()
+        assert arms[a].group_cancel(90).get('cancelled') is False  # the RT is not in 90: the record is forgotten, not stuck
+        arms[a].group_join(91, 0, 2)
+        assert arms[a].group_cancel(91).get('cancelled') is True
+        arms[a].disarm()
+        try:
+            arms[a].group_join(92, 0, 2)
+        except Refused:
+            pass
+        arms[a].arm()
+        arms[a].group_join(93, 0, 2)  # 92 is from an earlier ARM epoch: stale, not a block
+        assert arms[a].group_cancel(93).get('cancelled') is True
         settle()
 
         # group_cancel after group_release but before the execution is cancelled: the released member must not fall back to
