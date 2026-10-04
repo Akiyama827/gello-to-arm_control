@@ -76,6 +76,10 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
             return runtime.group_report(str(args['execution_id']))
         if op == 'group_events':
             return runtime.group_events(session)
+    if op == 'state_history':
+        if runtime.extensions.get('state_history') != 1:
+            raise Refused('state_history/1 is unavailable')
+        return runtime.state_history()
     if op == "now":
         return enc(runtime.now())
     if op == "state":

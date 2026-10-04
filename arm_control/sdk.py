@@ -313,6 +313,14 @@ class ArmClient:
     def group_events(self) -> list:
         return list(self._group_call('group_events'))
 
+    # -- negotiated state_history/1 ---------------------------------------------
+    def state_history(self) -> dict:
+        """The supervisor's recent RT packets: ``samples`` (oldest first; RT stamp ``t_mono_ns`` on ``clock_domain``,
+        ``age_ns`` on the supervisor's clock at ``now_ns``), ``authority`` and ``clock_domain`` (None: unattested)."""
+        if self.extensions.get('state_history') != 1:
+            raise Refused('supervisor does not advertise state_history/1')
+        return self._channel.call('state_history')
+
     # -- lifetime ----------------------------------------------------------------
     def close(self) -> None:
         """Ends this session: ownership, if held, is released by the supervisor
