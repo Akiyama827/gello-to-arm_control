@@ -145,7 +145,7 @@ def main():
         assert not errors, errors
         for n in ARMS:
             assert arms[n].status(coordinator.last_executions[n]).phase in (Phase.CANCELLED, Phase.FAULTED), arms[n].status(coordinator.last_executions[n])  # FAULTED: retired by the peer rule first
-        no_fault(arms, 'after cancelling a running group')  # the survivor must not latch
+        no_fault(arms, 'after cancelling a running group')  # covers only the coordinator's near-simultaneous cancel; skewed or one-sided cancels latch the survivor (documented)
 
         # a member released on admission would start alone: refused; after a group cancel nothing is joined any more
         try:

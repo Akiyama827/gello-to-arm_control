@@ -789,6 +789,10 @@ class RobotRuntime:
 
     def _group_set(self, session, joined):
         self._owns(session)
+        if self._group is not None and self._group[0] != joined[0]:
+            # The RT holds one group record: with an uncertain exchange a second group would leave it unknown which one
+            # the RT is in. Cancel the first.
+            raise Refused(f'group join refused: already joined to group {self._group[0]}: cancel it before joining another')
         previous, self._group = self._group, (*joined, self._authority.arm_epoch)
         return self._authority.arm_epoch, previous
 
@@ -833,7 +837,11 @@ class RobotRuntime:
                     self._cancel_execution(ex, 'group cancelled')
             # No measured hold is staged until the RT CANCEL has been sent (group_cancel clears this; the deadline is only
             # a bound if it never gets to).
-            self._group_cancelling = time.monotonic() + 2 * float(self.link.config.ack_timeout_s)
+            now = time.monotonic()
+            self._group_cancelling = now + 2 * float(self.link.config.ack_timeout_s)
+            # The re-stage grace starts here, not after the RT reply: a caller-thread delay after the reply must not
+            # let the RT's retire of a standing hold be taken for a native failure.
+            self._group_hold_grace = self._group_cancelling + 1.0
         self._group_release.clear()
         return joined
 

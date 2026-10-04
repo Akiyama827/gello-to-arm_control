@@ -34,8 +34,17 @@ drives two or more supervisors and returns the same `GroupStartRecord` as the di
   asserts no fault for longer than `--fault-ms` after a cancel of running members and after every failed start. Survivors of
   mutation testing (defence in depth, no bench case reaches them): the 'interrupt only if committing' flag and the
   staging hold-off during the RT CANCEL.
+  **Survivor latch (deterministic, measured).** Through the supervisor the surviving member is LATCHED, not held, whenever
+  the peer retires, faults or is lost, when only one member's `group_cancel` reaches the RT, or when the members' cancels
+  are more than about 25 ms apart (the RT retires the peer, and the survivor's command stream ends). Measured 20/20 on
+  this tip, 10/10 on `e1fead7`, 10/10 on `991429a`: not a regression. Cancel skew 10 ms: 0/15 latch; 25 ms: 14/15; 50 ms:
+  14/15. Recovery is DISARM then ARM. This deviates from the ctrl040-design section 9 policy of holding the survivor;
+  CTRL-042 evaluates it. The bench's no-fault assertion covers only the coordinator's near-simultaneous parallel cancel.
+  Cancelling a committing group waits up to the budget (at most 1 s) for the RT's answer. The re-stage grace is armed when
+  the supervisor takes the group, before the RT exchange.
   What else this slice fixes: a refused JOIN restores the previous group (it no longer wipes a group the RT is still joined
-  to, and no released member falls back to a plain COMMIT); a cancel the RT did not confirm can be retried; an uncertain
+  to, and no released member falls back to a plain COMMIT); joining a second group while one is recorded is refused (cancel
+  the first); a cancel the RT did not confirm can be retried; an uncertain
   JOIN stays recorded so a cancel still reaches the RT; the supervisor's and the RT servers' output goes to files in the
   bench (a full pipe blocks a child). The group RPCs may block their connection thread up to the link's acknowledgement
   timeouts (longer than the service's 1 s wait bound). A failed start with a peer that never joined can latch the
