@@ -194,7 +194,24 @@ class RobotRuntime:
             result['stream'] = 1
         if self._native is not None and getattr(self.link, 'group_capable', False):
             result['group'] = 1
+        if callable(getattr(self.link, 'recent_states', None)):
+            result['state_history'] = 1
         return result
+
+    def state_history(self) -> dict:
+        """state_history/1: the link's recent RT packets with their RT-host stamps, read-only (no ownership needed, like
+        ``state``). ``age_ns`` is each packet's age on THIS host's monotonic clock at ``now_ns``; the RT stamp
+        ``t_mono_ns`` is on the clock named by ``clock_domain`` (None: unattested)."""
+        now = time.monotonic()
+        samples = [dict(t_mono_ns=st.t_mono_ns, state_seq=st.state_seq, age_ns=int(max(0.0, now - rx) * 1e9),
+                        session_id=st.session_id, arm_epoch=st.arm_epoch, stop_epoch=st.stop_epoch,
+                        armed=st.armed, faulted=st.faulted, q=list(st.q), dq=list(st.dq))
+                   for st, rx in self.link.recent_states()]
+        health = self.link.motor_health()
+        domain = getattr(self.link, 'clock_domain', None)
+        return dict(clock_domain=None if domain is None else ':'.join(domain), now_ns=int(now * 1e9),
+                    authority=dict(session_id=health['session_id'], arm_epoch=health['arm_epoch']),
+                    samples=samples)
 
     # -- controller/1: runtime consequences, existing controller law -------------
     def controller_presets(self):
