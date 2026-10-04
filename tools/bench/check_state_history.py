@@ -21,8 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_dual_supervisor import start_arm  # noqa: E402
 
 from arm_control.multi_arm.supervised_feedback import align_arms  # noqa: E402
+from arm_control.plants.remote_rt import protocol as rtp  # noqa: E402
 from arm_control.sdk import ArmClient, Refused  # noqa: E402
-from arm_control.supervisor.runtime import Refused as ServiceRefused  # noqa: E402
+from arm_control.supervisor.runtime import Refused as ServiceRefused, RobotRuntime  # noqa: E402
 from arm_control.supervisor.service import dispatch  # noqa: E402
 
 
@@ -85,7 +86,19 @@ def units():
         def state_history(self):
             Slow.t += .030
             return super().state_history()
-    refused({n: Slow(reply([i * ms for i in range(1, 6)], age_ns=25 * ms)) for n in 'ab'}, 'stale', clock=lambda: Slow.t)
+    refused({n: Slow(reply([i * ms for i in range(1, 6)], age_ns=5 * ms)) for n in 'ab'}, 'stale', clock=lambda: Slow.t)
+
+    # the supervisor side: values, stamps and ages come from the link's packets, unmixed
+    st = rtp.State(n=3, state_seq=9, t_mono_ns=123, flags=rtp.FLAG_ARMED, session_id=7, arm_epoch=2, stop_epoch=1,
+                   q=[1., 2., 3.], dq=[4., 5., 6.])
+    link = SimpleNamespace(recent_states=lambda: ((st, time.monotonic() - .02),), clock_domain=('mono', 'h', 'b'),
+                           motor_health=lambda: dict(session_id='7', arm_epoch=2))
+    out = RobotRuntime.state_history(SimpleNamespace(link=link))
+    (one,) = out['samples']
+    assert out['clock_domain'] == 'mono:h:b' and out['authority'] == dict(session_id='7', arm_epoch=2), out
+    assert (one['q'], one['dq'], one['t_mono_ns'], one['state_seq'], one['armed'], one['faulted']) == (
+        [1., 2., 3.], [4., 5., 6.], 123, 9, True, False), one
+    assert 15e6 < one['age_ns'] < 200e6, one['age_ns']
 
     # the SDK and the service refuse without the negotiated extension (not just this bench's stub)
     bare = ArmClient.__new__(ArmClient)
