@@ -50,7 +50,7 @@ from arm_control.messages import (
 )
 from arm_control.control.inprocess import QueueControllerNode
 from arm_control.plants.remote_rt import protocol as rtp
-from arm_control.plants.remote_rt.client import RtBackend, epoch_reached
+from arm_control.plants.remote_rt.client import ReferenceRefused, RtBackend, RtLinkError, epoch_reached
 from arm_control.plants.remote_rt.reference import ReferenceHorizon, SelectionUnresolved
 from arm_control.plants.remote_rt.observation import AppliedTracker, authority, robot_state
 
@@ -148,6 +148,11 @@ class RobotRuntime:
         self._native_pending = None
         self._native_epoch = 0
         self._native_failed = False
+        self._group = None            # group/1: the joined RT group (group_id, member_index, member_count)
+        self._group_release = {}      # execution id -> (group_id, member_index, budget_ns), consumed at COMMIT
+        self._group_reports = {}      # execution id -> the RT's COMMIT_GROUP reply or refusal (bounded)
+        self._group_cancelling = 0.0  # monotonic deadline: no measured hold is staged while a group CANCEL is on the wire
+        self._group_hold_grace = 0.0  # monotonic: after it, the RT's group retire may have retired this arm's standing hold
         self.controller = self._build_controller()
         self._payload = PayloadState(0, PayloadValue(0.))
         self._presets = resolve_presets(cfg.get('control_mode') or {}, self.joints,
@@ -187,6 +192,8 @@ class RobotRuntime:
         result = {'controller': 1}
         if self._native is not None and self._stream_admission is not None:
             result['stream'] = 1
+        if self._native is not None and getattr(self.link, 'group_capable', False):
+            result['group'] = 1
         return result
 
     # -- controller/1: runtime consequences, existing controller law -------------
@@ -716,6 +723,149 @@ class RobotRuntime:
                ) -> ExecutionStatus:
         return self._call(self._cancel, session, execution_id, reason)
 
+    # -- group/1: CTRL-040 RT group execution, through this supervisor's one RT session ----------------
+    def group_join(self, session: str, group_id: int, member_index: int, member_count: int) -> dict:
+        # The RT exchange runs on the CALLER's thread, never on the 100 Hz loop (it can wait for an ack); the loop only
+        # checks ownership and records the result.
+        self._call(self._group_check, session)
+        # Recorded BEFORE the exchange: if its outcome is uncertain the RT may have joined, and group_cancel must still
+        # reach it. A clear refusal (the RT answered) forgets it again.
+        epoch, previous = self._call(self._group_set, session, (group_id, member_index, member_count))
+        try:
+            reply = self.link.group_join(group_id, member_index, member_count)
+        except ReferenceRefused as exc:
+            self._call(self._group_unset, session, previous)  # the RT answered: restore what it is still joined to
+            raise Refused(f'group join refused: {exc} {getattr(exc, "reply", None) or ""}') from exc
+        except RtLinkError as exc:
+            raise Refused(f'group join outcome unknown ({exc}); cancel the group before joining again') from exc
+        domain = getattr(self.link, 'clock_domain', None)
+        return dict(clock_domain=None if domain is None else ':'.join(domain), state=reply.get('state'),
+                    arm_epoch=epoch, reference_limit=rtp.MAX_REFERENCE_KNOTS)
+
+    def group_release(self, session: str, execution_id: str, group_id: int, budget_ns: int) -> ExecutionStatus:
+        return self._call(self._group_release_op, session, execution_id, group_id, budget_ns)
+
+    def group_cancel(self, session: str, group_id: int) -> dict:
+        # Order matters: (1) the loop forgets the group and cancels its members' executions and holds off staging a measured
+        # hold; (2) here, wait for the member-cancel jobs to leave the link worker, so no other exchange sets the shared
+        # interrupt flag under the GROUP_CANCEL; (3) the RT exchange; (4) the loop may stage the hold again. Otherwise the
+        # RT's retire hits a hold that was just selected, or the cancel interrupts it, and the arm goes silent and latches.
+        joined = self._call(self._group_take, session, group_id)
+        if joined is None:
+            return dict(cancelled=False, reason='not joined')
+        try:
+            h = self._native
+            end = time.monotonic() + 2.0
+            while h is not None and h.busy and time.monotonic() < end:
+                time.sleep(0.005)
+            self.link.group_cancel(group_id, joined[1], joined[2])  # on the caller's thread, see group_join
+        except ReferenceRefused as exc:
+            if exc.result == rtp.REF_GROUP_REFUSED:  # the RT answered that it is not in this group: nothing to retry
+                return dict(cancelled=False, reason='the RT is not in this group')
+            self._call(self._group_restore, session, joined)
+            raise Refused(f'group cancel not confirmed: {exc} {getattr(exc, "reply", None) or ""}') from exc
+        except RtLinkError as exc:
+            self._call(self._group_restore, session, joined)  # not confirmed: a retry must reach the RT again
+            raise Refused(f'group cancel not confirmed: {exc} {getattr(exc, "reply", None) or ""}') from exc
+        finally:
+            self._call(self._group_cancel_done)
+        return dict(cancelled=True)
+
+    def group_report(self, execution_id: str) -> dict:
+        """The RT's group COMMIT reply for this execution (``selected_ns``, ``deadline_ns``, ``reference_id``), its
+        refusal (``error``), or ``{}`` while it is still pending."""
+        with self._cv:
+            return dict(self._group_reports.get(execution_id, {}))
+
+    def group_events(self, session: str) -> list:
+        """Unsolicited RT group reports (a peer fault/cancel/loss retired this member), drained. Owner only: another
+        client must not take the owner's events."""
+        self._call(self._group_check, session)
+        out = []
+        events = getattr(self.link, 'group_events', None)
+        while events:
+            out.append(dict(events.popleft()))
+        return out
+
+    def _group_check(self, session):
+        self._owns(session)
+        if self._native is None or not getattr(self.link, 'group_capable', False):
+            raise Refused('the RT server has no group record (group/1 is unavailable)')
+
+    def _group_set(self, session, joined):
+        self._owns(session)
+        if self._group is not None and self._group[0] != joined[0] and self._group[3] == self._authority.arm_epoch:
+            # The RT holds one group record: with an uncertain exchange a second group would leave it unknown which one
+            # the RT is in. Cancel the first. (A group from an earlier ARM epoch is stale: it cannot be released any more.)
+            raise Refused(f'group join refused: already joined to group {self._group[0]}: cancel it before joining another')
+        previous, self._group = self._group, (*joined, self._authority.arm_epoch)
+        return self._authority.arm_epoch, previous
+
+    def _group_release_op(self, session, execution_id, group_id, budget_ns):
+        self._owns(session)
+        if self._group is None or self._group[0] != group_id:
+            raise Refused('join the group before releasing a member')
+        ack_ns = int(float(self.link.config.ack_timeout_s) * 1e9)
+        if not 0 < budget_ns <= min(rtp.GROUP_MAX_BUDGET_NS, ack_ns // 2):
+            raise Refused('budget must be positive and at most half the RT acknowledgement timeout (the COMMIT_GROUP wait)')
+        if self._group[3] != self._authority.arm_epoch:
+            self._group = None
+            raise Refused('the ARM epoch changed since the group was joined: join again')
+        ex = self._get(execution_id)
+        if ex.stream is not None or ex.request.start is not Start.ON_RELEASE:
+            raise Refused('a group member is a planned ON_RELEASE execution')
+        self._group_release[execution_id] = (group_id, self._group[1], int(budget_ns))
+        while len(self._group_release) > 16:
+            self._group_release.pop(next(iter(self._group_release)))
+        self._group_reports.pop(execution_id, None)
+        try:
+            return self._release(session, execution_id)
+        except BaseException:
+            self._group_release.pop(execution_id, None)
+            raise
+
+    def _group_take(self, session, group_id, cancel_members=True):
+        self._owns(session)
+        if self._group is None or self._group[0] != group_id:
+            return None
+        joined, self._group = self._group, None
+        if cancel_members:
+            # Members released for this group, or committing through it right now, must not fall back to a plain COMMIT
+            # and start alone: cancel their executions with the group.
+            h = self._native
+            eids = list(self._group_release)
+            if h is not None and h.group_used is not None and h.group_used[0] == group_id and h.key is not None:
+                eids.append(h.key)
+            for eid in dict.fromkeys(eids):
+                ex = self._executions.get(eid)
+                if ex is not None and not ex.status.terminal and ex.completed_at is None:
+                    self._cancel_execution(ex, 'group cancelled')
+            # No measured hold is staged until the RT CANCEL has been sent (group_cancel clears this; the deadline is only
+            # a bound if it never gets to).
+            now = time.monotonic()
+            self._group_cancelling = now + 2.0 + 2 * float(self.link.config.ack_timeout_s)  # the busy wait plus the exchange
+            # The re-stage grace starts here, not after the RT reply: a caller-thread delay after the reply must not
+            # let the RT's retire of a standing hold be taken for a native failure.
+            self._group_hold_grace = self._group_cancelling + 1.0
+        self._group_release.clear()
+        return joined
+
+    def _group_restore(self, session, joined):
+        self._owns(session)
+        if self._group is None:
+            self._group = joined
+
+    def _group_cancel_done(self):
+        # The RT's GROUP_CANCEL retires whatever reference this member has selected, including a standing measured hold
+        # (an RT-side scoping question, CTRL-042). That retire is the answer to OUR cancel, so the hold is re-staged for a
+        # short grace period instead of ending the command stream as a native failure.
+        self._group_cancelling = 0.0
+        self._group_hold_grace = time.monotonic() + 1.0
+
+    def _group_unset(self, session, previous):
+        self._owns(session)
+        self._group = previous
+
     def status(self, execution_id: str, *, wait_s: float = 0.0) -> ExecutionStatus:
         """Current status; with ``wait_s`` waits (bounded) for a terminal one."""
         with self._cv:
@@ -1216,6 +1366,11 @@ class RobotRuntime:
             # decision from THIS state sample, with its original sample time.
             # The sender may repeat it but never make its age look younger.
             self._publish_measured_reference_hold(state, rx, h.feedback, h.point)
+        if h.group_reply is not None and h.key is not None and h.group_reply.get('key') == h.key:
+            # the RT's COMMIT_GROUP answer for THIS execution, whatever happens next
+            self._group_reports[h.key] = {k: v for k, v in h.group_reply.items() if k != 'key'} | dict(reference_id=h.id)
+            for stale in list(self._group_reports)[:-32]:
+                del self._group_reports[stale]
         if self._stream_step():
             return
         if state is None or not state.armed:
@@ -1241,7 +1396,10 @@ class RobotRuntime:
                           reference_id=h.id, reference_revision=h.revision)
             self._drop_staged(ex, h.error)
         if h.key is None and h.error:
-            self._native_failed = True
+            if time.monotonic() < self._group_hold_grace:
+                h.error = ''  # the hold was retired by our own GROUP_CANCEL: the tail stages a new one
+            else:
+                self._native_failed = True
         if h.key is None and h.ready and self._native_pending is None and not self._native_failed:
             h.approve()
         eid = self._native_pending
@@ -1285,6 +1443,7 @@ class RobotRuntime:
                 self._receipt(ex, Phase.REJECTED, refusal)
                 self._drop_staged(ex, refusal)
             else:
+                h.group = self._group_release.pop(eid, None)  # a group member commits through COMMIT_GROUP
                 h.approve()
 
     def _publish_measured_reference_hold(self, state, rx, ref, point) -> None:
@@ -1337,7 +1496,8 @@ class RobotRuntime:
         # target and its compensation. Admit that fixed target explicitly;
         # never mislabel its dynamics as an envelope for the old moving curve.
         if (self._native_failed or self._native_pending is not None
-                or self.controller.runtime_state['executing'] or h.busy):
+                or self.controller.runtime_state['executing'] or h.busy
+                or time.monotonic() < self._group_cancelling):
             return None
         if ref and ref['status'] == rtp.REFERENCE_UNDERFLOW:
             self._native_failed = True

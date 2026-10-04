@@ -115,6 +115,10 @@ def main() -> int:
                                                str(ROOT / "tools/bench/check_dual_supervisor.py"),
                                                "--server", server],
                            logs=logs, env=env, timeout=180))
+        results.append(run("dual_group", [sys.executable,
+                                          str(ROOT / "tools/bench/check_dual_group.py"),
+                                          "--server", server],
+                           logs=logs, env=env, timeout=240))
         binaries = {
             "server": server,
             "probe": str(build / "reference_probe.so"),

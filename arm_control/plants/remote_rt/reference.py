@@ -109,6 +109,9 @@ class ReferenceHorizon:
         self._schedstat_first_timeslices = None
         self._schedstat_last_timeslices = None
         self._schedstat_stagnant_loops = 0
+        # CTRL-040 group COMMIT (set by the supervisor just before approve(); consumed by it): (group_id, member_index,
+        # budget_ns). ``group_reply`` is what the RT answered (selected_ns/deadline_ns on its clock, or the refusal).
+        self.group = self.group_reply = self.group_used = None
         self._envelope_thread.start()
 
     def _schedstat_sample(self):
@@ -292,6 +295,7 @@ class ReferenceHorizon:
         self._epoch = int(self.link.motor_health()['arm_epoch'])
         self._interrupt = threading.Event()
         self.error, self.point, self.feedback = '', None, None
+        self.group_reply = self.group_used = None  # a new reference owns no earlier group answer
         self._selection_rx = self._first_tracking_at = None
         self._selection_phase = 0.
         self._window, self._revision = (0, 0), 0
@@ -388,6 +392,8 @@ class ReferenceHorizon:
         session, epoch = self._session, self._epoch
         deadline = self._selection_deadline_ns if revision == 1 or self.stream else None
         latest = self._latest_phase if self.stream else cut
+        group, self.group, self.group_reply = self.group, None, None
+        self.group_used = group  # the (group_id, member_index, budget_ns) this COMMIT belongs to
         observed_phase = None if self.point is None else self.point.time
 
         def commit():
@@ -414,6 +420,9 @@ class ReferenceHorizon:
                     raise _NotDispatched('no selected phase for revision deadline')
                 phase_deadline = min(latest, observed_phase + budget / 1e9)
                 budget = 0
+            if group is not None:  # one shared budget; the RT's group rendezvous aligns the members' selection
+                return self.link.group_commit(upload, reference_id=identity, group_id=group[0],
+                                              member_index=group[1], budget_ns=group[2])
             # RT anchors the duration at SEAL, which precedes receipt of its
             # ACK and this PC budget calculation. This can refuse early but
             # cannot grant extra network/queue time or compare host clocks.
@@ -475,11 +484,17 @@ class ReferenceHorizon:
                         self.candidate_selection = 'not_requested'
                 if kind == 'commit' and isinstance(exc, ReferenceRefused) and self._revision == 1:
                     self.selection_requested = False  # RT proved it did not select
+                if kind == 'commit' and self.group_used:  # any failure of a group COMMIT is the member's answer
+                    self.group_reply = dict(error=str(exc), result=getattr(exc, 'result', None),
+                                            reply=getattr(exc, 'reply', None) or {},
+                                            group_id=self.group_used[0], key=self.key)
                 if not self._interrupt.is_set() and not self.stream:
                     self.error = str(exc)
             else:
                 if kind == 'stage' and not self._interrupt.is_set():
                     self._upload, self._stage_ready = result, True
+                if kind == 'commit' and isinstance(result, dict) and 'selected_ns' in result and self.group_used:
+                    self.group_reply = dict(result, group_id=self.group_used[0], key=self.key)
         if self._cancel_job is not None and self._cancel_job.done():
             try:
                 self._cancel_job.result()
