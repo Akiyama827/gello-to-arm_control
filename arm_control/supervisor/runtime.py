@@ -151,7 +151,8 @@ class RobotRuntime:
         self._group = None            # group/1: the joined RT group (group_id, member_index, member_count)
         self._group_release = {}      # execution id -> (group_id, member_index, budget_ns), consumed at COMMIT
         self._group_reports = {}      # execution id -> the RT's COMMIT_GROUP reply or refusal (bounded)
-        self._group_disturbed_until = 0.0  # monotonic: a group cancel may interrupt this arm's hold upload until then
+        self._group_cancelling = 0.0  # monotonic deadline: no measured hold is staged while a group CANCEL is on the wire
+        self._group_hold_grace = 0.0  # monotonic: after it, the RT's group retire may have retired this arm's standing hold
         self.controller = self._build_controller()
         self._payload = PayloadState(0, PayloadValue(0.))
         self._presets = resolve_presets(cfg.get('control_mode') or {}, self.joints,
@@ -729,11 +730,11 @@ class RobotRuntime:
         self._call(self._group_check, session)
         # Recorded BEFORE the exchange: if its outcome is uncertain the RT may have joined, and group_cancel must still
         # reach it. A clear refusal (the RT answered) forgets it again.
-        epoch = self._call(self._group_set, session, (group_id, member_index, member_count))
+        epoch, previous = self._call(self._group_set, session, (group_id, member_index, member_count))
         try:
             reply = self.link.group_join(group_id, member_index, member_count)
         except ReferenceRefused as exc:
-            self._call(self._group_take, session, group_id, False)
+            self._call(self._group_unset, session, previous)  # the RT answered: restore what it is still joined to
             raise Refused(f'group join refused: {exc} {getattr(exc, "reply", None) or ""}') from exc
         except RtLinkError as exc:
             raise Refused(f'group join outcome unknown ({exc}); cancel the group before joining again') from exc
@@ -745,14 +746,24 @@ class RobotRuntime:
         return self._call(self._group_release_op, session, execution_id, group_id, budget_ns)
 
     def group_cancel(self, session: str, group_id: int) -> dict:
-        joined = self._call(self._group_take, session, group_id)  # forget it: nothing more is released, members cancelled
+        # Order matters: (1) the loop forgets the group and cancels its members' executions and holds off staging a measured
+        # hold; (2) here, wait for the member-cancel jobs to leave the link worker, so no other exchange sets the shared
+        # interrupt flag under the GROUP_CANCEL; (3) the RT exchange; (4) the loop may stage the hold again. Otherwise the
+        # RT's retire hits a hold that was just selected, or the cancel interrupts it, and the arm goes silent and latches.
+        joined = self._call(self._group_take, session, group_id)
         if joined is None:
             return dict(cancelled=False, reason='not joined')
         try:
+            h = self._native
+            end = time.monotonic() + 2.0
+            while h is not None and h.busy and time.monotonic() < end:
+                time.sleep(0.005)
             self.link.group_cancel(group_id, joined[1], joined[2])  # on the caller's thread, see group_join
         except RtLinkError as exc:
             self._call(self._group_restore, session, joined)  # not confirmed: a retry must reach the RT again
             raise Refused(f'group cancel not confirmed: {exc} {getattr(exc, "reply", None) or ""}') from exc
+        finally:
+            self._call(self._group_cancel_done)
         return dict(cancelled=True)
 
     def group_report(self, execution_id: str) -> dict:
@@ -778,8 +789,8 @@ class RobotRuntime:
 
     def _group_set(self, session, joined):
         self._owns(session)
-        self._group = (*joined, self._authority.arm_epoch)
-        return self._authority.arm_epoch
+        previous, self._group = self._group, (*joined, self._authority.arm_epoch)
+        return self._authority.arm_epoch, previous
 
     def _group_release_op(self, session, execution_id, group_id, budget_ns):
         self._owns(session)
@@ -820,9 +831,9 @@ class RobotRuntime:
                 ex = self._executions.get(eid)
                 if ex is not None and not ex.status.terminal and ex.completed_at is None:
                     self._cancel_execution(ex, 'group cancelled')
-            # The RT CANCEL (and the link's upload interrupt) can disturb this arm's measured-hold upload: that is
-            # recoverable (the tail re-stages the hold), not a native failure that ends the command stream.
-            self._group_disturbed_until = time.monotonic() + 3 * float(self.link.config.ack_timeout_s)
+            # No measured hold is staged until the RT CANCEL has been sent (group_cancel clears this; the deadline is only
+            # a bound if it never gets to).
+            self._group_cancelling = time.monotonic() + 2 * float(self.link.config.ack_timeout_s)
         self._group_release.clear()
         return joined
 
@@ -830,6 +841,17 @@ class RobotRuntime:
         self._owns(session)
         if self._group is None:
             self._group = joined
+
+    def _group_cancel_done(self):
+        # The RT's GROUP_CANCEL retires whatever reference this member has selected, including a standing measured hold
+        # (an RT-side scoping question, CTRL-042). That retire is the answer to OUR cancel, so the hold is re-staged for a
+        # short grace period instead of ending the command stream as a native failure.
+        self._group_cancelling = 0.0
+        self._group_hold_grace = time.monotonic() + 1.0
+
+    def _group_unset(self, session, previous):
+        self._owns(session)
+        self._group = previous
 
     def status(self, execution_id: str, *, wait_s: float = 0.0) -> ExecutionStatus:
         """Current status; with ``wait_s`` waits (bounded) for a terminal one."""
@@ -1361,8 +1383,8 @@ class RobotRuntime:
                           reference_id=h.id, reference_revision=h.revision)
             self._drop_staged(ex, h.error)
         if h.key is None and h.error:
-            if time.monotonic() < self._group_disturbed_until and not h.selected:
-                h.error = ''  # a group cancel interrupted the hold upload: the tail below re-stages it
+            if time.monotonic() < self._group_hold_grace:
+                h.error = ''  # the hold was retired by our own GROUP_CANCEL: the tail stages a new one
             else:
                 self._native_failed = True
         if h.key is None and h.ready and self._native_pending is None and not self._native_failed:
@@ -1461,7 +1483,8 @@ class RobotRuntime:
         # target and its compensation. Admit that fixed target explicitly;
         # never mislabel its dynamics as an envelope for the old moving curve.
         if (self._native_failed or self._native_pending is not None
-                or self.controller.runtime_state['executing'] or h.busy):
+                or self.controller.runtime_state['executing'] or h.busy
+                or time.monotonic() < self._group_cancelling):
             return None
         if ref and ref['status'] == rtp.REFERENCE_UNDERFLOW:
             self._native_failed = True

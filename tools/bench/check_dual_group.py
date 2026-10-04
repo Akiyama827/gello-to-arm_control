@@ -24,7 +24,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from check_dual_supervisor import start_arm  # noqa: E402
+from check_dual_supervisor import _tail, start_arm  # noqa: E402
 from check_sdk_supervisor import JOINTS  # noqa: E402
 
 from arm_control.execution.contract import Phase, Start, TrajectoryRequest  # noqa: E402
@@ -55,14 +55,11 @@ def settle():
 
 
 def recover(arms):
-    """OPEN (CTRL-034 item 4a / CTRL-042 survivor semantics): cancelling RUNNING group members can leave an arm without a PC
-    command stream (the RT retires the peer's reference, the supervisor's measured-hold BEGIN is refused while the RT still
-    holds the old one) so the RT latches CMD_LOST after --fault-ms; measured about 1 in 5 runs, only the second arm. The
-    existing recovery is DISARM then ARM. Not fixed here (it needs an RT-side or survivor-semantics decision)."""
+    """DISARM then ARM (the existing recovery from a latched arm; also a new ARM epoch where a case needs one)."""
     for arm in arms.values():
         arm.disarm()
         arm.arm()
-    settle()  # let the RT retire what a cancel left before the next BEGIN (REF_BUSY otherwise: the 4a race)
+    settle()
 
 
 def no_fault(arms, label='', seconds=1.2):
@@ -147,8 +144,8 @@ def main():
         errors = coordinator.cancel(2, coordinator.last_executions)
         assert not errors, errors
         for n in ARMS:
-            assert arms[n].status(coordinator.last_executions[n]).phase is Phase.CANCELLED
-        recover(arms)  # see recover(): a cancel of running members can latch the survivor
+            assert arms[n].status(coordinator.last_executions[n]).phase in (Phase.CANCELLED, Phase.FAULTED), arms[n].status(coordinator.last_executions[n])  # FAULTED: retired by the peer rule first
+        no_fault(arms, 'after cancelling a running group')  # the survivor must not latch
 
         # a member released on admission would start alone: refused; after a group cancel nothing is joined any more
         try:
@@ -202,7 +199,7 @@ def main():
         known_4a = []
 
         def failed_then_ok(gid, expect, patch=None, undo=None, duration=2.0, attempt=0):
-            reqs_ = requests(f'f{gid}', duration)
+            reqs_ = requests(f'f{gid}a{attempt}', duration)
             if patch:
                 patch(reqs_)
             try:
@@ -223,7 +220,7 @@ def main():
             for n, eid in coordinator.last_executions.items():
                 assert wait(lambda e=eid, n=n: arms[n].status(e).terminal, 6, f'{n} to be cancelled')
                 assert arms[n].status(eid).phase in (Phase.CANCELLED, Phase.REJECTED, Phase.EXPIRED), (n, arms[n].status(eid))
-            recover(arms)
+            no_fault(arms, f'after failed group {gid}')
             record_ = coordinator.start(gid + 1, requests(f'f{gid}ok'))  # nothing is left joined or busy
             assert record_.rt_skew_sec is not None
             coordinator.cancel(gid + 1, coordinator.last_executions)
@@ -244,6 +241,30 @@ def main():
         arms[a].group_report = lambda eid: dict(selected_ns=5, deadline_ns=6, reference_id=1, group_id=999)  # another group's
         failed_then_ok(46, 'no reply within the budget', undo=lambda: setattr(arms[a], 'group_report', real_report),
                        duration=8.0)  # long enough to still be running when the coordinator gives up
+
+        # A refused JOIN of another group leaves the joined one intact: it can still be cancelled and re-joined, and a
+        # member released into it is not turned into a plain COMMIT.
+        arms[a].group_join(70, 0, 2)
+        try:
+            arms[a].group_join(71, 0, 2)
+        except Refused as exc:
+            assert 'refused' in str(exc), exc
+        else:
+            raise AssertionError('a second group was joined')
+        eid_j = arms[a].execute(requests('g70')[a]).execution_id
+        try:
+            arms[a].group_join(72, 0, 2)  # refused again, after the member is staged
+        except Refused:
+            pass
+        arms[a].group_release(eid_j, 70, int(GROUP_BUDGET_S * 1e9))  # still allowed: group 70 is still joined
+        report_j = wait(lambda: arms[a].group_report(eid_j), 5, 'the lone member of group 70')  # only a GROUP commit reports
+        assert report_j.get('group_id') == 70 and 'selected_ns' not in report_j, report_j  # never a plain COMMIT, never selected
+        assert arms[a].group_cancel(70).get('cancelled') is True
+        arms[a].cancel(eid_j)
+        recover(arms)  # a lone COMMIT_GROUP whose peer never joined fails fast; this contrived flow is not a latch claim
+        arms[a].group_join(73, 0, 2)  # joinable again
+        arms[a].group_cancel(73)
+        settle()
 
         # group_cancel after group_release but before the execution is cancelled: the released member must not fall back to
         # a plain COMMIT and start alone; its execution is cancelled with the group.
@@ -301,7 +322,7 @@ def main():
                 proc.terminate()
             try:
                 proc.wait(timeout=3)
-                print('--- log (tail)\n' + ''.join((proc.stdout.readlines() if proc.stdout else [])[-25:]))
+                print('--- log (tail)\n' + _tail(proc, 25))
             except Exception:  # noqa: BLE001
                 pass
         raise

@@ -41,15 +41,24 @@ from arm_control.multi_arm.supervised import plan_body, plan_request  # noqa: E4
 ARMS = ('arm_a', 'arm_b')
 
 
+def _tail(proc, lines=40):
+    log = getattr(proc, '_log', None)
+    if log is None:
+        return ''
+    log.seek(0)
+    return ''.join(log.readlines()[-lines:])
+
+
 def start_arm(server, tmp: Path, name: str, extra_args=()):
     udp, tcp = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
     rt = subprocess.Popen([server, '--backend', 'fake', '--n', '3', '--instance-id', name, '--joint-names',
                            ','.join(JOINTS), '--udp-port', str(udp), '--tcp-port', str(tcp), '--hold-ms', '100',
                            '--fault-ms', '600', '--enable-reference', *extra_args],
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                          stdout=(rt_log := tempfile.TemporaryFile(mode='w+')), stderr=subprocess.STDOUT, text=True)
+    rt._log = rt_log  # a file, not a pipe: nobody drains it, and a full pipe would block the child
     deadline = time.monotonic() + 10
     while not tcp_listening(tcp):
-        assert rt.poll() is None, rt.stdout.read()
+        assert rt.poll() is None, _tail(rt)
         assert time.monotonic() < deadline, f'{name}: arm_rt_server did not listen'
         time.sleep(0.02)
     workdir = tmp / name
@@ -73,11 +82,13 @@ def start_arm(server, tmp: Path, name: str, extra_args=()):
                  'sys.argv[0] = "arm_control.supervisor.service"; '
                  'runpy.run_module("arm_control.supervisor.service", run_name="__main__")']
     sup = subprocess.Popen([*entry, '--config', str(cfg),
-                            '--socket', str(sock)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            '--socket', str(sock)], stdout=(sup_log := tempfile.TemporaryFile(mode='w+')),
+                           stderr=subprocess.STDOUT, text=True,
                            env=dict(os.environ))
+    sup._log = sup_log
     deadline = time.monotonic() + 30
     while True:
-        assert sup.poll() is None, sup.stdout.read()
+        assert sup.poll() is None, _tail(sup)
         assert time.monotonic() < deadline, f'{name}: supervisor did not come up'
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:

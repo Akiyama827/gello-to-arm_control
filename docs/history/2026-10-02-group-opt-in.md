@@ -20,16 +20,25 @@ drives two or more supervisors and returns the same `GroupStartRecord` as the di
 - After a cancel, a new group is refused at JOIN (GROUP_REFUSED) or at BEGIN (REF_BUSY, the open CTRL-034 item 4a race) until
   the RT has retired the running members and their peers (about PEER_MAX_AGE plus a tick): a safe refusal the caller
   retries after a short settle; the bench waits 0.4 s.
-- **OPEN: cancelling RUNNING group members can latch an arm.** The RT retires the peer's reference; the supervisor's
-  measured-hold BEGIN is then refused while the RT still holds the old reference (the open CTRL-034 item 4a race), so that
-  arm's PC command stream is silent and the RT latches CMD_LOST after `--fault-ms`. Measured in the bench about 1 run in 5
-  (always the second arm); recovery is DISARM then ARM (the existing hold→latch ladder). This is a survivor-semantics /
-  RT-side question (CTRL-042), not fixed here, and it makes a routine group cancel on hardware unacceptable until decided.
-  What this slice does fix: a group start that fails with no running member (a lone refused COMMIT_GROUP) latches nothing (the
-  bench asserts no fault for longer than `--fault-ms`); `group_cancel` cancels the executions released for the group, so a
-  member cannot fall back to a plain COMMIT and start alone; a cancel the RT did not confirm can be retried; a join whose
-  outcome is uncertain stays recorded so a cancel still reaches the RT; a hold upload disturbed by a group cancel is
-  re-staged, not treated as a native failure. The group RPCs may block their connection thread up to the link's
-  acknowledgement timeouts (longer than the service's 1 s wait bound).
+- **Group cancel and the CMD_LOST latch (diagnosed in review, PC-side).** Cancelling running group members used to latch
+  CMD_LOST on an arm (about 1 cycle in 10). Cause: the link's `group_cancel` set the interrupt flag it shares with every
+  upload and COMMIT, so it interrupted the member's own measured-hold COMMIT (the RT had already selected that hold); the
+  supervisor then read the interrupted exchange as a native failure and stopped commanding, and the RT latched after
+  `--fault-ms`. The RT's GROUP_CANCEL also retires whatever reference the member has selected, including a standing hold
+  (an RT-side scoping question for CTRL-042; the PC works around it, see below). Now: (1) the link's `group_cancel`
+  interrupts only a COMMIT_GROUP wait that is actually in flight; (2) the supervisor's `group_cancel` cancels the members'
+  executions itself, holds off staging a measured hold, waits for its member-cancel jobs to leave the link worker, sends the
+  RT CANCEL, then re-enables the hold; (3) a hold retired by that RT CANCEL is re-staged during a 1 s grace instead of ending
+  the command stream; (4) `SdkGroupCoordinator.cancel` cancels the group on every member in parallel via `group_cancel`
+  (not execution-first); a member may end FAULTED instead of CANCELLED when the RT's peer rule retires it first. The bench
+  asserts no fault for longer than `--fault-ms` after a cancel of running members and after every failed start. Survivors of
+  mutation testing (defence in depth, no bench case reaches them): the 'interrupt only if committing' flag and the
+  staging hold-off during the RT CANCEL.
+  What else this slice fixes: a refused JOIN restores the previous group (it no longer wipes a group the RT is still joined
+  to, and no released member falls back to a plain COMMIT); a cancel the RT did not confirm can be retried; an uncertain
+  JOIN stays recorded so a cancel still reaches the RT; the supervisor's and the RT servers' output goes to files in the
+  bench (a full pipe blocks a child). The group RPCs may block their connection thread up to the link's acknowledgement
+  timeouts (longer than the service's 1 s wait bound). A failed start with a peer that never joined can latch the
+  first arm (a lone COMMIT_GROUP whose peer is unknown): recovery is DISARM then ARM; not claimed otherwise.
 - Not a qualification: fake RT only, approved constants as defaults, no unit file may pass `--group-*` until the FR3-host
   tick-gap measurement and the CTRL-042 decision. Bench: `tools/bench/check_dual_group.py`.

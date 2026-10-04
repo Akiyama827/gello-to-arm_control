@@ -197,6 +197,7 @@ class RtBackend:
         # HELLO clk=<host>:<boot> (CTRL-041): the RT host's keyed clock identity, or None
         # (unattested: an older server, or one that could not read its host identity).
         self.clock_domain: tuple[str, str, str] | None = None
+        self._group_committing = False  # a COMMIT_GROUP wait is in flight (the only exchange group_cancel may interrupt)
         # CTRL-040: the server was started with a group record (HELLO g=1); events are the server's
         # unsolicited CTL_GROUP_STATUS reports (a peer fault/cancel/loss retired this member).
         self.group_capable = False
@@ -754,18 +755,23 @@ class RtBackend:
         if not self.group_capable:
             raise RtLinkError("server was not started with a group record")
         session_id, arm_epoch = self._reference_scope(session_id, arm_epoch)
-        with self._upload_lock:
-            return self._reference_exchange(
-                rtp.CTL_GROUP_COMMIT, _scope=(session_id, arm_epoch), session_id=session_id,
-                group_id=group_id, upload_id=upload_id, reference_id=reference_id,
-                budget_ns=budget_ns, arm_epoch=arm_epoch, member_index=member_index)
+        self._group_committing = True
+        try:
+            with self._upload_lock:
+                return self._reference_exchange(
+                    rtp.CTL_GROUP_COMMIT, _scope=(session_id, arm_epoch), session_id=session_id,
+                    group_id=group_id, upload_id=upload_id, reference_id=reference_id,
+                    budget_ns=budget_ns, arm_epoch=arm_epoch, member_index=member_index)
+        finally:
+            self._group_committing = False
 
     def group_cancel(self, group_id: int, member_index: int, member_count: int, *,
                      session_id: int | None = None, arm_epoch: int | None = None) -> dict:
         if not self.group_capable:
             raise RtLinkError("server was not started with a group record")
         session_id, arm_epoch = self._reference_scope(session_id, arm_epoch)
-        self._upload_cancel.set()  # interrupt an upload/COMMIT wait of this member first
+        if self._group_committing:  # interrupt only a COMMIT_GROUP wait: never another upload or the member's own hold
+            self._upload_cancel.set()
         with self._upload_lock:
             self._upload_cancel.clear()
             return self._reference_exchange(

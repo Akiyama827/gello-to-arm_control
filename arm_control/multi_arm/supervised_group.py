@@ -145,16 +145,28 @@ class SdkGroupCoordinator:
         return GroupStartRecord(group_id, domain, members)
 
     def cancel(self, group_id: int, executions: dict | None = None) -> dict:
-        """Best effort on every member (a failing member does not stop the others); returns the errors."""
+        """Cancel the group on every member IN PARALLEL (a failing member does not stop the others); returns the errors.
+
+        Each supervisor's ``group_cancel`` itself cancels the executions released for the group, holds off its measured
+        hold until the RT CANCEL has been sent, and only then lets the hold be staged; cancelling an execution first (the
+        old order) stages the hold before the RT retires it. The executions are cancelled again afterwards (idempotent)
+        so every member is terminal when this returns."""
         errors = {}
-        for name in self.names:
+
+        def one(name):
             arm = self.arms[name]
             try:
-                if executions and name in executions:
-                    arm.cancel(executions[name], 'group cancelled')
                 arm.group_cancel(group_id)
             except Exception as exc:  # noqa: BLE001 - a failing member must not stop the others
                 errors[name] = f'{type(exc).__name__}: {exc}'
+            try:
+                if executions and name in executions:
+                    arm.cancel(executions[name], 'group cancelled')
+            except Exception as exc:  # noqa: BLE001
+                errors.setdefault(name, f'{type(exc).__name__}: {exc}')
+
+        with ThreadPoolExecutor(max_workers=len(self.names)) as pool:
+            list(pool.map(one, self.names))
         return errors
 
     def events(self) -> dict:
