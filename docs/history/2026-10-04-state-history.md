@@ -11,6 +11,7 @@ no extrapolation, the same limits). Freshness uses the client's clock with each 
 the error is toward refusal. An arm with an unattested clock domain is refused (a supervisor hides the host name the direct
 path falls back on); different domains, stale or non-increasing histories and a changed authority are refused.
 
-Limits: 32 packets (about 32 ms at the RT publish rate: a slow client misses brackets and gets a refusal, never an
-extrapolation). The closure record (`multi_arm/closure.py`) still reads the direct link; moving it is a later slice.
+Limits: 32 packets, about 128 ms at the default 250 Hz RT publish rate (measured: 32 samples spanning 126 ms in review).
+The binding limit is `align_feedback`'s 50 ms freshness (`max_age_s`), about 12 packets: a client that reads late or slowly
+gets a refusal, never an extrapolation. Reply size about 7 KB at 3 joints. The closure record (`multi_arm/closure.py`) still reads the direct link; moving it is a later slice.
 Not a qualification: fake RT only. Bench: `tools/bench/check_state_history.py` (in the offline suite).

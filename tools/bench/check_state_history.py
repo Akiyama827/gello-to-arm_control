@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import numpy as np
 import sys
 import tempfile
+from types import SimpleNamespace
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -20,6 +22,8 @@ from check_dual_supervisor import start_arm  # noqa: E402
 
 from arm_control.multi_arm.supervised_feedback import align_arms  # noqa: E402
 from arm_control.sdk import ArmClient, Refused  # noqa: E402
+from arm_control.supervisor.runtime import Refused as ServiceRefused  # noqa: E402
+from arm_control.supervisor.service import dispatch  # noqa: E402
 
 
 class Canned:
@@ -63,6 +67,36 @@ def units():
     bad = reply([ms, 2 * ms])
     bad['authority']['session_id'] = '8'
     refused({'a': Canned(bad), 'b': good['b']}, 'authority changed')
+    # unattested on BOTH arms (the case the direct path covers by host name): refused
+    refused({n: Canned(reply([ms, 2 * ms], domain=None)) for n in 'ab'}, 'attested')
+    # freshness is exact against the 50 ms limit, on a fixed clock
+    fixed = lambda: 100.0  # noqa: E731
+    for age_ms, fresh in ((49, True), (51, False)):
+        arms = {n: Canned(reply([i * ms for i in range(1, 6)], age_ns=age_ms * ms)) for n in 'ab'}
+        if fresh:
+            align_arms(arms, clock=fixed)
+        else:
+            refused(arms, 'stale', clock=fixed)
+
+    # the age is taken from a read BEFORE the call: time passing during the call counts against the sample
+    class Slow(Canned):
+        t = 100.0
+
+        def state_history(self):
+            Slow.t += .030
+            return super().state_history()
+    refused({n: Slow(reply([i * ms for i in range(1, 6)], age_ns=25 * ms)) for n in 'ab'}, 'stale', clock=lambda: Slow.t)
+
+    # the SDK and the service refuse without the negotiated extension (not just this bench's stub)
+    bare = ArmClient.__new__(ArmClient)
+    bare.extensions = {}
+    for call in (bare.state_history, lambda: dispatch(SimpleNamespace(extensions={}), 's', 'state_history', {})):
+        try:
+            call()
+        except (Refused, ServiceRefused):
+            pass
+        else:
+            raise AssertionError('state_history without the extension')
     try:
         align_arms({'a': Canned({}, ext=0), 'b': good['b']})
     except Refused:
@@ -107,9 +141,17 @@ def main():
                 raise
             for b in info['brackets'].values():
                 assert b['before_t_mono_ns'] <= info['t_mono_ns'] <= b['after_t_mono_ns'], info
+            for n, b in info['brackets'].items():  # the joint values are the RT's, not q/dq mixed up
+                st = arms[n].state()
+                assert np.allclose(b['q'], np.asarray(st.q), atol=1e-2), (n, b['q'], st.q)
             ok += 1
             time.sleep(.05)
         print(f'aligned {ok}/20')
+        assert ok >= 10, ok
+        # a history that stops refreshing (this arm's RT is gone) is refused as stale, measured on the supervisor's clock
+        procs[1].terminate()  # arm_a's RT (procs = sup, rt per arm)
+        time.sleep(.2)
+        refused(arms, 'stale')
     finally:
         for c in clients:
             c.close()
