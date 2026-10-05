@@ -190,6 +190,27 @@ def main():
         assert trace_export.main(["--root", str(sub), "--prune", "--keep-files", "0", "--yes",
                                   "--confirm-exported", str(out)]) == 0
         assert not [p for p in sub.glob("2*.json") if (out / p.name).is_file()], "an exported trace survived the prune"
+        # 4b. A symlink named like a trace is not a trace: not counted, never pruned, never exported, and what it points to is
+        # untouched. Orphan .partial files count toward capacity (and are named by the warning).
+        sym_root, outside = Path(tmp) / "symroot", Path(tmp) / "outside.json"
+        sym_root.mkdir()
+        outside.write_text("{}")
+        (sym_root / "20990101T000000000000Z-link.json").symlink_to(outside)
+        assert diagnostics._traces(sym_root) == []
+        assert diagnostics.prune_traces(sym_root, keep_files=0, keep_bytes=0) == [] and outside.read_text() == "{}"
+        assert not trace_export.export(sym_root, Path(tmp) / "symexport")["traces"]
+        (sym_root / "20990101T000000000001Z-x.json.partial").write_bytes(b"x" * 2048)
+        assert diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=1024), "a partial file did not count"
+        assert not diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=4096)
+        # 4c. Durability: the trace and its sidecar are fsynced before the rename and the directory after it, in that order.
+        order = []
+        real_fsync, real_replace = diagnostics.os.fsync, diagnostics.os.replace
+        with patch.object(diagnostics.os, "fsync", side_effect=lambda fd: order.append("fsync") or real_fsync(fd)), \
+                patch.object(diagnostics.os, "replace", side_effect=lambda a, b: order.append("replace") or real_replace(a, b)):
+            t = diagnostics.PairFaultTrace("durable")
+            t.record(dict(index=0))
+            t.save("durable", {}, root=Path(tmp) / "durable")
+        assert order == ["fsync", "fsync", "replace", "fsync"], order  # trace, sidecar, rename, directory
         # 5. The module opens no transport: importing it pulls in no plant, SDK or device module.
         code = ("import sys, arm_control.multi_arm.trace_export;"
                 "bad=[m for m in sys.modules if m.startswith(('arm_control.plants','arm_control.sdk','arm_control.supervisor'))];"
