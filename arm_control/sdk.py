@@ -68,6 +68,37 @@ def _items(decoder, values):
     return tuple(decoder(v) for v in values)
 
 
+def _mapping(value):
+    if not isinstance(value, dict):
+        raise ValueError(f"expected an object, got {type(value).__name__}")
+    return value
+
+
+def _mappings(value):
+    return [_mapping(v) for v in _items(lambda v: v, value)]
+
+
+def _need(mapping, *keys):
+    for key in keys:
+        mapping[key]
+    return mapping
+
+
+_HISTORY_SAMPLE = ("t_mono_ns", "state_seq", "age_ns", "session_id", "arm_epoch", "stop_epoch", "armed", "faulted", "q", "dq")
+
+
+def _history(value):
+    value = _need(_mapping(value), "clock_domain", "now_ns", "authority", "samples")
+    if value["clock_domain"] is not None and not isinstance(value["clock_domain"], str):
+        raise ValueError("clock_domain is neither text nor null")
+    _need(_mapping(value["authority"]), "session_id", "arm_epoch")
+    for sample in _mappings(value["samples"]):
+        _need(sample, *_HISTORY_SAMPLE)
+        if not isinstance(sample["q"], list) or not isinstance(sample["dq"], list):
+            raise ValueError("sample joints are not lists")
+    return value
+
+
 def _generation(reply):
     gen = reply["gen"]
     if type(gen) is not int:
@@ -316,8 +347,8 @@ class ArmClient:
 
     def group_join(self, group_id: int, member_index: int, member_count: int) -> dict:
         """Bind this arm to the RT group; the reply names the RT clock domain (None: unattested)."""
-        return self._group_call('group_join', group_id=group_id, member_index=member_index,
-                                member_count=member_count)
+        return _dec(_mapping, self._group_call('group_join', group_id=group_id, member_index=member_index,
+                                               member_count=member_count))
 
     def group_release(self, execution_id: str, group_id: int, budget_ns: int):
         """Release a staged ON_RELEASE execution through COMMIT_GROUP; selection is observed asynchronously
@@ -328,13 +359,13 @@ class ArmClient:
     def group_report(self, execution_id: str) -> dict:
         """``selected_ns``/``deadline_ns``/``reference_id`` once the RT selected it, ``error`` if it refused, ``{}``
         while pending. Times are on the RT host clock."""
-        return self._group_call('group_report', execution_id=execution_id)
+        return _dec(_mapping, self._group_call('group_report', execution_id=execution_id))
 
     def group_cancel(self, group_id: int) -> dict:
-        return self._group_call('group_cancel', group_id=group_id)
+        return _dec(_mapping, self._group_call('group_cancel', group_id=group_id))
 
     def group_events(self) -> list:
-        return list(self._group_call('group_events'))
+        return _dec(_mappings, self._group_call('group_events'))
 
     # -- negotiated state_history/1 ---------------------------------------------
     def state_history(self) -> dict:
@@ -342,7 +373,7 @@ class ArmClient:
         ``age_ns`` on the supervisor's clock at ``now_ns``), ``authority`` and ``clock_domain`` (None: unattested)."""
         if self.extensions.get('state_history') != 1:
             raise Refused('supervisor does not advertise state_history/1')
-        return self._channel.call('state_history')
+        return _dec(_history, self._channel.call('state_history'))
 
     # -- lifetime ----------------------------------------------------------------
     def close(self) -> None:

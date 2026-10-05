@@ -150,12 +150,15 @@ def wrapped_methods():
             if op == 'hello':
                 return dict(contract_version=CONTRACT_VERSION, identity=codec.encode(RobotIdentity('x', ('j',), 'fake')),
                             capabilities=codec.encode(Capabilities(CONTRACT_VERSION, ('joint',))), session='s',
-                            extensions={'controller': 1})
+                            extensions={'controller': 1, 'group': 1, 'state_history': 1})
             return self.result
 
         def close(self):
             pass
-    for after in (5, {}, {'settled': 'yes'}, {'settled': True}, {'settled': True, 'authority': 3}, None):
+    from arm_control.execution.contract import Authority, Lifecycle
+    armed = codec.encode(Authority(Lifecycle.CLAIMED))
+    for after in ({'settled': 1, 'authority': armed}, 5, {}, {'settled': 'yes'}, {'settled': 0}, {'settled': 1, 'authority': None}, {'settled': True},
+                  {'settled': True, 'authority': 3}, None):
         for method in ('arm', 'disarm'):
             client = ArmClient('x', channel=Garbage('AWAIT'))
             client._channel.after = after
@@ -181,6 +184,52 @@ def wrapped_methods():
                 raise AssertionError(f'{name} with {result!r}: {type(exc).__name__}: {exc}') from exc
             else:
                 raise AssertionError(f'{name} accepted {result!r}')
+
+
+def extension_replies():
+    """group/1 and state_history/1 replies are shape-checked too: a wrong-shaped payload is SupervisorError, a good one passes."""
+    from arm_control.execution.contract import CONTRACT_VERSION  # noqa: F401 (same fake as wrapped_methods)
+    good_sample = dict(t_mono_ns=1, state_seq=1, age_ns=0, session_id=1, arm_epoch=1, stop_epoch=0, armed=True, faulted=False,
+                       q=[0.], dq=[0.])
+    good_history = dict(clock_domain='h:b', now_ns=1, authority=dict(session_id='1', arm_epoch=1), samples=[good_sample])
+    cases = {
+        'group_join': (lambda c: c.group_join(1, 0, 2), (5, 'x', [1], None), {'clock_domain': None}),
+        'group_report': (lambda c: c.group_report('e'), (5, 'x', [1], None), {}),
+        'group_cancel': (lambda c: c.group_cancel(1), (5, 'x', [1], None), {'cancelled': True}),
+        'group_events': (lambda c: c.group_events(), (5, 'x', {}, [1], None), [{'kind': 'peer'}]),
+        'state_history': (lambda c: c.state_history(),
+                          (5, 'x', [], {}, dict(good_history, clock_domain=3), dict(good_history, samples={}),
+                           dict(good_history, samples=[dict(good_sample, q=5)]),
+                           dict(good_history, samples=[{k: v for k, v in good_sample.items() if k != 'age_ns'}]),
+                           dict(good_history, authority=[])), good_history),
+    }
+
+    class Fixed:
+        def __init__(self, result):
+            self.result = result
+
+        def call(self, op, wait_s=0.0, **args):
+            if op == 'hello':
+                from arm_control.execution import codec
+                from arm_control.execution.contract import Capabilities, RobotIdentity
+                return dict(contract_version=CONTRACT_VERSION, identity=codec.encode(RobotIdentity('x', ('j',), 'fake')),
+                            capabilities=codec.encode(Capabilities(CONTRACT_VERSION, ('joint',))), session='s',
+                            extensions={'group': 1, 'state_history': 1})
+            return self.result
+
+        def close(self):
+            pass
+    for name, (call, bad, good) in cases.items():
+        for result in bad:
+            try:
+                call(ArmClient('x', channel=Fixed(result)))
+            except SupervisorError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                raise AssertionError(f'{name} with {result!r}: {type(exc).__name__}: {exc}') from exc
+            else:
+                raise AssertionError(f'{name} accepted {result!r}')
+        assert call(ArmClient('x', channel=Fixed(good))) == good, name
 
 
 def main():
@@ -218,6 +267,7 @@ def main():
     concurrent_close()
     codec_layer()
     wrapped_methods()
+    extension_replies()
     print('PASS: unreadable supervisor replies are SupervisorError (outcome unknown), the channel is dropped; '
           'well-formed ok/refused/timeout replies map as before')
 
