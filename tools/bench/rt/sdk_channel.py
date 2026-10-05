@@ -132,6 +132,57 @@ def codec_layer():
         raise AssertionError('hello without a contract version accepted')
 
 
+def wrapped_methods():
+    """The real ArmClient methods (not just _dec): a well-formed envelope whose payload does not fit the contract is
+    SupervisorError from every method that decodes one, including the ones that index or iterate the raw result."""
+    from arm_control.execution import codec
+    from arm_control.execution.contract import CONTRACT_VERSION, Capabilities, RobotIdentity
+
+    class Garbage:
+        def __init__(self, result):
+            self.result = result
+
+        def call(self, op, wait_s=0.0, **args):
+            if op in ('arm', 'disarm') and self.result == 'AWAIT':
+                return {'gen': 1}
+            if op == 'await_authority':
+                return self.after
+            if op == 'hello':
+                return dict(contract_version=CONTRACT_VERSION, identity=codec.encode(RobotIdentity('x', ('j',), 'fake')),
+                            capabilities=codec.encode(Capabilities(CONTRACT_VERSION, ('joint',))), session='s',
+                            extensions={'controller': 1})
+            return self.result
+
+        def close(self):
+            pass
+    for after in (5, {}, {'settled': 'yes'}, {'settled': True}, {'settled': True, 'authority': 3}, None):
+        for method in ('arm', 'disarm'):
+            client = ArmClient('x', channel=Garbage('AWAIT'))
+            client._channel.after = after
+            try:
+                getattr(client, method)(timeout_s=.5)
+            except SupervisorError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                raise AssertionError(f'{method} await with {after!r}: {type(exc).__name__}: {exc}') from exc
+            else:
+                raise AssertionError(f'{method} accepted await reply {after!r}')
+    calls = {'arm': lambda c: c.arm(timeout_s=.5), 'disarm': lambda c: c.disarm(timeout_s=.5),
+             'receipts': lambda c: c.receipts('e'), 'presets': lambda c: c.controller_presets(),
+             'state': lambda c: c.state(), 'status': lambda c: c.status('e')}
+    for result in (5, 'x', [1, 2], {}, {'gen': 'one', 'settled': 'yes', 'authority': 3}, [{'bogus': 1}], None):
+        for name, call in calls.items():
+            client = ArmClient('x', channel=Garbage(result))
+            try:
+                call(client)
+            except SupervisorError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                raise AssertionError(f'{name} with {result!r}: {type(exc).__name__}: {exc}') from exc
+            else:
+                raise AssertionError(f'{name} accepted {result!r}')
+
+
 def main():
     bad = {
         'undecodable bytes': lambda i: b'\xff\xfe not json',
@@ -159,10 +210,14 @@ def main():
     assert type(got) is Refused and str(got) == 'no', repr(got)
     got, _ = outcome(lambda i: json.dumps({'id': i, 'ok': False, 'kind': 'timeout', 'error': 't'}).encode())
     assert type(got) is TimeoutError, repr(got)
+    for kind in (['refused'], {'k': 1}, 5, None):  # `kind` is any JSON value: never hashed, never a TypeError
+        got, _ = outcome(lambda i, kind=kind: json.dumps({'id': i, 'ok': False, 'kind': kind, 'error': ['not text']}).encode())
+        assert type(got) is SupervisorError and str(got) == repr(['not text']), (kind, repr(got))
     got, _ = outcome(lambda i: json.dumps({'id': i, 'ok': True, 'result': {'a': 1}}).encode())
     assert got == {'a': 1}, got
     concurrent_close()
     codec_layer()
+    wrapped_methods()
     print('PASS: unreadable supervisor replies are SupervisorError (outcome unknown), the channel is dropped; '
           'well-formed ok/refused/timeout replies map as before')
 

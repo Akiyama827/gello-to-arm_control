@@ -309,6 +309,29 @@ def cases(arm, runtime, scene, service):
     assert tele_l.report.selected == tele_l.report.unknown, tele_l.report
     tele_l.session.close('done')
     idle()
+    assert len(tele_l.report.unknown) == len(set(tele_l.report.unknown)), tele_l.report  # an id is listed once
+    dup = Report()
+    dup.mark_unknown('x')
+    dup.mark_unknown('x')
+    assert dup.unknown == ['x'], dup.unknown
+    # a failure BEFORE a revision exists (the state read) sent nothing: 'refused', not 'unknown'
+    tele_p = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,
+                           clock=lambda: clock[0])
+    tele_p.start()
+    until(lambda: arm.stream_state(tele_p.session.execution_id).selected_revision == 1, 8)
+    real_state_p = arm.state
+
+    def no_state():
+        raise SupervisorError('no reply to the state read')
+    arm.state = no_state
+    try:
+        assert tele_p.command(target, held=True) == 'refused'
+    finally:
+        arm.state = real_state_p
+    assert not tele_p.report.requested and not tele_p.report.unknown and tele_p.report.refused and tele_p.pending is None, \
+        tele_p.report
+    tele_p.session.close('done')
+    idle()
     # a REAL expiry for teleop: not 'busy' forever
     idle()
     tele_x = DeadmanTeleop(arm, ctx, deadman_timeout_s=.3, max_speed_rad_s=.5, min_step_s=.2, hold_s=6.,

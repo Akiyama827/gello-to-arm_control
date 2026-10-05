@@ -53,7 +53,7 @@ class DeadmanTeleop:
         except (TimeoutError, OSError):
             return True
         except SupervisorError as exc:  # e.g. history pruned: the fate is unknown, do not stay busy forever
-            self.report.unknown.append(self.pending[0])
+            self.report.mark_unknown(self.pending[0])
             self.report.notes.append(f'{self.pending[0]}: revision status unavailable ({exc!r}); fate unknown')
             self.pending = None
             return False
@@ -102,7 +102,7 @@ class DeadmanTeleop:
                 return 'refused'
             # no usable reply: the revision may have been admitted and selected; the next command settles it
             self.report.requested.append(rid)
-            self.report.unknown.append(rid)
+            self.report.mark_unknown(rid)
             self.report.notes.append(f'{rid}: no reply to the revision ({exc!r}); fate unknown')
             self.pending = (rid, rid)
             return 'unknown'
