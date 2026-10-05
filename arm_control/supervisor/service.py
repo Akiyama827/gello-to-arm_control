@@ -76,6 +76,10 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
             return runtime.group_report(str(args['execution_id']))
         if op == 'group_events':
             return runtime.group_events(session)
+    if op == 'trace_samples':
+        if runtime.extensions.get('trace') != 1:
+            raise Refused('trace/1 is unavailable')
+        return runtime.trace_samples(max(0, int(args.get('after') or 0)))
     if op == 'state_history':
         if runtime.extensions.get('state_history') != 1:
             raise Refused('state_history/1 is unavailable')

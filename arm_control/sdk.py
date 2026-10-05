@@ -99,6 +99,17 @@ def _history(value):
     return value
 
 
+def _trace(value):
+    value = _need(_mapping(value), "samples", "latest_seq", "dropped", "errors", "capacity")
+    for key in ("latest_seq", "dropped", "errors", "capacity"):
+        if type(value[key]) is not int:
+            raise ValueError(f"{key} is not an integer")
+    for sample in _mappings(value["samples"]):
+        if type(_need(sample, "seq", "pc_monotonic", "plan_id", "q_rt")["seq"]) is not int:
+            raise ValueError("sample seq is not an integer")
+    return value
+
+
 def _generation(reply):
     gen = reply["gen"]
     if type(gen) is not int:
@@ -366,6 +377,16 @@ class ArmClient:
 
     def group_events(self) -> list:
         return _dec(_mappings, self._group_call('group_events'))
+
+    # -- negotiated trace/1 -----------------------------------------------------
+    def trace_samples(self, after: int = 0) -> dict:
+        """The supervisor's controller ticks recorded after sequence ``after`` (``seq`` on each sample), oldest first, from
+        a bounded ring: ``dropped`` counts ticks that fell off it before this read (the reader's gap), ``errors`` ticks that
+        could not be recorded, ``latest_seq`` where to read from next. Each sample is the controller diagnostic the direct
+        hardware runtime keeps (``*_pc`` the PC's command terms, ``*_rt`` the RT packet it consumed)."""
+        if self.extensions.get('trace') != 1:
+            raise Refused('supervisor does not advertise trace/1')
+        return _dec(_trace, self._channel.call('trace_samples', after=int(after)))
 
     # -- negotiated state_history/1 ---------------------------------------------
     def state_history(self) -> dict:

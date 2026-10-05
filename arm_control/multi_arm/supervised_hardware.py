@@ -19,7 +19,7 @@ from arm_control.multi_arm.cooperative import CooperativeKinematics
 from arm_control.multi_arm.hands import HandControl
 from arm_control.multi_arm.supervised import SdkArmHandle
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
-from arm_control.sdk import ArmClient
+from arm_control.sdk import ArmClient, SupervisorError
 
 
 class _AuthorityHandle:
@@ -102,6 +102,7 @@ class SupervisedHardware(HandControl):
         self.hands, self.fingers, self.finger_limits = {}, {}, {}
         self._measured_fingers, self._hand_results = {}, {}
         self._sample = {}
+        self._trace_seq, self._trace_dropped, self._trace_errors, self._trace_latest = {}, {}, {}, {}
         self._closed = False
         self._connected = False
         self._hand_factory = hand_factory or BridgeClient
@@ -117,6 +118,7 @@ class SupervisedHardware(HandControl):
                     SdkArmHandle(client, a, model_token=config.model_tokens.get(a)), self)
                 self.slices[a] = slice(offset, offset + n)
                 self._sample[a] = (np.zeros(n), np.zeros(n), False)
+                self._trace_seq[a] = self._trace_dropped[a] = self._trace_errors[a] = 0
                 offset += n
                 self.finger_limits[a] = tuple(cfg.get('gripper_range_m') or (0., .04))
             world_factory = world_factory or (lambda c: MuJoCoCollisionWorld.from_scene(
@@ -200,6 +202,26 @@ class SupervisedHardware(HandControl):
             if a in self.hands:
                 for result in self.hands[a].pop_move_results():
                     self._hand_results[a] = result
+            self._read_trace(a)
+
+    def _read_trace(self, a):
+        """Read the supervisor's controller ticks since the last read (trace/1). The ring is bounded: a read that comes back
+        late reports the ticks that fell off as ``dropped``, and they are counted, not hidden. A supervisor without trace/1
+        or one that does not answer leaves the previous sample."""
+        client = self.clients[a]
+        if client.extensions.get('trace') != 1:
+            return
+        try:
+            reply = client.trace_samples(self._trace_seq[a])
+        except (SupervisorError, TimeoutError, OSError):
+            return
+        self._trace_dropped[a] += reply['dropped']
+        self._trace_errors[a] = max(self._trace_errors[a], reply['errors'])
+        if reply['samples']:
+            self._trace_latest[a] = reply['samples'][-1]
+            self._trace_seq[a] = reply['samples'][-1]['seq']
+        elif reply['latest_seq'] < self._trace_seq[a]:
+            self._trace_seq[a] = reply['latest_seq']  # the supervisor restarted: its sequence starts again
 
     def telemetry(self):
         out = {}
@@ -211,10 +233,14 @@ class SupervisedHardware(HandControl):
         return out
 
     def diagnostic_sample(self):
-        """What this runtime has: the supervisor's measured joints. It has no RT packets, PC commands or controller
-        internals (those belong to the supervisor), and says so rather than filling them in."""
-        arms = {a: dict(source='supervisor', q_measured=self._sample[a][0].tolist(), dq_measured=self._sample[a][1].tolist(),
-                        measurement_valid=self._sample[a][2], health=self.handles[a].state().fault_reason)
+        """The supervisor's newest controller tick per arm (trace/1: the same record the direct runtime keeps, with its own
+        sequence), the measured joints, and the count of ticks that fell off the supervisor's ring before they were read
+        (``trace_dropped``). Without trace/1 only the measured joints are present, and nothing is filled in."""
+        arms = {a: dict(dict(source='supervisor', q_measured=self._sample[a][0].tolist(),
+                             dq_measured=self._sample[a][1].tolist(), measurement_valid=self._sample[a][2],
+                             fault_reason=self.handles[a].state().fault_reason),
+                        **(self._trace_latest.get(a) or {}), trace_seq=self._trace_seq[a],
+                        trace_dropped=self._trace_dropped[a], trace_errors=self._trace_errors[a])
                 for a in self.handles}
         return dict(pc_monotonic=time.monotonic(), reference_time_pc=None, arms=arms, feedback_ready=True,
                     feedback_alignment=None)

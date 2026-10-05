@@ -198,6 +198,7 @@ class PairFaultTrace:
         return path
 
 
+
 # The execution-chain links the dual_fault sample schema (v1 and v2) carries, in chain
 # order (CTRL-051). A lineage report is complete exactly when every link is
 # JOINED by identity, not when each field merely appears somewhere.
@@ -270,10 +271,10 @@ def reconstruct_lineage(samples, *, pair_id=None):
         for index in range(first, last + 1):
             arms = window[index].get("arms") or {}
             joined_here = {arm for arm, view in arms.items()
-                           if view.get("plan_id") is not None
+                           if view.get("plan_id")
                            and declared.get(arm) == view.get("plan_id")}
             foreign.update(arm for arm, view in arms.items()
-                           if view.get("plan_id") is not None
+                           if view.get("plan_id")
                            and declared.get(arm) != view.get("plan_id"))
             if not joined_here:
                 continue

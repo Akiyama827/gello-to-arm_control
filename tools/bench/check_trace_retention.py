@@ -220,6 +220,19 @@ def main():
             t.record(dict(index=0))
             t.save("durable", {}, root=Path(tmp) / "durable")
         assert order == ["fsync", "fsync", "replace", "fsync"], order  # trace, sidecar, rename, directory
+        # 4d. An arm whose controller holds NO plan ('' or None: finished or not yet loaded) is idle, not running a foreign plan;
+        # a different non-empty plan is foreign. The identity join is on plans, so an empty id never breaks or fakes a chain.
+        def tick(life, plan_a, plan_b, i):
+            arms = {a: dict(plan_id=p, tau_ff_pc=[0.], raw_pc=[0.], q_cmd_pc=[0.], last_cmd_seq=i, q_rt=[0.])
+                    for a, p in (("a", plan_a), ("b", plan_b))}
+            return dict(pair_id="p", lifecycle=life, pair_plans={"a": "pa", "b": "pb"}, arms=arms, pc_monotonic=float(i))
+        done = [tick("ready", "pa", "pb", 0), tick("executing", "pa", "pb", 1), tick("executing", "pa", "", 2),
+                tick("executing", "", None, 3), tick("complete", "", "", 4)]
+        report = diagnostics.reconstruct_lineage(done, pair_id="p")
+        assert report["complete"] and not report["foreign_arms"], report
+        other = done[:2] + [tick("executing", "pa", "someone-else", 2)] + done[3:]
+        report = diagnostics.reconstruct_lineage(other, pair_id="p")
+        assert not report["complete"] and report["foreign_arms"] == ["b"], report
         # 5. The module opens no transport: importing it pulls in no plant, SDK or device module.
         code = ("import sys, arm_control.multi_arm.trace_export;"
                 "bad=[m for m in sys.modules if m.startswith(('arm_control.plants','arm_control.sdk','arm_control.supervisor'))];"

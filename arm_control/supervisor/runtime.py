@@ -18,6 +18,7 @@ disarmed with no owner.
 """
 from __future__ import annotations
 
+import collections
 import itertools
 import queue
 import socket
@@ -32,6 +33,7 @@ import numpy as np
 from arm_control.motion import JointState, JointTrajectory
 from arm_control.config import arm_joints
 from arm_control.control.arm_controller import ArmController
+from arm_control.control.diagnostic import controller_diagnostic
 from arm_control.control.factory import build_arm_controller
 from arm_control.control.presets import resolve_presets
 from arm_control.execution.controller import ControllerState, PayloadState, PayloadValue
@@ -57,6 +59,9 @@ from arm_control.plants.remote_rt.observation import AppliedTracker, authority, 
 #: Executions kept for status queries and request_id idempotency.
 #: ponytail: fixed window; persist the ledger if replay needs more (CTRL-050).
 RETAINED = 512
+#: trace/1 ring: the newest controller ticks kept for a reader (about 0.64 s at the 100 Hz tick); older ones are overwritten
+#: and reported as a gap, never waited for
+TRACE_TICKS = 64
 
 
 class Refused(Exception):
@@ -148,6 +153,10 @@ class RobotRuntime:
         self._native_pending = None
         self._native_epoch = 0
         self._native_failed = False
+        self._trace = collections.deque(maxlen=TRACE_TICKS)  # trace/1: the newest controller ticks, a bounded ring
+        self._trace_seq = 0           # sequence of the last tick recorded (gaps = ticks that fell off the ring)
+        self._trace_errors = 0        # ticks whose record could not be built (never allowed to stop the loop)
+        self._last_packet = (None, 0.)  # (RT state packet, receive time) the controller last consumed
         self._group = None            # group/1: the joined RT group (group_id, member_index, member_count)
         self._group_release = {}      # execution id -> (group_id, member_index, budget_ns), consumed at COMMIT
         self._group_reports = {}      # execution id -> the RT's COMMIT_GROUP reply or refusal (bounded)
@@ -196,7 +205,39 @@ class RobotRuntime:
             result['group'] = 1
         if callable(getattr(self.link, 'recent_states', None)):
             result['state_history'] = 1
+            result['trace'] = 1
         return result
+
+    def trace_samples(self, after: int = 0) -> dict:
+        """trace/1: controller ticks recorded after sequence ``after``, oldest first (read-only, no ownership needed).
+        ``dropped`` counts the ticks in between that fell off the ring before the reader came back (0 when ``after`` is 0:
+        a first read has no gap to measure); ``errors`` counts ticks that could not be recorded. The loop never waits for
+        a reader: the ring overwrites, and the gap is reported, not hidden."""
+        with self._cv:
+            ring = [s for s in self._trace if s['seq'] > after]
+            latest, errors = self._trace_seq, self._trace_errors
+        dropped = max(0, ring[0]['seq'] - after - 1) if ring and after > 0 else 0
+        return dict(samples=ring, latest_seq=latest, dropped=dropped, errors=errors, capacity=TRACE_TICKS)
+
+    def _record_trace(self, health) -> None:
+        """One per-arm controller diagnostic per tick (the same record the direct hardware runtime keeps), stamped with a
+        sequence, the PC time, the authority lifecycle and the native reference. Never raises into the loop."""
+        try:
+            packet, received = self._last_packet
+            sample = controller_diagnostic(self.link, self.controller, packet, received, health)
+            native = self._native
+            # The controller runs an EXECUTION; the identity a client requested (and a pair joins its lineage on) is the
+            # request id: ``plan_id`` carries that, ``execution_id`` the controller's own.
+            execution = self._executions.get(sample['plan_id'])
+            sample.update(execution_id=sample['plan_id'],
+                          plan_id=sample['plan_id'] if execution is None else execution.request.request_id)
+            sample.update(seq=self._trace_seq + 1, pc_monotonic=time.monotonic(),
+                          lifecycle=self._authority.lifecycle.value, executing=bool(self.controller.runtime_state['executing']),
+                          reference_id=getattr(native, 'id', None), reference_revision=getattr(native, 'revision', None))
+            self._trace_seq += 1
+            self._trace.append(sample)
+        except Exception:  # noqa: BLE001 -- diagnostics must not stop the control loop
+            self._trace_errors += 1
 
     def state_history(self) -> dict:
         """state_history/1: the link's recent RT packets with their RT-host stamps, read-only (no ownership needed, like
@@ -1612,6 +1653,7 @@ class RobotRuntime:
             state, rx = history[-1]
             if state.state_seq != self._seen_seq:
                 self._seen_seq = state.state_seq
+                self._last_packet = (state, rx)
                 c.on_motor_state(pack_motor_state_dict(link.motor_state(state=state)))
                 # Arrival freshness survives a delayed tick (RemoteHardware's seam).
                 if c._last_state_at is not None:
@@ -1624,6 +1666,7 @@ class RobotRuntime:
         c.tick()
         rs = c.runtime_state
         self._pump_controller(sent_for=rs["plan_id"] if rs["executing"] else None)
+        self._record_trace(health)
         for ex in list(self._executions.values()):
             if (ex.first_seq is not None and not ex.status.terminal
                     and self._tracker.fault_seen(ex.epoch)):
