@@ -120,12 +120,12 @@ def cases(arm, runtime, scene, service):
         profile_client = ActionChunkClient(stub, ctx, max_age_s=2., hold_s=6.,
                                            spec=ActionSpec(joints3, control_profile=expected))
         try:
-            profile_client._check_profile()
+            seen = profile_client._check_profile()
         except NeedsOperator as exc:
             assert not ok, (ext, selected, expected)
             assert ('cannot report' in str(exc)) == (ext == 0), str(exc)  # unverifiable is said apart from a mismatch
         else:
-            assert ok, (ext, selected, expected)
+            assert ok and seen == (selected if ext else None), (ext, selected, expected, seen)
         if not ok:  # start() refuses before it opens anything
             try:
                 profile_client.start()
@@ -133,34 +133,37 @@ def cases(arm, runtime, scene, service):
                 assert profile_client.session is None
             else:
                 raise AssertionError('start() opened a stream under the wrong control profile')
-        assert profile_client.report.profile_at_start == (selected if ext else None)
+        assert profile_client.report.profile_at_start is None  # recorded only for a stream that actually opened
     # not asserted + the profile read fails: recorded best effort (a note), never an abort; asserted + fails: refused
     def failing():
         raise SupervisorError('no reply')
     flaky = SimpleNamespace(extensions={'controller': 1}, controller_state=failing)
     quiet = ActionChunkClient(flaky, ctx, max_age_s=2., hold_s=6.)
-    quiet._check_profile()
-    assert quiet.report.profile_at_start is None and any('not recorded' in n for n in quiet.report.notes), quiet.report.notes
+    assert quiet._check_profile() is None and any('not recorded' in n for n in quiet.report.notes), quiet.report.notes
+    assert quiet.report.profile_at_start is None
     try:
         ActionChunkClient(flaky, ctx, max_age_s=2., hold_s=6., spec=ActionSpec(joints3, control_profile='track'))._check_profile()
     except NeedsOperator:
         pass
     else:
         raise AssertionError('an asserted profile that could not be read was accepted')
-    # a repeated start re-reads the profile (a stale record from an earlier start is never kept)
-    seq = iter(['track', 'soft'])
-    again = ActionChunkClient(SimpleNamespace(extensions={'controller': 1},
-                                              controller_state=lambda: SimpleNamespace(preset_id=next(seq))), ctx,
+    # every read is fresh: a later read that fails is None (plus a note), never the previous start's value
+    reads = iter(['track', 'soft', SupervisorError('gone')])
+
+    def scripted():
+        value = next(reads)
+        if isinstance(value, Exception):
+            raise value
+        return SimpleNamespace(preset_id=value)
+    again = ActionChunkClient(SimpleNamespace(extensions={'controller': 1}, controller_state=scripted), ctx,
                               max_age_s=2., hold_s=6.)
-    again._check_profile()
-    assert again.report.profile_at_start == 'track'
-    again._check_profile()
-    assert again.report.profile_at_start == 'soft'
+    assert [again._check_profile() for _ in range(3)] == ['track', 'soft', None] and again.report.notes
 
     # -- action chunks ------------------------------------------------------------------------------------------
     idle()
     client = ActionChunkClient(arm, ctx, max_age_s=2., hold_s=6.)
     generation = client.start()
+    assert client.report.profile_at_start == arm.controller_state().preset_id  # what was selected when the stream opened
     now = arm.now()
 
     def chunk(name, *, age=0., **kw):
@@ -222,7 +225,9 @@ def cases(arm, runtime, scene, service):
     assert client.submit(chunk('hold-1', observed_at=arm.now())) == 'sent'
     assert client.submit(chunk('hold-2', observed_at=arm.now())) == 'waiting'
     for name, kw in (('nan', dict(values=np.full((1, 3), np.nan))), ('inf', dict(values=np.full((1, 3), np.inf))),
-                     ('dt-nan', dict(dt_s=float('nan'))), ('dt-neg', dict(dt_s=-.5)),
+                     ('dt-nan', dict(dt_s=float('nan'))), ('dt-neg', dict(dt_s=-.5)), ('dt-zero', dict(dt_s=0.)),
+                     ('dt-none', dict(dt_s=None)), ('dt-text', dict(dt_s='fast')),
+                     ('knots-0', dict(values=np.zeros((0, 3)))), ('knots-128', dict(values=np.zeros((128, 3)))),
                      ('base-short', dict(mode='delta', base_q=(0.,), values=np.full((1, 3), .001))),
                      ('base-nan', dict(mode='delta', base_q=(np.nan,) * 3, values=np.full((1, 3), .001)))):
         assert client.submit(chunk(name, observed_at=arm.now(), **kw)) == 'refused', name

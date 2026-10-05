@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from arm_control.clients.common import (
-    ActionSpec, NeedsOperator, Report, StreamContext, StreamSession, note_outcome, request_id)
+    MAX_KNOTS, ActionSpec, NeedsOperator, Report, StreamContext, StreamSession, note_outcome, request_id)
 from arm_control.sdk import Refused, SupervisorError
 
 
@@ -53,17 +53,19 @@ class ActionChunkClient:
         # The profile is checked BEFORE anything is cancelled or opened: a refusal leaves a running stream running. It is a
         # separate call from the stream open, so the owning session could switch preset between the two (only the owner can);
         # a switch after the open ends the stream (the supervisor cancels live executions on a preset change).
-        self._check_profile()
+        profile = self._check_profile()
         if not self.cancel('restart'):
             raise NeedsOperator('previous stream not confirmed cancelled; not opening a second one')
         self.generation += 1
         self.session = StreamSession(self.arm, self.ctx, hold_s=self.hold_s)
+        self.report.profile_at_start = profile  # recorded only for a stream that actually opened
         self.inflight = self.waiting = None
         self._sent_obs_ns = -1
         return self.generation
 
-    def _check_profile(self) -> None:
-        """The control profile the spec expects must be the one selected: a run never switches it, and never assumes it."""
+    def _check_profile(self):
+        """The control profile the spec expects must be the one selected: a run never switches it, and never assumes it.
+        Returns the selected preset id (None when it cannot be read and nothing is asserted)."""
         expected = None if self._spec is None else self._spec.control_profile
         profile = None
         if self.arm.extensions.get('controller') == 1:
@@ -74,14 +76,14 @@ class ActionChunkClient:
                     raise NeedsOperator(f'the run expects control profile {expected!r} but reading the profile failed: '
                                         f'{exc!r}') from exc
                 self.report.notes.append(f'control profile not recorded: {exc!r}')
-        self.report.profile_at_start = profile
         if expected is None:
-            return
+            return profile
         if self.arm.extensions.get('controller') != 1:
             raise NeedsOperator(f'the run expects control profile {expected!r} but the supervisor cannot report its profile')
         if profile != expected:
-            raise NeedsOperator(f'control profile {self.report.profile_at_start!r} is selected, the run expects {expected!r}: '
+            raise NeedsOperator(f'control profile {profile!r} is selected, the run expects {expected!r}: '
                                 'select it explicitly; a client never switches it')
+        return profile
 
     def cancel(self, reason: str = 'cancelled') -> bool:
         """True when the stream cancel was confirmed (or there was none). Otherwise the session is kept so ``cancel`` can
@@ -99,6 +101,8 @@ class ActionChunkClient:
         values = np.asarray(chunk.values, dtype=float)
         if values.ndim != 2 or values.shape[1] != len(self.ctx.joints):
             raise ValueError('chunk must be (T, joints)')
+        if not 1 <= len(values) <= MAX_KNOTS:
+            raise ValueError(f'a chunk has 1..{MAX_KNOTS} knots, not {len(values)}')
         if self._spec is not None:
             values = self._spec.to_radians(values, chunk.mode)  # the declared units and normalization; composition must match
         if chunk.mode == 'delta':
@@ -127,8 +131,12 @@ class ActionChunkClient:
             return 'late', 'requested before the last start/cancel'
         if tuple(chunk.joints) != tuple(self.ctx.joints):
             return 'refused', 'joint names or order differ from the stream context'
-        if not np.isfinite(chunk.dt_s) or chunk.dt_s <= 0:
-            return 'refused', 'dt_s must be positive and finite'
+        try:
+            dt_ok = bool(np.isfinite(chunk.dt_s) and chunk.dt_s > 0)
+        except (TypeError, ValueError):
+            dt_ok = False
+        if not dt_ok:
+            return 'refused', 'dt_s must be a positive finite number'
         expected_units = 'rad' if self._spec is None else self._spec.units
         if chunk.units != expected_units:
             return 'refused', f'units {chunk.units!r}: this run declared {expected_units!r}'
