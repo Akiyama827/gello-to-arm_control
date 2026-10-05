@@ -115,7 +115,7 @@ class ActionChunkClient:
             # no usable reply: the revision may have been admitted and selected (a lost reply). Keep it in flight so
             # the ordering rule holds and pump() finds out; the fate is 'unknown' until it does.
             self.report.requested.append(chunk.chunk_id)
-            self.report.unknown.append(chunk.chunk_id)
+            self.report.mark_unknown(chunk.chunk_id)
             self.report.notes.append(f'{chunk.chunk_id}: no reply to the revision ({exc!r}); fate unknown')
             self.inflight = (chunk.chunk_id, rid, chunk.observed_at.ns)
             return
@@ -159,7 +159,7 @@ class ActionChunkClient:
                     return self.report  # try again on the next pump
                 except (SupervisorError, OSError) as exc:  # e.g. history pruned: the fate is unknown, do not stay stuck
                     self.report.notes.append(f'{chunk_id}: revision status unavailable ({exc!r}); fate unknown')
-                    self.report.unknown.append(chunk_id)
+                    self.report.mark_unknown(chunk_id)
                     kind = 'selected'  # conservative: it may have been selected, so nothing older may follow it
 
                 if kind not in ('refused', 'selected', 'ended'):

@@ -62,6 +62,26 @@ def _dec(decoder, value):
         raise SupervisorError(f"unreadable reply ({type(exc).__name__}: {exc}); outcome unknown") from exc
 
 
+def _items(decoder, values):
+    if not isinstance(values, list):
+        raise ValueError(f"expected a list, got {type(values).__name__}")
+    return tuple(decoder(v) for v in values)
+
+
+def _generation(reply):
+    gen = reply["gen"]
+    if type(gen) is not int:
+        raise ValueError(f"request generation {gen!r} is not an integer")
+    return gen
+
+
+def _settled(reply):
+    settled = reply["settled"]
+    if type(settled) is not bool:
+        raise ValueError(f"settled {settled!r} is not a boolean")
+    return settled, (codec.authority_from(reply["authority"]) if settled else None)
+
+
 class SocketChannel:
     """Newline-delimited JSON request/response over the supervisor's socket.
     One outstanding request at a time; a timeout closes the channel, since
@@ -117,8 +137,10 @@ class SocketChannel:
             if ok is not False:
                 self._close()
                 raise SupervisorError(f"{op}: malformed reply (ok={ok!r}); outcome unknown")
-            error = {"refused": Refused, "timeout": TimeoutError}.get(msg.get("kind"), SupervisorError)
-        raise error(msg.get("error", "unspecified error"))
+            kind, text = msg.get("kind"), msg.get("error", "unspecified error")
+            # `kind` may be any JSON value (a list is unhashable): compare, never hash it
+            error = Refused if kind == "refused" else TimeoutError if kind == "timeout" else SupervisorError
+        raise error(text if isinstance(text, str) else repr(text))
 
     def _close(self) -> None:
         if self._sock is not None:
@@ -182,11 +204,11 @@ class ArmClient:
 
     def arm(self, timeout_s: float = 5.0) -> Authority:
         """ARM and wait (bounded) until the controller is ready to execute."""
-        return self._await_authority(self._channel.call("arm")["gen"], True, timeout_s)
+        return self._await_authority(_dec(_generation, self._channel.call("arm")), True, timeout_s)
 
     def disarm(self, timeout_s: float = 5.0) -> Authority:
         """DISARM and wait (bounded) for the stop to be confirmed."""
-        return self._await_authority(self._channel.call("disarm")["gen"], False, timeout_s)
+        return self._await_authority(_dec(_generation, self._channel.call("disarm")), False, timeout_s)
 
     def _await_authority(self, gen: int, armed: bool, timeout_s: float) -> Authority:
         deadline = time.monotonic() + timeout_s
@@ -194,8 +216,9 @@ class ArmClient:
             left = deadline - time.monotonic()
             got = self._channel.call("await_authority", wait_s=WAIT_SLICE_S, gen=gen,
                                      armed=armed, wait_for_s=min(WAIT_SLICE_S, max(left, 0.0)))
-            if got["settled"]:
-                return _dec(lambda g: codec.authority_from(g["authority"]), got)
+            settled, authority = _dec(_settled, got)
+            if settled:
+                return authority
             if left <= 0:
                 raise TimeoutError(f"{'ARM' if armed else 'DISARM'} not confirmed within "
                                    f"{timeout_s}s; check authority()")
@@ -234,8 +257,8 @@ class ArmClient:
         return self.wait(execution_id, timeout_s)
 
     def receipts(self, execution_id: str) -> tuple[Receipt, ...]:
-        return tuple(_dec(codec.receipt_from, r) for r in
-                     self._channel.call("receipts", execution_id=execution_id))
+        return _dec(lambda rs: _items(codec.receipt_from, rs),
+                    self._channel.call("receipts", execution_id=execution_id))
 
     # -- negotiated controller/1 -----------------------------------------------
     def _controller_call(self, op, **args):
@@ -244,7 +267,7 @@ class ArmClient:
         return self._channel.call(op, **args)
 
     def controller_presets(self):
-        return tuple(_dec(codec.preset_from, p) for p in self._controller_call('controller_presets'))
+        return _dec(lambda ps: _items(codec.preset_from, ps), self._controller_call('controller_presets'))
 
     def controller_state(self):
         return _dec(codec.controller_state_from, self._controller_call('controller_state'))

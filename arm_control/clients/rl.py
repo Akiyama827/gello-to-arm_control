@@ -59,7 +59,7 @@ class StepWindow:
         except (SupervisorError, TimeoutError, OSError) as exc:  # infrastructure error mid-step: truncated, never raised
             self.report.notes.append(f'step aborted: {exc!r}')
             if self._sent:  # the revision may have been admitted or selected: motion may have happened
-                self.report.unknown.append(self._rid)
+                self.report.mark_unknown(self._rid)
                 return self._result(start, 'unknown', reason=repr(exc))
             return self._result(start, 'refused', reason=repr(exc))
 
