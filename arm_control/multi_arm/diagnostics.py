@@ -51,15 +51,25 @@ def _traces(root):
     return sorted(p for p in root.glob(TRACE_GLOB) if p.is_file() and not p.is_symlink())
 
 
+def _size(path):
+    try:
+        return path.stat().st_size
+    except OSError:  # a dangling link, or a file renamed by a concurrent save: not countable, never a reason to hide the rest
+        return 0
+
+
 def capacity_warning(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES):
-    """A message when the trace directory is over its capacity policy, else None. Never raises."""
+    """A message when the trace directory is over its capacity policy, else None. Never raises. Orphan ``*.partial`` files
+    (a save that never finished) count toward the bytes and are named in the message."""
     try:
         traces = _traces(root)
-        total = sum(p.stat().st_size for p in traces) + sum(p.stat().st_size for p in root.glob("*.partial"))
+        partials = [p for p in root.glob("*.partial") if not p.is_symlink()]
     except OSError:
         return None
+    total = sum(_size(p) for p in traces) + sum(_size(p) for p in partials)
     if len(traces) > keep_files or total > keep_bytes:
-        return (f"{len(traces)} fault trace(s), {total / 2**20:.1f} MiB in {root} exceed the capacity policy "
+        orphans = f" (including {len(partials)} unfinished .partial file(s))" if partials else ""
+        return (f"{len(traces)} fault trace(s), {total / 2**20:.1f} MiB in {root}{orphans} exceed the capacity policy "
                 f"({keep_files} files / {keep_bytes / 2**20:.0f} MiB): export and prune explicitly "
                 f"(export first: python -m arm_control.multi_arm.trace_export --dest DIR; then --prune --yes --confirm-exported DIR); "
                 f"nothing is deleted automatically")
