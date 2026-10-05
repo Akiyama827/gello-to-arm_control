@@ -24,10 +24,11 @@ from unittest.mock import patch
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from check_dual_supervisor import ARMS, plan_for, pump_until, start_arm  # noqa: E402
+from check_dual_supervisor import ARMS, plan_for, start_arm  # noqa: E402
 from check_sdk_supervisor import JOINTS  # noqa: E402
 
 from arm_control.execution.contract import Lifecycle  # noqa: E402
+from arm_control.multi_arm import diagnostics
 from arm_control.multi_arm.coordinator import BimanualCoordinator  # noqa: E402
 from arm_control.multi_arm.supervised_hardware import SupervisedHardware  # noqa: E402
 from arm_control.multi_arm.types import BimanualPlan, PairLifecycle  # noqa: E402
@@ -206,14 +207,63 @@ def main():
         before = runtime.joint_state()['position'].copy()
         coordinator = BimanualCoordinator(runtime.handles, staging_timeout_s=5., state_timeout_s=2.)
         plans = [plan_for(runtime.clients[n], 'hw1', n, tokens[n], .05 if n == a else -.05) for n in ARMS]
+        samples = []
+
+        def record():
+            """What the console records each tick: the runtime's diagnostic sample plus the pair identity it joins on."""
+            runtime.step()
+            coordinator.pump()
+            sample = runtime.diagnostic_sample()
+            members = coordinator.pair_state('hw1').members
+            sample.update(pair_id='hw1', lifecycle=coordinator.lifecycle.value,
+                          pair_plans={m.arm_id: m.plan_id for m in members})
+            samples.append(sample)
+
         coordinator.stage_pair(BimanualPlan('hw1', *plans))
-        pump_until(coordinator, lambda: coordinator.lifecycle is PairLifecycle.READY)
+        end = time.monotonic() + 15
+        while coordinator.lifecycle is not PairLifecycle.READY and time.monotonic() < end:
+            record()
+            time.sleep(.01)
         coordinator.execute_pair('hw1')
-        pump_until(coordinator, lambda: coordinator.lifecycle.terminal)
+        while not coordinator.lifecycle.terminal and time.monotonic() < end:
+            record()
+            time.sleep(.01)
+        assert coordinator.lifecycle.terminal, coordinator.lifecycle
+        # CTRL-051 through the supervisors: the lineage of the executed pair joins on identities in the supervisors' own
+        # controller ticks (trace/1), exactly as it does for the direct runtime; ticks that fell off a ring are counted.
+        lineage = diagnostics.reconstruct_lineage(samples, pair_id='hw1')
+        assert lineage['complete'], (lineage['missing'], lineage['foreign_arms'], lineage['declared_plans'])
+        assert set(lineage['links']) == set(diagnostics.LINE_LINKS) and not lineage['foreign_arms'], lineage
+        assert all(a_['trace_seq'] > 0 and a_['trace_errors'] == 0 for a_ in samples[-1]['arms'].values()), samples[-1]['arms']
+        assert all(isinstance(a_['trace_dropped'], int) for a_ in samples[-1]['arms'].values())
         assert coordinator.lifecycle is PairLifecycle.COMPLETE and coordinator.pair_state('hw1').ok()
         wait(lambda: (runtime.step() or True) and abs(runtime.joint_state()['position'][0] - before[0] - .05) < .01,
              what='the measured motion')
         assert abs(runtime.joint_state()['position'][3] - before[3] + .05) < .01
+
+        # trace/1 drop detection: a reader that comes back after the 64-tick ring turned over is told how many ticks it missed,
+        # and the runtime counts them; a prompt reader sees none.
+        first = runtime.clients[a].trace_samples(0)
+        assert first['dropped'] == 0 and first['samples'] and first['capacity'] == 64 and first['errors'] == 0, first['dropped']
+        seqs = [t['seq'] for t in first['samples']]
+        assert seqs == sorted(set(seqs)) and seqs[-1] == first['latest_seq'], seqs
+        prompt = runtime.clients[a].trace_samples(first['latest_seq'])
+        assert all(t['seq'] > first['latest_seq'] for t in prompt['samples']) and prompt['dropped'] == 0, prompt['dropped']
+        runtime.step()
+        gap_before = runtime._trace_dropped[a]
+        time.sleep(1.0)  # 100 ticks at 100 Hz: the 64-tick ring turns over
+        late = runtime.clients[a].trace_samples(first['latest_seq'])
+        assert late['dropped'] > 0 and late['dropped'] == late['samples'][0]['seq'] - first['latest_seq'] - 1, late['dropped']
+        assert len(late['samples']) <= 64
+        assert all(t['seq'] > first['latest_seq'] for t in late['samples']), 'an old sample was returned again'
+        runtime.step()
+        assert runtime._trace_dropped[a] - gap_before > 0, 'the runtime did not count the ticks it missed'
+        assert runtime.diagnostic_sample()['arms'][a]['trace_dropped'] == runtime._trace_dropped[a]
+        before_prompt = runtime._trace_dropped[a]
+        for _ in range(5):
+            runtime.step()
+            time.sleep(.01)
+        assert runtime._trace_dropped[a] == before_prompt, 'a prompt reader was told it missed ticks'
 
         # A per-arm DISARM (the console's disarm button) cancels that arm's Hand; stop() disarms both and cancels the Hands.
         arm_a_hand = hands[0].cancels

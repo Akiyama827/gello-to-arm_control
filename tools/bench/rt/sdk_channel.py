@@ -197,6 +197,15 @@ def extension_replies():
         'group_report': (lambda c: c.group_report('e'), (5, 'x', [1], None), {}),
         'group_cancel': (lambda c: c.group_cancel(1), (5, 'x', [1], None), {'cancelled': True}),
         'group_events': (lambda c: c.group_events(), (5, 'x', {}, [1], None), [{'kind': 'peer'}]),
+        'trace_samples': (lambda c: c.trace_samples(0),
+                          (5, 'x', [], {}, dict(samples=[], latest_seq=0, dropped=0, errors=0),
+                           dict(samples=[], latest_seq='0', dropped=0, errors=0, capacity=64),
+                           dict(samples=[1], latest_seq=0, dropped=0, errors=0, capacity=64),
+                           dict(samples=[dict(seq='1', pc_monotonic=0., plan_id='', q_rt=None)], latest_seq=1, dropped=0,
+                                errors=0, capacity=64),
+                           dict(samples=[dict(seq=1, pc_monotonic=0.)], latest_seq=1, dropped=0, errors=0, capacity=64)),
+                          dict(samples=[dict(seq=1, pc_monotonic=0., plan_id='', q_rt=None)], latest_seq=1, dropped=0,
+                               errors=0, capacity=64)),
         'state_history': (lambda c: c.state_history(),
                           (5, 'x', [], {}, dict(good_history, clock_domain=3), dict(good_history, samples={}),
                            dict(good_history, samples=[dict(good_sample, q=5)]),
@@ -214,7 +223,7 @@ def extension_replies():
                 from arm_control.execution.contract import Capabilities, RobotIdentity
                 return dict(contract_version=CONTRACT_VERSION, identity=codec.encode(RobotIdentity('x', ('j',), 'fake')),
                             capabilities=codec.encode(Capabilities(CONTRACT_VERSION, ('joint',))), session='s',
-                            extensions={'group': 1, 'state_history': 1})
+                            extensions={'group': 1, 'state_history': 1, 'trace': 1})
             return self.result
 
         def close(self):

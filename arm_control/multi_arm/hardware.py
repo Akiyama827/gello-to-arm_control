@@ -18,6 +18,7 @@ from arm_control.messages import (
     unpack_json_message, unpack_motor_command,
 )
 from arm_control.control.inprocess import QueueControllerNode
+from arm_control.control.diagnostic import controller_diagnostic
 from arm_control.multi_arm.hands import HandControl
 from arm_control.multi_arm.interface import LocalArmHandle
 from arm_control.multi_arm.synchronization import SharedReferenceClock
@@ -340,38 +341,8 @@ class RemoteHardware(HandControl):
         arms = {}
         for a, c in self.controllers.items():
             packet, received = self._observations.get(a, (None, None))
-            motor = self.links[a].motor_state(state=packet) if packet is not None else None
-            command = c.last_command
-            arms[a] = dict(
-                rt_host=self.links[a].config.host,
-                received_at_pc=received,
-                state_t_mono_ns=None if packet is None else packet.t_mono_ns,
-                state_seq=None if packet is None else packet.state_seq,
-                last_cmd_seq=None if packet is None else packet.last_cmd_seq,
-                rt_session=None if packet is None else f"{packet.session_id:016x}",
-                health=dict(self._observed_health.get(a, {})),
-                controller_measurement_valid=c._last_state_at is not None,
-                controller_observed_at_pc=c._last_state_at,
-                q_controller=c.last_state.position.tolist(),
-                dq_controller=c.last_state.velocity.tolist(),
-                q_rt=None if motor is None else motor["position"].tolist(),
-                dq_rt=None if motor is None else motor["velocity"].tolist(),
-                q_cmd_rt=None if motor is None else motor["position_cmd"].tolist(),
-                dq_cmd_rt=None if motor is None else motor["velocity_cmd"].tolist(),
-                q_cmd_pc=None if command is None else command.q_des.tolist(),
-                dq_cmd_pc=None if command is None else command.qd_des.tolist(),
-                tau_ff_pc=None if command is None else command.tau_ff.tolist(),
-                integral_bias_pc=c.integral.bias.tolist(),
-                raw_pc=(None if command is None else
-                        (command.kp * (command.q_des - c.last_state.position)
-                         + command.kd * (command.qd_des - c.last_state.velocity)
-                         + command.tau_ff).tolist()),
-                tau_cmd_rt=None if motor is None else motor["torque_cmd"].tolist(),
-                tau_meas_rt=None if motor is None else motor["torque"].tolist(),
-                plan_id=c.current_plan_id,
-                trajectory_elapsed_s=(c.reference.elapsed(self._reference_time)
-                                      if c.reference is not None and self._reference_time is not None else None),
-            )
+            arms[a] = controller_diagnostic(
+                self.links[a], c, packet, received, self._observed_health.get(a, {}), self._reference_time)
         return dict(pc_monotonic=now, reference_time_pc=self._reference_time, arms=arms,
                     feedback_ready=self.feedback_ready,
                     feedback_alignment=self._feedback_alignment if self.mode == "shared" else None)
