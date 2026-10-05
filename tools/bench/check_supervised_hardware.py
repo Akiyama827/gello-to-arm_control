@@ -266,6 +266,24 @@ def main():
         fourth.stop()
         fourth.close()
         assert all(p.authority().lifecycle is not Lifecycle.ARMED for p in probe.values())
+        # stop() while an ARM is in flight queues its DISARM behind it; close() must let that DISARM run
+        hands.clear()
+        fifth = make()
+        fifth.connect()
+        enter5 = threading.Event()
+        real5 = fifth.handles[a]._inner._arm.arm
+
+        def slow5(*args, **kw):
+            enter5.set()
+            time.sleep(.5)
+            return real5(*args, **kw)
+
+        with patch.object(fifth.handles[a]._inner._arm, 'arm', slow5):
+            fifth.handles[a].set_armed(True)
+            assert enter5.wait(2)
+            fifth.stop()
+            fifth.close()
+        assert all(p.authority().lifecycle is not Lifecycle.ARMED for p in probe.values())
 
         # Hands that are not measured keep the runtime from being fresh, and a failed connect closes everything.
         hands.clear()

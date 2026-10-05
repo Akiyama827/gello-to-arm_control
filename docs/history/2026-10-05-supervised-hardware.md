@@ -19,7 +19,8 @@ arms or moves), starts the Hands and waits for fresh measured feedback. ARM/DISA
 its lock while calling): not-ready while pending, a failure is the arm's fault until the next request succeeds, arming while
 one is pending is refused, a DISARM voids queued ARMs. `stop()` queues a DISARM on both; `close()` queues a DISARM and waits for it
 behind any request in flight (bounded by the SDK timeouts), then closes the clients (the supervisor cancels live executions; the
-robot holds). An invalid measurement from the supervisor is not fresh; the last good pose stays for display. Independent mode only: `set_shared_grasps` is refused (shared
+robot holds). An invalid measurement from the supervisor is not fresh; the last good pose stays for display. If the supervisor channel is lost, the DISARM cannot be delivered: the supervisor then abandons the session and leaves the arm armed and
+holding (its design), so close() on a dead channel is not a stop. Independent mode only: `set_shared_grasps` is refused (shared
 coupling needs the PC-side closure and stays on `RemoteHardware`, retirement condition: the closure moves behind
 `state_history/1`, slice 3, and the group path). `diagnostic_sample` reports only what this runtime has (measured joints from
 the supervisor), no RT packets or controller internals. Gains through `set_gains` need named presets, which this runtime does
