@@ -103,6 +103,7 @@ class SupervisedHardware(HandControl):
         self._measured_fingers, self._hand_results = {}, {}
         self._sample = {}
         self._trace_seq, self._trace_dropped, self._trace_errors, self._trace_latest = {}, {}, {}, {}
+        self._trace_ok = {}  # whether the last read of the supervisor's trace worked
         self._closed = False
         self._connected = False
         self._hand_factory = hand_factory or BridgeClient
@@ -119,6 +120,7 @@ class SupervisedHardware(HandControl):
                 self.slices[a] = slice(offset, offset + n)
                 self._sample[a] = (np.zeros(n), np.zeros(n), False)
                 self._trace_seq[a] = self._trace_dropped[a] = self._trace_errors[a] = 0
+                self._trace_ok[a] = True
                 offset += n
                 self.finger_limits[a] = tuple(cfg.get('gripper_range_m') or (0., .04))
             world_factory = world_factory or (lambda c: MuJoCoCollisionWorld.from_scene(
@@ -207,21 +209,22 @@ class SupervisedHardware(HandControl):
     def _read_trace(self, a):
         """Read the supervisor's controller ticks since the last read (trace/1). The ring is bounded: a read that comes back
         late reports the ticks that fell off as ``dropped``, and they are counted, not hidden. A supervisor without trace/1
-        or one that does not answer leaves the previous sample."""
+        has no trace; one that does not answer leaves the previous sample, marked ``trace_stale``. The client never
+        reconnects, so a restarted supervisor is a lost channel, not a sequence that starts again."""
         client = self.clients[a]
         if client.extensions.get('trace') != 1:
             return
         try:
             reply = client.trace_samples(self._trace_seq[a])
         except (SupervisorError, TimeoutError, OSError):
+            self._trace_ok[a] = False  # the held sample is now old: it is marked, never presented as current
             return
+        self._trace_ok[a] = True
         self._trace_dropped[a] += reply['dropped']
         self._trace_errors[a] = max(self._trace_errors[a], reply['errors'])
         if reply['samples']:
             self._trace_latest[a] = reply['samples'][-1]
             self._trace_seq[a] = reply['samples'][-1]['seq']
-        elif reply['latest_seq'] < self._trace_seq[a]:
-            self._trace_seq[a] = reply['latest_seq']  # the supervisor restarted: its sequence starts again
 
     def telemetry(self):
         out = {}
@@ -240,7 +243,8 @@ class SupervisedHardware(HandControl):
                              dq_measured=self._sample[a][1].tolist(), measurement_valid=self._sample[a][2],
                              fault_reason=self.handles[a].state().fault_reason),
                         **(self._trace_latest.get(a) or {}), trace_seq=self._trace_seq[a],
-                        trace_dropped=self._trace_dropped[a], trace_errors=self._trace_errors[a])
+                        trace_dropped=self._trace_dropped[a], trace_errors=self._trace_errors[a],
+                        trace_stale=not self._trace_ok[a])
                 for a in self.handles}
         return dict(pc_monotonic=time.monotonic(), reference_time_pc=None, arms=arms, feedback_ready=True,
                     feedback_alignment=None)
