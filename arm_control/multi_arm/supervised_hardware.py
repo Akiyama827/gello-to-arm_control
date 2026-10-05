@@ -78,7 +78,9 @@ class _AuthorityHandle:
         self._pending.append((self._pool.submit(apply), armed))
 
     def close(self) -> None:
-        self._pool.shutdown(wait=True, cancel_futures=True)
+        # Not cancel_futures: a queued DISARM (close()'s or an earlier stop()'s) must run behind the request in flight, or
+        # the arm is left armed with no owner. Queued ARMs are void already (the runtime is closed).
+        self._pool.shutdown(wait=True)
 
 
 class SupervisedHardware(HandControl):
@@ -193,6 +195,8 @@ class SupervisedHardware(HandControl):
             state = handle.state()
             if state.position is not None and state.velocity is not None:
                 self._sample[a] = (np.asarray(state.position, float), np.asarray(state.velocity, float), True)
+            else:  # an invalid measurement keeps the last good pose for display but is no longer a valid one
+                self._sample[a] = (*self._sample[a][:2], False)
             if a in self.hands:
                 for result in self.hands[a].pop_move_results():
                     self._hand_results[a] = result

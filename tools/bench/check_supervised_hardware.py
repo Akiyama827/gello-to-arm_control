@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -190,6 +191,16 @@ def main():
         wait(lambda: handle_b.state().ready and not handle_b.state().fault_reason, what='arm_b recovered')
         assert runtime.fresh
 
+        # An invalid measurement is not fresh (the last good pose is kept for display) and recovers with the next valid one.
+        good = runtime.joint_state()['position'].copy()
+        real_state = handle_b._inner.state
+        with patch.object(handle_b._inner, 'state', lambda: replace(real_state(), position=None, velocity=None)):
+            runtime.step()
+            assert not runtime.fresh and not runtime.diagnostic_sample()['arms'][b]['measurement_valid']
+            np.testing.assert_allclose(runtime.joint_state()['position'], good)
+        runtime.step()
+        assert runtime.fresh and runtime.diagnostic_sample()['arms'][b]['measurement_valid']
+
         # A pair plan runs through the coordinator over the runtime's handles.
         runtime.step()
         before = runtime.joint_state()['position'].copy()
@@ -204,7 +215,14 @@ def main():
              what='the measured motion')
         assert abs(runtime.joint_state()['position'][3] - before[3] + .05) < .01
 
-        # A rejected sample leaves the last good one; stop() disarms both and cancels the Hands.
+        # A per-arm DISARM (the console's disarm button) cancels that arm's Hand; stop() disarms both and cancels the Hands.
+        arm_a_hand = hands[0].cancels
+        handle_a.set_armed(False)
+        assert hands[0].cancels > arm_a_hand
+        wait(lambda: probe[a].authority().lifecycle is not Lifecycle.ARMED, what='arm_a disarmed by the per-arm request')
+        wait(lambda: not handle_a._pending or (handle_a.state() and not handle_a._pending), what='the DISARM reaped')
+        handle_a.set_armed(True)
+        wait(lambda: handle_a.state().ready, what='arm_a re-armed')
         cancels = sum(h.cancels for h in hands.values())
         runtime.stop()
         wait(lambda: all(p.authority().lifecycle is not Lifecycle.ARMED for p in probe.values()), what='both disarmed')
@@ -221,12 +239,39 @@ def main():
             raise AssertionError('armed after close')
         assert all(p.authority().lifecycle is not Lifecycle.ARMED for p in probe.values())
 
+        # close() while an ARM is in flight: the queued DISARM still runs, so the arm is not left armed without an owner.
+        hands.clear()
+        third = make()
+        third.connect()
+        slow_enter = threading.Event()
+        real_third = third.handles[a]._inner._arm.arm
+
+        def slow_third(*args, **kw):
+            slow_enter.set()
+            time.sleep(.5)
+            return real_third(*args, **kw)
+
+        with patch.object(third.handles[a]._inner._arm, 'arm', slow_third):
+            third.handles[a].set_armed(True)
+            assert slow_enter.wait(2)
+            third.close()
+        assert probe[a].authority().lifecycle is not Lifecycle.ARMED, probe[a].authority()
+        # stop() followed by close() likewise
+        hands.clear()
+        fourth = make()
+        fourth.connect()
+        for h in fourth.handles.values():
+            h.set_armed(True)
+        wait(lambda: all(h.state().ready for h in fourth.handles.values()), what='fourth armed')
+        fourth.stop()
+        fourth.close()
+        assert all(p.authority().lifecycle is not Lifecycle.ARMED for p in probe.values())
+
         # Hands that are not measured keep the runtime from being fresh, and a failed connect closes everything.
         hands.clear()
         second = make()
         orig = FakeHand.snapshot
-        with patch.object(FakeHand, 'snapshot', lambda self: dict(orig(self), measured=False)), \
-                patch('arm_control.multi_arm.supervised_hardware.time.monotonic', side_effect=iter([0.] + [10.] * 10_000)):
+        with patch.object(FakeHand, 'snapshot', lambda self: dict(orig(self), measured=False)):
             try:
                 second.connect()
             except ValueError as exc:
