@@ -20,6 +20,17 @@ last `start()`/`cancel()`, or a cancel is still unconfirmed (`cancel()` returned
 chunk **replaces** the waiting one. Nothing is clipped: the supervisor's admission has the final word and its refusal reason
 is reported.
 
+## Action spec (units, normalization, profile)
+
+`ActionSpec` states once what a policy's numbers mean and is recorded in `Report.spec`: named joints in order, `units`
+(`rad`, or `normalized` with a per-joint `offset` and `scale`, both required and finite, `scale > 0`; nothing is assumed),
+`composition` (`absolute`: `rad = offset + scale * v`; `delta`: `rad = scale * v`, an offset belongs to a position, not a
+difference), the longest chunk horizon (`horizon_s`, a longer chunk is refused) and the control profile the run expects
+(`control_profile`). Pass it as `ActionChunkClient(..., spec=...)`: chunk units and composition must match it (refused
+otherwise), and `start()` raises `NeedsOperator` unless the supervisor's selected preset is the expected one (also when
+it cannot report its profile): a client never switches a profile. `Report.profile_at_start` records what was selected.
+Without a spec the client accepts `rad` chunks as before.
+
 ## What a `Report` says
 
 Three separate facts per high-level action: `requested` (sent), `admitted` (the supervisor's trusted admission accepted it:
@@ -35,6 +46,8 @@ already overtaken by inference latency are not skipped, so a policy must account
 
 ## Not done
 
-"Limit changes visible in execution reports and datasets" (the supervisor refusal reason is reported, nothing is clipped, but there is no dataset record), LeRobot and OpenPI boundaries (project-owned, optional extras, under `Control/`), a normalization map, and the control-profile
-field in a recorded dataset. These need a real policy interface to adapt and are not built here. No hardware run; a real run
-needs the corresponding capability gate.
+"Limit changes visible in execution reports and datasets": the supervisor's refusal reason is reported and nothing is
+clipped, so there is no limit change to record; a dataset writer is project-owned. LeRobot and OpenPI boundaries (project-owned,
+optional extras, under `Control/`): neither package is installed here, so an adapter could not be checked against its API,
+and none is written; adding the extras is an explicit decision. No hardware run; a real run needs the corresponding
+capability gate.

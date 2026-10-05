@@ -32,7 +32,9 @@ from arm_control.multi_arm import diagnostics
 from arm_control.multi_arm.coordinator import BimanualCoordinator  # noqa: E402
 from arm_control.multi_arm.supervised_hardware import SupervisedHardware  # noqa: E402
 from arm_control.multi_arm.types import BimanualPlan, PairLifecycle  # noqa: E402
-from arm_control.sdk import ArmClient, Refused  # noqa: E402
+from arm_control.supervisor.runtime import Refused as ServiceRefused, RobotRuntime  # noqa: E402
+from arm_control.supervisor.service import dispatch  # noqa: E402
+from arm_control.sdk import ArmClient, Refused, SupervisorError  # noqa: E402
 
 
 class FakeHand:
@@ -264,6 +266,45 @@ def main():
             runtime.step()
             time.sleep(.01)
         assert runtime._trace_dropped[a] == before_prompt, 'a prompt reader was told it missed ticks'
+
+        # A supervisor that stops answering the trace read: the held sample is marked stale (never presented as current), and a
+        # working read clears the mark.
+        real_trace = runtime.clients[a].trace_samples
+
+        def broken(*args, **kw):
+            raise SupervisorError('trace read failed')
+        runtime.clients[a].trace_samples = broken
+        try:
+            runtime.step()
+            sample_a = runtime.diagnostic_sample()['arms'][a]
+            assert sample_a['trace_stale'] and sample_a['seq'] > 0, 'the held sample was dropped or presented as current'
+            assert not runtime.diagnostic_sample()['arms'][b]['trace_stale']
+        finally:
+            runtime.clients[a].trace_samples = real_trace
+        runtime.step()
+        assert not runtime.diagnostic_sample()['arms'][a]['trace_stale']
+        # a supervisor without trace/1 has no trace (nothing invented, nothing stale); the SDK and the service refuse the op
+        bare = object.__new__(SupervisedHardware)
+        bare.clients = {a: SimpleNamespace(extensions={})}
+        bare._trace_seq, bare._trace_dropped, bare._trace_errors, bare._trace_latest, bare._trace_ok = (
+            {a: 0}, {a: 0}, {a: 0}, {}, {a: True})
+        bare._read_trace(a)
+        assert not bare._trace_latest and bare._trace_ok[a] and bare._trace_seq[a] == 0
+        gate = object.__new__(ArmClient)
+        gate.extensions = {}
+        for call in (lambda: gate.trace_samples(0), lambda: dispatch(SimpleNamespace(extensions={}), 's', 'trace_samples', {})):
+            try:
+                call()
+            except (Refused, ServiceRefused):
+                pass
+            else:
+                raise AssertionError('trace_samples without the extension')
+        # a record that cannot be built is counted and never raises into the loop, and does not advance the sequence
+        stub = SimpleNamespace(_last_packet=(object(), 0.), link=SimpleNamespace(), controller=SimpleNamespace(),
+                               _native=None, _executions={}, _authority=SimpleNamespace(lifecycle=Lifecycle.ARMED),
+                               _trace_seq=7, _trace=[], _trace_errors=0)
+        RobotRuntime._record_trace(stub, {})
+        assert stub._trace_errors == 1 and stub._trace_seq == 7 and not stub._trace, 'a failed record was not counted'
 
         # A per-arm DISARM (the console's disarm button) cancels that arm's Hand; stop() disarms both and cancels the Hands.
         arm_a_hand = hands[0].cancels

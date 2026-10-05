@@ -10,10 +10,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from arm_control.clients.chunks import ActionChunkClient, Chunk
-from arm_control.clients.common import NeedsOperator, Report, StreamContext, classify, note_outcome, resolved
+from arm_control.clients.common import ActionSpec, NeedsOperator, Report, StreamContext, classify, note_outcome, resolved
 from arm_control.clients.planner import run_reviewed
 from arm_control.clients.rl import StepWindow
 from arm_control.clients.teleop import DeadmanTeleop
@@ -48,6 +50,67 @@ def cases(arm, runtime, scene, service):
     idle()
     report, status = run_reviewed(arm, replace(request, request_id='bad', model_token='other'), timeout_s=2.)
     assert report.refused and not report.admitted and status.phase is Phase.REJECTED, (report, status)
+
+    # -- action spec: units, composition, normalization map and the expected control profile (no robot motion) --------
+    joints3 = tuple(ctx.joints)
+    for bad in (dict(units='deg'), dict(composition='sideways'), dict(units='normalized'),
+                dict(units='normalized', offset=(0., 0., 0.), scale=(1., 1.)),
+                dict(units='normalized', offset=(0., 0., 0.), scale=(1., 0., 1.)),
+                dict(units='normalized', offset=(0., float('nan'), 0.), scale=(1., 1., 1.)),
+                dict(units='rad', scale=(1., 1., 1.)), dict(horizon_s=0.)):
+        try:
+            ActionSpec(joints3, **bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted a bad spec {bad}')
+    spec_abs = ActionSpec(joints3, units='normalized', offset=(.1, .2, .3), scale=(2., 3., 4.), horizon_s=1.)
+    spec_delta = ActionSpec(joints3, composition='delta', units='normalized', offset=(.1, .2, .3), scale=(2., 3., 4.))
+    unit = np.array([[1., -1., .5]])
+    assert np.allclose(spec_abs.to_radians(unit, 'absolute'), [[2.1, -2.8, 2.3]])  # offset + scale * v
+    assert np.allclose(spec_delta.to_radians(unit, 'delta'), [[2., -3., 2.]])      # a difference has no offset
+    try:
+        spec_abs.to_radians(unit, 'delta')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a chunk composition that differs from the spec was converted')
+    assert spec_abs.record()['scale'] == [2., 3., 4.] and spec_abs.record()['units'] == 'normalized'
+    try:
+        ActionChunkClient(arm, ctx, max_age_s=2., hold_s=6., spec=ActionSpec(tuple(reversed(joints3))))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a spec with other joints was accepted')
+    spec_client = ActionChunkClient(arm, ctx, max_age_s=2., hold_s=6., spec=spec_abs)
+    assert spec_client.report.spec == spec_abs.record()  # declared in the report from the start
+    assert np.allclose(spec_client._knots(Chunk('n', joints3, unit, .5, None, 0, units='normalized')), [[2.1, -2.8, 2.3]])
+    base3 = (1., 2., 3.)
+    spec_client.spec = spec_delta
+    assert np.allclose(spec_client._knots(Chunk('d', joints3, unit, .5, None, 0, mode='delta', base_q=base3,
+                                                units='normalized')), [[3., -1., 5.]])
+    # control profile: the run asserts the one it expects and never switches it
+    for ext, selected, expected, ok in ((1, 'track', 'track', True), (1, 'soft', 'track', False), (1, None, 'track', False),
+                                        (0, None, 'track', False), (1, 'soft', None, True)):
+        stub = SimpleNamespace(extensions={'controller': ext}, controller_state=lambda selected=selected: SimpleNamespace(
+            preset_id=selected))
+        profile_client = ActionChunkClient(stub, ctx, max_age_s=2., hold_s=6.,
+                                           spec=ActionSpec(joints3, control_profile=expected))
+        try:
+            profile_client._check_profile()
+        except NeedsOperator as exc:
+            assert not ok, (ext, selected, expected)
+            assert ('cannot report' in str(exc)) == (ext == 0), str(exc)  # unverifiable is said apart from a mismatch
+        else:
+            assert ok, (ext, selected, expected)
+        if not ok:  # start() refuses before it opens anything
+            try:
+                profile_client.start()
+            except NeedsOperator:
+                assert profile_client.session is None
+            else:
+                raise AssertionError('start() opened a stream under the wrong control profile')
+        assert profile_client.report.profile_at_start == (selected if ext else None)
 
     # -- action chunks ------------------------------------------------------------------------------------------
     idle()
@@ -94,6 +157,21 @@ def cases(arm, runtime, scene, service):
     until(lambda: client.pump() and client.inflight is None, 8)
     assert client.submit(delta) == 'sent'
     until(lambda: client.pump() and 'delta-ok' in client.report.selected, 8)
+    # the same live session under a declared spec: normalized values reach the RT as radians, units/horizon/composition rules apply
+    until(lambda: client.pump() and client.inflight is None, 8)
+    base_now = np.asarray(arm.state().q)
+    client.spec = ActionSpec(joints3, units='normalized', offset=tuple(base_now), scale=(1., 1., 1.), horizon_s=1.0)
+    normalized = chunk('norm', units='normalized', values=np.full((2, 3), .002), observed_at=arm.now())
+    assert client.submit(normalized) == 'sent', client.report
+    until(lambda: client.pump() and 'norm' in client.report.selected, 8)
+    n_req = len(client.report.requested)
+    assert client.submit(chunk('norm-rad', values=np.full((2, 3), .002), observed_at=arm.now())) == 'refused'  # rad under a normalized spec
+    assert client.submit(chunk('norm-long', units='normalized', dt_s=.6, values=np.full((2, 3), .002),
+                               observed_at=arm.now())) == 'refused'  # 1.2 s > the declared 1.0 s horizon
+    assert client.submit(chunk('norm-delta', units='normalized', mode='delta', base_q=tuple(base_now),
+                               values=np.full((2, 3), .002), observed_at=arm.now())) == 'refused'  # composition differs
+    assert len(client.report.requested) == n_req, 'a refused chunk reached the supervisor'
+    client.spec = None
     # an async admission refusal is reported as refused, never as admitted or selected
     until(lambda: client.pump() and client.inflight is None, 8)
     far = chunk('far', values=np.asarray(arm.state().q)[None, :] + 50., observed_at=arm.now())

@@ -29,6 +29,68 @@ class StreamContext:
     stream_policy_id: str
 
 
+@dataclass(frozen=True)
+class ActionSpec:
+    """What a policy's numbers mean, stated once and recorded with every run (CTRL-052): joints (named, in order), the units
+    the policy emits (``rad`` or ``normalized``), composition (``absolute`` positions or ``delta`` on the observation's
+    ``base_q``), the longest horizon one chunk may cover, the control profile the run expects, and, for ``normalized``
+    actions, the per-joint map to radians.
+
+    Normalization is ``rad = offset + scale * value`` for an absolute action and ``rad = scale * value`` for a delta (an
+    offset belongs to a position, never to a difference). Nothing is guessed: a normalized spec needs both vectors, finite,
+    one entry per joint, ``scale > 0``. ``control_profile`` is the supervisor's preset id the run expects (``None``: not
+    asserted); a run that finds another selected refuses to start rather than switch it."""
+    joints: tuple
+    composition: str = 'absolute'
+    units: str = 'rad'
+    horizon_s: float | None = None
+    control_profile: str | None = None
+    offset: tuple | None = None
+    scale: tuple | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, 'joints', tuple(self.joints))
+        if not self.joints:
+            raise ValueError('an action spec names its joints')
+        if self.composition not in ('absolute', 'delta'):
+            raise ValueError(f'unknown composition {self.composition!r}')
+        if self.units not in ('rad', 'normalized'):
+            raise ValueError(f'unknown units {self.units!r} (rad or normalized)')
+        if self.horizon_s is not None and not self.horizon_s > 0:
+            raise ValueError('horizon_s must be positive')
+        n = len(self.joints)
+        if self.units == 'rad':
+            if self.offset is not None or self.scale is not None:
+                raise ValueError('a rad spec has no normalization map')
+            return
+        if self.offset is None or self.scale is None:
+            raise ValueError('normalized actions need both offset and scale, one entry per joint: nothing is assumed')
+        offset, scale = (np.asarray(v, dtype=float).ravel() for v in (self.offset, self.scale))
+        if offset.shape != (n,) or scale.shape != (n,) or not (np.isfinite(offset).all() and np.isfinite(scale).all()):
+            raise ValueError('offset and scale must be finite, one entry per joint')
+        if not (scale > 0).all():
+            raise ValueError('scale must be positive for every joint')
+        object.__setattr__(self, 'offset', tuple(offset.tolist()))
+        object.__setattr__(self, 'scale', tuple(scale.tolist()))
+
+    def to_radians(self, values, composition: str):
+        """(T, n) policy values -> radians for this spec; ``composition`` is the chunk's and must be the spec's."""
+        if composition != self.composition:
+            raise ValueError(f'chunk composition {composition!r} differs from the spec ({self.composition!r})')
+        values = np.asarray(values, dtype=float)
+        if self.units == 'rad':
+            return values
+        scaled = np.asarray(self.scale) * values
+        return scaled if composition == 'delta' else np.asarray(self.offset) + scaled
+
+    def record(self) -> dict:
+        """The spec as a plain dict, for execution reports and datasets."""
+        return dict(joints=list(self.joints), composition=self.composition, units=self.units, horizon_s=self.horizon_s,
+                    control_profile=self.control_profile,
+                    offset=None if self.offset is None else list(self.offset),
+                    scale=None if self.scale is None else list(self.scale))
+
+
 @dataclass
 class Report:
     """Three separate facts per high-level action. ``requested``: sent to the supervisor (nothing is claimed).
@@ -45,6 +107,8 @@ class Report:
     late: list = field(default_factory=list)      # dropped as too old or for a closed session
     selected_revision: int | None = None
     notes: list = field(default_factory=list)
+    spec: dict | None = None                      # the ActionSpec the run declared (``ActionSpec.record()``), if any
+    profile_at_start: str | None = None           # the supervisor's selected preset id when the stream opened
 
     def mark_unknown(self, item_id) -> None:
         if item_id not in self.unknown:
