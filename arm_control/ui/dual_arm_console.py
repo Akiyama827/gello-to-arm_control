@@ -20,6 +20,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from arm_control.config import arm_joints, ee_frame, gripper_joints
+from arm_control.control.factory import arm_urdf
+from arm_control.dynamics import PinocchioDynamics
 from arm_control import frames
 from arm_control.console_server import ConsoleServer, file_asset
 from arm_control.grasp_visual import VisualFK
@@ -259,8 +261,22 @@ class DualArmConsole:
                 self._mesh_cache.cleanup()
             raise
 
+    def _measured(self, a):
+        """Arm ``a``'s last measured joint vector, through its handle (the console never reads a controller). A sample the
+        handle rejects leaves the last good one here, as the display always did; before the first one: refused."""
+        q = self.runtime.handles[a].state().position
+        if q is not None:
+            self._last_q[a] = q.copy()
+        if a not in self._last_q:
+            raise ValueError(f"no measured pose for {a} yet")
+        return self._last_q[a].copy()
+
     def _initialize(self, port, start_server):
         self.visual = _visuals(self.config)
+        # Model joint limits (the robot description is their one source, as for the controller), not a controller's.
+        self._limits = {a: PinocchioDynamics(arm_urdf(cfg), arm_joints(cfg)).joint_limits
+                        for a, cfg in self.config.robots.items()}
+        self._last_q = {}
         self.kin = getattr(self.runtime, "kinematics", None)
         if self.kin is None and self.config.shared_object:
             self.kin = CooperativeKinematics(self.config)
@@ -645,7 +661,7 @@ class DualArmConsole:
             arms = {}
             for a, s in arm_states.items():
                 cfg = self.config.robots[a]
-                q = self.runtime.controllers[a].last_state.position.copy()
+                q = self._measured(a)
                 pose = self.visual[a].poses(q, finger_positions[a])
                 world_T = frames.world_T_arm(cfg)
                 T = np.eye(4)
@@ -653,7 +669,7 @@ class DualArmConsole:
                 T[:3, 3] = pose["ee"]["p"]
                 base_T = np.linalg.inv(world_T) @ T
 
-                lo, hi = self.runtime.controllers[a].executor.joint_limits
+                lo, hi = self._limits[a]
                 arms[a] = dict(
                     s.to_payload(),
                     joints=arm_joints(cfg),
@@ -832,8 +848,8 @@ class DualArmConsole:
                 if action == "gripper":
                     if self.runtime.mode == "shared":
                         raise ValueError("fixed shared grasps lock both Hands")
-                    controller = self.runtime.controllers[a]
-                    if not controller.armed or not controller.ready_sent:
+                    hand_state = self.runtime.handles[a].state()
+                    if not hand_state.armed or not hand_state.ready:
                         raise ValueError(
                             "arm the controller before commanding its Hand"
                         )
@@ -942,10 +958,7 @@ class DualArmConsole:
                     self._virtual_grasps(),
                 )
                 self._object_start = self.runtime.object_pose()
-                starts = {
-                    a: c.last_state.position.copy()
-                    for a, c in self.runtime.controllers.items()
-                }
+                starts = {a: self._measured(a) for a in self.runtime.handles}
                 self._future_revision = self.revision
                 self._future = self._pool.submit(
                     plan_request,

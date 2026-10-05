@@ -512,6 +512,15 @@ def main(pair_path, binary, refinement="none"):
             else:
                 raise AssertionError("hardware admitted unqualified shared-object mode")
             a = next(iter(state["arms"]))
+            # A Hand command needs the handle's readiness, not only an armed controller.
+            real_state = app.runtime.handles[a].state
+            with patch.object(app.runtime.handles[a], "state", lambda: replace(real_state(), armed=True, ready=False)):
+                try:
+                    action("gripper", arm_id=a, width_mm=40)
+                except ValueError as exc:
+                    assert "arm the controller" in str(exc), exc
+                else:
+                    raise AssertionError("Hand commanded while the handle was not ready")
             link = app.runtime.links[a]
             link.invalid = True
             wait(lambda s: not s["connected"])

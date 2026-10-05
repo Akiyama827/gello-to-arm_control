@@ -18,6 +18,7 @@ from arm_control.messages import (
     unpack_json_message, unpack_motor_command,
 )
 from arm_control.control.inprocess import QueueControllerNode
+from arm_control.multi_arm.hands import HandControl
 from arm_control.multi_arm.interface import LocalArmHandle
 from arm_control.multi_arm.synchronization import SharedReferenceClock
 from arm_control.multi_arm.feedback import FeedbackGap, align_feedback
@@ -59,7 +60,7 @@ class _HardwareHandle(LocalArmHandle):
                        fault_reason=health.get("latched_fault") or self.runtime._faults.get(self.arm_id))
 
 
-class RemoteHardware:
+class RemoteHardware(HandControl):
     """Prepare locally, then connect after the viewer has loaded its assets.
 
     Nonblocking console ticks; bounded authority RPCs run per arm off-loop.
@@ -238,28 +239,6 @@ class RemoteHardware:
             return self.joint_state()
         return {"position": np.concatenate(list(self._closure_positions.values()))}
 
-    def finger_positions(self):
-        for a, hand in self.hands.items():
-            state = hand.snapshot()
-            if state.get("measured") is True:
-                self._measured_fingers[a] = float(state["width"]) / 2
-        # A stale display retains its last measurement; fresh=False disables
-        # motion. Reconnection must never display a fabricated open Hand.
-        return dict(self._measured_fingers)
-
-    def set_fingers(self, values):
-        for a, width in values.items():
-            if not np.isfinite(width) or not self.finger_limits[a][0] <= width <= self.finger_limits[a][1]:
-                raise ValueError("Hand target outside configured limits")
-            hand = self.hands[a]
-            if not hand.send_line(
-                f"MOVE {width * 2:.9g} 0.05",
-                {"request_id": f"console-{time.monotonic_ns()}", "_position_move": True},
-            ):
-                raise ValueError(f"{a}: Hand unavailable, busy or missing active-stop support")
-            self.fingers[a] = width
-            self._hand_results.pop(a, None)
-
     def object_pose(self):
         if self.kinematics is None:
             return None
@@ -270,14 +249,6 @@ class RemoteHardware:
             poses = self.kinematics.objects(self._closure_positions)
             return next(iter(poses.values())).copy()
         return self._object_pose.copy()
-
-    @property
-    def hand_busy(self):
-        return any(h.snapshot().get("busy") for h in self.hands.values())
-
-    def cancel_hands(self):
-        for hand in self.hands.values():
-            hand.cancel_move()
 
     def stop(self):
         """Queue disarm immediately, even when no further console tick can run."""

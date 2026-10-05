@@ -119,6 +119,10 @@ def main() -> int:
                                           str(ROOT / "tools/bench/check_dual_group.py"),
                                           "--server", server],
                            logs=logs, env=env, timeout=240))
+        results.append(run("supervised_hardware", [sys.executable,
+                                                   str(ROOT / "tools/bench/check_supervised_hardware.py"),
+                                                   "--server", server],
+                           logs=logs, env=env, timeout=180))
         results.append(run("state_history", [sys.executable,
                                              str(ROOT / "tools/bench/check_state_history.py"),
                                              "--server", server],

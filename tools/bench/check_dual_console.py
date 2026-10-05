@@ -83,6 +83,29 @@ def main():
             finally:
                 del app.runtime.finger_positions
             assert app.runtime.fingers == {a: hi for a, (_, hi) in limits.items()}
+        # The console reads limits from the model and poses through the handles, never a controller: the displayed limits are
+        # the controller's own, a rejected sample keeps the last good pose, and before any measurement a plan is refused.
+        state = fetch()
+        for a_, arm_ in state["arms"].items():
+            lo, hi = app.runtime.controllers[a_].executor.joint_limits
+            np.testing.assert_allclose(arm_["limits_deg"], np.rad2deg(np.vstack([lo, hi])).T.tolist(), atol=1e-6)
+        with app._lock:
+            from dataclasses import replace
+            real = app.runtime.handles["left"].state
+            good = app._measured("left")
+            app.runtime.handles["left"].state = lambda: replace(real(), position=None, velocity=None)
+            try:
+                np.testing.assert_allclose(app._measured("left"), good)
+                app._last_q.pop("left")
+                try:
+                    app._measured("left")
+                except ValueError as exc:
+                    assert "no measured pose" in str(exc), exc
+                else:
+                    raise AssertionError("a pose was invented before any measurement")
+            finally:
+                del app.runtime.handles["left"].state
+            app._measured("left")
         assert b"Dual-arm control" in fetch("")
         assert b"currentPreview" in fetch("static/dual.js")
         geometry = fetch("geometry")
