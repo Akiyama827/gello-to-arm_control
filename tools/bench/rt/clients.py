@@ -86,9 +86,32 @@ def cases(arm, runtime, scene, service):
     assert spec_client.report.spec == spec_abs.record()  # declared in the report from the start
     assert np.allclose(spec_client._knots(Chunk('n', joints3, unit, .5, None, 0, units='normalized')), [[2.1, -2.8, 2.3]])
     base3 = (1., 2., 3.)
-    spec_client.spec = spec_delta
+    spec_client._spec = spec_delta  # test hook: the public attribute is read-only
     assert np.allclose(spec_client._knots(Chunk('d', joints3, unit, .5, None, 0, mode='delta', base_q=base3,
                                                 units='normalized')), [[3., -1., 5.]])
+    try:
+        spec_client.spec = None
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError('the spec can be swapped under a recorded Report')
+    for shape in (np.zeros(3), np.zeros((2, 1)), np.zeros((2, 4)), np.zeros((1, 2, 3))):
+        try:
+            spec_abs.to_radians(shape, 'absolute')
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'a {shape.shape} action was converted (broadcast)')
+    try:
+        ActionSpec(joints3, units='deg', offset=(0., 0., 0.), scale=(1., 1., 1.))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unknown units accepted when a map was given')
+    caller_offset = [.1, .2, .3]
+    frozen = ActionSpec(joints3, units='normalized', offset=caller_offset, scale=[1., 1., 1.])
+    caller_offset[0] = 99.
+    assert frozen.offset == (.1, .2, .3) and isinstance(frozen.offset, tuple), frozen.offset
     # control profile: the run asserts the one it expects and never switches it
     for ext, selected, expected, ok in ((1, 'track', 'track', True), (1, 'soft', 'track', False), (1, None, 'track', False),
                                         (0, None, 'track', False), (1, 'soft', None, True)):
@@ -111,6 +134,28 @@ def cases(arm, runtime, scene, service):
             else:
                 raise AssertionError('start() opened a stream under the wrong control profile')
         assert profile_client.report.profile_at_start == (selected if ext else None)
+    # not asserted + the profile read fails: recorded best effort (a note), never an abort; asserted + fails: refused
+    def failing():
+        raise SupervisorError('no reply')
+    flaky = SimpleNamespace(extensions={'controller': 1}, controller_state=failing)
+    quiet = ActionChunkClient(flaky, ctx, max_age_s=2., hold_s=6.)
+    quiet._check_profile()
+    assert quiet.report.profile_at_start is None and any('not recorded' in n for n in quiet.report.notes), quiet.report.notes
+    try:
+        ActionChunkClient(flaky, ctx, max_age_s=2., hold_s=6., spec=ActionSpec(joints3, control_profile='track'))._check_profile()
+    except NeedsOperator:
+        pass
+    else:
+        raise AssertionError('an asserted profile that could not be read was accepted')
+    # a repeated start re-reads the profile (a stale record from an earlier start is never kept)
+    seq = iter(['track', 'soft'])
+    again = ActionChunkClient(SimpleNamespace(extensions={'controller': 1},
+                                              controller_state=lambda: SimpleNamespace(preset_id=next(seq))), ctx,
+                              max_age_s=2., hold_s=6.)
+    again._check_profile()
+    assert again.report.profile_at_start == 'track'
+    again._check_profile()
+    assert again.report.profile_at_start == 'soft'
 
     # -- action chunks ------------------------------------------------------------------------------------------
     idle()
@@ -160,7 +205,7 @@ def cases(arm, runtime, scene, service):
     # the same live session under a declared spec: normalized values reach the RT as radians, units/horizon/composition rules apply
     until(lambda: client.pump() and client.inflight is None, 8)
     base_now = np.asarray(arm.state().q)
-    client.spec = ActionSpec(joints3, units='normalized', offset=tuple(base_now), scale=(1., 1., 1.), horizon_s=1.0)
+    client._spec = ActionSpec(joints3, units='normalized', offset=tuple(base_now), scale=(1., 1., 1.), horizon_s=1.0)
     normalized = chunk('norm', units='normalized', values=np.full((2, 3), .002), observed_at=arm.now())
     assert client.submit(normalized) == 'sent', client.report
     until(lambda: client.pump() and 'norm' in client.report.selected, 8)
@@ -171,7 +216,29 @@ def cases(arm, runtime, scene, service):
     assert client.submit(chunk('norm-delta', units='normalized', mode='delta', base_q=tuple(base_now),
                                values=np.full((2, 3), .002), observed_at=arm.now())) == 'refused'  # composition differs
     assert len(client.report.requested) == n_req, 'a refused chunk reached the supervisor'
-    client.spec = None
+    client._spec = None
+    # non-finite and malformed chunks are refused at submit (not at send), so they never evict a valid waiting chunk
+    until(lambda: client.pump() and client.inflight is None, 8)
+    assert client.submit(chunk('hold-1', observed_at=arm.now())) == 'sent'
+    assert client.submit(chunk('hold-2', observed_at=arm.now())) == 'waiting'
+    for name, kw in (('nan', dict(values=np.full((1, 3), np.nan))), ('inf', dict(values=np.full((1, 3), np.inf))),
+                     ('dt-nan', dict(dt_s=float('nan'))), ('dt-neg', dict(dt_s=-.5)),
+                     ('base-short', dict(mode='delta', base_q=(0.,), values=np.full((1, 3), .001))),
+                     ('base-nan', dict(mode='delta', base_q=(np.nan,) * 3, values=np.full((1, 3), .001)))):
+        assert client.submit(chunk(name, observed_at=arm.now(), **kw)) == 'refused', name
+    assert client.waiting is not None and client.waiting.chunk_id == 'hold-2', 'a bad chunk evicted the waiting one'
+    until(lambda: client.pump() and client.inflight is None and client.waiting is None, 8)
+    # a profile refusal leaves a RUNNING stream running (nothing is cancelled before the check)
+    running = client.session
+    client._spec = ActionSpec(joints3, control_profile='no-such-profile')
+    try:
+        client.start()
+    except NeedsOperator:
+        pass
+    else:
+        raise AssertionError('start() ran under the wrong control profile')
+    assert client.session is running and not running.closed and not client.cancel_pending, 'a refused start stopped the stream'
+    client._spec = None
     # an async admission refusal is reported as refused, never as admitted or selected
     until(lambda: client.pump() and client.inflight is None, 8)
     far = chunk('far', values=np.asarray(arm.state().q)[None, :] + 50., observed_at=arm.now())

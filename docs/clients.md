@@ -29,7 +29,13 @@ difference), the longest chunk horizon (`horizon_s`, a longer chunk is refused) 
 (`control_profile`). Pass it as `ActionChunkClient(..., spec=...)`: chunk units and composition must match it (refused
 otherwise), and `start()` raises `NeedsOperator` unless the supervisor's selected preset is the expected one (also when
 it cannot report its profile): a client never switches a profile. `Report.profile_at_start` records what was selected.
-Without a spec the client accepts `rad` chunks as before.
+The profile is checked before anything is cancelled or opened, so a refusal leaves a running stream running; it is a
+separate call from the stream open, so the owning session could switch preset between the two (only the owner can; a switch
+after the open ends the stream, the supervisor cancels live executions on a preset change). `spec` is read-only. Without a
+spec the client accepts `rad` chunks as before, and `start()` records the profile best effort (a read failure is a note, never
+an abort); an asserted profile that cannot be read is refused. A chunk that is non-finite (values, `dt_s`, or the composed
+delta), has a `base_q` that is not one entry per joint (never broadcast), or a shape other than `(T, joints)` is refused at
+`submit`, so it cannot evict a valid waiting chunk.
 
 ## What a `Report` says
 

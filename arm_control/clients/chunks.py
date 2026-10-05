@@ -37,17 +37,25 @@ class ActionChunkClient:
             raise ValueError('max_age_s must be positive (it is the caller\'s deadline, there is no default)')
         if spec is not None and spec.joints != tuple(ctx.joints):
             raise ValueError('the action spec names different joints (or another order) than the stream context')
-        self.arm, self.ctx, self.max_age_s, self.hold_s, self.spec = arm, ctx, max_age_s, hold_s, spec
+        self.arm, self.ctx, self.max_age_s, self.hold_s, self._spec = arm, ctx, max_age_s, hold_s, spec
         self.generation, self.session, self.report = 0, None, Report()
         self.report.spec = None if spec is None else spec.record()
         self.inflight, self.waiting, self._sent_obs_ns = None, None, -1
         self.cancel_pending = False
 
+    @property
+    def spec(self) -> ActionSpec | None:
+        """The declared spec (read-only: ``Report.spec`` records it once, so it cannot be swapped under a recorded run)."""
+        return self._spec
+
     def start(self) -> int:
         """Open a stream; chunks produced before this call (an older generation) are late forever."""
+        # The profile is checked BEFORE anything is cancelled or opened: a refusal leaves a running stream running. It is a
+        # separate call from the stream open, so the owning session could switch preset between the two (only the owner can);
+        # a switch after the open ends the stream (the supervisor cancels live executions on a preset change).
+        self._check_profile()
         if not self.cancel('restart'):
             raise NeedsOperator('previous stream not confirmed cancelled; not opening a second one')
-        self._check_profile()
         self.generation += 1
         self.session = StreamSession(self.arm, self.ctx, hold_s=self.hold_s)
         self.inflight = self.waiting = None
@@ -56,15 +64,22 @@ class ActionChunkClient:
 
     def _check_profile(self) -> None:
         """The control profile the spec expects must be the one selected: a run never switches it, and never assumes it."""
-        self.report.profile_at_start = None
+        expected = None if self._spec is None else self._spec.control_profile
+        profile = None
         if self.arm.extensions.get('controller') == 1:
-            self.report.profile_at_start = self.arm.controller_state().preset_id
-        expected = None if self.spec is None else self.spec.control_profile
+            try:
+                profile = self.arm.controller_state().preset_id
+            except (SupervisorError, TimeoutError, OSError) as exc:
+                if expected is not None:  # asserted but unverifiable: refuse; not asserted: record best effort, never abort
+                    raise NeedsOperator(f'the run expects control profile {expected!r} but reading the profile failed: '
+                                        f'{exc!r}') from exc
+                self.report.notes.append(f'control profile not recorded: {exc!r}')
+        self.report.profile_at_start = profile
         if expected is None:
             return
         if self.arm.extensions.get('controller') != 1:
             raise NeedsOperator(f'the run expects control profile {expected!r} but the supervisor cannot report its profile')
-        if self.report.profile_at_start != expected:
+        if profile != expected:
             raise NeedsOperator(f'control profile {self.report.profile_at_start!r} is selected, the run expects {expected!r}: '
                                 'select it explicitly; a client never switches it')
 
@@ -84,13 +99,21 @@ class ActionChunkClient:
         values = np.asarray(chunk.values, dtype=float)
         if values.ndim != 2 or values.shape[1] != len(self.ctx.joints):
             raise ValueError('chunk must be (T, joints)')
-        if self.spec is not None:
-            values = self.spec.to_radians(values, chunk.mode)  # the declared units and normalization; composition must match
+        if self._spec is not None:
+            values = self._spec.to_radians(values, chunk.mode)  # the declared units and normalization; composition must match
         if chunk.mode == 'delta':
             if chunk.base_q is None:
                 raise ValueError('a delta chunk composes on base_q, the joint position at observation time')
-            return np.asarray(chunk.base_q, dtype=float) + values
+            base = np.asarray(chunk.base_q, dtype=float)
+            if base.shape != (len(self.ctx.joints),):
+                raise ValueError('base_q must have one entry per joint (it is never broadcast)')
+            values = base + values
+            if not np.isfinite(values).all():
+                raise ValueError('the composed chunk is not finite')
+            return values
         if chunk.mode == 'absolute':
+            if not np.isfinite(values).all():
+                raise ValueError('the chunk is not finite')
             return values
         raise ValueError(f'unknown composition {chunk.mode!r}')
 
@@ -104,13 +127,15 @@ class ActionChunkClient:
             return 'late', 'requested before the last start/cancel'
         if tuple(chunk.joints) != tuple(self.ctx.joints):
             return 'refused', 'joint names or order differ from the stream context'
-        expected_units = 'rad' if self.spec is None else self.spec.units
+        if not np.isfinite(chunk.dt_s) or chunk.dt_s <= 0:
+            return 'refused', 'dt_s must be positive and finite'
+        expected_units = 'rad' if self._spec is None else self._spec.units
         if chunk.units != expected_units:
             return 'refused', f'units {chunk.units!r}: this run declared {expected_units!r}'
-        if self.spec is not None and self.spec.horizon_s is not None:
+        if self._spec is not None and self._spec.horizon_s is not None:
             horizon = len(chunk.values) * chunk.dt_s
-            if horizon > self.spec.horizon_s + 1e-9:
-                return 'refused', f'chunk horizon {horizon:.3f} s exceeds the declared {self.spec.horizon_s} s'
+            if horizon > self._spec.horizon_s + 1e-9:
+                return 'refused', f'chunk horizon {horizon:.3f} s exceeds the declared {self._spec.horizon_s} s'
         try:
             self._knots(chunk)  # shape, composition and base_q are checked when submitted, not when finally sent
         except ValueError as exc:

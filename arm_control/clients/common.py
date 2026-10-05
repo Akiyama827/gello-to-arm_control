@@ -78,6 +78,8 @@ class ActionSpec:
         if composition != self.composition:
             raise ValueError(f'chunk composition {composition!r} differs from the spec ({self.composition!r})')
         values = np.asarray(values, dtype=float)
+        if values.ndim != 2 or values.shape[1] != len(self.joints):
+            raise ValueError('values must be (T, joints): a shape is never broadcast')
         if self.units == 'rad':
             return values
         scaled = np.asarray(self.scale) * values
