@@ -87,6 +87,7 @@ class SimLink:
         self._arm_t = 0.0
         self._hold_q: np.ndarray | None = None
         self._in_hold = False
+        self._plant_ok = True                # per ARM epoch, as in the RT: false after a failed step until the next ARM
         self._tick_snap = None               # the authority snapshot of the tick in flight (for its failure sample)
         self._pub_stop_epoch = 0             # the stop epoch the published samples show: advanced only by a RELEASED step
         self._cmd_gains = None               # the gains of the last accepted command this epoch (a hold keeps them, as the RT does)
@@ -148,6 +149,7 @@ class SimLink:
             state = self._state
             self._hold_q = np.asarray(state.q if state else np.zeros(self.n), dtype=float).copy()
             self._cmd, self._cmd_t, self._in_hold, self._cmd_gains = None, 0.0, False, None
+            self._plant_ok = True
             self._epochs += 1
             self._arm_epoch = self._epochs
             self._armed = True
@@ -253,25 +255,28 @@ class SimLink:
         fault, not HOLDING, the last good pose. An ARM or DISARM that landed during the step is therefore not confirmed by it, and
         a failure of a step that ran under authority that has since changed is not latched against the new authority."""
         with self._lock:
-            snap = dict(self._tick_snap or dict(armed=False, arm_epoch=0, stop_epoch=self._pub_stop_epoch,
+            # No snapshot means the failure came before this tick stored one: nothing ran, so the live authority is the truth.
+            snap = dict(self._tick_snap or dict(armed=self._armed, arm_epoch=self._arm_epoch, stop_epoch=self._pub_stop_epoch,
                                                 last_cmd_seq=self._last_cmd_seq, gen=(self._arm_epoch, self._stop_epoch)))
             current = (self._arm_epoch, self._stop_epoch) == snap.get("gen", (self._arm_epoch, self._stop_epoch))
-            if current and not self._fault_code:  # the first message is the root cause; later ticks do not overwrite it
-                self._fault_code, self._latched_fault = rtp.FAULT_PLANT, f"sim plant failed: {exc!r}"
             if current:
+                self._plant_ok = False  # the servo releases the plant until the next ARM, whatever fault is already latched
                 self._cmd = None
+                if not self._fault_code:  # the first cause is the one latched and published; later ones do not overwrite it
+                    self._fault_code, self._latched_fault = rtp.FAULT_PLANT, f"sim plant failed: {exc!r}"
             last = self._state
             motor = dict(position=np.asarray(last.q if last else np.zeros(self.n), float),
                          velocity=np.asarray(last.dq if last else np.zeros(self.n), float))
-            snap.update(fault=rtp.FAULT_PLANT, holding=False)
+            snap.update(fault=self._fault_code or rtp.FAULT_PLANT, holding=False)
             snap.pop("gen", None)
         self._publish(now, motor=motor, snapshot=snap)
 
     def _tick(self, now: float) -> None:
+        self._tick_snap = None  # a failure before this tick's snapshot is stored must not reuse the previous tick's authority
         with self._lock:
             command = None
             holding = False
-            if self._armed and self._fault_code == rtp.FAULT_PLANT:
+            if self._armed and not self._plant_ok:
                 # A failed plant is not driven: like the RT server (which writes nothing), the servo releases it.
                 measured = self._state.q if self._state else np.zeros(self.n)
                 command = dict(position=np.asarray(measured, float).copy(), velocity=np.zeros(self.n),

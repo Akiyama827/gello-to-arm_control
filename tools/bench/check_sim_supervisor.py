@@ -280,6 +280,26 @@ def link_races(tmp):
         assert link.latest_state()[0].dq == good.dq and link.motor_health()['state_fresh']
         gated.inner.step = real_step_global
         assert link.safe_stop() and link.latest_state()[0].fault_code == 0
+        # a plant failure AFTER another cause is latched still releases the plant (the first cause stays the published one)
+        link.enable_all()
+        for _ in range(20):
+            link.apply_command(command([.1, 0, 0], kp=100.))
+            time.sleep(.01)
+        wait(lambda: link.latest_state()[0].fault_code == rtp.FAULT_CMD_LOST, 2., 'CMD_LOST')
+        assert np.allclose(gated.inner._last_command['kp'], 100.)  # holding with the last command's gains
+        gated.inner.step = (lambda *a, **k: (_ for _ in ()).throw(RuntimeError('late plant failure')))
+        wait(lambda: not link._plant_ok, 1., 'the plant failure')
+        time.sleep(.05)  # failing ticks keep publishing: every one of them carries the FIRST cause, never FAULT_PLANT
+        assert not [h for h, _ in link.recent_states() if h.fault_code == rtp.FAULT_PLANT]
+        assert {h.fault_code for h, _ in list(link.recent_states())[-8:]} == {rtp.FAULT_CMD_LOST}
+        gated.inner.step = real_step_global
+        wait(lambda: not gated.inner._last_command['kp'].any(), 1., 'the release after a plant failure under CMD_LOST')
+        s = link.latest_state()[0]
+        assert s.fault_code == rtp.FAULT_CMD_LOST and not s.holding and 'command stream lost' in link.motor_health()['latched_fault'], s
+        assert link.safe_stop()
+        link.enable_all()  # a new ARM resets the per-epoch plant flag
+        assert link._plant_ok
+        assert link.safe_stop()
         # a plant fault while disarmed is faulted but neither armed nor HOLDING (the plant is released)
         real_step = gated.inner.step
 
