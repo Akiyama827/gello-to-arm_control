@@ -11,8 +11,9 @@ What it models of the RT server, and nothing more:
   stop epoch and clears a fault; ARM while a fault is latched is refused;
 * commands: a command is accepted only while armed and not faulted, and ``last_cmd_seq`` is the sequence of the last accepted
   one, which is what the APPLIED rule reads;
-* the deadman: after ``hold_ms`` without a command the plant holds the measured pose at the hold gains, after ``fault_ms`` it
-  latches ``FAULT_CMD_LOST`` and keeps holding until DISARM.
+* the deadman: after ``hold_ms`` without a command the plant holds the measured pose (with the last accepted command's gains, the
+  configured hold gains before any), after ``fault_ms`` it latches ``FAULT_CMD_LOST`` and keeps holding until DISARM;
+* a DISARM releases the plant (zero-gain word), and so does a plant failure (``FAULT_PLANT``).
 
 What it does not: no native reference (v7) path, no group record, no pose-hold, no clock domain (a simulation has no RT host
 clock), and no RT-side torque clamp or slew beyond what the plant itself applies. Every servo parameter comes from the config's
@@ -86,6 +87,7 @@ class SimLink:
         self._arm_t = 0.0
         self._hold_q: np.ndarray | None = None
         self._in_hold = False
+        self._pub_stop_epoch = 0             # the stop epoch the published samples show: advanced only by a RELEASED step
         self._cmd_gains = None               # the gains of the last accepted command this epoch (a hold keeps them, as the RT does)
         self._fault_code = 0
         self._latched_fault = ""
@@ -242,6 +244,15 @@ class SimLink:
                 with self._lock:
                     self._fault_code, self._latched_fault = rtp.FAULT_PLANT, f"sim plant failed: {exc!r}"
                     self._cmd = None
+                    last = self._state
+                    motor = dict(position=np.asarray(last.q if last else np.zeros(self.n), float),
+                                 velocity=np.zeros(self.n))
+                    if not self._armed:
+                        self._pub_stop_epoch = self._stop_epoch
+                # the fault is PUBLISHED (from the last good pose) so a reader sees it, and the stream does not go stale
+                self._publish(now, motor=motor, snapshot=dict(
+                    armed=self._armed, fault=self._fault_code, holding=False, arm_epoch=self._arm_epoch,
+                    stop_epoch=self._pub_stop_epoch, last_cmd_seq=self._last_cmd_seq))
             next_t += self._period
             if now - next_t > self._period:
                 next_t = now
@@ -251,7 +262,12 @@ class SimLink:
         with self._lock:
             command = None
             holding = False
-            if self._armed:
+            if self._armed and self._fault_code == rtp.FAULT_PLANT:
+                # A failed plant is not driven: like the RT server (which writes nothing), the servo releases it.
+                measured = self._state.q if self._state else np.zeros(self.n)
+                command = dict(position=np.asarray(measured, float).copy(), velocity=np.zeros(self.n),
+                               torque=np.zeros(self.n), kp=np.zeros(self.n), kd=np.zeros(self.n))
+            elif self._armed:
                 silent = now - max(self._cmd_t, self._arm_t)
                 if self._cmd is not None and not self._fault_code and silent * 1e3 <= self.hold_ms:
                     command, self._in_hold = self._cmd, False
@@ -271,8 +287,10 @@ class SimLink:
                 measured = self._state.q if self._state else np.zeros(self.n)
                 command = dict(position=np.asarray(measured, float).copy(), velocity=np.zeros(self.n),
                                torque=np.zeros(self.n), kp=np.zeros(self.n), kd=np.zeros(self.n))
-            snapshot = dict(armed=self._armed, fault=self._fault_code, holding=holding or bool(self._fault_code),
-                            arm_epoch=self._arm_epoch, stop_epoch=self._stop_epoch, last_cmd_seq=self._last_cmd_seq)
+            if not self._armed:  # only a released step publishes a DISARM (a DISARM then ARM inside one step shows neither)
+                self._pub_stop_epoch = self._stop_epoch
+            snapshot = dict(armed=self._armed, fault=self._fault_code, holding=holding,
+                            arm_epoch=self._arm_epoch, stop_epoch=self._pub_stop_epoch, last_cmd_seq=self._last_cmd_seq)
         motor = self._plant.step(command)
         self._publish(now, motor=motor, command=command, snapshot=snapshot)
 
@@ -285,7 +303,7 @@ class SimLink:
                 motor = self._plant.motor_state()
             if snapshot is None:
                 snapshot = dict(armed=self._armed, fault=self._fault_code, holding=False, arm_epoch=self._arm_epoch,
-                                stop_epoch=self._stop_epoch, last_cmd_seq=self._last_cmd_seq)
+                                stop_epoch=self._pub_stop_epoch, last_cmd_seq=self._last_cmd_seq)
             flags = rtp.FLAG_ARMED if snapshot["armed"] else 0
             if snapshot["fault"]:
                 flags |= rtp.FLAG_FAULTED

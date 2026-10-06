@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import numpy as np
@@ -58,7 +59,7 @@ def command(q, kp=100., kd=20.):
 def link_unit(tmp):
     cfg = RtConfig(instance_id='sim_arm', state_timeout_s=.5)
     for bad in ({k: v for k, v in SERVO.items() if k != 'hold_ms'}, dict(SERVO, fault_ms=50), dict(SERVO, fault_ms=100),
-                dict(SERVO, state_hz=0), dict(SERVO, state_hz=1e7), dict(SERVO, hold_kp=float('nan')), dict(SERVO, hold_kp=-5),
+                dict(SERVO, state_hz=0), dict(SERVO, state_hz=0.5), dict(SERVO, state_hz=1e7), dict(SERVO, hold_kp=float('nan')), dict(SERVO, hold_kp=-5),
                 dict(SERVO, hold_kd=-1), dict(SERVO, hold_ms='soon'), dict(SERVO, hold_ms=None), dict(SERVO, hold_ms=float('inf'))):
         try:
             SimLink(cfg, JOINTS, object(), servo=bad)
@@ -158,10 +159,120 @@ def link_unit(tmp):
         link.close()
 
 
+class Gated:
+    """A plant whose step can be held open: the race between an ARM/DISARM/command and a step that already took its snapshot."""
+
+    def __init__(self, inner):
+        self.inner, self.entered, self.release, self.gate = inner, threading.Event(), threading.Event(), False
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def step(self, command=None):
+        if self.gate:
+            self.gate = False
+            self.entered.set()
+            assert self.release.wait(10), 'the gated step was never released'
+        return self.inner.step(command)
+
+
+def link_races(tmp):
+    cfg = RtConfig(instance_id='sim_arm', state_timeout_s=.5)
+    gated = Gated(plant(tmp / 'three.urdf'))
+    link = SimLink(cfg, JOINTS, gated, servo=SERVO)
+    link.open()
+    try:
+        link.enable_all()
+        for _ in range(20):
+            link.apply_command(command([.1, 0, 0]))
+            time.sleep(.01)
+        before = link.latest_state()[0]
+        assert before.armed and before.stop_epoch == 0
+        # a DISARM then an ARM land inside one step: that step ran ARMED, so no sample may show the DISARM yet
+        gated.entered.clear(), gated.release.clear()
+        gated.gate = True
+        assert gated.entered.wait(2)
+        result = {}
+        t = threading.Thread(target=lambda: result.update(stopped=link.safe_stop()))
+        t.start()
+        wait(lambda: link._stop_epoch == 1, 2., 'the DISARM request')
+        seq_before = link._cmd_seq
+        accepted_during = link.apply_command(command([.2, 0, 0]))  # disarmed now: handed a sequence, not accepted
+        assert accepted_during == seq_before + 1
+        armer = threading.Thread(target=link.enable_all)  # the ARM lands in the same step as the DISARM
+        armer.start()
+        wait(lambda: link._armed, 2., 'the ARM request')
+        gated.release.set()
+        t.join(10)
+        armer.join(10)
+        # no step ran released, so the DISARM is NOT confirmed (False), and no sample may claim it (stop_epoch still 0)
+        assert result['stopped'] is False, result
+        s = link.latest_state()[0]
+        assert s.armed and s.arm_epoch == 2 and s.stop_epoch == 0, s
+        assert all(h.stop_epoch == 0 for h, _ in link.recent_states() if h.armed), 'an armed sample showed the DISARM'
+        assert link.safe_stop()
+        assert not link.latest_state()[0].armed and link.latest_state()[0].stop_epoch == 2
+        # a command accepted while a step is in flight is not reported by the sample of that step
+        link.enable_all()
+        link.apply_command(command([.1, 0, 0]))
+        time.sleep(.05)
+        gated.entered.clear(), gated.release.clear()
+        gated.gate = True
+        assert gated.entered.wait(2)
+        published = link._state_seq  # the gated step will publish sample published + 1
+        seq = link.apply_command(command([.1, 0, 0]))
+        in_flight = link.latest_state()[0].last_cmd_seq
+        assert in_flight != seq
+        gated.release.set()
+        wait(lambda: link.latest_state()[0].last_cmd_seq == seq, 1., 'the command in a later sample')
+        step_sample = next(h for h, _ in link.recent_states() if h.state_seq == published + 1)
+        assert step_sample.last_cmd_seq == in_flight, (step_sample.last_cmd_seq, in_flight, seq)  # not the later command
+        assert link.safe_stop()
+        # a plant fault while disarmed is faulted but neither armed nor HOLDING (the plant is released)
+        real_step = gated.inner.step
+
+        def failing(*args, **kw):
+            raise RuntimeError('plant exploded')
+        gated.inner.step = failing
+        wait(lambda: link.latest_state()[0].fault_code == rtp.FAULT_PLANT, 1., 'FAULT_PLANT while disarmed')
+        s = link.latest_state()[0]
+        assert s.faulted and not s.armed and not s.holding, s
+        gated.inner.step = real_step
+        assert link.safe_stop() and not link.latest_state()[0].faulted
+        # an ARMED plant fault releases the plant (zero word) instead of holding it, and is not reported as HOLDING
+        link.enable_all()
+        for _ in range(20):
+            link.apply_command(command([.1, 0, 0], kp=200.))
+            time.sleep(.01)
+        gated.inner.step = failing
+        wait(lambda: link.latest_state()[0].fault_code == rtp.FAULT_PLANT, 1., 'FAULT_PLANT while armed')
+        gated.inner.step = real_step
+        wait(lambda: not gated.inner._last_command['kp'].any(), 1., 'the released word after a plant fault')
+        s = link.latest_state()[0]
+        assert s.armed and s.faulted and not s.holding, s
+        assert link.safe_stop()
+    finally:
+        gated.release.set()
+        link.close()
+    # close() with a step stuck: bounded, and the plant is left open rather than closed under the running step
+    stuck = Gated(plant(tmp / 'three.urdf'))
+    link = SimLink(cfg, JOINTS, stuck, servo=SERVO)
+    link.open()
+    stuck.gate = True
+    assert stuck.entered.wait(2)
+    began = time.monotonic()
+    link.close()
+    assert time.monotonic() - began < 8, 'close() hung on a stuck step'
+    assert stuck.inner.model is not None, 'the plant was closed under a running step'
+    stuck.release.set()
+    link._thread.join(5) if link._thread is not None else None
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix='sim_supervisor_'))
     cfg_path = write_config(tmp, 0, 0)  # also writes three.urdf; the rt ports are unused by the sim plant
     link_unit(tmp)
+    link_races(tmp)
     try:
         SimLink.from_config(load_robot_config(cfg_path))  # the fixture config has no sim_servo yet
     except ValueError as exc:
