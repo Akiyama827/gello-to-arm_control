@@ -13,8 +13,18 @@ no authority and no control law. It refuses to start if the supervisor runs othe
 (`check_config`: one recipe, `default_gains_and_presets`, proven against the running supervisor).
 
 **What it does that the in-process node did implicitly:** a new plan REPLACES a staged-but-unreleased one (the supervisor refuses a
-second admitted plan, found by running the real graph); an ungated plan is released when admitted; the first fresh measured pose after
-ARM becomes the `ready` event; a mode heartbeat keeps the console's mode fresh.
+second admitted plan, found by running the real graph; staged plans are tracked when staged, so an execute right behind a plan finds
+it) and is REFUSED while one runs ("... is still executing"); an ungated plan is released when admitted; cancelling a running leg
+reports a failed `leg_result` as well as the clear; the first fresh measured pose after ARM becomes the `ready` event; a mode
+heartbeat keeps the console's mode fresh; `motor_health` (armed, latched fault) is published on change and twice a second, because the
+console takes its armed state and its fault latch from it, and only it CLEARS a latch.
+
+**Faults and loss.** A supervisor fault (e.g. `cmd_lost`) is a recoverable `motor_health` latch plus a log line, not the terminal
+`fault` controller event (which in-process means the controller stopped for good), so the console clears it after DISARM then ARM.
+If the supervisor cannot be read (the SDK channel never reconnects), unknown is never published as DISARMED: the bridge emits ONE
+terminal `fault` and a `motor_health` with `unknown_authority`, the node ends non-zero, and it tries to DISARM through a new
+session (a supervisor that loses its owner cancels and HOLDS, staying armed, by design). The launcher watches the supervisor and
+stops the graph if it exits.
 
 **Stated differences:** jog and gripper are refused with a notice (the supervisor has no raw-jog and no gripper); gains must be named
 presets (`gain_presets`); `hold` cancels the live leg and leaves the arm held by the supervisor (no latched "frozen" state); `stop`
@@ -27,13 +37,23 @@ cancels and DISARMs; `motor_state` gains and measured torque are zeros where the
    thresholds, except the speed limits, which are the ones this example's own planner already runs at; the project's real FR3 policy is
    slower and would refuse this example's plans) together with the sim servo parameters (the RT server's own launch defaults). A
    simulation example only; nothing there applies to a deployment.
-3. The plant spawned with the Hand shut (the Dora node opened it after load; the shared builder did not): `open_jaws` is now shared.
+3. The Dora node opens the Hand after load and the shared builder did not: `open_jaws` is now shared, so both spawn alike. (It does not
+   cure finding 4: the swing is the same with the jaws shut.)
 4. ARM, plan, re-plan and the console's mode display work through the supervisor. EXECUTE was rejected by admission ("start point 0.377
    rad from measured pose (tol 0.1)"): **joint 7 of the simulated FR3 oscillates by about +-0.6 rad whenever it is held**, and the
-   supervisor's start tolerance catches what the in-process controller (no start check) never showed. Measured on the plant alone, with
-   fingers unservoed, with and without gravity compensation, with and without self-collision, at control periods 1 to 10 ms, and in the
-   STOCK graph (the end-effector yaw wanders by tens of degrees once armed): not a SimLink or bridge effect. Likely the wrist's tiny
-   inertia against kp 400 under the 12 N*m limit (a limit cycle); a plant/gains question for the example, not changed here.
+   supervisor's start tolerance catches what the in-process controller (no start check) never showed. Measured on the plant alone (and
+   in the STOCK graph, where the end-effector yaw wanders by tens of degrees once armed): not a SimLink, bridge or jaws effect (jaws
+   open or shut, gravity compensation on or off, control period 1 to 10 ms all give the same swing). Review measured the cause: the
+   explicit-damping instability of the 1 ms plant step (kd*dt/I > 2 with a wrist inertia of about 0.003 kg m^2) at the example's
+   kd 10 for joint 7: kd 6 or less holds still (0.001 rad), kd 7 swings 2 rad, a 0.5 ms step holds still; the 12 N*m limit only bounds
+   it into a limit cycle. A plant-step or example-gains question, not changed here.
+
+**Contract differences still stated:** `runtime_state.stopped` is always False; `plan_cleared` is sent for every cancelled plan even when the
+cancel did not name it; `ready` can fire again when measured validity flickers; a plan refused by supervisor admission gives
+`plan_staged` false only (in-process also sends a `leg_result` for policy refusals); plan cancels run synchronously in the Dora loop
+for up to 2 s; the same-preset-gains cancel relies on the supervisor (`live` is not passed). The review also saw, once, the supervisor
+log "stopped: non-finite or invalid servo command; controller replaced" about 7 s after a re-ARM that followed a freeze; not
+root-caused (the joint-7 limit cycle is a candidate).
 
 Not done: a deterministic end-to-end execute through the real Dora graph (blocked by finding 4; the bridge contract is benched against a
 real supervisor on the 3-joint fixture in `tools/bench/check_dora_arm.py`, and ARM/plan/re-plan were verified live); real-hardware graphs;

@@ -52,8 +52,8 @@ def build_single_model_backend(cfg, *, control_period: float) -> MuJoCoBackend:
 def open_jaws(backend, cfg) -> None:
     """The plant declares its starting state: the Hand spawns OPEN at the arm's configured width (MuJoCo's zero is a SHUT hand).
 
-    Shared by the Dora ``mujoco_interface`` node and the supervisor's simulated link, so a supervised twin does not spawn with
-    its jaws closed (measured: the closed hand spun the wrist joint of the simulated FR3 under any hold command).
+    Shared by the Dora ``mujoco_interface`` node and the supervisor's simulated link, so both spawn the same twin (an open hand, not
+    MuJoCo's zero). It does not change the wrist behaviour of the simulated FR3, which is the same with the jaws shut.
     """
     backend.load()
     fingers = int(backend.gripper_positions().size)

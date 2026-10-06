@@ -1,6 +1,7 @@
 # The simulated plant behind an arm supervisor (examples/run_console.py --supervised): what the supervisor needs that a real RT
-# server brings with it. SimLink invents none of these, so they are STATED here. They are the arm_rt_server's own launch defaults
-# (rt/src/server.hpp), so the simulated servo's deadman and hold behave like the one the hardware runs:
+# server brings with it. SimLink invents none of these, so they are STATED here. `sim_servo` below is the arm_rt_server's own launch
+# defaults (rt/src/server.hpp), so the simulated servo's deadman and hold behave like the one the hardware runs; the `rt` timeouts are the
+# PC-side client defaults (plants/remote_rt/client.py RtConfig):
 rt:
   instance_id: sim_console       # the supervisor's socket and identity; any valid id
   state_timeout_s: 0.5
