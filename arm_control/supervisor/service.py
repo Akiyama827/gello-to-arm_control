@@ -209,8 +209,16 @@ def main(argv=None, *, stream_admission=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True, help="robot config (with an rt: block)")
     parser.add_argument("--socket", help="socket path (default: per-user, per-instance)")
+    parser.add_argument("--plant", choices=("rt", "sim"), default="rt",
+                        help="rt: an arm_rt_server (default); sim: the config's MuJoCo plant behind the same supervisor")
     args = parser.parse_args(argv)
-    runtime = RobotRuntime(load_robot_config(args.config), stream_admission=stream_admission)
+    cfg = load_robot_config(args.config)
+    link = None
+    if args.plant == "sim":
+        from arm_control.plants.sim_link import SimLink
+
+        link = SimLink.from_config(cfg)
+    runtime = RobotRuntime(cfg, link=link, stream_admission=stream_admission)
     if not runtime.instance_id:
         raise SystemExit("config has no rt.instance_id")
     stop = threading.Event()
