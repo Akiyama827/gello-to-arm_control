@@ -113,6 +113,19 @@ try:
 finally:
     lib.probe_destroy(h)
 
+# A joint held still ON a limit is sampled exactly at it, natively too (offset form; the weighted sum went one ulp past).
+hi = -0.1518
+t = np.array([0.0, 2.0])
+for v in (np.zeros((2, 2)), None):
+    q = np.array([[0.0, hi], [0.3, hi]])
+    h = create(t, q, v)
+    assert h
+    try:
+        held = {sample(h, x, 2)[2] for x in np.linspace(0, 2, 2001)}
+        assert held == {hi}, sorted(held)[-3:]
+    finally:
+        lib.probe_destroy(h)
+
 invalid = []
 for name, t, q, v in [
     ("one_knot", np.zeros(1), np.zeros((1, 7)), None),
