@@ -34,7 +34,11 @@ include:
 # refuses an entry key no code reads.)
 sim_model_path: franka/urdf/fr3.urdf
 sim_update_rate_hz: 100
-sim_timestep: 0.001
+# 0.5 ms, not 1 ms: the plant closes an EXPLICIT PD every step, and the FR3 wrist (joint 7, axial inertia about 0.003 kg m^2) at its
+# kd 10 is past the explicit-damping limit kd*dt/I < 2 at 1 ms. Measured (hold at the spawn pose, 6 s): joint 7 swung 1.26 rad at
+# 1 ms, 0.0004 rad at 0.5 ms; the sim still runs about 64x faster than real time. The swing showed in both the stock and the
+# supervised console (the supervisor's start tolerance then refused every Execute).
+sim_timestep: 0.0005
 sim_launch_viewer: false
 sim_self_collision: true
 update_rate_hz: 100
