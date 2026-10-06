@@ -1676,6 +1676,20 @@ def _check_planner_limits() -> None:
     assert v.tolist() == [0.7, 0.7] and a.tolist() == [1.2, 1.2], (v, a)
     v, a = arm_speed_limits({"arm": {}}, 2, required=False)
     assert np.isinf(v).all() and np.isinf(a).all(), (v, a)
+    v, _ = arm_speed_limits({"arm": {"joints": ["a", "b"], "max_vel": {"b": 0.1}}, "execution_policy": policy}, 2)
+    assert v.tolist() == [0.4, 0.1], v                                               # named: the policy for the rest
+    try:
+        arm_speed_limits({"arm": {"max_vel": [0.2, 0.41]}, "execution_policy": policy}, 2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("one joint faster than the execution policy was accepted")
+    try:                                                                              # partial policy: the arm states the rest
+        arm_speed_limits({"arm": {}, "execution_policy": {"velocity_limits": [0.4, 0.4]}}, 2)
+    except ValueError as exc:
+        assert "max_acc" in str(exc), exc
+    else:
+        raise AssertionError("an unbounded acceleration fell back to a default")
     print("arm_console: planner speed limits follow the execution policy")
 
 

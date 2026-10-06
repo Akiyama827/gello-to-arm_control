@@ -88,16 +88,21 @@ def arm_speed_limits(cfg, n: int, *, required: bool = True):
     otherwise -- the controller would refuse every plan at admission); without one the arm states its own (``required``), or the
     planner is unbounded here (``required=False``, a caller that bounds speed itself)."""
     arm = _arm_block(cfg)
-    policy = cfg.get("execution_policy")
-    if not policy:
-        if required:
-            return gain_vector(cfg, "max_vel", n), gain_vector(cfg, "max_acc", n)
-        return tuple(np.full(n, np.inf) if arm.get(key) is None else gain_vector(cfg, key, n) for key in ("max_vel", "max_acc"))
-    stated = {plan: arm[key] for key, plan in (("max_vel", "vel_limits"), ("max_acc", "acc_limits")) if arm.get(key) is not None}
-    try:
-        return planner_speed_limits(stated, policy, [str(i) for i in range(n)])
-    except ValueError as exc:
-        raise ValueError(str(exc).replace("planner.vel_limits", "arm.max_vel").replace("planner.acc_limits", "arm.max_acc")) from None
+    policy = cfg.get("execution_policy") or {}
+    joints = list(arm.get("joints") or [])
+    names = joints if len(joints) == n else [str(i) for i in range(n)]
+    limits = []
+    for index, (key, plan_key, policy_key) in enumerate((("max_vel", "vel_limits", "velocity_limits"),
+                                                         ("max_acc", "acc_limits", "acceleration_limits"))):
+        if policy.get(policy_key) is None:   # the policy leaves this one unbounded: the arm states its own, as before
+            limits.append(gain_vector(cfg, key, n) if required or arm.get(key) is not None else np.full(n, np.inf))
+            continue
+        stated = {} if arm.get(key) is None else {plan_key: arm[key]}
+        try:
+            limits.append(planner_speed_limits(stated, {policy_key: policy[policy_key]}, names)[index])
+        except ValueError as exc:
+            raise ValueError(f"arm.{key}: {exc}".replace(f"planner.{plan_key} ", "")) from None
+    return limits[0], limits[1]
 
 
 def gripper_command_cfg(cfg) -> dict:
