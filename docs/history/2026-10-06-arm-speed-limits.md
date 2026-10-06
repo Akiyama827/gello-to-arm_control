@@ -25,3 +25,4 @@ Review (ACCEPT) notes, folded in before merge: named per-joint limits are read b
 longer brings back a 1.0 default (the arm must state the unbounded limit). For the project's step 2: `tools/demo/workcell_add.py` builds
 `ArmPlanner` from the raw `arm.max_vel` and should use `arm_speed_limits`. The dual console's refusal of the project's `dual_arm.yaml` arms is
 stricter than necessary (its pair caps 0.2/0.4 already kept speeds under the policy), but it fails closed, and step 2 removes the cause.
+Round 2 (ACCEPT): a mapping naming no such joint is now refused (it was dropped silently, losing the slower limit it stated).

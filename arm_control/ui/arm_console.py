@@ -1679,6 +1679,12 @@ def _check_planner_limits() -> None:
     v, _ = arm_speed_limits({"arm": {"joints": ["a", "b"], "max_vel": {"b": 0.1}}, "execution_policy": policy}, 2)
     assert v.tolist() == [0.4, 0.1], v                                               # named: the policy for the rest
     try:
+        arm_speed_limits({"arm": {"joints": ["a", "b"], "max_vel": {"bb": 0.1}}, "execution_policy": policy}, 2)
+    except ValueError as exc:
+        assert "no such joint" in str(exc), exc
+    else:
+        raise AssertionError("a misspelt joint name in a speed limit was ignored")
+    try:
         arm_speed_limits({"arm": {"max_vel": [0.2, 0.41]}, "execution_policy": policy}, 2)
     except ValueError:
         pass

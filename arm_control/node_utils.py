@@ -333,6 +333,9 @@ def planner_speed_limits(planner_cfg, policy, planned):
         if plan_key in planner_cfg:
             stated = planner_cfg[plan_key]
             if isinstance(stated, Mapping) and bound is not None:   # per joint by name; joints it does not name take the policy
+                unknown = set(stated) - set(names)
+                if unknown:   # a misspelt joint would silently lose the slower limit it states
+                    raise ValueError(f"planner.{plan_key} names no such joint: {sorted(unknown)} (joints: {names})")
                 value = np.array([float(stated.get(name, bound[i])) for i, name in enumerate(names)], dtype=float)
             else:
                 value = expand_named_values(stated, names=names, default=fallback)
