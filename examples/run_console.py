@@ -31,6 +31,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 SINGLE = REPO_ROOT / "dataflows" / "sim_franka_motion.yml"
+SUPERVISED = REPO_ROOT / "dataflows" / "sim_franka_motion_supervised.yml"
+SUPERVISED_PROFILE = REPO_ROOT / "examples" / "profiles" / "sim_supervised.yaml"
+MODE_PROFILE = REPO_ROOT / "examples" / "profiles" / "motion_franka.yaml"
 PAIR_CONFIG = REPO_ROOT / "examples" / "configs" / "dual_arm.yaml"
 OBJECT_CONFIG = REPO_ROOT / "examples" / "configs" / "dual_arm_object.yaml"
 DEFAULT_CONFIG = REPO_ROOT / "examples" / "configs" / "sim_arm.yaml"
@@ -114,6 +117,9 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=7520, help="dual console loopback port")
     parser.add_argument("--check", action="store_true",
                         help="report readiness and exit, launching nothing")
+    parser.add_argument("--supervised", action="store_true",
+                        help="the arm's SUPERVISOR is the control authority (over the same MuJoCo plant): starts it with the graph")
+    parser.add_argument("--no-viewer", action="store_true", help="do not start a Rerun viewer (headless runs)")
     args = parser.parse_args()
 
     if args.dual:
@@ -133,7 +139,7 @@ def main() -> int:
 
     ready, hint = assets_ready()
     config = args.config if args.config.is_absolute() else REPO_ROOT / args.config
-    graph = SINGLE
+    graph = SUPERVISED if args.supervised else SINGLE
 
     if args.check or not ready:
         print(f"config: {config}  {'ok' if config.is_file() else 'MISSING'}")
@@ -168,7 +174,36 @@ def main() -> int:
         [str(REPO_ROOT), env.get("PYTHONPATH", "")]
     ).strip(os.pathsep)
 
-    ensure_rerun_viewer()
+    supervisor = None
+    live: dict = {"graph": None}
+    stopped_by: list[int] = []
+
+    def _stop(signum, _frame):
+        # Signal only; never wait here. The handler runs on the main thread, which may be blocked in a wait holding Popen's
+        # _waitpid_lock, so a handler that waits re-enters that lock on the same thread and hangs. Signalling dora is enough --
+        # it reaps its nodes, the wait returns, and the real teardown runs in `finally`, off the handler. Installed BEFORE
+        # anything is started: a signal during the supervisor's start-up or the viewer's must not orphan either.
+        stopped_by.append(int(signum))
+        graph_proc = live["graph"]
+        if graph_proc is not None:
+            try:
+                os.killpg(os.getpgid(graph_proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _stop)
+    if args.supervised:
+        try:
+            supervisor, env = start_supervisor(config, env, stopped=lambda: bool(stopped_by))
+        except RuntimeError as exc:
+            print(f"[run_console] {exc}", file=sys.stderr)
+            return 128 + stopped_by[0] if stopped_by else 1
+    if stopped_by:
+        _stop_supervisor(supervisor)
+        return 128 + stopped_by[0]
+    if not args.no_viewer:
+        ensure_rerun_viewer()
     print(f"[run_console] {config.name} -> {graph.name}", flush=True)
     print("[run_console] console on http://127.0.0.1:7500", flush=True)
     print("[run_console] the arm comes up DISARMED — press ARM on the page", flush=True)
@@ -186,30 +221,97 @@ def main() -> int:
     except FileNotFoundError:
         print("`dora` is not on PATH — is the dora-rs CLI installed?",
               file=sys.stderr)
+        _stop_supervisor(supervisor)
         return 1
 
-    stopped_by: list[int] = []
-
-    def _stop(signum, _frame):
-        # Signal only; never wait here. The handler runs on the main thread,
-        # which is blocked in proc.wait() holding Popen's _waitpid_lock, so a
-        # handler that waits re-enters that lock on the same thread and hangs.
-        # Signalling dora is enough -- it reaps its nodes, wait() returns, and
-        # the real teardown runs in `finally`, off the handler.
-        stopped_by.append(int(signum))
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _stop)
+    live["graph"] = proc
+    if stopped_by:  # a signal arrived between the graph's start and now
+        _terminate_graph(proc)
     try:
-        return proc.wait()
+        if supervisor is None:
+            return proc.wait()
+        # With a supervisor the graph is only as alive as the thing that owns control: watch both.
+        while proc.poll() is None:
+            if supervisor.poll() is not None:
+                print(f"[run_console] the supervisor exited ({supervisor.returncode}): stopping the graph", file=sys.stderr, flush=True)
+                _terminate_graph(proc)
+                return 1
+            time.sleep(0.5)
+        return proc.returncode
     finally:
         _terminate_graph(proc)
+        _stop_supervisor(supervisor)  # after the graph: its SIGTERM DISARMs the plant through the link
         if stopped_by:
             raise SystemExit(128 + stopped_by[0])
+
+
+def start_supervisor(config: Path, env: dict, stopped=lambda: False):
+    """Start the arm's supervisor over the simulated plant and return ``(process, env for the graph)``.
+
+    One merged config is written (the entry config, the stated sim servo parameters, the mode profile as ``control_mode``) and given to
+    the supervisor AND every node, so they cannot run different configurations; the bridge node also checks the supervisor's gains.
+    """
+    import tempfile
+
+    import yaml
+
+    from arm_control.config import load_config_tree
+
+    merged = load_config_tree(config)
+    merged.update(yaml.safe_load(SUPERVISED_PROFILE.read_text()))
+    merged["control_mode"] = yaml.safe_load(MODE_PROFILE.read_text())
+    workdir = Path(tempfile.mkdtemp(prefix="supervised_console_"))
+    merged_path = workdir / "supervised_arm.yaml"
+    merged_path.write_text(yaml.safe_dump(merged))
+    sock = workdir / "arm.sock"
+    log = open(workdir / "supervisor.log", "w")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "arm_control.supervisor.service", "--config", str(merged_path), "--socket", str(sock), "--plant", "sim"],
+        env=dict(env, ARM_CONTROL_CONFIG=str(merged_path)), cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True)  # its own session: a Ctrl-C reaches the graph, and the supervisor outlives it long enough to be stopped after
+    proc._workdir, proc._log = workdir, log
+    import socket as _socket
+
+    deadline = time.monotonic() + 60
+    while True:
+        if proc.poll() is not None:
+            raise RuntimeError(f"the supervisor exited ({proc.returncode}); see {workdir / 'supervisor.log'}")
+        if stopped():
+            _stop_supervisor(proc)
+            raise RuntimeError("stopped while the supervisor was starting")
+        if time.monotonic() > deadline:
+            _stop_supervisor(proc)
+            raise RuntimeError(f"the supervisor did not come up; see {workdir / 'supervisor.log'}")
+        probe = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            probe.connect(str(sock))
+            break
+        except OSError:
+            time.sleep(0.2)
+        finally:
+            probe.close()
+    print(f"[run_console] supervisor up on {sock} (config {merged_path})", flush=True)
+    return proc, dict(env, ARM_CONTROL_CONFIG=str(merged_path), ARM_CONTROL_SOCKET=str(sock))
+
+
+def _stop_supervisor(proc) -> None:
+    """SIGTERM (the supervisor DISARMs the plant on the way out), then kill if it does not stop. Safe with None and twice."""
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    try:
+        proc._log.close()
+    except Exception:  # noqa: BLE001
+        pass
+    if proc.returncode in (0, -signal.SIGTERM):  # a clean stop leaves nothing behind; a failure keeps its log
+        import shutil
+
+        shutil.rmtree(proc._workdir, ignore_errors=True)
 
 
 def _port_holder(config) -> int | None:
@@ -272,6 +374,7 @@ def _terminate_graph(proc, grace_s: float = 8.0) -> None:
 def _self_check() -> None:
     """The launcher's own claims: the files it points at have to exist."""
     assert SINGLE.is_file(), SINGLE
+    assert SUPERVISED.is_file() and SUPERVISED_PROFILE.is_file() and MODE_PROFILE.is_file()
     assert PAIR_CONFIG.is_file(), PAIR_CONFIG
     assert OBJECT_CONFIG.is_file(), OBJECT_CONFIG
     assert DEFAULT_CONFIG.is_file(), DEFAULT_CONFIG

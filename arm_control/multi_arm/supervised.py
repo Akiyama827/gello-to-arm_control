@@ -24,6 +24,8 @@ that talk to the supervisor block up to the SDK timeouts (``set_armed`` up to ``
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import time
 
 import numpy as np
@@ -292,3 +294,66 @@ class SdkArmHandle:
 
     def command_gripper(self, finger_m: float) -> None:
         raise ValueError('the Hand/gripper stays with the project console, not an arm supervisor')
+
+
+class AsyncAuthorityHandle:
+    """A ``SdkArmHandle`` whose ARM/DISARM do not block the caller (the console holds its lock while calling): the request
+    runs on this arm's single worker, ``state`` reports not-ready while it is pending, and a failure is the arm's fault
+    reason until the next request succeeds. Everything else is the SDK handle's."""
+
+    def __init__(self, inner: SdkArmHandle, *, is_closed=lambda: False, on_disarm=lambda arm_id: None) -> None:
+        """``is_closed()``: the owner is shutting down (no new ARM); ``on_disarm(arm_id)``: called when a DISARM is requested
+        (the dual runtime cancels the arm's Hand there)."""
+        self._inner, self._is_closed, self._on_disarm = inner, is_closed, on_disarm
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f'{inner.arm_id}-authority')
+        self._pending: list = []   # [(future, armed)], oldest first
+        self._generation = 0
+        self._fault: str | None = None
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    @property
+    def arm_id(self) -> str:
+        return self._inner.arm_id
+
+    def _reap(self) -> None:
+        while self._pending and self._pending[0][0].done():
+            future, _ = self._pending.pop(0)
+            if future.cancelled():
+                continue
+            error = future.exception()
+            self._fault = None if error is None else str(error)
+
+    def state(self):
+        self._reap()
+        state = self._inner.state()
+        return replace(state, ready=bool(state.ready) and not self._pending,
+                       fault_reason=state.fault_reason or self._fault)
+
+    def set_armed(self, armed: bool) -> None:
+        self._reap()
+        if armed and self._is_closed():
+            raise ValueError('the owner is closed')
+        if armed and self._pending:
+            raise ValueError('wait for the current authority acknowledgement before arming')
+        if not armed:
+            self._on_disarm(self.arm_id)
+            if any(not want and not f.done() for f, want in self._pending):
+                return  # a DISARM is already in flight
+            for f, _ in self._pending:
+                f.cancel()  # queued enables are void; one DISARM follows the one in flight
+        self._generation += 1
+        generation = self._generation
+
+        def apply():
+            if armed and (self._is_closed() or generation != self._generation):
+                return
+            self._inner.set_armed(armed)
+
+        self._pending.append((self._pool.submit(apply), armed))
+
+    def close(self) -> None:
+        # Not cancel_futures: a queued DISARM (close()'s or an earlier stop()'s) must run behind the request in flight, or
+        # the arm is left armed with no owner. Queued ARMs are void already (the runtime is closed).
+        self._pool.shutdown(wait=True)

@@ -51,7 +51,7 @@ from arm_control.plants.mujoco.composer import (
     build_scene_backend,
     build_workcell_backend,
 )
-from arm_control.plants.mujoco.single import build_single_model_backend
+from arm_control.plants.mujoco.single import build_single_model_backend, open_jaws
 
 
 def _without_schema(payload: dict) -> dict:
@@ -174,17 +174,7 @@ def main() -> None:
     # NB the count comes from the PLANT, not gripper_joints(cfg): that list is
     # deliberately EMPTY for an arm whose gripper is its own device (the FR3's
     # Hand), while the composed scene still has the finger joints.
-    _fingers = int(backend.gripper_positions().size)
-    # Same accessor sim_bridge uses for this block (the gripper config sits
-    # under the robot key, not the arm block).
-    _gcfg = dict((cfg.get("franka") or {}).get("gripper") or {})
-    _open_w = float(_gcfg.get("open_width_m", 0.0))
-    if _fingers and _open_w > 0:
-        backend.apply_gripper_command([_open_w / _fingers] * _fingers)
-        print(
-            f"[mujoco_interface] jaws spawned OPEN at {_open_w * 1000:.0f} mm",
-            flush=True,
-        )
+    open_jaws(backend, cfg)
 
     # Mirror the twin's ground truth (module/base/fixtures) into Rerun so ONE
     # viewer shows sim truth + plan previews. Fully thread-isolated: with no

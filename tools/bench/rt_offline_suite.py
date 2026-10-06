@@ -119,6 +119,11 @@ def main() -> int:
                                           str(ROOT / "tools/bench/check_dual_group.py"),
                                           "--server", server],
                            logs=logs, env=env, timeout=240))
+        results.append(run("console_graphs", [sys.executable, str(ROOT / "arm_control/ui/arm_console.py"), "--self-check"],
+                           logs=logs, env=env, timeout=180))  # every console graph has exactly one authority source and can stream
+        results.append(run("dora_arm", [sys.executable,
+                                        str(ROOT / "tools/bench/check_dora_arm.py")],
+                           logs=logs, env=env, timeout=180))
         results.append(run("sim_supervisor", [sys.executable,
                                               str(ROOT / "tools/bench/check_sim_supervisor.py")],
                            logs=logs, env=env, timeout=180))

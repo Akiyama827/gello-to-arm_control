@@ -7,8 +7,6 @@ project's Hands. ARM and DISARM run off the console loop and report through the 
 refused here. Selected by passing this class as the console's ``runtime_factory``; no default and no launch file changes.
 """
 
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 import time
 
 import numpy as np
@@ -17,70 +15,9 @@ from arm_control.config import arm_joints, gripper_joints
 from arm_control.end_effectors.franka_adapter import BridgeClient
 from arm_control.multi_arm.cooperative import CooperativeKinematics
 from arm_control.multi_arm.hands import HandControl
-from arm_control.multi_arm.supervised import SdkArmHandle
+from arm_control.multi_arm.supervised import AsyncAuthorityHandle, SdkArmHandle
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.sdk import ArmClient, SupervisorError
-
-
-class _AuthorityHandle:
-    """A ``SdkArmHandle`` whose ARM/DISARM do not block the caller (the console holds its lock while calling): the request
-    runs on this arm's single worker, ``state`` reports not-ready while it is pending, and a failure is the arm's fault
-    reason until the next request succeeds. Everything else is the SDK handle's."""
-
-    def __init__(self, inner: SdkArmHandle, runtime) -> None:
-        self._inner, self._runtime = inner, runtime
-        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f'{inner.arm_id}-authority')
-        self._pending: list = []   # [(future, armed)], oldest first
-        self._generation = 0
-        self._fault: str | None = None
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-    @property
-    def arm_id(self) -> str:
-        return self._inner.arm_id
-
-    def _reap(self) -> None:
-        while self._pending and self._pending[0][0].done():
-            future, _ = self._pending.pop(0)
-            if future.cancelled():
-                continue
-            error = future.exception()
-            self._fault = None if error is None else str(error)
-
-    def state(self):
-        self._reap()
-        state = self._inner.state()
-        return replace(state, ready=bool(state.ready) and not self._pending,
-                       fault_reason=state.fault_reason or self._fault)
-
-    def set_armed(self, armed: bool) -> None:
-        self._reap()
-        if armed and self._runtime._closed:
-            raise ValueError('hardware runtime is closed')
-        if armed and self._pending:
-            raise ValueError('wait for the current authority acknowledgement before arming')
-        if not armed:
-            self._runtime._cancel_hand(self.arm_id)
-            if any(not want and not f.done() for f, want in self._pending):
-                return  # a DISARM is already in flight
-            for f, _ in self._pending:
-                f.cancel()  # queued enables are void; one DISARM follows the one in flight
-        self._generation += 1
-        generation = self._generation
-
-        def apply():
-            if armed and (self._runtime._closed or generation != self._generation):
-                return
-            self._inner.set_armed(armed)
-
-        self._pending.append((self._pool.submit(apply), armed))
-
-    def close(self) -> None:
-        # Not cancel_futures: a queued DISARM (close()'s or an earlier stop()'s) must run behind the request in flight, or
-        # the arm is left armed with no owner. Queued ARMs are void already (the runtime is closed).
-        self._pool.shutdown(wait=True)
 
 
 class SupervisedHardware(HandControl):
@@ -115,8 +52,9 @@ class SupervisedHardware(HandControl):
                 n = len(arm_joints(cfg))
                 client = arm_factory(a, cfg)
                 self.clients[a] = client
-                self.handles[a] = _AuthorityHandle(
-                    SdkArmHandle(client, a, model_token=config.model_tokens.get(a)), self)
+                self.handles[a] = AsyncAuthorityHandle(
+                    SdkArmHandle(client, a, model_token=config.model_tokens.get(a)),
+                    is_closed=lambda: self._closed, on_disarm=self._cancel_hand)
                 self.slices[a] = slice(offset, offset + n)
                 self._sample[a] = (np.zeros(n), np.zeros(n), False)
                 self._trace_seq[a] = self._trace_dropped[a] = self._trace_errors[a] = 0

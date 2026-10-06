@@ -100,12 +100,13 @@ class SimLink:
         """The simulated plant a robot config describes: its ``sim_*`` plant keys (``plants.mujoco.single``), its ``rt`` block for
         the instance id and freshness bounds, and the required ``sim_servo`` block."""
         from arm_control.config import arm_joints
-        from arm_control.plants.mujoco.single import build_single_model_backend
+        from arm_control.plants.mujoco.single import build_single_model_backend, open_jaws
 
         servo = dict(cfg.get("sim_servo") or {})
         if "state_hz" not in servo:
             raise ValueError("config has no sim_servo.state_hz: nothing is assumed")
         plant = build_single_model_backend(cfg, control_period=1.0 / float(servo["state_hz"]))
+        open_jaws(plant, cfg)  # the Hand spawns open, as in the Dora plant node (MuJoCo's zero is a shut hand)
         return cls(RtConfig.from_config(cfg), arm_joints(cfg), plant, servo=servo)
 
     @property

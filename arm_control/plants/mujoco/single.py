@@ -47,3 +47,25 @@ def build_single_model_backend(cfg, *, control_period: float) -> MuJoCoBackend:
         # self-supporting robot should still fall.
         gravcomp_prefixes=("",) if cfg.get("sim_gravcomp", False) else (),
     )
+
+
+def open_jaws(backend, cfg) -> None:
+    """The plant declares its starting state: the Hand spawns OPEN at the arm's configured width (MuJoCo's zero is a SHUT hand).
+
+    Shared by the Dora ``mujoco_interface`` node and the supervisor's simulated link, so both spawn the same twin (an open hand, not
+    MuJoCo's zero). It does not change the wrist behaviour of the simulated FR3, which is the same with the jaws shut.
+    """
+    backend.load()
+    fingers = int(backend.gripper_positions().size)
+    # Same accessor sim_bridge uses for this block (the gripper config sits
+    # under the robot key, not the arm block).
+    gripper_cfg = dict((cfg.get("franka") or {}).get("gripper") or {})
+    open_w = float(gripper_cfg.get("open_width_m", 0.0))
+    if fingers and open_w > 0:
+        backend.apply_gripper_command([open_w / fingers] * fingers)
+        print(
+            f"[mujoco_interface] jaws spawned OPEN at {open_w * 1000:.0f} mm",
+            flush=True,
+        )
+
+
