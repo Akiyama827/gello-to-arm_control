@@ -20,6 +20,7 @@ from arm_control import frames
 from arm_control.config import CONTROL_ROOT, arm_joints, ee_frame, gripper_joints
 from arm_control.control.factory import (
     arm_urdf,
+    arm_speed_limits,
     gain_vector,
     gripper_command_cfg,
 )
@@ -170,12 +171,13 @@ def build_planner(
 
     preview, ghost = build_preview(cfg, world, ik, urdf, joints, grip_joints)
 
+    speed = arm_speed_limits(cfg, n)
     planner = ArmPlanner(
         arm_id=arm_id,
         ik=ik,
         ompl=ompl,
-        max_vel=gain_vector(cfg, "max_vel", n),
-        max_acc=gain_vector(cfg, "max_acc", n),
+        max_vel=speed[0],
+        max_acc=speed[1],
         world=world,
         trajectory_refiner=refiner,
         ik_candidate_attempts=planner_cfg.get('ik_candidate_attempts', 0),

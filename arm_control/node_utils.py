@@ -331,7 +331,14 @@ def planner_speed_limits(planner_cfg, policy, planned):
     for plan_key, policy_key, fallback in (("vel_limits", "velocity_limits", 0.5), ("acc_limits", "acceleration_limits", 1.0)):
         bound = None if not policy or policy.get(policy_key) is None else np.asarray(policy[policy_key], dtype=float).ravel()
         if plan_key in planner_cfg:
-            value = expand_named_values(planner_cfg[plan_key], names=names, default=fallback)
+            stated = planner_cfg[plan_key]
+            if isinstance(stated, Mapping) and bound is not None:   # per joint by name; joints it does not name take the policy
+                unknown = set(stated) - set(names)
+                if unknown:   # a misspelt joint would silently lose the slower limit it states
+                    raise ValueError(f"planner.{plan_key} names no such joint: {sorted(unknown)} (joints: {names})")
+                value = np.array([float(stated.get(name, bound[i])) for i, name in enumerate(names)], dtype=float)
+            else:
+                value = expand_named_values(stated, names=names, default=fallback)
             if bound is not None and np.any(value > bound[: len(value)] + 1e-12):
                 raise ValueError(f"planner.{plan_key} {value.tolist()} exceeds execution_policy.{policy_key} "
                                  f"{bound[: len(value)].tolist()}: the planner may plan slower than the policy, never faster")
