@@ -321,10 +321,6 @@ def _check_resolve_gains() -> None:
     print("node_utils: resolve_gains and integral admission OK")
 
 
-if __name__ == "__main__":
-    _check_resolve_gains()
-
-
 def planner_speed_limits(planner_cfg, policy, planned):
     """``(vmax, amax)`` the planner times plans with. The execution policy is the SINGLE statement of an arm's speed limits (the
     controller refuses a plan above it at admission): without a planner statement the planner uses it; a planner may state LOWER
@@ -345,3 +341,7 @@ def planner_speed_limits(planner_cfg, policy, planned):
             value = expand_named_values(fallback, names=names, default=fallback)
         limits.append(value)
     return limits[0], limits[1]
+
+
+if __name__ == "__main__":
+    _check_resolve_gains()
