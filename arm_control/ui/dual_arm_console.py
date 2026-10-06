@@ -20,7 +20,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from arm_control.config import arm_joints, ee_frame, gripper_joints
-from arm_control.control.factory import arm_urdf
+from arm_control.control.factory import arm_speed_limits, arm_urdf
 from arm_control.dynamics import PinocchioDynamics
 from arm_control import frames
 from arm_control.console_server import ConsoleServer, file_asset
@@ -154,13 +154,9 @@ def plan_request(
         resolved = resolve_gains(cfg, cfg.get("control_mode") or {}, list(actor.joints), n)
         gains[a] = (resolved["kp"], resolved["kd"])
         dynamics = PinocchioDynamics(str(actor.path), actor.joints)
-        velocity[a] = np.minimum(
-            np.minimum(config.velocity, dynamics.velocity_limits),
-            cfg.raw["arm"].get("max_vel", np.inf),
-        )
-        acceleration[a] = np.minimum(
-            np.full(n, config.acceleration), cfg.raw["arm"].get("max_acc", np.inf)
-        )
+        arm_vel, arm_acc = arm_speed_limits(cfg, n, required=False)
+        velocity[a] = np.minimum(np.minimum(config.velocity, dynamics.velocity_limits), arm_vel)
+        acceleration[a] = np.minimum(np.full(n, config.acceleration), arm_acc)
         held.update({f"{a}__{j}": fingers[a] for j in gripper_joints(cfg)})
         if mode == "shared" or prepare_grasps or a not in active:
             continue

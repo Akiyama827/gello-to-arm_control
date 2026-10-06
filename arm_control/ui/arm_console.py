@@ -1660,6 +1660,22 @@ def _check_planner_limits() -> None:
         raise AssertionError("a planner faster than the execution policy was accepted")
     v, a = planner_speed_limits({}, None, names)
     assert v.tolist() == [0.5, 0.5] and a.tolist() == [1.0, 1.0], (v, a)          # no policy: the historical defaults
+    # The planning stack and the dual console read arm.max_vel/max_acc under the same rule.
+    from arm_control.control.factory import arm_speed_limits
+    v, a = arm_speed_limits({"arm": {}, "execution_policy": policy}, 2)
+    assert v.tolist() == [0.4, 0.4] and a.tolist() == [0.8, 0.8], (v, a)
+    v, a = arm_speed_limits({"arm": {"max_vel": [0.2, 0.3]}, "execution_policy": policy}, 2)
+    assert v.tolist() == [0.2, 0.3] and a.tolist() == [0.8, 0.8], (v, a)
+    try:
+        arm_speed_limits({"arm": {"max_vel": [0.5, 0.5]}, "execution_policy": policy}, 2)
+    except ValueError as exc:
+        assert "arm.max_vel" in str(exc) and "exceeds execution_policy" in str(exc), exc
+    else:
+        raise AssertionError("an arm.max_vel faster than the execution policy was accepted")
+    v, a = arm_speed_limits({"arm": {"max_vel": 0.7, "max_acc": 1.2}}, 2)            # no policy: the arm's own statement
+    assert v.tolist() == [0.7, 0.7] and a.tolist() == [1.2, 1.2], (v, a)
+    v, a = arm_speed_limits({"arm": {}}, 2, required=False)
+    assert np.isinf(v).all() and np.isinf(a).all(), (v, a)
     print("arm_console: planner speed limits follow the execution policy")
 
 
