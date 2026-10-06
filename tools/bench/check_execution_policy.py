@@ -291,6 +291,13 @@ def check_goal_on_limit():
     assert policy.command_valid(command(np.nextafter(hi, 0)), 1)            # one ulp past: rounding, legal
     assert policy.command_valid(command(hi + 0.5 * ENVELOPE_TOL), 1)
     assert not policy.command_valid(command(hi + 1e-6), 1)                 # a micro-radian past: refused
+    from arm_control.contracts.motion import unpack_plan
+
+    def waypoints(end):
+        return unpack_plan(plan(width=1, times=[0, 1], positions=np.array([[hi - 0.01], [end]]),
+                                velocities=np.zeros((2, 1)), kp=[600], kd=[20]))
+    assert policy.plan_error(waypoints(np.nextafter(hi, 0)), np.array([hi - 0.01]), 1) is None   # a knot one ulp past: legal
+    assert policy.plan_error(waypoints(hi + 1e-6), np.array([hi - 0.01]), 1)                     # a micro-radian past: refused
     print("goal on a joint limit: held exactly, one rounding allowance for plan, curve and servo OK")
 
 

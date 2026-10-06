@@ -23,5 +23,12 @@ the value the curve check already used, not a new margin (1e-8 rad is far below 
 * Live (headless, the example graphs with joint 4 driven onto its upper limit, implementation/control merged in for the FR3 armature): supervised 6 of 6 runs and stock 1 of 1 complete both moves (before: the second move faulted in 6 of 9 supervised runs).
 * Mutants killed: the old Python evaluator, a strict servo comparison, and the old native evaluator.
 
+**Still open (review, recorded for the operator).** Holds anchored at the MEASURED pose (the static hold, the tracking-error fallback, the
+anchored hold after a non-quiescent command) put q_des at measured q. With a goal on a limit, measured q can sit past it by more than the
+allowance (encoder noise, overshoot), and such a hold fails the envelope check and faults. This was already the case before the slice, and the
+fault is fail-safe. Clamping a measured hold anchor into the envelope is a separate operator decision. The end-of-move hold anchors at the
+last commanded target, which is exact, and that is why the live runs pass. The native RT server applies no joint position envelope of its own:
+position safety is the PC's curve certification before upload, plus the vendor's limits.
+
 **Hardware.** The native evaluator runs on the RT box for negotiated native references. The fix needs a box rebuild and redeploy, and has not
 been verified on hardware.
