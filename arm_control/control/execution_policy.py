@@ -14,6 +14,11 @@ from arm_control.control.gains import validate_torque_limits
 from arm_control.motion import JointTrajectory
 
 
+# Position-envelope rounding allowance (rad), one value for the waypoints, the certified curve and every servo command: the curve
+# check always allowed it, the sample and servo checks compared strictly, so a goal ON a joint limit -- which the evaluator can sample
+# one ulp past -- was admitted and then faulted mid-move ("non-finite or invalid servo command"). 1e-8 rad is far below any encoder.
+ENVELOPE_TOL = 1e-8
+
 @dataclass(frozen=True)
 class ExecutionPolicy:
     command_rate_hz: float
@@ -78,7 +83,8 @@ class ExecutionPolicy:
         if np.any(np.diff(t) <= 0):
             return "trajectory times must be strictly increasing"
         if self.position_lower is not None:
-            if np.any(q < self.position_lower) or np.any(q > self.position_upper):
+            if (np.any(q < self.position_lower - ENVELOPE_TOL)
+                    or np.any(q > self.position_upper + ENVELOPE_TOL)):
                 return "trajectory outside configured position/velocity safety envelope"
         dt = np.diff(t)[:, None]
         if self.velocity_limits is not None:
@@ -109,8 +115,8 @@ class ExecutionPolicy:
         # newly refusing anything the retimer produces today.
         curve = JointTrajectory(times=t, positions=q, velocities=v).bounds()
         if self.position_lower is not None:
-            if (np.any(curve["q_min"] < self.position_lower - 1e-8)
-                    or np.any(curve["q_max"] > self.position_upper + 1e-8)):
+            if (np.any(curve["q_min"] < self.position_lower - ENVELOPE_TOL)
+                    or np.any(curve["q_max"] > self.position_upper + ENVELOPE_TOL)):
                 return ("interpolated trajectory leaves the position envelope "
                         "between waypoints")
         if self.velocity_limits is not None:
@@ -157,7 +163,8 @@ class ExecutionPolicy:
             if value.shape != (n_arm,) or not np.isfinite(value).all():
                 return False
         if self.position_lower is not None:
-            if np.any(command.q_des < self.position_lower) or np.any(command.q_des > self.position_upper):
+            if (np.any(command.q_des < self.position_lower - ENVELOPE_TOL)
+                    or np.any(command.q_des > self.position_upper + ENVELOPE_TOL)):
                 return False
         if self.velocity_limits is not None and np.any(np.abs(command.qd_des) > self.velocity_limits + 1e-8):
             return False

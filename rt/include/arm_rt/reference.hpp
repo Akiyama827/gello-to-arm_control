@@ -44,14 +44,16 @@ inline bool sample(const NativeReference& r, double t, double* out) {
   for(int j=0;j<r.n;++j) {
     const double q0=r.q[lower*NJ+j], q1=r.q[upper*NJ+j];
     if(!r.hermite) {
-      out[1+j]=(1.-s)*q0+s*q1;
+      out[1+j]=q0+s*(q1-q0);
       out[1+r.n+j]=(q1-q0)/h;
       out[1+2*r.n+j]=0.;
     } else {
       const double v0=r.v[lower*NJ+j], v1=r.v[upper*NJ+j];
-      out[1+j]=(2*s3-3*s2+1)*q0+(s3-2*s2+s)*h*v0+(-2*s3+3*s2)*q1+(s3-s2)*h*v1;
-      out[1+r.n+j]=(6*s2-6*s)*q0/h+(3*s2-4*s+1)*v0+(-6*s2+6*s)*q1/h+(3*s2-2*s)*v1;
-      out[1+2*r.n+j]=(12*s-6)*q0/(h*h)+(6*s-4)*v0/h+(-12*s+6)*q1/(h*h)+(6*s-2)*v1/h;
+      // Offset form (as JointTrajectory.sample_at): a segment held still returns its knot exactly, never one ulp past a limit.
+      const double dq=q1-q0;
+      out[1+j]=q0+(3*s2-2*s3)*dq+h*((s3-2*s2+s)*v0+(s3-s2)*v1);
+      out[1+r.n+j]=(6*s-6*s2)*dq/h+(3*s2-4*s+1)*v0+(3*s2-2*s)*v1;
+      out[1+2*r.n+j]=(6-12*s)*dq/(h*h)+((6*s-4)*v0+(6*s-2)*v1)/h;
     }
   }
   return true;

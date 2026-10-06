@@ -173,6 +173,7 @@ def main():
     assert c._running and commands(c), "profile-off scheduling/recovery changed"
     check_deadlines()
     check_interpolated_limits()
+    check_goal_on_limit()
     check_factory_envelope()
     check_modes_and_validation()
     check_cartesian_lifecycle()
@@ -259,6 +260,45 @@ def check_interpolated_limits():
     assert policy.plan_error(ok, np.zeros(1), 1) is None, \
         policy.plan_error(ok, np.zeros(1), 1)
     print("interpolated limits: curve certified, not just its samples OK")
+
+
+def check_goal_on_limit():
+    """A joint held ON its limit is flown, not faulted (measured live: joint 4 at -0.1518 faulted the second move in 6 of 9 runs).
+
+    The evaluator returns a still segment's knot exactly, and the plan, curve and servo checks share one rounding allowance
+    (ENVELOPE_TOL), so a command one ulp past the limit is legal and one a micro-radian past it is not.
+    """
+    from arm_control.control.execution_policy import ENVELOPE_TOL, ExecutionPolicy
+    from arm_control.motion.types import JointServoCommand, JointTrajectory
+
+    hi = -0.1518
+    flat = JointTrajectory(times=np.array([0.0, 2.0]), positions=np.array([[0.0, hi], [0.3, hi]]),
+                           velocities=np.zeros((2, 2)))
+    held = {float(flat.sample_at(t).position[1]) for t in np.linspace(0, 2, 2001)}
+    assert held == {hi}, sorted(held)[-3:]
+    linear = JointTrajectory(times=np.array([0.0, 2.0]), positions=np.array([[hi], [hi]]))
+    assert {float(linear.sample_at(t).position[0]) for t in np.linspace(0, 2, 2001)} == {hi}
+    policy = ExecutionPolicy(
+        command_rate_hz=100, state_timeout_sec=.25, health_timeout_sec=1,
+        start_pos_tol_rad=.1, abort_pos_err_rad=.35, hold_relatch_rad=.3,
+        torque_limits=np.array([87.0]), position_lower=np.array([-3.0]), position_upper=np.array([hi]),
+    )
+
+    def command(q):
+        return JointServoCommand(np.array([q]), np.zeros(1), np.zeros(1), np.array([600.0]), np.array([20.0]))
+
+    assert policy.command_valid(command(hi), 1)
+    assert policy.command_valid(command(np.nextafter(hi, 0)), 1)            # one ulp past: rounding, legal
+    assert policy.command_valid(command(hi + 0.5 * ENVELOPE_TOL), 1)
+    assert not policy.command_valid(command(hi + 1e-6), 1)                 # a micro-radian past: refused
+    from arm_control.contracts.motion import unpack_plan
+
+    def waypoints(end):
+        return unpack_plan(plan(width=1, times=[0, 1], positions=np.array([[hi - 0.01], [end]]),
+                                velocities=np.zeros((2, 1)), kp=[600], kd=[20]))
+    assert policy.plan_error(waypoints(np.nextafter(hi, 0)), np.array([hi - 0.01]), 1) is None   # a knot one ulp past: legal
+    assert policy.plan_error(waypoints(hi + 1e-6), np.array([hi - 0.01]), 1)                     # a micro-radian past: refused
+    print("goal on a joint limit: held exactly, one rounding allowance for plan, curve and servo OK")
 
 
 def check_factory_envelope():
