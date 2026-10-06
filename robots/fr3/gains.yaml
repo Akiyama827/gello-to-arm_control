@@ -1,0 +1,10 @@
+# FR3 default joint stiffness and damping (the fallback when a control mode states none). Joint stiffness in N*m/rad, as libfranka's
+# impedance takes it; kd in N*m*s/rad. The SIMULATED plant closes an explicit PD with these, which is why it needs the 0.5 ms step in
+# sim.yaml; the real arm's damping lives in its control profile.
+arm:
+  kp: [1200, 1200, 1200, 1200, 800, 600, 400]
+  kd: [30, 30, 30, 30, 20, 15, 10]
+
+# Why kd is kp/40 (MEASURED on the simulated FR3 at the then 1 ms plant step: hold at the home pose with gravity feedforward, settled
+# max |qd| over the last 40% of a 4 s run): kd 0 -> 83.8 rad/s (unusable); kp/20 -> 0.87; kp/30..kp/60 -> 0.0000 (flat, settled
+# plateau); kp/16 -> 0.93 (MORE damping is worse here). Past ~kp/20 extra damping degrades settling: re-run the sweep before changing.

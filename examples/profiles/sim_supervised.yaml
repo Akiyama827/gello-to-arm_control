@@ -13,17 +13,4 @@ sim_servo:
   hold_kp: 50                    # RT default: hold gains before any command of the epoch
   hold_kd: 5
 
-# A supervisor REQUIRES an execution policy (100 Hz deadline mode): it is the authority, not a pass-through. The stock in-process
-# example controller runs without one; stating it here is part of what "the supervisor owns control" means. Provenance: every threshold
-# is the project's FR3 policy (Control/configs/robots/franka/execution.yaml) EXCEPT the speed limits, which are the ones this example's
-# own planner already runs at (examples/profiles/motion_franka.yaml planner.vel_limits 0.5 / acc_limits 1.0; the project's real FR3
-# policy is slower, 0.4 / 0.8, and would refuse this example's plans). A SIMULATION example only: nothing here applies to a deployment.
-execution_policy:
-  command_rate_hz: 100
-  state_timeout_sec: 0.25
-  health_timeout_sec: 1.0
-  start_pos_tol_rad: 0.1
-  abort_pos_err_rad: 0.35
-  hold_relatch_rad: 0.3
-  velocity_limits: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-  acceleration_limits: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+# The execution policy a supervisor requires is the FR3's own (robots/fr3/execution.yaml), included by the entry config: not restated here.

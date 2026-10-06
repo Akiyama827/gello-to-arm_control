@@ -258,8 +258,8 @@ def start_supervisor(config: Path, env: dict, stopped=lambda: False):
     from arm_control.config import load_config_tree
 
     merged = load_config_tree(config)
-    merged.update(yaml.safe_load(SUPERVISED_PROFILE.read_text()))
-    merged["control_mode"] = yaml.safe_load(MODE_PROFILE.read_text())
+    merged.update(load_config_tree(SUPERVISED_PROFILE))
+    merged["control_mode"] = load_config_tree(MODE_PROFILE)
     workdir = Path(tempfile.mkdtemp(prefix="supervised_console_"))
     merged_path = workdir / "supervised_arm.yaml"
     merged_path.write_text(yaml.safe_dump(merged))

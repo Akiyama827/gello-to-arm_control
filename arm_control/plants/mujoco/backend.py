@@ -64,6 +64,10 @@ def _warn_python_pd_once() -> None:
     )
 
 
+#: the RT server's servo period: the unit of its slew budget (rt/src/server.hpp, 1 kHz)
+RT_TICK_S = 0.001
+
+
 class MuJoCoUnavailableError(RuntimeError):
     """Raised when the scene cannot be built (missing assets, bad config)."""
 
@@ -716,10 +720,16 @@ class MuJoCoBackend:
     # they get fine CoACD decomposition, module-only contact bits, and pad-force
     # readout. Empty = a scene with no grip fingers.
     finger_body_match: tuple = ()
-    # Servo slew budget, N·m per plant tick. Same default as the RT server's
+    # Servo slew budget, N·m per 1 ms RT TICK. Same default as the RT server's
     # ServerConfig::slew (rt/src/server.hpp) — the sim has no better source,
     # and a twin that ramps faster than the robot flatters every transient.
+    # The servo law applies it per CALL, once per plant step, so _apply_pd
+    # scales it by step/1 ms: at a 0.5 ms step the twin slews at the robot's
+    # 1000 N·m/s, not twice that.
     slew_per_tick: float = 1.0
+    # Reflected rotor inertia added to each arm joint of a SINGLE-MODEL plant (kg.m^2), from the robot's own config
+    # (`sim_armature`); 0 = the description's own. Scene and workcell plants keep their own rule.
+    arm_armature: float = 0.0
     model_revision: int = 0
 
     model: Any = field(default=None, init=False, repr=False)
@@ -1131,6 +1141,17 @@ class MuJoCoBackend:
                 self.data.qpos[joint.qposadr[0]] = float(value)
         else:
             _transfer_state(*previous, self.model, self.data)
+        if self.arm_armature and self.scene is None and self.workcell_scene is None:
+            # A single-model arm carries its robot's reflected rotor inertia (`sim_armature`; the FR3 states Franka's published
+            # MJCF value, the one the workcell plant applies as ARM_ARMATURE). Without it the FR3 wrist (link inertia
+            # ~0.002 kg.m^2) limit-cycles under the explicit PD; measured after a move at a 0.5 ms step: 0.05 rad/s residual on
+            # joint 7 without, 0.0000 with. Fingers excluded (their "armature" is a mass, as in scene mode).
+            fingers = set(self.gripper_joints)
+            for name in self.joint_names:
+                if name in fingers:
+                    continue
+                dof = self.model.joint(name).dofadr[0]
+                self.model.dof_armature[dof] = max(float(self.arm_armature), float(self.model.dof_armature[dof]))
         if self.workcell_scene is not None and self.scene_state is not None:
             if previous[0] is None:
                 # SPAWN ONLY. actor_q is the scene's declared start pose, and
@@ -1634,7 +1655,7 @@ class MuJoCoBackend:
             kd=kd,
             tau_ref=tau_ref,
             tau_limit=self._tau_limit,
-            slew_per_tick=float(self.slew_per_tick),
+            slew_per_tick=float(self.slew_per_tick) * float(self.model.opt.timestep) / RT_TICK_S,
         )[self._driven]
 
     def ee_wrench(self) -> np.ndarray:

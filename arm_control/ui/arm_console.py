@@ -70,6 +70,7 @@ from arm_control.node_utils import (
     ShutdownFlag,
     _load_mode_config,
     expand_named_values,
+    planner_speed_limits,
     install_signal_handlers,
     next_event_gil_friendly,
     resolve_gains,
@@ -883,8 +884,7 @@ def _run(
             plan_kd if spec.get("kd") is None
             else expand_named_values(spec["kd"], names=planned, default=0.0),
         )
-    vmax = expand_named_values(planner_cfg.get("vel_limits", 0.5), names=planned, default=0.5)
-    amax = expand_named_values(planner_cfg.get("acc_limits", 1.0), names=planned, default=1.0)
+    vmax, amax = planner_speed_limits(planner_cfg, cfg.get("execution_policy"), planned)
 
     world, _ = build_collision_stack(
         cfg.urdf_path,
@@ -1644,6 +1644,25 @@ def _check_payload_declaration() -> None:
     print("arm_console: page and HandPanel agree on the payload field")
 
 
+def _check_planner_limits() -> None:
+    """The execution policy is the single statement of the speed limits; the planner follows it and may only be slower."""
+    names = ["a", "b"]
+    policy = {"velocity_limits": [0.4, 0.4], "acceleration_limits": [0.8, 0.8]}
+    v, a = planner_speed_limits({}, policy, names)
+    assert v.tolist() == [0.4, 0.4] and a.tolist() == [0.8, 0.8], (v, a)          # defaults to the policy
+    v, a = planner_speed_limits({"vel_limits": 0.2}, policy, names)
+    assert v.tolist() == [0.2, 0.2] and a.tolist() == [0.8, 0.8], (v, a)          # slower is allowed
+    try:
+        planner_speed_limits({"vel_limits": 0.5}, policy, names)
+    except ValueError as exc:
+        assert "exceeds execution_policy" in str(exc), exc
+    else:
+        raise AssertionError("a planner faster than the execution policy was accepted")
+    v, a = planner_speed_limits({}, None, names)
+    assert v.tolist() == [0.5, 0.5] and a.tolist() == [1.0, 1.0], (v, a)          # no policy: the historical defaults
+    print("arm_console: planner speed limits follow the execution policy")
+
+
 def _check_graphs() -> None:
     """Every arm_controller in every graph must be able to stream.
 
@@ -1704,6 +1723,7 @@ def cli() -> None:
         _check_routes()
         _check_payload_declaration()
         _check_graphs()
+        _check_planner_limits()
     else:
         main()
 

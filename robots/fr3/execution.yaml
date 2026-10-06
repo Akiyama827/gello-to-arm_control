@@ -1,0 +1,12 @@
+# FR3 execution policy: the admission limits a controller (in process or in a supervisor) enforces on every plan and stream. THE
+# single statement of the FR3's speed and acceleration limits: planners default to these and may only plan slower (the console
+# refuses a planner limit above them).
+execution_policy:
+  command_rate_hz: 100
+  state_timeout_sec: 0.25
+  health_timeout_sec: 1.0
+  start_pos_tol_rad: 0.1
+  abort_pos_err_rad: 0.35
+  hold_relatch_rad: 0.3
+  velocity_limits: [0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4]
+  acceleration_limits: [0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]
