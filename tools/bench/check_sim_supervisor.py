@@ -56,6 +56,21 @@ def command(q, kp=100., kd=20.):
     return dict(position=np.asarray(q, float), velocity=np.zeros(3), torque=np.zeros(3), kp=np.full(3, kp), kd=np.full(3, kd))
 
 
+def plant_model_checks(tmp):
+    """The single-model plant: a robot's stated armature (`sim_armature`) is applied and nothing otherwise, and the servo law's torque slew is per
+    1 ms RT tick at ANY plant step (it is applied per step, so the per-step budget scales with the step)."""
+    for step, armature in ((0.001, 0.1), (0.0005, 0.0)):
+        b = MuJoCoBackend(joint_names=list(JOINTS), single_model_path=str(tmp / 'three.urdf'), timestep=step, control_period=step,
+                          ground_z=None, arm_armature=armature)
+        b.load()
+        assert np.allclose(b.model.dof_armature[b._vadr], armature), (armature, b.model.dof_armature)
+        before = np.array(b.data.ctrl, dtype=float)
+        b.step(dict(position=np.full(3, 1.0), velocity=np.zeros(3), torque=np.zeros(3), kp=np.full(3, 1e4), kd=np.zeros(3)))
+        moved = np.max(np.abs(np.array(b.data.ctrl, dtype=float) - before))
+        assert abs(moved - b.slew_per_tick * step / 0.001) < 1e-9, (step, moved)  # one step: exactly the scaled budget, saturated
+        b.close()
+
+
 def link_unit(tmp):
     cfg = RtConfig(instance_id='sim_arm', state_timeout_s=.5)
     for bad in ({k: v for k, v in SERVO.items() if k != 'hold_ms'}, dict(SERVO, fault_ms=50), dict(SERVO, fault_ms=100),
@@ -343,6 +358,7 @@ def link_races(tmp):
 def main():
     tmp = Path(tempfile.mkdtemp(prefix='sim_supervisor_'))
     cfg_path = write_config(tmp, 0, 0)  # also writes three.urdf; the rt ports are unused by the sim plant
+    plant_model_checks(tmp)
     link_unit(tmp)
     link_races(tmp)
     try:

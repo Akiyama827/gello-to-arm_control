@@ -1,27 +1,15 @@
 # Generic FR3 model profile for the standalone simulation example.
 # No deployed addresses, camera roles, workcell calibration, or task geometry.
 # Stage a stock franka_description under the selected ARM_CONTROL_ROOT first.
+include:
+  - ../../robots/fr3/description.yaml   # the FR3's own facts (joints, frames, URDF, torque ratings): stated once there
+  - ../../robots/fr3/gains.yaml         # its default stiffness/damping
+
+# Example-only: an arm at the world origin, not a deployed bench (the deployed placement lives with the project's workcell).
 arm:
-  joints: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
-  gripper_joints: [fr3_finger_joint1, fr3_finger_joint2]
-  ee_frame: fr3_hand_tcp
-  urdf: franka/urdf/fr3.urdf
   plant_gravity_comp: true
   world_origin: [0.0, 0.0, 0.0]
   world_rpy: [0.0, 0.0, 0.0]
-  kp: [1200, 1200, 1200, 1200, 800, 600, 400]
-  kd: [30, 30, 30, 30, 20, 15, 10]
-  # FR3 factory torque ratings (N*m): the same statement as the project's configs/robots/franka/limits.yaml and the URDF `effort`
-  # values. The example lacked it, so the controller refused to build (max_torque all zeros) since the examples were split out of
-  # the deployed configuration (62a48b6): the stock console never came up.
-  max_tau: [87, 87, 87, 87, 12, 12, 12]
-num_motors: 7
-motor_ids: [1, 2, 3, 4, 5, 6, 7]
-motor_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
-joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
-render_joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
-urdf_path: franka/urdf/fr3.urdf
-gripper_range_m: [0.0, 0.04]
 # The simulation node uses this to initialize finger opening.
 franka:
   gripper:

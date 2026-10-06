@@ -46,8 +46,8 @@ controller:
 
 # OMPL RRT-Connect over joint space + MuJoCo self-collision oracle.
 planner:
-  vel_limits: 0.5          # rad/s — keep <= franka.max_joint_velocities
-  acc_limits: 1.0          # rad/s^2
+  # vel_limits / acc_limits deliberately ABSENT: the planner times plans at the FR3 execution policy's limits
+  # (robots/fr3/execution.yaml), the single statement; state lower ones here only to plan slower.
   self_collision_padding_m: -0.002
   solve_time_sec: 2.0
   simplify_time_sec: 0.5

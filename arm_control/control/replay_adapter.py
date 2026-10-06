@@ -38,6 +38,7 @@ from arm_control.messages import (
     unpack_motor_state,
 )
 from arm_control.node_utils import (
+    planner_speed_limits,
     ShutdownFlag,
     _load_mode_config,
     install_signal_handlers,
@@ -130,30 +131,12 @@ def build_replay(
 
 
 def _replay_acceleration_limits(cfg, mode_cfg):
-    """Where replay's acceleration cap comes from, resolved in explicit order.
-
-    This was one nested `.get()` with `mode_cfg['planner']['acc_limits']` as the
-    default. Python evaluates that default BEFORE calling `.get()`, so a
-    deployment carrying `execution_policy.acceleration_limits` and no mode
-    profile raised KeyError on a fallback it never needed -- and
-    `_load_mode_config()` legitimately returns {} when none is configured. A
-    reusable package must not demand a mode-profile file to read a limit its
-    caller already supplied.
-
-    KEY PRESENCE, not truthiness: the same rule as the torque limits. A missing
-    key may fall back; a key that is PRESENT and malformed is an operator error
-    and must not silently resolve to some other number.
+    """Replay's acceleration cap: the same rule as the planner (`planner_speed_limits`). The execution policy's limit when the robot
+    states one; a mode profile's `planner.acc_limits` only if not faster (refused at startup otherwise); with neither, the historical
+    1.0 rad/s^2. A mode profile is optional (`_load_mode_config()` may return {}).
     """
-    execution = cfg.get("execution_policy") or {}
-    if "acceleration_limits" in execution:
-        return execution["acceleration_limits"]
-    planner = mode_cfg.get("planner") or {}
-    if "acc_limits" in planner:
-        return planner["acc_limits"]
-    raise ValueError(
-        "replay requires execution_policy.acceleration_limits (robot config) "
-        "or planner.acc_limits (mode profile); neither is configured"
-    )
+    return planner_speed_limits(mode_cfg.get("planner") or {}, cfg.get("execution_policy"),
+                                arm_joints(cfg))[1]
 
 
 def main() -> None:

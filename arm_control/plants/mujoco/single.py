@@ -15,6 +15,7 @@ def build_single_model_backend(cfg, *, control_period: float) -> MuJoCoBackend:
         joint_names=joint_names,
         single_model_path=_resolve(str(cfg.get("sim_model_path", ""))),
         timestep=float(cfg.get("sim_timestep", 0.001)),
+        arm_armature=float(cfg.get("sim_armature", 0.0)),
         control_period=control_period,
         ground_z=None,
         launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
