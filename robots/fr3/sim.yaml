@@ -1,0 +1,19 @@
+# The simulated FR3 (single-model MuJoCo plant), stated once for the Dora plant node and the supervisor's simulated link.
+sim_model_path: franka/urdf/fr3.urdf
+sim_update_rate_hz: 100
+# 0.5 ms (operator decision 2026-10-06). The joint-7 instability that prompted it had a second cause, found in review: this
+# single-model plant lacked the arm's reflected rotor inertia that the scene-mode plant always had (ARM_ARMATURE 0.1, Franka's own
+# published MJCF value); both plant modes now apply it. Measured on the FR3 wrist (mass-matrix diagonal ~0.0018 kg m^2): without
+# armature, a hold swung 1.26 rad at 1 ms and a move left a 0.05 rad/s limit cycle at 0.5 ms; with it, the arm settles to ~1e-6
+# rad/s (at 1 ms too). The servo law's torque slew is scaled per step, so it stays the RT server's 1 N*m per 1 ms tick at any step.
+sim_timestep: 0.0005
+sim_launch_viewer: false   # debug only: the native viewer costs ~14 ms per sync
+sim_self_collision: true
+# The FR3's control box holds the arm up whether or not a host streams; the twin models that.
+sim_gravcomp: true
+# Spawn pose: MuJoCo's implicit zero is outside joint 4's range (it would sag onto the stops).
+sim_default_joint_positions:
+  fr3_joint2: -0.785
+  fr3_joint4: -2.356
+  fr3_joint6: 1.571
+  fr3_joint7: 0.785

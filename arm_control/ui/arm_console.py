@@ -883,8 +883,7 @@ def _run(
             plan_kd if spec.get("kd") is None
             else expand_named_values(spec["kd"], names=planned, default=0.0),
         )
-    vmax = expand_named_values(planner_cfg.get("vel_limits", 0.5), names=planned, default=0.5)
-    amax = expand_named_values(planner_cfg.get("acc_limits", 1.0), names=planned, default=1.0)
+    vmax, amax = planner_speed_limits(planner_cfg, cfg.get("execution_policy"), planned)
 
     world, _ = build_collision_stack(
         cfg.urdf_path,
@@ -1644,6 +1643,47 @@ def _check_payload_declaration() -> None:
     print("arm_console: page and HandPanel agree on the payload field")
 
 
+def planner_speed_limits(planner_cfg, policy, planned):
+    """``(vmax, amax)`` the planner times plans with. The execution policy is the SINGLE statement of an arm's speed limits (the
+    controller refuses a plan above it at admission): without a planner statement the planner uses it; a planner may state LOWER
+    limits (plan slower), never higher -- refused here, at load, rather than every plan refused at Execute. A config with no policy
+    keeps the planner's own statement, else the historical 0.5 rad/s / 1.0 rad/s^2."""
+    names = list(planned)
+    limits = []
+    for plan_key, policy_key, fallback in (("vel_limits", "velocity_limits", 0.5), ("acc_limits", "acceleration_limits", 1.0)):
+        bound = None if not policy or policy.get(policy_key) is None else np.asarray(policy[policy_key], dtype=float).ravel()
+        if plan_key in planner_cfg:
+            value = expand_named_values(planner_cfg[plan_key], names=names, default=fallback)
+            if bound is not None and np.any(value > bound[: len(value)] + 1e-12):
+                raise ValueError(f"planner.{plan_key} {value.tolist()} exceeds execution_policy.{policy_key} "
+                                 f"{bound[: len(value)].tolist()}: the planner may plan slower than the policy, never faster")
+        elif bound is not None:
+            value = bound[: len(names)].copy()
+        else:
+            value = expand_named_values(fallback, names=names, default=fallback)
+        limits.append(value)
+    return limits[0], limits[1]
+
+
+def _check_planner_limits() -> None:
+    """The execution policy is the single statement of the speed limits; the planner follows it and may only be slower."""
+    names = ["a", "b"]
+    policy = {"velocity_limits": [0.4, 0.4], "acceleration_limits": [0.8, 0.8]}
+    v, a = planner_speed_limits({}, policy, names)
+    assert v.tolist() == [0.4, 0.4] and a.tolist() == [0.8, 0.8], (v, a)          # defaults to the policy
+    v, a = planner_speed_limits({"vel_limits": 0.2}, policy, names)
+    assert v.tolist() == [0.2, 0.2] and a.tolist() == [0.8, 0.8], (v, a)          # slower is allowed
+    try:
+        planner_speed_limits({"vel_limits": 0.5}, policy, names)
+    except ValueError as exc:
+        assert "exceeds execution_policy" in str(exc), exc
+    else:
+        raise AssertionError("a planner faster than the execution policy was accepted")
+    v, a = planner_speed_limits({}, None, names)
+    assert v.tolist() == [0.5, 0.5] and a.tolist() == [1.0, 1.0], (v, a)          # no policy: the historical defaults
+    print("arm_console: planner speed limits follow the execution policy")
+
+
 def _check_graphs() -> None:
     """Every arm_controller in every graph must be able to stream.
 
@@ -1704,6 +1744,7 @@ def cli() -> None:
         _check_routes()
         _check_payload_declaration()
         _check_graphs()
+        _check_planner_limits()
     else:
         main()
 

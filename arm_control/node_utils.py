@@ -16,7 +16,6 @@ from typing import Mapping
 import time
 
 import numpy as np
-import yaml
 
 from arm_control import CONTROL_ROOT, REPO_ROOT
 
@@ -92,7 +91,12 @@ def _load_mode_config() -> dict:
     raw = os.environ.get("ARM_CONTROL_MODE_CONFIG")
     if not raw:
         return {}
-    return yaml.safe_load(resolve_mode_config_path(raw).read_text()) or {}
+    # The config-tree loader, so a mode profile can include a shared one and state only what it changes.
+    from arm_control.config import load_config_tree
+
+    tree = load_config_tree(resolve_mode_config_path(raw))
+    tree.pop("include", None)
+    return tree
 
 
 def resolve_mode_config_path(raw: str | Path) -> Path:
