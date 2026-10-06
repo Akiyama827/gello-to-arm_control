@@ -119,6 +119,9 @@ def main() -> int:
                                           str(ROOT / "tools/bench/check_dual_group.py"),
                                           "--server", server],
                            logs=logs, env=env, timeout=240))
+        results.append(run("sim_supervisor", [sys.executable,
+                                              str(ROOT / "tools/bench/check_sim_supervisor.py")],
+                           logs=logs, env=env, timeout=180))
         results.append(run("trace_retention", [sys.executable,
                                                str(ROOT / "tools/bench/check_trace_retention.py")],
                            logs=logs, env=env, timeout=120))

@@ -28,7 +28,7 @@ import numpy as np
 from dora import Node
 
 
-from arm_control.config import ee_frame, gripper_joints, load_robot_config
+from arm_control.config import load_robot_config
 from arm_control.messages import (
     pack_json_message,
     pack_motor_state,
@@ -47,12 +47,11 @@ from arm_control.node_utils import (
     install_signal_handlers,
     scene_injections,
 )
-from arm_control.plants.mujoco.backend import MuJoCoBackend
 from arm_control.plants.mujoco.composer import (
-    _resolve,
     build_scene_backend,
     build_workcell_backend,
 )
+from arm_control.plants.mujoco.single import build_single_model_backend
 
 
 def _without_schema(payload: dict) -> dict:
@@ -158,42 +157,7 @@ def main() -> None:
         joint_names = list(cfg.joint_names)
         n = len(joint_names) if joint_names else cfg.num_motors
         arm_slices = {}
-        backend = MuJoCoBackend(
-            joint_names=joint_names,
-            single_model_path=_resolve(str(cfg.get("sim_model_path", ""))),
-            timestep=float(cfg.get("sim_timestep", 0.001)),
-            control_period=period,
-            ground_z=None,
-            launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
-            # Single-model joints carry no scene prefix; servo the fingers so
-            # they hold instead of free-sliding (and take gripper commands).
-            # From the arm's OWN config (`arm.gripper_joints`) — a new robot is a
-            # new YAML, never an edit here.
-            gripper_joints=tuple(gripper_joints(cfg)),
-            ee_body=ee_frame(cfg),
-            # Spawn pose. The block below argues the plant must DECLARE its
-            # starting state and then only did so for the jaws: the arm itself
-            # was left at MuJoCo's implicit zero, which for the FR3 is not even
-            # inside the joint limits (joint4's range is [-3.077, -0.117], so
-            # zero is 0.117 rad outside it). Measured: the demo spawned there,
-            # sagged onto the joint4/joint6 stops within seconds, and the first
-            # Cartesian jog was refused with "no IK solution" — from a pose no
-            # operator chose. Same key and same values the scenario configs
-            # already use.
-            default_joint_positions={
-                str(k): float(v)
-                for k, v in (cfg.get("sim_default_joint_positions") or {}).items()
-            },
-            # A twin that lets the arm fall is the one telling the lie: the
-            # FR3's control box runs its own gravity compensation whether or
-            # not a host is streaming, so a DISARMED arm holds its pose on the
-            # bench. Scene mode has always modelled that (gravcomp_prefixes);
-            # single-model mode did not, which is why an unarmed demo slumped.
-            # The empty prefix matches every body — in this mode the model IS
-            # the arm. Opt-in, because a single model that is NOT a
-            # self-supporting robot should still fall.
-            gravcomp_prefixes=("",) if cfg.get("sim_gravcomp", False) else (),
-        )
+        backend = build_single_model_backend(cfg, control_period=period)
         print(f"[mujoco_interface] single model: {backend.model_path}", flush=True)
     backend.load()
 
