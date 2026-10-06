@@ -45,12 +45,7 @@ planner:
   # Joint1..Joint6, which made the file unusable for any other arm.)
   vel_limits: 0.5          # rad/s, scalar or per-joint dict — bench-conservative
   acc_limits: 1.0          # rad/s^2
-  # Absorbs shallow convex-hull overlap at the rest pose (MuJoCo hulls the
-  # concave STLs for collision); hulls stay conservative elsewhere.
-  self_collision_padding_m: -0.002
-  solve_time_sec: 2.0
-  simplify_time_sec: 0.5
-  resolution_frac: 0.005   # validity-check resolution, fraction of joint-space extent
+  # OMPL settings: the code defaults (planning/high_level.PLANNER_DEFAULTS); state one here only to deviate.
 
 # Jog envelope — the safety bounds on unplanned, held-button motion.
 #

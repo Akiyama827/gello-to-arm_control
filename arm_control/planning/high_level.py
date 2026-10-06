@@ -14,6 +14,17 @@ from arm_control.planning.retiming import (
     bound_trajectory, collision_checked_retiming, time_parameterize_blended,
 )
 
+# The OMPL planner's settings when a config states none: the single statement (configs state only a deviation).
+# padding absorbs shallow convex-hull overlap at the rest pose (MuJoCo hulls concave STLs); resolution_frac is the validity-check
+# step as a fraction of the joint-space extent.
+PLANNER_DEFAULTS = {"self_collision_padding_m": -0.002, "solve_time_sec": 2.0, "simplify_time_sec": 0.5,
+                    "resolution_frac": 0.005}
+
+
+def ompl_settings(planner_cfg) -> dict:
+    """``solve_time_sec``/``simplify_time_sec``/``resolution_frac`` for an OMPLPlanner: the config's, else the defaults."""
+    return {k: float(planner_cfg.get(k, PLANNER_DEFAULTS[k])) for k in ("solve_time_sec", "simplify_time_sec", "resolution_frac")}
+
 if TYPE_CHECKING:
     from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
     from arm_control.planning.ompl_planner import OMPLPlanner
@@ -100,7 +111,7 @@ def build_collision_stack(
         list(planned_joints),
         cache_dir=cache_dir,
         self_collision_padding_m=float(
-            planner_cfg.get("self_collision_padding_m", -0.002)
+            planner_cfg.get("self_collision_padding_m", PLANNER_DEFAULTS["self_collision_padding_m"])
         ),
         environment=environment,
         held_positions={
@@ -113,9 +124,7 @@ def build_collision_stack(
     ompl = OMPLPlanner(
         list(zip(world.lower, world.upper)),
         world.in_collision,
-        solve_time_sec=float(planner_cfg.get("solve_time_sec", 2.0)),
-        simplify_time_sec=float(planner_cfg.get("simplify_time_sec", 0.5)),
-        resolution_frac=float(planner_cfg.get("resolution_frac", 0.005)),
+        **ompl_settings(planner_cfg),
     )
     return world, ompl
 
