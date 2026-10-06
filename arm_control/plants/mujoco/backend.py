@@ -727,6 +727,9 @@ class MuJoCoBackend:
     # scales it by step/1 ms: at a 0.5 ms step the twin slews at the robot's
     # 1000 N·m/s, not twice that.
     slew_per_tick: float = 1.0
+    # Reflected rotor inertia added to each arm joint of a SINGLE-MODEL plant (kg.m^2), from the robot's own config
+    # (`sim_armature`); 0 = the description's own. Scene and workcell plants keep their own rule.
+    arm_armature: float = 0.0
     model_revision: int = 0
 
     model: Any = field(default=None, init=False, repr=False)
@@ -1138,9 +1141,9 @@ class MuJoCoBackend:
                 self.data.qpos[joint.qposadr[0]] = float(value)
         else:
             _transfer_state(*previous, self.model, self.data)
-        if self.scene is None and self.workcell_scene is None:
-            # A single-model arm carries the same reflected rotor inertia as the arm in a scene (ARM_ARMATURE, Franka's own
-            # published MJCF value): one description of the arm in both plant modes. Without it the FR3 wrist (link inertia
+        if self.arm_armature and self.scene is None and self.workcell_scene is None:
+            # A single-model arm carries its robot's reflected rotor inertia (`sim_armature`; the FR3 states Franka's published
+            # MJCF value, the one the workcell plant applies as ARM_ARMATURE). Without it the FR3 wrist (link inertia
             # ~0.002 kg.m^2) limit-cycles under the explicit PD; measured after a move at a 0.5 ms step: 0.05 rad/s residual on
             # joint 7 without, 0.0000 with. Fingers excluded (their "armature" is a mass, as in scene mode).
             fingers = set(self.gripper_joints)
@@ -1148,7 +1151,7 @@ class MuJoCoBackend:
                 if name in fingers:
                     continue
                 dof = self.model.joint(name).dofadr[0]
-                self.model.dof_armature[dof] = max(ARM_ARMATURE, float(self.model.dof_armature[dof]))
+                self.model.dof_armature[dof] = max(float(self.arm_armature), float(self.model.dof_armature[dof]))
         if self.workcell_scene is not None and self.scene_state is not None:
             if previous[0] is None:
                 # SPAWN ONLY. actor_q is the scene's declared start pose, and

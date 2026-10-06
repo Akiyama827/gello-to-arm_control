@@ -57,14 +57,13 @@ def command(q, kp=100., kd=20.):
 
 
 def plant_model_checks(tmp):
-    """The single-model plant: the arm's reflected rotor inertia is applied (as in scene mode), and the servo law's torque slew is per
+    """The single-model plant: a robot's stated armature (`sim_armature`) is applied and nothing otherwise, and the servo law's torque slew is per
     1 ms RT tick at ANY plant step (it is applied per step, so the per-step budget scales with the step)."""
-    from arm_control.plants.mujoco.backend import ARM_ARMATURE
-    for step in (0.001, 0.0005):
+    for step, armature in ((0.001, 0.1), (0.0005, 0.0)):
         b = MuJoCoBackend(joint_names=list(JOINTS), single_model_path=str(tmp / 'three.urdf'), timestep=step, control_period=step,
-                          ground_z=None)
+                          ground_z=None, arm_armature=armature)
         b.load()
-        assert np.allclose(b.model.dof_armature[b._vadr], ARM_ARMATURE), b.model.dof_armature
+        assert np.allclose(b.model.dof_armature[b._vadr], armature), (armature, b.model.dof_armature)
         before = np.array(b.data.ctrl, dtype=float)
         b.step(dict(position=np.full(3, 1.0), velocity=np.zeros(3), torque=np.zeros(3), kp=np.full(3, 1e4), kd=np.zeros(3)))
         moved = np.max(np.abs(np.array(b.data.ctrl, dtype=float) - before))

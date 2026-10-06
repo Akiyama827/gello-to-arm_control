@@ -38,6 +38,7 @@ from arm_control.messages import (
     unpack_motor_state,
 )
 from arm_control.node_utils import (
+    planner_speed_limits,
     ShutdownFlag,
     _load_mode_config,
     install_signal_handlers,
@@ -144,16 +145,8 @@ def _replay_acceleration_limits(cfg, mode_cfg):
     key may fall back; a key that is PRESENT and malformed is an operator error
     and must not silently resolve to some other number.
     """
-    execution = cfg.get("execution_policy") or {}
-    if "acceleration_limits" in execution:
-        return execution["acceleration_limits"]
-    planner = mode_cfg.get("planner") or {}
-    if "acc_limits" in planner:
-        return planner["acc_limits"]
-    raise ValueError(
-        "replay requires execution_policy.acceleration_limits (robot config) "
-        "or planner.acc_limits (mode profile); neither is configured"
-    )
+    return planner_speed_limits(mode_cfg.get("planner") or {}, cfg.get("execution_policy"),
+                                arm_joints(cfg))[1]
 
 
 def main() -> None:

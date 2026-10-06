@@ -70,6 +70,7 @@ from arm_control.node_utils import (
     ShutdownFlag,
     _load_mode_config,
     expand_named_values,
+    planner_speed_limits,
     install_signal_handlers,
     next_event_gil_friendly,
     resolve_gains,
@@ -1641,28 +1642,6 @@ def _check_payload_declaration() -> None:
     assert "payload_id" in inspect.getsource(HandPanel.request), \
         "HandPanel no longer accepts the field the page sends"
     print("arm_console: page and HandPanel agree on the payload field")
-
-
-def planner_speed_limits(planner_cfg, policy, planned):
-    """``(vmax, amax)`` the planner times plans with. The execution policy is the SINGLE statement of an arm's speed limits (the
-    controller refuses a plan above it at admission): without a planner statement the planner uses it; a planner may state LOWER
-    limits (plan slower), never higher -- refused here, at load, rather than every plan refused at Execute. A config with no policy
-    keeps the planner's own statement, else the historical 0.5 rad/s / 1.0 rad/s^2."""
-    names = list(planned)
-    limits = []
-    for plan_key, policy_key, fallback in (("vel_limits", "velocity_limits", 0.5), ("acc_limits", "acceleration_limits", 1.0)):
-        bound = None if not policy or policy.get(policy_key) is None else np.asarray(policy[policy_key], dtype=float).ravel()
-        if plan_key in planner_cfg:
-            value = expand_named_values(planner_cfg[plan_key], names=names, default=fallback)
-            if bound is not None and np.any(value > bound[: len(value)] + 1e-12):
-                raise ValueError(f"planner.{plan_key} {value.tolist()} exceeds execution_policy.{policy_key} "
-                                 f"{bound[: len(value)].tolist()}: the planner may plan slower than the policy, never faster")
-        elif bound is not None:
-            value = bound[: len(names)].copy()
-        else:
-            value = expand_named_values(fallback, names=names, default=fallback)
-        limits.append(value)
-    return limits[0], limits[1]
 
 
 def _check_planner_limits() -> None:
