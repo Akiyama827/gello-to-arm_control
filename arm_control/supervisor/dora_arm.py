@@ -35,6 +35,8 @@ from arm_control.supervisor.console_adapter import ConsoleControlAdapter
 NOTICE_PERIOD_S = 1.0
 #: the bridge publishes state and drains events at the controller's 100 Hz
 PUMP_PERIOD_S = 0.01
+#: motor_health is published on change and at least this often (the console treats silence as stale)
+HEALTH_PERIOD_S = 0.5
 
 
 def default_gains_and_presets(cfg):
@@ -71,6 +73,10 @@ class DoraArmBridge:
         self._armed_sent: bool | None = None
         self._notice_at: dict[str, float] = {}
         self._mode_at = -1e9
+        self._health_at = -1e9
+        self._health_sent: tuple | None = None
+        self._fault_text = ''                      # a recoverable supervisor fault, shown through motor_health like a server latch
+        self.lost: str | None = None               # why the supervisor is unreachable (terminal for this node)
 
     # -- startup ---------------------------------------------------------------------------------------------------
     def check_config(self, kp, kd) -> None:
@@ -98,6 +104,11 @@ class DoraArmBridge:
             self._event('plan_staged', '', False, f'unreadable plan: {exc}')
             return
         plan_id = str(body['plan_id'])
+        now = self.handle.state()
+        running = now.running_plan_id if now.executing else None
+        if running:  # as in-process: a plan is refused while one RUNS (only a staged, unreleased one is replaced)
+            self._event('plan_staged', plan_id, False, f'{running} is still executing')
+            return
         # The in-process controller replaces a staged-but-unreleased plan when a new one arrives (it only refuses while one RUNS);
         # the supervisor refuses a second admitted plan until the first is superseded or cancelled: do the replacement here.
         for old in list(self._staged):
@@ -108,6 +119,7 @@ class DoraArmBridge:
         if not body.get('gated'):
             self._release_on_stage.add(plan_id)
             body = dict(body, gated=True)
+        self._staged.append(plan_id)  # at stage time, not when the event is forwarded: an execute right behind it must find it
         self.handle.stage(ArmPlan(self.arm_id, plan_id, body))
 
     def on_control(self, value) -> None:
@@ -138,24 +150,39 @@ class DoraArmBridge:
             self.handle.execute(str(group['execute']))
         elif 'cancel' in group:
             self._staged.clear()  # a cancel clears whatever was staged (a targeted one names it)
-            self.handle.cancel(str(group.get('reason') or 'cancelled'), plan_id=group.get('cancel_plan_id'))
+            self._cancel_leg(str(group.get('reason') or 'cancelled'), group.get('cancel_plan_id'))
         elif 'hold' in group:
             self._staged.clear()
-            self.handle.cancel(str(group.get('reason') or 'hold'))
+            self._cancel_leg(str(group.get('reason') or 'hold'), None)
         elif 'stop' in group:
             self._staged.clear()
-            self.handle.cancel(str(group.get('reason') or group['stop'] or 'stop'))
+            self._cancel_leg(str(group.get('reason') or group['stop'] or 'stop'), None)
             self.handle.set_armed(False)
+
+    def _cancel_leg(self, reason: str, plan_id) -> None:
+        """Cancel, and say what the in-process controller says: a cancelled RUNNING leg is a failed leg_result, not only a clear."""
+        now = self.handle.state()
+        running = now.running_plan_id if now.executing else None
+        self.handle.cancel(reason, plan_id=plan_id)
+        if running and plan_id in (None, running):
+            self._event('leg_result', str(running), False, f'cancelled: {reason}')
 
     # -- periodic: events, authority edge, measured state -----------------------------------------------------------
     def pump(self) -> None:
         for event in self.handle.poll_events():
             self._forward(event)
         state = self.handle.state()
+        if state.armed is None:
+            # The supervisor cannot be read. Unknown is never reported as DISARMED: the arm may still be armed and holding (an owner
+            # that vanishes leaves it so). Terminal for this node: the SDK channel never reconnects.
+            self._lose(state.fault_reason or 'supervisor unreachable')
+            return
+        self._fault_text = '' if state.fault_reason is None else self._fault_text
         armed = bool(state.armed)
         if armed != self._armed_sent:
             self._armed_sent = armed
             self.emit('arm', pack_json_message('arm', {'armed': armed}))
+        self._publish_health(state, armed)
         ready = bool(state.ready) and state.position is not None
         if ready and not self._was_ready:  # the first fresh measured pose after ARM: where a sequence must start from
             self.emit('controller_event', pack_controller_event(
@@ -165,13 +192,37 @@ class DoraArmBridge:
             self._mode_event(ok=True, heartbeat=True)
         self._publish_motor_state()
 
+    def _lose(self, reason: str) -> None:
+        if self.lost is None:
+            self.lost = reason
+            self.emit('controller_event', pack_controller_event(kind='fault', ok=False, reason=f'supervisor lost: {reason}'))
+            self.emit('motor_health', pack_json_message('motor_health', dict(
+                armed=False, state_fresh=False, latched_fault=f'supervisor lost: {reason}', any_fault=True,
+                supports_pose_hold=False, unknown_authority=True)))
+
+    def _publish_health(self, state, armed: bool) -> None:
+        """The console reads armed and its fault latch from ``motor_health`` (authoritative, and the only thing that CLEARS a latch)."""
+        fault = self._fault_text
+        key = (armed, fault)
+        if key != self._health_sent or self._clock() - self._health_at >= HEALTH_PERIOD_S:
+            self._health_sent, self._health_at = key, self._clock()
+            self.emit('motor_health', pack_json_message('motor_health', dict(
+                armed=armed, state_fresh=state.position is not None, latched_fault=fault, any_fault=bool(fault),
+                supports_pose_hold=False)))
+
     def _forward(self, event: dict) -> None:
         plan_id = str(event.get('plan_id') or '')
+        if event['kind'] == 'fault':
+            # A supervisor fault is recoverable (DISARM then ARM) and the console clears a latch only through motor_health; the
+            # controller_event `fault` of the in-process node is the terminal stop. Surface it as a latch, and in the log.
+            self._fault_text = str(event.get('reason') or 'supervisor fault')
+            self._event('mode', '', False, f'supervisor fault: {self._fault_text}')
+            return
         if event['kind'] == 'plan_cleared' and plan_id in self._replaced:
             self._replaced.discard(plan_id)  # the new plan replaced it: the in-process controller reports no clear for that
             return
-        if event['kind'] == 'plan_staged' and event.get('ok', True):
-            self._staged.append(plan_id)
+        if event['kind'] == 'plan_staged' and not event.get('ok', True) and plan_id in self._staged:
+            self._staged.remove(plan_id)  # refused: nothing is staged
         if event['kind'] == 'plan_staged' and plan_id in self._release_on_stage:
             self._release_on_stage.discard(plan_id)
             if event.get('ok', True):
@@ -229,6 +280,25 @@ class DoraArmBridge:
 __all__ = ['DoraArmBridge']
 
 
+def release_after_loss(instance_id: str, socket_path=None) -> str:
+    """Best effort once the supervisor channel was lost: a supervisor that loses its owner CANCELS and HOLDS, staying armed. A new
+    session claims the robot and DISARMS it. Returns what happened (never raises): the caller is already failing."""
+    from arm_control.sdk import ArmClient
+
+    try:
+        fresh = ArmClient(instance_id, socket_path=socket_path, timeout_s=3.0)
+    except Exception as exc:  # noqa: BLE001
+        return f'no supervisor to release ({exc}); if the arm was armed it is held by its servo: DISARM it'
+    try:
+        fresh.claim()
+        fresh.disarm(timeout_s=3.0)
+        return 'the arm was DISARMED through a new session'
+    except Exception as exc:  # noqa: BLE001
+        return f'could not DISARM through a new session ({exc!r}); DISARM it explicitly'
+    finally:
+        fresh.close()
+
+
 # -- the Dora seam -------------------------------------------------------------------------------------------------------
 def main() -> None:
     """Dora node: ``arm_controller``'s contract served by the arm's supervisor (``ARM_CONTROL_CONFIG`` picks the arm, ``ARM_ID`` names
@@ -270,13 +340,20 @@ def main() -> None:
             if time.monotonic() - last_pump >= PUMP_PERIOD_S:
                 last_pump = time.monotonic()
                 bridge.pump()
+                if bridge.lost is not None:
+                    break
     finally:
-        try:  # leave the arm DISARMED: the supervisor abandons a vanished owner and stays armed
-            handle.set_armed(False)
-        except Exception:  # noqa: BLE001
-            pass
+        if bridge.lost is None:
+            try:  # leave the arm DISARMED: the supervisor abandons a vanished owner and stays armed
+                handle.set_armed(False)
+            except Exception:  # noqa: BLE001
+                pass
         handle.close()
         arm.close()
+        if bridge.lost is not None:
+            print(f"[supervised_arm] supervisor lost: {bridge.lost}; {release_after_loss(instance_id, os.environ.get('ARM_CONTROL_SOCKET') or None)}", flush=True)
+    if bridge.lost is not None:
+        raise SystemExit(1)
 
 
 def cli() -> None:

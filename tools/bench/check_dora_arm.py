@@ -29,7 +29,7 @@ from arm_control.contracts.motion import pack_control_update, pack_jog, pack_pla
 from arm_control.contracts.motor import unpack_motor_state  # noqa: E402
 from arm_control.multi_arm.supervised import AsyncAuthorityHandle, SdkArmHandle  # noqa: E402
 from arm_control.sdk import ArmClient  # noqa: E402
-from arm_control.supervisor.dora_arm import DoraArmBridge, default_gains_and_presets  # noqa: E402
+from arm_control.supervisor.dora_arm import DoraArmBridge, default_gains_and_presets, release_after_loss  # noqa: E402
 from arm_control.config import load_robot_config  # noqa: E402
 
 KP, KD = np.full(3, 100.), np.full(3, 5.)  # kd 20 destabilises this 0.02 kg m^2 fixture at the sim's 4 ms step; 5 is its default
@@ -81,6 +81,7 @@ def main():
     sup = subprocess.Popen([sys.executable, '-m', 'arm_control.supervisor.service', '--config', str(cfg_path), '--socket', str(sock),
                             '--plant', 'sim'], stdout=log, stderr=subprocess.STDOUT, env=dict(os.environ))
     arm = handle = None
+    ok = False
     try:
         end = time.monotonic() + 30
         while True:
@@ -152,6 +153,27 @@ def main():
         bridge.on_control(pack_control_update(execute='r2'))
         pump(lambda: [e for e in cap.events('leg_result') if e['plan_id'] == 'r2'], 'leg_result r2', 15.)
         assert [e for e in cap.events('leg_result') if e['plan_id'] == 'r2'][0]['ok'] is True
+        # plan + execute with NO pump between, then another plan while it runs: the running leg is neither replaced nor cancelled; the new
+        # plan is refused (as in-process: a plan is refused while one runs); the running leg still reports its result
+        qx = np.asarray(arm.state().q)
+        bridge.on_plan(plan_message('x1', qx, qx + [.1, 0, 0], 1.5, gated=True))
+        bridge.on_control(pack_control_update(execute='x1'))
+        time.sleep(.4)
+        bridge.on_plan(plan_message('x2', qx, qx + [.05, 0, 0], 1.0, gated=True))
+        refused_x2 = [e for e in cap.events('plan_staged') if e['plan_id'] == 'x2']
+        assert refused_x2 and refused_x2[0]['ok'] is False and 'still executing' in refused_x2[0]['reason'], refused_x2
+        pump(lambda: [e for e in cap.events('leg_result') if e['plan_id'] == 'x1'], 'leg_result x1', 15.)
+        assert [e for e in cap.events('leg_result') if e['plan_id'] == 'x1'][0]['ok'] is True, 'the running leg was cancelled'
+        assert not [e for e in cap.events('plan_cleared') if e['plan_id'] == 'x1']
+        # cancelling a RUNNING leg reports a failed leg_result (as in-process), not only a clear
+        qy = np.asarray(arm.state().q)
+        bridge.on_plan(plan_message('y1', qy, qy + [.1, 0, 0], 3.0, gated=True))
+        bridge.on_control(pack_control_update(execute='y1'))
+        time.sleep(.5)
+        bridge.on_control(pack_control_update(cancel=True, reason='operator'))
+        pump(lambda: [e for e in cap.events('leg_result') if e['plan_id'] == 'y1'], 'leg_result y1')
+        failed = [e for e in cap.events('leg_result') if e['plan_id'] == 'y1'][0]
+        assert failed['ok'] is False and 'cancelled' in failed['reason'], failed
         # a targeted cancel of a staged plan answers plan_cleared; one aimed at another plan does not clear it
         q2 = np.asarray(arm.state().q)
         bridge.on_plan(plan_message('c1', q2, q2 + [.1, 0, 0], 1.0, gated=True))
@@ -190,6 +212,57 @@ def main():
         for t, v in cap.out:
             if t == 'arm':
                 pass
+        # a supervisor fault is a motor_health latch (recoverable: the console clears it from motor_health), never the terminal `fault` event;
+        # it clears when the supervisor reports none
+        from arm_control.multi_arm.types import ArmControlState
+
+        class FakeHandle:
+            def __init__(self):
+                self.fault, self.events = None, []
+
+            def poll_events(self):
+                out, self.events = self.events, []
+                return out
+
+            def state(self):
+                return ArmControlState('arm', position=np.zeros(3), velocity=np.zeros(3), armed=True, ready=True, executing=False,
+                                       frozen=False, fault_reason=self.fault, session_id='s')
+        fake, cap2 = FakeHandle(), Capture()
+        fb = DoraArmBridge(arm, fake, presets, cap2, arm_id='arm')
+        fake.events.append(dict(kind='fault', plan_id='', ok=False, reason='cmd_lost', runtime_state={}))
+        fake.fault = 'cmd_lost'
+        fb.pump()
+        health = [unpack_json_message(v) for t, v in cap2.out if t == 'motor_health']
+        assert health and health[-1]['latched_fault'] == 'cmd_lost' and health[-1]['any_fault'] is True, health
+        assert not cap2.events('fault') and [m for m in cap2.events('mode') if not m['ok'] and 'cmd_lost' in m['reason']]
+        fake.fault = None
+        fb._clock = lambda: time.monotonic() + 100  # past the health period
+        fb.pump()
+        assert unpack_json_message([v for t, v in cap2.out if t == 'motor_health'][-1])['latched_fault'] == '', 'the latch never cleared'
+        n_health = len([1 for t, _ in cap2.out if t == 'motor_health'])
+        fb.pump()
+        assert len([1 for t, _ in cap2.out if t == 'motor_health']) == n_health, 'motor_health repeated without a change or the period'
+        fb._clock = lambda: time.monotonic() + 200
+        fb.pump()
+        assert len([1 for t, _ in cap2.out if t == 'motor_health']) == n_health + 1, 'no motor_health heartbeat (the console treats silence as stale)'
+        # the supervisor is lost (the SDK channel dies): UNKNOWN is never published as DISARMED, a terminal fault is, the node ends, and
+        # a new session DISARMS what the vanished owner left armed
+        bridge.on_control(pack_control_update(arm=True))
+        pump(lambda: handle.state().ready, 'armed before the loss')
+        arm_edges_before = [unpack_json_message(v)['armed'] for t, v in cap.out if t == 'arm']
+        arm._channel.close()
+        pump(lambda: bridge.lost, 'the loss')
+        assert [unpack_json_message(v)['armed'] for t, v in cap.out if t == 'arm'] == arm_edges_before, 'unknown was published as an arm edge'
+        lost_events = [e for e in cap.events('fault') if 'supervisor lost' in e['reason']]
+        assert len(lost_events) == 1 and any(unpack_json_message(v).get('unknown_authority') for t, v in cap.out if t == 'motor_health')
+        bridge.pump()
+        assert len([e for e in cap.events('fault') if 'supervisor lost' in e['reason']]) == 1, 'the loss was reported twice'
+        watcher = ArmClient('sdk_arm', socket_path=sock)
+        assert watcher.authority().lifecycle.value == 'armed', 'the supervisor holds an ownerless arm armed (by design)'
+        said = release_after_loss('sdk_arm', sock)
+        assert 'DISARMED' in said, said
+        assert watcher.authority().lifecycle.value != 'armed'
+        watcher.close()
         ok = True
     finally:
         if handle is not None:
@@ -206,6 +279,9 @@ def main():
         except subprocess.TimeoutExpired:
             sup.kill()
         log.close()
+        if ok:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
     print('PASS: the Dora controller contract (plan/control/jog/gripper in; controller_event/arm/motor_state/model_revision out) over a '
           'supervisor on a simulated plant: ARM edge and ready, gated and ungated plans, targeted cancel, preset gains, refusals, stop, drift')
     return ok

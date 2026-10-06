@@ -19,6 +19,7 @@ nodes:
       motor_state: supervised_arm/motor_state
       controller_arm: supervised_arm/arm
       controller_event: supervised_arm/controller_event
+      motor_health: supervised_arm/motor_health
       plant_capabilities: supervised_arm/model_revision
     outputs:
       - plan
@@ -52,4 +53,5 @@ nodes:
       - motor_state
       - arm
       - controller_event
+      - motor_health
       - model_revision
