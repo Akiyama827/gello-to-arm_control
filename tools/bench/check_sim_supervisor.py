@@ -164,6 +164,7 @@ class Gated:
 
     def __init__(self, inner):
         self.inner, self.entered, self.release, self.gate = inner, threading.Event(), threading.Event(), False
+        self.fail_on_release = False
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
@@ -173,12 +174,16 @@ class Gated:
             self.gate = False
             self.entered.set()
             assert self.release.wait(10), 'the gated step was never released'
+            if self.fail_on_release:
+                self.fail_on_release = False
+                raise RuntimeError('plant failed mid-step')
         return self.inner.step(command)
 
 
 def link_races(tmp):
     cfg = RtConfig(instance_id='sim_arm', state_timeout_s=.5)
     gated = Gated(plant(tmp / 'three.urdf'))
+    real_step_global = gated.inner.step
     link = SimLink(cfg, JOINTS, gated, servo=SERVO)
     link.open()
     try:
@@ -228,6 +233,53 @@ def link_races(tmp):
         step_sample = next(h for h, _ in link.recent_states() if h.state_seq == published + 1)
         assert step_sample.last_cmd_seq == in_flight, (step_sample.last_cmd_seq, in_flight, seq)  # not the later command
         assert link.safe_stop()
+        # a step that FAILS publishes the authority it ran under: an ARM or DISARM that landed during it is not confirmed by
+        # that sample, and the failure is not latched against the new authority
+        def failing_step_with(request):
+            link.enable_all()
+            for _ in range(20):
+                link.apply_command(command([.1, 0, 0]))
+                time.sleep(.01)
+            gated.entered.clear(), gated.release.clear()
+            gated.gate, gated.fail_on_release = True, True
+            assert gated.entered.wait(2)
+            request()
+            gated.release.set()
+        outcome = {}
+        failing_step_with(lambda: (threading.Thread(target=lambda: outcome.update(stopped=link.safe_stop())).start(),
+                                   wait(lambda: link._stop_epoch == 4, 2., 'the DISARM request')))
+        wait(lambda: 'stopped' in outcome, 3., 'the DISARM to settle')
+        history = [h for h, _ in link.recent_states()]
+        failure = [h for h in history if h.fault_code == rtp.FAULT_PLANT]
+        assert len(failure) == 1 and failure[0].armed and failure[0].stop_epoch == 3 and not failure[0].holding, failure
+        assert outcome['stopped'] is True and not link.latest_state()[0].armed and link.latest_state()[0].stop_epoch == 4
+        assert link._fault_code == 0 and not link.latest_state()[0].faulted, 'a failure of a step under old authority latched'
+        # DISARM then ARM inside the failing step: the ARM is not confirmed by the failure sample
+        thread = []
+        failing_step_with(lambda: (thread.append(threading.Thread(target=lambda: outcome.update(stopped=link.safe_stop()))),
+                                   thread[0].start(), wait(lambda: link._stop_epoch == 5, 2., 'the DISARM request'),
+                                   thread.append(threading.Thread(target=link.enable_all)), thread[1].start(),
+                                   wait(lambda: link._armed, 2., 'the ARM request')))
+        thread[0].join(5), thread[1].join(5)
+        s_ = link.latest_state()[0]
+        assert s_.armed and not s_.faulted and link._fault_code == 0, s_
+        assert not [h for h, _ in link.recent_states() if h.arm_epoch == s_.arm_epoch and h.faulted], 'the new epoch inherited the fault'
+        assert link.safe_stop()
+        # a plant that fails every tick keeps the publish rate, latches the FIRST message and reports the last good velocity
+        good = link.latest_state()[0]
+        counter = iter(range(1, 10**6))
+
+        def always(*args, **kw):
+            raise RuntimeError(f'boom {next(counter)}')
+        gated.inner.step = always
+        seq0 = link._state_seq
+        time.sleep(1.0)
+        rate = link._state_seq - seq0
+        assert 150 <= rate <= 350, f'{rate} samples in 1 s while the plant fails'
+        assert 'boom 1' in link.motor_health()['latched_fault'], link.motor_health()['latched_fault']
+        assert link.latest_state()[0].dq == good.dq and link.motor_health()['state_fresh']
+        gated.inner.step = real_step_global
+        assert link.safe_stop() and link.latest_state()[0].fault_code == 0
         # a plant fault while disarmed is faulted but neither armed nor HOLDING (the plant is released)
         real_step = gated.inner.step
 

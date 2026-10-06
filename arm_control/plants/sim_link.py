@@ -87,6 +87,7 @@ class SimLink:
         self._arm_t = 0.0
         self._hold_q: np.ndarray | None = None
         self._in_hold = False
+        self._tick_snap = None               # the authority snapshot of the tick in flight (for its failure sample)
         self._pub_stop_epoch = 0             # the stop epoch the published samples show: advanced only by a RELEASED step
         self._cmd_gains = None               # the gains of the last accepted command this epoch (a hold keeps them, as the RT does)
         self._fault_code = 0
@@ -241,22 +242,30 @@ class SimLink:
             try:
                 self._tick(now)
             except Exception as exc:  # noqa: BLE001 -- a plant that fails is a plant fault, latched, never a dead thread
-                with self._lock:
-                    self._fault_code, self._latched_fault = rtp.FAULT_PLANT, f"sim plant failed: {exc!r}"
-                    self._cmd = None
-                    last = self._state
-                    motor = dict(position=np.asarray(last.q if last else np.zeros(self.n), float),
-                                 velocity=np.zeros(self.n))
-                    if not self._armed:
-                        self._pub_stop_epoch = self._stop_epoch
-                # the fault is PUBLISHED (from the last good pose) so a reader sees it, and the stream does not go stale
-                self._publish(now, motor=motor, snapshot=dict(
-                    armed=self._armed, fault=self._fault_code, holding=False, arm_epoch=self._arm_epoch,
-                    stop_epoch=self._pub_stop_epoch, last_cmd_seq=self._last_cmd_seq))
+                self._plant_failed(now, exc)
             next_t += self._period
             if now - next_t > self._period:
                 next_t = now
             time.sleep(max(0.0, next_t - time.monotonic()))
+
+    def _plant_failed(self, now: float, exc: Exception) -> None:
+        """The failing cycle publishes ITS OWN sample, as the RT does: the authority the step ran under (``_tick_snap``), the
+        fault, not HOLDING, the last good pose. An ARM or DISARM that landed during the step is therefore not confirmed by it, and
+        a failure of a step that ran under authority that has since changed is not latched against the new authority."""
+        with self._lock:
+            snap = dict(self._tick_snap or dict(armed=False, arm_epoch=0, stop_epoch=self._pub_stop_epoch,
+                                                last_cmd_seq=self._last_cmd_seq, gen=(self._arm_epoch, self._stop_epoch)))
+            current = (self._arm_epoch, self._stop_epoch) == snap.get("gen", (self._arm_epoch, self._stop_epoch))
+            if current and not self._fault_code:  # the first message is the root cause; later ticks do not overwrite it
+                self._fault_code, self._latched_fault = rtp.FAULT_PLANT, f"sim plant failed: {exc!r}"
+            if current:
+                self._cmd = None
+            last = self._state
+            motor = dict(position=np.asarray(last.q if last else np.zeros(self.n), float),
+                         velocity=np.asarray(last.dq if last else np.zeros(self.n), float))
+            snap.update(fault=rtp.FAULT_PLANT, holding=False)
+            snap.pop("gen", None)
+        self._publish(now, motor=motor, snapshot=snap)
 
     def _tick(self, now: float) -> None:
         with self._lock:
@@ -291,6 +300,8 @@ class SimLink:
                 self._pub_stop_epoch = self._stop_epoch
             snapshot = dict(armed=self._armed, fault=self._fault_code, holding=holding,
                             arm_epoch=self._arm_epoch, stop_epoch=self._pub_stop_epoch, last_cmd_seq=self._last_cmd_seq)
+            # kept under the lock BEFORE the step: if the step raises, the failure sample is the one this step ran under
+            self._tick_snap = dict(snapshot, gen=(self._arm_epoch, self._stop_epoch))
         motor = self._plant.step(command)
         self._publish(now, motor=motor, command=command, snapshot=snapshot)
 
