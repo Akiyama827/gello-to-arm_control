@@ -17,8 +17,8 @@ nodes:
       ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
     inputs:
       motor_state: supervised_arm/motor_state
-      controller_arm: supervised_arm/arm
       controller_event: supervised_arm/controller_event
+      # the console takes its armed state and its fault latch from motor_health alone (it needs exactly ONE authority source)
       motor_health: supervised_arm/motor_health
       plant_capabilities: supervised_arm/model_revision
     outputs:

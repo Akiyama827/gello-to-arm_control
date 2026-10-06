@@ -125,6 +125,9 @@ def main():
         pump(lambda: cap.events('ready'), 'the ready event')
         edges = [unpack_json_message(v)['armed'] for t, v in cap.out if t == 'arm']
         assert edges == [False, True], edges  # announced once at start, once on the ARM edge
+        health_after_arm = [unpack_json_message(v) for t, v in cap.out if t == 'motor_health']
+        assert health_after_arm[-1]['armed'] is True and health_after_arm[0]['armed'] is False, health_after_arm  # on change, not on the period
+        assert len(health_after_arm) <= 6, 'motor_health is flooding'
         ready = cap.events('ready')[0]
         assert ready['q'].shape == (3,) and ready['runtime_state']['armed'] is True and ready['runtime_state']['n_arm'] == 3, ready
         q0 = np.asarray(arm.state().q)
@@ -288,4 +291,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(0 if main() else 1)

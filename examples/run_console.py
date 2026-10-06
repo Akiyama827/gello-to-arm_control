@@ -267,7 +267,8 @@ def start_supervisor(config: Path, env: dict, stopped=lambda: False):
     log = open(workdir / "supervisor.log", "w")
     proc = subprocess.Popen(
         [sys.executable, "-m", "arm_control.supervisor.service", "--config", str(merged_path), "--socket", str(sock), "--plant", "sim"],
-        env=dict(env, ARM_CONTROL_CONFIG=str(merged_path)), cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
+        env=dict(env, ARM_CONTROL_CONFIG=str(merged_path)), cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True)  # its own session: a Ctrl-C reaches the graph, and the supervisor outlives it long enough to be stopped after
     proc._workdir, proc._log = workdir, log
     import socket as _socket
 

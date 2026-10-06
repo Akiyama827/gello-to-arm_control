@@ -21,10 +21,17 @@ console takes its armed state and its fault latch from it, and only it CLEARS a 
 
 **Faults and loss.** A supervisor fault (e.g. `cmd_lost`) is a recoverable `motor_health` latch plus a log line, not the terminal
 `fault` controller event (which in-process means the controller stopped for good), so the console clears it after DISARM then ARM.
-If the supervisor cannot be read (the SDK channel never reconnects), unknown is never published as DISARMED: the bridge emits ONE
-terminal `fault` and a `motor_health` with `unknown_authority`, the node ends non-zero, and it tries to DISARM through a new
-session (a supervisor that loses its owner cancels and HOLDS, staying armed, by design). The launcher watches the supervisor and
+If the supervisor cannot be read (the SDK channel never reconnects), no ARM/DISARM edge is published (unknown is not an edge): the
+bridge emits ONE terminal `fault` and a `motor_health` carrying `unknown_authority` (the console has no consumer for that flag: its
+badge reads DISARMED with the "supervisor lost" fault, and Execute is gated by the fault), the node ends non-zero, and it tries to
+DISARM through a new session (a supervisor that loses its owner cancels and HOLDS, staying armed, by design). The launcher watches the supervisor and
 stops the graph if it exits.
+
+The console takes its armed state and fault latch from `motor_health` ONLY in this graph (its graph check requires exactly one authority
+source), so the `arm` output is published but not wired. A failed ARM or DISARM (the handle's fault reason) is shown as the same latch.
+Known, not this branch's: in the live example the simulated FR3 can slump after a long freeze and a re-ARM may drop within seconds when
+the supervisor's controller rejects a servo command as invalid (`execution_policy.command_valid`), so "DISARM then ARM recovers" is not
+reliable live there.
 
 **Stated differences:** jog and gripper are refused with a notice (the supervisor has no raw-jog and no gripper); gains must be named
 presets (`gain_presets`); `hold` cancels the live leg and leaves the arm held by the supervisor (no latched "frozen" state); `stop`

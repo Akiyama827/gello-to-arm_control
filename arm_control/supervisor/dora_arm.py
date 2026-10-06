@@ -177,7 +177,10 @@ class DoraArmBridge:
             # that vanishes leaves it so). Terminal for this node: the SDK channel never reconnects.
             self._lose(state.fault_reason or 'supervisor unreachable')
             return
-        self._fault_text = '' if state.fault_reason is None else self._fault_text
+        if state.fault_reason is not None:  # a failed ARM/DISARM or a supervisor fault is the arm's latch until it clears
+            self._fault_text = str(state.fault_reason)
+        else:
+            self._fault_text = ''
         armed = bool(state.armed)
         if armed != self._armed_sent:
             self._armed_sent = armed
