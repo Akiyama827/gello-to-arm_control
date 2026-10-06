@@ -32,7 +32,8 @@ from arm_control.plants.remote_rt.client import RtConfig, RtLinkError  # noqa: E
 from arm_control.plants.sim_link import SimLink  # noqa: E402
 from arm_control.sdk import ArmClient, Refused  # noqa: E402
 
-SERVO = dict(state_hz=250, hold_ms=100, fault_ms=600, hold_kp=30, hold_kd=5)  # the fake-RT bench's own launch values
+# hold_ms/fault_ms are the fake-RT bench's launch values; state_hz and the hold gains are the RT server's own defaults
+SERVO = dict(state_hz=250, hold_ms=100, fault_ms=600, hold_kp=50, hold_kd=5)
 
 
 def plant(urdf):
@@ -56,7 +57,9 @@ def command(q, kp=100., kd=20.):
 
 def link_unit(tmp):
     cfg = RtConfig(instance_id='sim_arm', state_timeout_s=.5)
-    for bad in ({k: v for k, v in SERVO.items() if k != 'hold_ms'}, dict(SERVO, fault_ms=50), dict(SERVO, state_hz=0)):
+    for bad in ({k: v for k, v in SERVO.items() if k != 'hold_ms'}, dict(SERVO, fault_ms=50), dict(SERVO, fault_ms=100),
+                dict(SERVO, state_hz=0), dict(SERVO, state_hz=1e7), dict(SERVO, hold_kp=float('nan')), dict(SERVO, hold_kp=-5),
+                dict(SERVO, hold_kd=-1), dict(SERVO, hold_ms='soon'), dict(SERVO, hold_ms=None), dict(SERVO, hold_ms=float('inf'))):
         try:
             SimLink(cfg, JOINTS, object(), servo=bad)
         except ValueError:
@@ -86,6 +89,10 @@ def link_unit(tmp):
         link.enable_all()
         s = link.latest_state()[0]
         assert s.armed and s.arm_epoch == 1 and s.holding and not s.faulted, s
+        link.enable_all()  # already armed: acknowledged, no new epoch
+        assert link.latest_state()[0].arm_epoch == 1 and link._epochs == 1
+        # holding since ARM, before any command: the configured hold gains
+        wait(lambda: np.allclose(link._plant._last_command['kp'], SERVO['hold_kp']), 1., 'the hold gains after ARM')
         # commands are accepted and tracked; last_cmd_seq is the accepted sequence
         seq = None
         end = time.monotonic() + 1.5
@@ -94,8 +101,10 @@ def link_unit(tmp):
             time.sleep(.01)
         s = link.latest_state()[0]
         assert not s.holding and s.last_cmd_seq == seq and abs(s.q[0] - .2) < .03, (s.holding, s.last_cmd_seq, seq, s.q)
-        # deadman: after hold_ms the plant holds where it is; after fault_ms CMD_LOST latches, still holding
+        # deadman: after hold_ms the plant holds where it is, with the gains of the last accepted command (as the RT does);
+        # after fault_ms CMD_LOST latches, still holding
         wait(lambda: link.latest_state()[0].holding, .5, 'the hold')
+        assert np.allclose(link._plant._last_command['kp'], 100.) and np.allclose(link._plant._last_command['kd'], 20.)
         held = list(link.latest_state()[0].q)
         assert not link.latest_state()[0].faulted
         wait(lambda: link.latest_state()[0].faulted, 1.5, 'CMD_LOST')
@@ -116,9 +125,23 @@ def link_unit(tmp):
         assert link.safe_stop()
         s = link.latest_state()[0]
         assert not s.armed and not s.faulted and s.stop_epoch == 1 and not link.motor_health()['any_fault'], s
+        assert link.motor_health()['arm_epoch'] == 0  # the link's own view is disarmed
         link.enable_all()
         assert link.latest_state()[0].arm_epoch == 2 and link.latest_state()[0].armed  # never reused
         assert link.safe_stop() and link.latest_state()[0].stop_epoch == 2
+        assert link.safe_stop() and link.latest_state()[0].stop_epoch == 3  # every DISARM counts, as on the RT server
+        # a confirmed DISARM RELEASES the plant: its last word is zero-gain, zero-torque (step(None) would keep the old one)
+        link.enable_all()
+        end = time.monotonic() + .5
+        while time.monotonic() < end:
+            link.apply_command(command([.5, .4, .3], kp=200., kd=30.))
+            time.sleep(.01)
+        assert np.allclose(link._plant._last_command['kp'], 200.)
+        assert link.safe_stop()
+        time.sleep(.05)
+        last = link._plant._last_command
+        assert not last['kp'].any() and not last['kd'].any() and not last['torque'].any(), last
+        assert not link.latest_state()[0].tau_cmd[0] and not link.latest_state()[0].armed
         # a plant that fails latches FAULT_PLANT, not a dead thread
         link.enable_all()
         real_step = link._plant.step

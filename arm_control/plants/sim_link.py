@@ -45,13 +45,23 @@ class SimLink:
         self.joint_names = list(joint_names)
         self.n = len(self.joint_names)
         self._plant = plant
-        hz, self.hold_ms, fault_ms = (float(servo[k]) for k in ("state_hz", "hold_ms", "fault_ms"))
-        if not (np.isfinite([hz, self.hold_ms, fault_ms]).all() and hz > 0 and self.hold_ms > 0 and fault_ms >= self.hold_ms):
-            raise ValueError("sim_servo: state_hz and hold_ms must be positive and finite, and fault_ms at least hold_ms")
+        try:
+            hz, self.hold_ms, fault_ms, kp, kd = (float(servo[k]) for k in _SERVO_KEYS)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"sim_servo values must be numbers: {exc}") from exc
+        # The RT server's own launch checks: 0 < hold < fault strictly, a state rate it can run, finite non-negative gains.
+        if not np.isfinite([hz, self.hold_ms, fault_ms, kp, kd]).all():
+            raise ValueError("sim_servo values must be finite")
+        if not 1 <= hz <= 1000:
+            raise ValueError("sim_servo.state_hz must be 1..1000 (the RT server's range)")
+        if not 0 < self.hold_ms < fault_ms:
+            raise ValueError("sim_servo: 0 < hold_ms < fault_ms is required")
+        if kp < 0 or kd < 0:
+            raise ValueError("sim_servo: hold_kp and hold_kd must not be negative")
         self._period = 1.0 / hz
         self._fault_s = fault_ms / 1e3
-        self._hold_kp = np.full(self.n, float(servo["hold_kp"]))
-        self._hold_kd = np.full(self.n, float(servo["hold_kd"]))
+        self._hold_kp = np.full(self.n, kp)
+        self._hold_kd = np.full(self.n, kd)
         self.backend_name = "sim"
         self.rt_setup = "sim"
         self.clock_domain = None             # a simulation has no RT host clock to attest
@@ -76,6 +86,7 @@ class SimLink:
         self._arm_t = 0.0
         self._hold_q: np.ndarray | None = None
         self._in_hold = False
+        self._cmd_gains = None               # the gains of the last accepted command this epoch (a hold keeps them, as the RT does)
         self._fault_code = 0
         self._latched_fault = ""
         self._state_seq = 0
@@ -118,6 +129,9 @@ class SimLink:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():  # a step still running: closing the plant under it would rebuild it
+                print("[sim_link] servo thread did not stop; the plant is left open", flush=True)
+                return
             self._thread = None
         self._plant.close()
 
@@ -126,27 +140,30 @@ class SimLink:
         with self._lock:
             if self._fault_code:
                 raise RtLinkError(f"arm refused: {self._latched_fault or 'latched fault'}")
+            if self._armed:
+                return  # already armed: acknowledged without a new epoch, as the RT server does
             state = self._state
             self._hold_q = np.asarray(state.q if state else np.zeros(self.n), dtype=float).copy()
-            self._cmd, self._cmd_t, self._in_hold = None, 0.0, False
+            self._cmd, self._cmd_t, self._in_hold, self._cmd_gains = None, 0.0, False, None
             self._epochs += 1
             self._arm_epoch = self._epochs
             self._armed = True
             self._arm_t = time.monotonic()
-        self._await_state(lambda s: s.armed and s.arm_epoch == self._arm_epoch, "arm")
+            epoch = self._arm_epoch
+        # The ack is receipt; the ARM is complete in a sample that was STEPPED under it (samples carry the authority they ran in).
+        self._await_state(lambda s: s.armed and s.arm_epoch == epoch, "arm")
 
     def safe_stop(self) -> bool:
         with self._lock:
-            was = self._armed or self._fault_code
             self._armed = False
             self._fault_code, self._latched_fault = 0, ""
-            self._cmd, self._hold_q, self._in_hold = None, None, False
-            self._arm_epoch = 0
-            if was:
-                self._stop_epoch += 1
+            self._cmd, self._hold_q, self._in_hold, self._cmd_gains = None, None, False, None
+            self._stop_epoch += 1  # every DISARM, as the RT server counts them
+            stop = self._stop_epoch
         if self._thread is None:
             return True
-        return self._await_state(lambda s: not s.armed, "disarm", raise_on_timeout=False)
+        # Confirmed only by a sample that was stepped with the servo already released (zero gains), not by the ack alone.
+        return self._await_state(lambda s: not s.armed and s.stop_epoch >= stop, "disarm", raise_on_timeout=False)
 
     def _await_state(self, predicate, what, *, raise_on_timeout=True) -> bool:
         """The ack is receipt; completion is a state sample produced after it (as on the RT link)."""
@@ -171,6 +188,7 @@ class SimLink:
             self._cmd_seq = (self._cmd_seq + 1) & 0xFFFFFFFF
             if self._armed and not self._fault_code:  # a disarmed or faulted servo ignores commands
                 self._cmd, self._cmd_t = cmd, time.monotonic()
+                self._cmd_gains = (cmd["kp"], cmd["kd"])
                 self._last_cmd_seq = self._cmd_seq
             return self._cmd_seq
 
@@ -210,7 +228,7 @@ class SimLink:
                 "last_cmd_seq": state.last_cmd_seq if state else 0, "sent_cmd_seq": self._cmd_seq,
                 "online_mask": state.online_mask if state else 0, "active_mask": (1 << self.n) - 1,
                 "instance_id": self.config.instance_id, "session_id": f"{self.session_id:016x}",
-                "arm_epoch": self._arm_epoch, "stop_epoch": state.stop_epoch if state else 0,
+                "arm_epoch": self._arm_epoch if self._armed else 0, "stop_epoch": state.stop_epoch if state else 0,
                 "state_seq": state.state_seq if state else 0, "state_t_mono_ns": state.t_mono_ns if state else 0}
 
     # -- the servo thread --------------------------------------------------------------------------------------
@@ -243,22 +261,35 @@ class SimLink:
                         measured = self._state.q if self._state else np.zeros(self.n)
                         self._hold_q = np.asarray(measured, dtype=float).copy()
                         self._cmd, self._in_hold = None, True
-                    command = dict(position=self._hold_q, velocity=np.zeros(self.n), torque=np.zeros(self.n),
-                                   kp=self._hold_kp, kd=self._hold_kd)
+                    kp, kd = self._cmd_gains if self._cmd_gains is not None else (self._hold_kp, self._hold_kd)
+                    command = dict(position=self._hold_q, velocity=np.zeros(self.n), torque=np.zeros(self.n), kp=kp, kd=kd)
                     if silent >= self._fault_s and not self._fault_code:
                         self._fault_code, self._latched_fault = rtp.FAULT_CMD_LOST, "command stream lost"
+            else:
+                # Released: the plant is told so. MuJoCoBackend.step(None) would keep re-applying its last command, so a
+                # disarmed servo writes an explicit zero-gain, zero-torque word (the plant's own passive support stays).
+                measured = self._state.q if self._state else np.zeros(self.n)
+                command = dict(position=np.asarray(measured, float).copy(), velocity=np.zeros(self.n),
+                               torque=np.zeros(self.n), kp=np.zeros(self.n), kd=np.zeros(self.n))
+            snapshot = dict(armed=self._armed, fault=self._fault_code, holding=holding or bool(self._fault_code),
+                            arm_epoch=self._arm_epoch, stop_epoch=self._stop_epoch, last_cmd_seq=self._last_cmd_seq)
         motor = self._plant.step(command)
-        self._publish(now, motor=motor, command=command, holding=holding)
+        self._publish(now, motor=motor, command=command, snapshot=snapshot)
 
-    def _publish(self, now: float, *, motor=None, command=None, holding=False) -> None:
+    def _publish(self, now: float, *, motor=None, command=None, snapshot=None) -> None:
+        """Publish one state sample. ``snapshot`` is the authority the tick STEPPED the plant under, so a sample never reports a
+        state its physics did not run in (an ARM or DISARM that lands mid-step shows in the next sample)."""
         zeros = np.zeros(self.n)
         with self._lock:
             if motor is None:
                 motor = self._plant.motor_state()
-            flags = rtp.FLAG_ARMED if self._armed else 0
-            if self._fault_code:
+            if snapshot is None:
+                snapshot = dict(armed=self._armed, fault=self._fault_code, holding=False, arm_epoch=self._arm_epoch,
+                                stop_epoch=self._stop_epoch, last_cmd_seq=self._last_cmd_seq)
+            flags = rtp.FLAG_ARMED if snapshot["armed"] else 0
+            if snapshot["fault"]:
                 flags |= rtp.FLAG_FAULTED
-            if holding:
+            if snapshot["holding"]:
                 flags |= rtp.FLAG_HOLDING
             self._state_seq += 1
             q, dq = np.asarray(motor["position"], float), np.asarray(motor["velocity"], float)
@@ -267,12 +298,14 @@ class SimLink:
             kd = zeros if command is None else np.asarray(command["kd"], float)
             qd_cmd = zeros if command is None else np.asarray(command["velocity"], float)
             tau_ff = zeros if command is None else np.asarray(command["torque"], float)
-            tau_cmd = tau_ff + kp * (q_cmd - q) + kd * (qd_cmd - dq)  # the PD word the plant was given
+            # NOT the RT's numbers: this is the PD word the plant was given, before the compiled servo law's clamp and slew,
+            # and ``tau`` is the same word, not a measured torque.
+            tau_cmd = tau_ff + kp * (q_cmd - q) + kd * (qd_cmd - dq)
             state = rtp.State(
-                n=self.n, state_seq=self._state_seq, last_cmd_seq=self._last_cmd_seq, t_mono_ns=time.monotonic_ns(),
-                flags=flags, fault_code=self._fault_code, session_id=self.session_id,
-                identity_hash=self.identity.identity_hash if self.identity else 0, arm_epoch=self._arm_epoch,
-                stop_epoch=self._stop_epoch, q=q.tolist(), dq=dq.tolist(), tau=tau_cmd.tolist(), tau_cmd=tau_cmd.tolist(),
-                q_cmd=q_cmd.tolist(), qd_cmd=qd_cmd.tolist(), wrench=[0.0] * 6)
+                n=self.n, state_seq=self._state_seq, last_cmd_seq=snapshot["last_cmd_seq"], t_mono_ns=time.monotonic_ns(),
+                flags=flags, fault_code=snapshot["fault"], session_id=self.session_id,
+                identity_hash=self.identity.identity_hash if self.identity else 0, arm_epoch=snapshot["arm_epoch"],
+                stop_epoch=snapshot["stop_epoch"], q=q.tolist(), dq=dq.tolist(), tau=tau_cmd.tolist(),
+                tau_cmd=tau_cmd.tolist(), q_cmd=q_cmd.tolist(), qd_cmd=qd_cmd.tolist(), wrench=[0.0] * 6)
             self._state, self._state_rx_t = state, now
             self._history.append((state, now))
