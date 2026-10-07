@@ -339,6 +339,7 @@ def main():
         stacks = {}
         for name in ARMS:
             rt, sup, sock, token = start_arm(args.server, tmp, name)
+            rt._name, sup._name = f'{name} arm_rt_server', f'{name} supervisor'
             procs += [sup, rt]
             stacks[name] = (sock, token)
         handles = {}
@@ -440,6 +441,12 @@ def main():
               'coordinator over SdkArmHandle: pair completes, mid-flight cancel confirmed on both arms, an uncarriable '
               'member rejects the pair and clears its partner, a foreign model is refused by the coordinator and by the '
               'supervisor, a failing leg faults the pair')
+    except BaseException:
+        # An intermittent fault (REFERENCE_EXPIRED once in ~70 runs, 2026-10-07) is only diagnosable from the children's own
+        # records: the supervisor's reference diagnostics (sender gaps, scheduling) and the RT server's fault journal detail.
+        for proc in procs:
+            print(f'--- {getattr(proc, "_name", proc.args[0])} (last 120 lines) ---\n{_tail(proc, 120)}', file=sys.stderr)
+        raise
     finally:
         for client in clients:
             client.close()
