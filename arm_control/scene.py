@@ -9,6 +9,7 @@ from typing import Any, Mapping
 import yaml
 
 from arm_control import CONTROL_ROOT
+from arm_control.config import load_config_tree
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -189,9 +190,20 @@ class SceneState:
         self.revision += 1
 
 
+def scene_tree(source: Path) -> dict:
+    """A scene file resolved through its ``include:`` list (several arms on one bench share one bench file). Asset paths in a scene
+    are relative to the scene file, so an included scene file must sit in the includer's directory."""
+    includes = (yaml.safe_load(source.read_text()) or {}).get("include") or []
+    for name in [includes] if isinstance(includes, str) else includes:
+        # ponytail: checks the top level only; a shared scene file that itself includes another is not supported
+        if Path(str(name)).parent != Path("."):
+            raise ValueError(f"{source}: include {name!r} must be in the scene's own directory (its asset paths are relative)")
+    return load_config_tree(source)
+
+
 def load_scene(path: str | Path) -> SceneSpec:
     source = Path(path).resolve()
-    raw = _mapping(yaml.safe_load(source.read_text()) or {}, str(source))
+    raw = _mapping(scene_tree(source), str(source))
     if raw.get("version") != 1:
         raise ValueError("scene version must be 1")
     scene = _mapping(raw.get("scene"), "scene")
@@ -294,6 +306,19 @@ assembly: {ignored: true}
             pass
         else:
             raise AssertionError("non-finite pose accepted")
+        # A scene that includes a shared one resolves as if written whole; an include from another directory is refused.
+        (root / "shared.yaml").write_text(text)
+        (root / "arm.yaml").write_text("version: 1\ninclude: [shared.yaml]\nscene:\n  actors:\n    welder: {pos: [0, 2, 0]}\n")
+        spec = load_scene(root / "arm.yaml")
+        assert spec.actor_names == ("welder", "turntable") and spec.object_names == ("first", "second")
+        (root / "sub").mkdir()
+        (root / "elsewhere.yaml").write_text("version: 1\ninclude: [sub/shared.yaml]\n")
+        try:
+            load_scene(root / "elsewhere.yaml")
+        except ValueError as exc:
+            assert "own directory" in str(exc), exc
+        else:
+            raise AssertionError("an include from another directory was accepted")
     print("scene: OK")
 
 
