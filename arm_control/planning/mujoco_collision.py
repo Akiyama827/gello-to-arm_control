@@ -18,6 +18,7 @@ import mujoco
 import numpy as np
 
 from arm_control import frames
+from arm_control.planning import PLANNER_DEFAULTS
 # URDF->MuJoCo staging is neither planning nor plant: both load the same staged
 # file. Re-exported so this module's own users keep working after the move.
 from arm_control.simulation.mujoco_model import (  # noqa: F401
@@ -68,7 +69,7 @@ class MuJoCoCollisionWorld:
         planned_joints: list[str],
         *,
         cache_dir: str | Path,
-        self_collision_padding_m: float = -0.002,
+        self_collision_padding_m: float = PLANNER_DEFAULTS["self_collision_padding_m"],
         environment: list[dict] | None = None,
         cloud_obstacles: dict | None = None,
         held_positions: dict[str, float] | None = None,
@@ -243,7 +244,7 @@ class MuJoCoCollisionWorld:
         state,
         planned_actor: str | tuple[str, ...],
         *,
-        self_collision_padding_m: float = -0.002,
+        self_collision_padding_m: float = PLANNER_DEFAULTS["self_collision_padding_m"],
         held_positions: dict[str, float] | None = None,
         ground_z: float | None = 0.0,
         body_sites: dict[str, str] | None = None,

@@ -24,7 +24,7 @@ from arm_control.control.factory import (
     gain_vector,
     gripper_command_cfg,
 )
-from arm_control.planning.high_level import ArmPlanner, build_collision_stack
+from arm_control.planning.high_level import ArmPlanner, build_collision_stack, ompl_settings
 # Scene-derived obstacles, from the rerun-free module: a controller host must
 # not need a visualiser to servo, and this import used to drag `rerun` in at
 # module level for a function that logs nothing.
@@ -127,10 +127,7 @@ def build_planner(
             from arm_control.planning.ompl_planner import OMPLPlanner
 
             ompl = OMPLPlanner(
-                list(zip(world.lower, world.upper)), world.in_collision,
-                solve_time_sec=float(planner_cfg.get("solve_time_sec", 2.0)),
-                simplify_time_sec=float(planner_cfg.get("simplify_time_sec", 0.5)),
-                resolution_frac=float(planner_cfg.get("resolution_frac", 0.005)),
+                list(zip(world.lower, world.upper)), world.in_collision, **ompl_settings(planner_cfg),
             )
     elif planner_cfg.get("use_ompl", bool(planner_cfg)):
         world, ompl = build_collision_stack(

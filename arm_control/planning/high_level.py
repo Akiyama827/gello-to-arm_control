@@ -9,10 +9,15 @@ import numpy as np
 from arm_control.frames import T_to_pose_xyzquat, pose_xyzquat_to_T
 from arm_control.planning.ik import PinocchioIK
 from arm_control.motion import JointTrajectory
+from arm_control.planning import PLANNER_DEFAULTS
 from arm_control.planning.retiming import (
     BLEND_TOLERANCE_RAD, COLLISION_STEP_RAD, RETIMING_STEPS_RAD,
     bound_trajectory, collision_checked_retiming, time_parameterize_blended,
 )
+
+def ompl_settings(planner_cfg) -> dict:
+    """``solve_time_sec``/``simplify_time_sec``/``resolution_frac`` for an OMPLPlanner: the config's, else the defaults."""
+    return {k: float(planner_cfg.get(k, PLANNER_DEFAULTS[k])) for k in ("solve_time_sec", "simplify_time_sec", "resolution_frac")}
 
 if TYPE_CHECKING:
     from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
@@ -100,7 +105,7 @@ def build_collision_stack(
         list(planned_joints),
         cache_dir=cache_dir,
         self_collision_padding_m=float(
-            planner_cfg.get("self_collision_padding_m", -0.002)
+            planner_cfg.get("self_collision_padding_m", PLANNER_DEFAULTS["self_collision_padding_m"])
         ),
         environment=environment,
         held_positions={
@@ -113,9 +118,7 @@ def build_collision_stack(
     ompl = OMPLPlanner(
         list(zip(world.lower, world.upper)),
         world.in_collision,
-        solve_time_sec=float(planner_cfg.get("solve_time_sec", 2.0)),
-        simplify_time_sec=float(planner_cfg.get("simplify_time_sec", 0.5)),
-        resolution_frac=float(planner_cfg.get("resolution_frac", 0.005)),
+        **ompl_settings(planner_cfg),
     )
     return world, ompl
 

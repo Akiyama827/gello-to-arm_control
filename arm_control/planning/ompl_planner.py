@@ -5,6 +5,8 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+from arm_control.planning import PLANNER_DEFAULTS
+
 try:
     from ompl import base as ob
     from ompl import geometric as og
@@ -29,9 +31,9 @@ class OMPLPlanner:
         collision_fn: CollisionFn,
         *,
         planner_name: str = "RRTConnect",
-        solve_time_sec: float = 2.0,
-        simplify_time_sec: float = 0.5,
-        resolution_frac: float = 0.01,
+        solve_time_sec: float = PLANNER_DEFAULTS["solve_time_sec"],
+        simplify_time_sec: float = PLANNER_DEFAULTS["simplify_time_sec"],
+        resolution_frac: float = PLANNER_DEFAULTS["resolution_frac"],
     ) -> None:
         self._limits = [(float(lo), float(hi)) for lo, hi in joint_limits]
         self._collision_fn = collision_fn
