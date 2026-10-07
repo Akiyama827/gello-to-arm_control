@@ -45,7 +45,7 @@ controller:
 # Planner (OMPL RRT-Connect over joint space + MuJoCo self-collision oracle): nothing to state.
 # vel_limits / acc_limits deliberately ABSENT: the planner times plans at the FR3 execution policy's limits
 # (robots/fr3/execution.yaml), the single statement; state lower ones under `planner:` only to plan slower. OMPL settings: the code
-# defaults (planning/high_level.PLANNER_DEFAULTS); state one only to deviate.
+# defaults (arm_control.planning.PLANNER_DEFAULTS); state one only to deviate.
 
 # See motion.yaml: the panel address moved to the robot config's
 # `console.http_port`, which is what actually keeps two arms apart.
