@@ -41,12 +41,23 @@ from arm_control.multi_arm.supervised import plan_body, plan_request  # noqa: E4
 ARMS = ('arm_a', 'arm_b')
 
 
-def _tail(proc, lines=40):
+def _log_text(proc):
+    # pread, not seek+read: the child shares this file description, so moving its offset could garble what it writes next.
     log = getattr(proc, '_log', None)
     if log is None:
         return ''
-    log.seek(0)
-    return ''.join(log.readlines()[-lines:])
+    try:
+        return os.pread(log.fileno(), os.fstat(log.fileno()).st_size, 0).decode(errors='replace')
+    except (OSError, ValueError) as exc:
+        return f'<log unavailable: {exc}>'
+
+
+def _tail(proc, lines=40):
+    return ''.join(_log_text(proc).splitlines(True)[-lines:])
+
+
+# The lines that name an expiry or a stall, wherever they sit in a long log (loop-gap lines can push them out of the tail).
+KEY_LINES = ('expired', 'sender gap', 'reference diagnostics', 'fault', 'FAULT')
 
 
 def start_arm(server, tmp: Path, name: str, extra_args=()):
@@ -442,10 +453,13 @@ def main():
               'member rejects the pair and clears its partner, a foreign model is refused by the coordinator and by the '
               'supervisor, a failing leg faults the pair')
     except BaseException:
-        # An intermittent fault (REFERENCE_EXPIRED once in ~70 runs, 2026-10-07) is only diagnosable from the children's own
+        # An intermittent fault (REFERENCE_EXPIRED once in 51 runs, 2026-10-07) is only diagnosable from the children's own
         # records: the supervisor's reference diagnostics (sender gaps, scheduling) and the RT server's fault journal detail.
         for proc in procs:
-            print(f'--- {getattr(proc, "_name", proc.args[0])} (last 120 lines) ---\n{_tail(proc, 120)}', file=sys.stderr)
+            name, text = getattr(proc, '_name', proc.args[0]), _log_text(proc)
+            keys = [line for line in text.splitlines() if any(k in line for k in KEY_LINES)]
+            print(f'--- {name}: key lines ---', *keys[-40:], f'--- {name} (last 120 lines) ---',
+                  ''.join(text.splitlines(True)[-120:]), sep='\n', file=sys.stderr)
         raise
     finally:
         for client in clients:
