@@ -62,6 +62,9 @@ def init_preview_stream(preview_cfg: dict | None, app_id: str = DEFAULT_APP_ID) 
     import rerun.blueprint as rrb
 
     cfg = dict(preview_cfg or {})
+    if cfg.get("connect") is not None and not str(cfg["connect"]).startswith("rerun+"):
+        # A config mistake stays loud; only an unreachable viewer is tolerated below.
+        raise ValueError(f"preview.connect must be a rerun+http(s):// URL, got {cfg['connect']!r}")
     try:
         rr.init(
             str(cfg.get("app_id", app_id)),
@@ -82,6 +85,7 @@ def init_preview_stream(preview_cfg: dict | None, app_id: str = DEFAULT_APP_ID) 
         # A disabled default recording: every later log is a no-op. (memory_recording() needs the recording rr.init
         # failed to make.)
         rr.RecordingStream(str(cfg.get("app_id", app_id)), make_default=True, default_enabled=False)
+        # From here rr.log/set_time are no-ops, but rr.send_blueprint raises (no application id): do not add one later.
 
 
 def log_frame_transform(entity_root: str, T: np.ndarray | None) -> None:
