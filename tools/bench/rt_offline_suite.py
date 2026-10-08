@@ -47,21 +47,43 @@ REGRESSIONS = (
     ("lifecycle_states", "lifecycle_states.py", "reference_runtime_selfcheck"),
 )
 # Device-free checks that need no build: run whether or not the build passed. A device-free check no suite runs is deleted.
+# An entry is a script under tools/ (bench/ unless a folder is given) and its arguments.
 CHECKS = (
     "check_arm_controller", "check_bimanual_contract", "check_bimanual_sync", "check_closure_record",
     "check_console_authority", "check_console_grasp", "check_cooperative", "check_dual_console", "check_dual_modes",
-    "check_execution_policy", "check_hand_grasp", "check_motion_profiles", "check_node_shutdown", "check_pair_planning",
-    "check_pose_hold", "check_pose_hold_sim", "check_refinement", "check_retiming", "check_rt_telemetry", "check_stream", "check_supervisor_ledger",
+    "check_dual_modes --refine", "check_execution_policy", "check_hand_grasp", "check_motion_profiles", "check_node_shutdown",
+    "check_pair_planning", "check_pose_hold", "check_pose_hold_sim", "check_refinement", "check_retiming", "check_rt_telemetry",
+    "check_stream", "check_supervisor_ledger",
     "inspect/check_console_controls", "inspect/check_console_page", "inspect/check_controller_mode_feedback",
     "inspect/check_ui_scene_injection",
 )
-# Module self-checks (python -m <module>); the ones that need a project description run in the project's suite.
+# These simulate the staged FR3 (franka/, gitignored, staged by tools/assets/setup_fr3.py). Unstaged, they do not run and one
+# fr3_assets FAIL names them: a fresh checkout is red until the assets are staged, never silently smaller.
+FR3_ASSET = ROOT / "franka/urdf/fr3.urdf"
+NEEDS_FR3 = {"check_cooperative", "check_dual_console", "check_dual_modes", "check_dual_modes --refine", "check_pair_planning",
+             "check_pose_hold_sim", "check_refinement"}
+# Module self-checks: `python -m <module> [args]`. Not here: the node CLIs (they run a node), kinematic_fit and model_bundle (they
+# read the project's FT description; the project suite runs them), simulation.mujoco_backend (a shim re-running a subset of
+# plants.mujoco.backend --self-check).
 MODULE_CHECKS = (
-    "arm_control.config", "arm_control.frames", "arm_control.scene", "arm_control.messages", "arm_control.planning.jog",
-    "arm_control.plants.base", "arm_control.plants.franka.backend", "arm_control.plants.remote_rt.protocol",
-    "arm_control.console_assets", "arm_control.mukca",
+    "arm_control.assets", "arm_control.calibration_console", "arm_control.config", "arm_control.console_assets",
+    "arm_control.console_server", "arm_control.control.factory", "arm_control.control.gains", "arm_control.control.integral",
+    "arm_control.control.jog_hold", "arm_control.control.leg_settling", "arm_control.control.reference",
+    "arm_control.end_effectors.hand_move", "arm_control.execution.codec", "arm_control.execution.contract", "arm_control.frames",
+    "arm_control.messages", "arm_control.motion.types", "arm_control.mukca", "arm_control.node_utils",
+    "arm_control.operator_console", "arm_control.planning.high_level", "arm_control.planning.ik", "arm_control.planning.jog",
+    "arm_control.planning.mujoco_collision", "arm_control.planning.preview_rerun", "arm_control.planning.retiming",
+    "arm_control.planning.scene_geoms", "arm_control.planning.trajectory", "arm_control.planning.trajopt",
+    "arm_control.planning.trajopt --native", "arm_control.plants.base", "arm_control.plants.dm.backend",
+    "arm_control.plants.franka.backend", "arm_control.plants.mujoco.backend --self-check",
+    "arm_control.plants.remote_rt.observation", "arm_control.plants.remote_rt.protocol", "arm_control.rt_protocol",
+    "arm_control.scene", "arm_control.simulation.rerun_scene", "arm_control.ui.hand_panel", "arm_control.ui.jog_panel",
+    "arm_control.ui.operator_arm --self-check", "arm_control.viz.visualizer --self-check",
 )
-
+# Scripts outside tools/ with their own self-check.
+SCRIPT_CHECKS = (
+    "examples/run_console.py --self-check", "tools/assets/setup_fr3.py --self-check", "rt/bindings/pose_hold_check.py",
+)
 
 def git(*args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
@@ -155,6 +177,9 @@ def main() -> int:
                                              str(ROOT / "tools/bench/check_state_history.py"),
                                              "--server", server],
                            logs=logs, env=env, timeout=120))
+        # The loopback rung: a live client against the built fake server (it SKIPs, rc 0, when no server is given).
+        results.append(run("remote_rt_client", [sys.executable, "-m", "arm_control.plants.remote_rt.client"], logs=logs,
+                           env={**env, "ARM_RT_SERVER_BIN": server}, timeout=180))
         binaries = {
             "server": server,
             "probe": str(build / "reference_probe.so"),
@@ -170,13 +195,23 @@ def main() -> int:
             results.append(run(name, command, logs=logs, env=env, timeout=300))
 
     for check in CHECKS:
-        path = ROOT / "tools" / (check if "/" in check else f"bench/{check}")
-        results.append(run(Path(check).name, [sys.executable, str(path.with_suffix(".py"))], logs=logs, env=env,
-                           timeout=180))
-    for module in MODULE_CHECKS:
-        results.append(run(module, [sys.executable, "-m", module], logs=logs, env=env, timeout=120))
-    results.append(run("run_console", [sys.executable, str(ROOT / "examples/run_console.py"), "--self-check"], logs=logs,
-                       env=env, timeout=120))
+        if check in NEEDS_FR3 and not FR3_ASSET.is_file():
+            continue
+        script, *extra = check.split()
+        path = ROOT / "tools" / (script if "/" in script else f"bench/{script}")
+        results.append(run(check.replace(" --", "_").replace("/", "_"), [sys.executable, f"{path}.py", *extra], logs=logs,
+                           env=env, timeout=180))
+    if not FR3_ASSET.is_file():
+        results.append(dict(name="fr3_assets", status="FAIL", returncode=None, seconds=0.0, command=[], log="",
+                            reason=f"{FR3_ASSET} not staged (tools/assets/setup_fr3.py); not run: {sorted(NEEDS_FR3)}"))
+        print(f"FAIL fr3_assets: {results[-1]['reason']}", flush=True)
+    for check in MODULE_CHECKS:
+        module, *extra = check.split()
+        results.append(run(check.replace(" --", "_"), [sys.executable, "-m", module, *extra], logs=logs, env=env, timeout=180))
+    for check in SCRIPT_CHECKS:
+        script, *extra = check.split()
+        results.append(run(Path(script).stem + "".join(e.replace("--", "_") for e in extra), [sys.executable, str(ROOT / script),
+                           *extra], logs=logs, env=env, timeout=120))
 
     summary = {"revision": revision, "dirty": dirty, "root": str(ROOT),
                "build_dir": str(build), "results": results,

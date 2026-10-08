@@ -46,3 +46,20 @@ The check now builds the plant with `build_single_model_backend` from an entry c
 with no fixture and no hash; the limits are unchanged. Measured with a freshly built `arm_rt_servo` (the compiled RT law the sim's
 Soft always uses; Soft refuses without it): generic FR3 6.9 mm peak / 0.026 rad/s at the end, FR3 #1 description 5.3 mm /
 0.002 rad/s, both PASS. It joins the suite; the project suite runs it on each deployed arm's description.
+
+## Review round 1 (BLOCK) and fixes
+
+* A fresh checkout was red (PASS=71 FAIL=5): five added checks simulate the staged FR3 (`franka/`, gitignored, staged by
+  `tools/assets/setup_fr3.py`), and the author's checkout had it. Now the suite names them (`NEEDS_FR3`, which also holds
+  `check_pose_hold_sim` and the `--refine` variant): unstaged, they do not run and one `fr3_assets` FAIL lists them, so a fresh
+  checkout is red until the assets are staged, never silently smaller. Confirmed in a fresh worktree (below).
+* "Every device-free check" was not yet true: 37 module self-checks, `rt/bindings/pose_hold_check.py`, `setup_fr3.py
+  --self-check`, `check_dual_modes --refine` and the `remote_rt.client` loopback (it SKIPped, rc 0, looking for `rt/build`) were
+  unrun. All are in now: every module with a `__main__` self-check (`MODULE_CHECKS`, 43 entries with flags), `SCRIPT_CHECKS`, and
+  the loopback rung against the suite's built server (`ARM_RT_SERVER_BIN`). Not run, by design: the node CLIs (they start a node),
+  `kinematic_fit` and `model_bundle` (project description), `simulation.mujoco_backend` (a shim re-running a subset of
+  `plants.mujoco.backend --self-check`), `multi_arm.trace_export` and `supervisor.service` (tools/servers, not checks).
+* The project has no suite runner yet; `check_dual_hardware`, `kinematic_fit`, `model_bundle` and the Soft check on each deployed
+  description are run by the project suite the next slice (P1) creates. Until then they are run by nothing.
+* Outside the tree: `inspect/check_console_page.py` needs `node` on PATH; the Soft checks need `arm_rt_servo` installed (Soft
+  refuses without it).
