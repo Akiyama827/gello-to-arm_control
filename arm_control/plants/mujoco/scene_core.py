@@ -279,26 +279,34 @@ class ScenePlant:
     (step 3, D1); the gripper keeps its spawn opening. Driven by ``SimLink``'s one servo thread, as ``SceneCore`` requires.
     """
 
-    def __init__(self, world, actor: str, width: int, *, period: float, idle_timeout: float) -> None:
-        backend, slices, _names, n = world
+    def __init__(self, world, actor: str, joints: list, *, period: float, idle_timeout: float) -> None:
+        backend, slices, names, n = world
         if actor not in slices:
             raise ValueError(f"sim_actor {actor!r} is not an actor of this world (actors: {sorted(slices)})")
+        width = len(joints)
         if slices[actor]["n"] != width:
             raise ValueError(f"sim_actor {actor!r} has {slices[actor]['n']} joints; the arm config names {width}")
         start = slices[actor]["start"]
+        # The world prefixes an actor's joints (``asm_fr3_joint1``); the order must still be the arm config's, or every command
+        # would drive the wrong joint.
+        world_joints = list(names)[start: start + width]
+        if not all(w.endswith(j) for w, j in zip(world_joints, joints)):
+            raise ValueError(f"sim_actor {actor!r} joints {world_joints} are not the arm config's {list(joints)} in order")
+        if not (np.isfinite(idle_timeout) and idle_timeout > 0):
+            raise ValueError("idle_timeout_sec must be finite and positive")
         self.actor, self.backend, self._slices = actor, backend, dict(slices)
         self._span = slice(start, start + width)
         self._core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
 
     @classmethod
-    def from_config(cls, cfg, width: int, *, period: float) -> "ScenePlant":
+    def from_config(cls, cfg, joints: list, *, period: float) -> "ScenePlant":
         actor = cfg.get("sim_actor")
         if not actor:
             raise ValueError("a scene plant needs sim_actor (the world's actor this supervisor drives): nothing is assumed")
         idle = cfg.get("idle_timeout_sec")
         if idle is None:
             raise ValueError("a scene plant needs idle_timeout_sec (the other actors' deadman): nothing is assumed")
-        return cls(build_world(cfg, period=period), str(actor), width, period=period, idle_timeout=float(idle))
+        return cls(build_world(cfg, period=period), str(actor), list(joints), period=period, idle_timeout=float(idle))
 
     def load(self) -> None:
         self.backend.load()

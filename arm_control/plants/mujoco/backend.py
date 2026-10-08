@@ -1836,7 +1836,7 @@ class MuJoCoBackend:
             q[name], dq[name] = float(self.data.qpos[joint.qposadr[0]]), float(self.data.qvel[joint.dofadr[0]])
         # Every free body (a loose module, a part) by its body name: qpos is [x, y, z, qw, qx, qy, qz] in the world frame for a
         # free joint, exact after the step. A world with none (one model) has no object poses.
-        objects = {self.model.body(int(self.model.jnt_bodyid[j])).name:
+        objects = {(self.model.body(int(self.model.jnt_bodyid[j])).name or f"body{int(self.model.jnt_bodyid[j])}"):
                    self.data.qpos[self.model.jnt_qposadr[j]: self.model.jnt_qposadr[j] + 7].tolist()
                    for j in range(self.model.njnt) if self.model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE}
         world = dict(sim_time_s=float(self.data.time), model_revision=int(self.model_revision), joint_q=q, joint_dq=dq,

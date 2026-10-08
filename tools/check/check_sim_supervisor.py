@@ -443,7 +443,8 @@ def scene_plant_unit(tmp):
     try:
         for extra, reason in (("idle_timeout_sec: 0.1\n", 'sim_actor'), ("sim_actor: arm\n", 'idle_timeout_sec'),
                               ("sim_actor: ghost\nidle_timeout_sec: 0.1\n", 'not an actor'),
-                              ("sim_actor: peer\nidle_timeout_sec: 0.1\n", 'has 1 joints')):
+                              ("sim_actor: peer\nidle_timeout_sec: 0.1\n", 'has 1 joints'),
+                              ("sim_actor: arm\nidle_timeout_sec: -1\n", 'finite and positive')):
             try:
                 SimLink.from_config(cfg(extra))
             except ValueError as exc:
@@ -462,6 +463,33 @@ def scene_plant_unit(tmp):
     peer = core.arm_slices['peer']
     peer_span = slice(peer['start'], peer['start'] + peer['n'])
     spawn_kp = core.command['kp'][peer_span].copy()
+    world = (scene.backend, core.arm_slices, list(scene.backend.joint_names), core.n)
+    try:
+        ScenePlant(world, 'arm', ['j2', 'j1', 'j3'], period=.004, idle_timeout=.1)
+    except ValueError as exc:
+        assert 'in order' in str(exc), exc
+    else:
+        raise AssertionError('a scene plant drove the actor with its joints out of order')
+    # Before the servo thread: the slice is written BEFORE the world steps, so the step a sample reports ran under that
+    # sample's command (a DISARM is confirmed only by a released step).
+    arm = core.arm_slices['arm']
+    arm_span = slice(arm['start'], arm['start'] + 3)
+    seen, inner = [], scene.backend.step
+    scene.backend.step = lambda cmd=None: (seen.append(np.asarray(cmd['kp'])[arm_span].copy()), inner(cmd))[1]
+    for kp in (7., 0.):
+        scene.step(command([0, 0, 0], kp=kp, kd=0.))
+        assert np.allclose(seen[-1], kp), (kp, seen[-1])
+    scene.backend.step = inner
+    # Object poses are this tick's, [x, y, z, qw, qx, qy, qz] in the world: equal to an independent kinematics pass.
+    import mujoco
+    for _ in range(50):
+        scene.step(command([0, 0, 0]))
+    poses = scene.observe()['object_poses']
+    m, d = scene.backend.model, scene.backend.data
+    mujoco.mj_kinematics(m, d)
+    (name, pose), = poses.items()
+    assert np.allclose(pose[:3], d.body(name).xpos) and np.allclose(pose[3:], d.body(name).xquat), (pose, d.body(name).xpos)
+    assert pose[2] < .19, f'the part did not fall: {pose}'
     link.open()
     try:
         link.enable_all()
@@ -474,7 +502,6 @@ def scene_plant_unit(tmp):
         assert s.armed and not s.faulted and np.allclose(s.q, target, atol=.03), s.q
         # ONLY the arm's slice is written: the peer keeps the world's spawn hold (its own writer is step 3)
         assert np.array_equal(core.command['kp'][peer_span], spawn_kp) and np.all(spawn_kp > 0), core.command['kp']
-        arm = core.arm_slices['arm']
         assert np.allclose(core.command['position'][arm['start']: arm['start'] + 3], target)
         link.safe_stop()
         wait(lambda: not np.any(core.command['kp'][arm['start']: arm['start'] + 3]), 1., 'the arm slice released on DISARM')

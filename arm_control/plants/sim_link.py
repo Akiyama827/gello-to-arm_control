@@ -134,7 +134,7 @@ class SimLink:
         period = 1.0 / float(servo["state_hz"])
         joints = arm_joints(cfg)
         if describes_scene(cfg):  # the supervisor hosts the whole world and drives one actor of it (``sim_actor``)
-            plant = ScenePlant.from_config(cfg, len(joints), period=period)
+            plant = ScenePlant.from_config(cfg, joints, period=period)
         else:
             plant = build_single_model_backend(cfg, control_period=period)
             open_jaws(plant, cfg)  # the Hand spawns open, as in the Dora plant node (MuJoCo's zero is a shut hand)
