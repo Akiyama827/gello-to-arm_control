@@ -412,6 +412,119 @@ def link_races(tmp):
     link._thread.join(5) if link._thread is not None else None
 
 
+def scene_plant_unit(tmp):
+    """The supervisor hosts a scene world (step 2b): SimLink's authority over ONE actor's slice; the other actors keep the world's
+    spawn hold; observe/1 names every actor and the free objects; a refused config names what it lacks."""
+    from arm_control.plants.mujoco.scene_core import ScenePlant
+
+    root = tmp / 'scene'
+    root.mkdir()
+    hinge = "<body name='l{i}' pos='0 0 .1'><joint name='j{i}' type='hinge' axis='0 1 0' armature='.1'/><geom type='capsule' size='.02 .05'/>"
+    (root / 'arm.xml').write_text("<mujoco><worldbody>" + "".join(hinge.format(i=i) for i in (1, 2, 3))
+                                  + "</body>" * 3 + "</worldbody></mujoco>")
+    (root / 'peer.xml').write_text("<mujoco><worldbody>" + hinge.format(i=1) + "</body></worldbody></mujoco>")
+    (root / 'item.xml').write_text("<mujoco><worldbody><body name='part'><freejoint name='free'/><geom type='box' "
+                                   "size='.02 .02 .02'/></body></worldbody></mujoco>")
+    (root / 'scene.yaml').write_text(
+        "version: 1\nscene:\n  actors:\n"
+        "    arm: {path: arm.xml, joints: [j1, j2, j3], pos: [0, 0, 0], rpy: [0, 0, 0]}\n"
+        "    peer: {path: peer.xml, joints: [j1], pos: [1, 0, 0], rpy: [0, 0, 0], q: [.3]}\n"
+        "  objects:\n    item: {path: item.xml, pos: [.5, .5, .2], rpy: [0, 0, 0]}\n")
+    base = write_config(tmp, 0, 0).read_text().replace("  native_reference: true\n", "")
+    servo = ("sim_servo: {" + ", ".join(f"{k}: {v}" for k, v in SERVO.items()) + "}\nsim_observe: {rate_hz: 250, ring_s: 1}\n")
+
+    def cfg(extra):
+        path = tmp / 'scene_cfg.yaml'
+        path.write_text(base + servo + extra)
+        return load_robot_config(path)
+
+    saved = os.environ.get('WORKCELL_SCENE')
+    os.environ['WORKCELL_SCENE'] = str(root / 'scene.yaml')
+    try:
+        for extra, reason in (("idle_timeout_sec: 0.1\n", 'sim_actor'), ("sim_actor: arm\n", 'idle_timeout_sec'),
+                              ("sim_actor: ghost\nidle_timeout_sec: 0.1\n", 'not an actor'),
+                              ("sim_actor: peer\nidle_timeout_sec: 0.1\n", 'has 1 joints'),
+                              ("sim_actor: arm\nidle_timeout_sec: -1\n", 'finite and positive')):
+            try:
+                SimLink.from_config(cfg(extra))
+            except ValueError as exc:
+                assert reason in str(exc), (reason, exc)
+            else:
+                raise AssertionError(f'a scene plant was built without {reason}')
+        link = SimLink.from_config(cfg("sim_actor: arm\nidle_timeout_sec: 0.1\n"))
+    finally:
+        if saved is None:
+            os.environ.pop('WORKCELL_SCENE', None)
+        else:
+            os.environ['WORKCELL_SCENE'] = saved
+    scene = link._plant
+    assert isinstance(scene, ScenePlant) and scene.actor == 'arm' and link.joint_names == list(JOINTS)
+    core = scene._core
+    peer = core.arm_slices['peer']
+    peer_span = slice(peer['start'], peer['start'] + peer['n'])
+    spawn_kp = core.command['kp'][peer_span].copy()
+    world = (scene.backend, core.arm_slices, list(scene.backend.joint_names), core.n)
+    try:
+        ScenePlant(world, 'arm', ['j2', 'j1', 'j3'], period=.004, idle_timeout=.1)
+    except ValueError as exc:
+        assert 'in order' in str(exc), exc
+    else:
+        raise AssertionError('a scene plant drove the actor with its joints out of order')
+    # Before the servo thread: the slice is written BEFORE the world steps, so the step a sample reports ran under that
+    # sample's command (a DISARM is confirmed only by a released step).
+    arm = core.arm_slices['arm']
+    arm_span = slice(arm['start'], arm['start'] + 3)
+    seen, inner = [], scene.backend.step
+    scene.backend.step = lambda cmd=None: (seen.append(np.asarray(cmd['kp'])[arm_span].copy()), inner(cmd))[1]
+    for kp in (7., 0.):
+        scene.step(command([0, 0, 0], kp=kp, kd=0.))
+        assert np.allclose(seen[-1], kp), (kp, seen[-1])
+    scene.backend.step = inner
+    # Object poses are this tick's, [x, y, z, qw, qx, qy, qz] in the world: equal to an independent kinematics pass.
+    import mujoco
+    for _ in range(50):
+        scene.step(command([0, 0, 0]))
+    poses = scene.observe()['object_poses']
+    m, d = scene.backend.model, scene.backend.data
+    mujoco.mj_kinematics(m, d)
+    (name, pose), = poses.items()
+    assert np.allclose(pose[:3], d.body(name).xpos) and np.allclose(pose[3:], d.body(name).xquat), (pose, d.body(name).xpos)
+    assert pose[2] < .19, f'the part did not fall: {pose}'
+    link.open()
+    try:
+        link.enable_all()
+        target = np.array([.3, -.2, .1])
+        end = time.monotonic() + 1.5
+        while time.monotonic() < end:
+            link.apply_command(command(target))
+            time.sleep(.01)
+        s = link.latest_state()[0]
+        assert s.armed and not s.faulted and np.allclose(s.q, target, atol=.03), s.q
+        # ONLY the arm's slice is written: the peer keeps the world's spawn hold (its own writer is step 3)
+        assert np.array_equal(core.command['kp'][peer_span], spawn_kp) and np.all(spawn_kp > 0), core.command['kp']
+        assert np.allclose(core.command['position'][arm['start']: arm['start'] + 3], target)
+        link.safe_stop()
+        wait(lambda: not np.any(core.command['kp'][arm['start']: arm['start'] + 3]), 1., 'the arm slice released on DISARM')
+        assert np.array_equal(core.command['kp'][peer_span], spawn_kp), 'DISARM of the arm released another actor'
+        batch = link.observations(0)
+        last = batch['samples'][-1]
+        world_names = list(scene.backend.joint_names)
+        assert set(last['actor_q']) == {'arm', 'peer'}, last['actor_q']
+        assert list(last['actor_q']['arm']) == world_names[arm['start']: arm['start'] + 3], last['actor_q']
+        assert abs(list(last['actor_q']['peer'].values())[0] - .3) < .02, last['actor_q']['peer']
+        poses = last['object_poses']
+        assert poses and len(poses) == 1 and len(next(iter(poses.values()))) == 7, poses
+        assert last['topology'] is not None and batch['errors'] == 0, (last['topology'], batch['errors'])
+        # a world that fails to step is a plant fault, latched against the epoch it ran under, as for one model
+        link.enable_all()
+        scene._core.tick = lambda now: (_ for _ in ()).throw(RuntimeError('scene step failed'))
+        wait(lambda: link.latest_state()[0].fault_code == rtp.FAULT_PLANT, 1., 'FAULT_PLANT from a failing scene step')
+    finally:
+        link.close()
+    print('ScenePlant: one actor under SimLink authority, others keep their hold, actor-keyed observations, plant fault: PASS',
+          flush=True)
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix='sim_supervisor_'))
     cfg_path = write_config(tmp, 0, 0)  # also writes three.urdf; the rt ports are unused by the sim plant
@@ -419,6 +532,7 @@ def main():
     link_unit(tmp)
     observe_unit(tmp)
     link_races(tmp)
+    scene_plant_unit(tmp)
     try:
         SimLink.from_config(load_robot_config(cfg_path))  # the fixture config has no sim_servo yet
     except ValueError as exc:

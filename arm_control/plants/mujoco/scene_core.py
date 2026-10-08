@@ -27,6 +27,12 @@ from arm_control.plants.mujoco.composer import build_scene_backend, build_workce
 from arm_control.plants.mujoco.single import build_single_model_backend, open_jaws
 
 
+def describes_scene(cfg) -> bool:
+    """Whether a config's plant is a scene (a workcell, ``WORKCELL_SCENE``, or a composed plant, ``scene.arm``) and not one model.
+    ``build_world`` and the supervisor's sim plant branch on this one rule."""
+    return bool(os.environ.get("WORKCELL_SCENE") or (cfg.get("scene") or {}).get("arm"))
+
+
 def build_world(cfg, *, period: float):
     """The world a robot config describes: a workcell scene (``WORKCELL_SCENE``), a composed plant scene (``scene.arm``), or one
     model. Returns ``(backend, arm_slices, joint_names, n)``; the backend is loaded and its jaws opened."""
@@ -57,7 +63,7 @@ def build_world(cfg, *, period: float):
             f"[mujoco_interface] generic workcell: {n} actuators, slices={arm_slices}",
             flush=True,
         )
-    elif scene_cfg and scene_cfg.get("arm"):
+    elif describes_scene(cfg):
         # `scene.arm` is what makes a scene block a COMPOSED PLANT scene, and
         # the truthiness of `scene:` alone is not: a real-arm config carries a
         # partial `scene:` describing the docking base as a static fixture for
@@ -261,3 +267,67 @@ class SceneCore:
         echoed = np.asarray(state.get("position_cmd", []), dtype=np.float64)
         pos_cmd[: min(self.n, echoed.size)] = echoed[: min(self.n, echoed.size)]
         return pos_cmd
+
+
+class ScenePlant:
+    """One actor of a scene world, as the plant behind a ``SimLink`` (scene hosting, step 2b; 2026-10-08-scene-hosting-design.md).
+
+    The supervisor hosts the world: ``SimLink`` keeps its authority, deadman and observe/1 rules unchanged, and this adapter gives
+    it the supervised actor's slice of a ``SceneCore`` -- the same world code the Dora plant node runs. Each step writes the
+    actor's slice (``SimLink`` writes every tick: a command, a hold or a release word, so the slice's own idle deadman never
+    fires for it) and steps the whole world once. The other actors keep the world's spawn hold until their own writers exist
+    (step 3, D1); the gripper keeps its spawn opening. Driven by ``SimLink``'s one servo thread, as ``SceneCore`` requires.
+    """
+
+    def __init__(self, world, actor: str, joints: list, *, period: float, idle_timeout: float) -> None:
+        backend, slices, names, n = world
+        if actor not in slices:
+            raise ValueError(f"sim_actor {actor!r} is not an actor of this world (actors: {sorted(slices)})")
+        width = len(joints)
+        if slices[actor]["n"] != width:
+            raise ValueError(f"sim_actor {actor!r} has {slices[actor]['n']} joints; the arm config names {width}")
+        start = slices[actor]["start"]
+        # The world prefixes an actor's joints (``asm_fr3_joint1``); the order must still be the arm config's, or every command
+        # would drive the wrong joint.
+        world_joints = list(names)[start: start + width]
+        if not all(w.endswith(j) for w, j in zip(world_joints, joints)):
+            raise ValueError(f"sim_actor {actor!r} joints {world_joints} are not the arm config's {list(joints)} in order")
+        if not (np.isfinite(idle_timeout) and idle_timeout > 0):
+            raise ValueError("idle_timeout_sec must be finite and positive")
+        self.actor, self.backend, self._slices = actor, backend, dict(slices)
+        self._span = slice(start, start + width)
+        self._core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
+
+    @classmethod
+    def from_config(cls, cfg, joints: list, *, period: float) -> "ScenePlant":
+        actor = cfg.get("sim_actor")
+        if not actor:
+            raise ValueError("a scene plant needs sim_actor (the world's actor this supervisor drives): nothing is assumed")
+        idle = cfg.get("idle_timeout_sec")
+        if idle is None:
+            raise ValueError("a scene plant needs idle_timeout_sec (the other actors' deadman): nothing is assumed")
+        return cls(build_world(cfg, period=period), str(actor), list(joints), period=period, idle_timeout=float(idle))
+
+    def load(self) -> None:
+        self.backend.load()
+
+    def close(self) -> None:
+        self.backend.close()
+
+    def _mine(self, state: dict) -> dict:
+        return {"position": np.asarray(state["position"], float)[self._span].copy(),
+                "velocity": np.asarray(state["velocity"], float)[self._span].copy()}
+
+    def step(self, command: dict) -> dict:
+        now = time.monotonic()
+        self._core.set_slice(self.actor, dict(command, cartesian=None), now)
+        return self._mine(self._core.tick(now))
+
+    def motor_state(self) -> dict:
+        return self._mine(self.backend.motor_state())
+
+    def observe(self) -> dict:
+        world = self.backend.observe()
+        names = list(self.backend.joint_names)
+        world["actors"] = {a: names[s["start"]: s["start"] + s["n"]] for a, s in self._slices.items()}
+        return world
