@@ -57,6 +57,8 @@ CHECKS = (
     "check_stream", "check_supervisor_ledger",
     "check_console_controls", "check_console_page", "check_controller_mode_feedback", "check_ui_scene_injection",
 )
+# Wall-clock assertions (check_refinement: parent heartbeat gap < 0.25 s, teardown < 2 s): run alone, not in the pool.
+TIMED = {"check_refinement"}
 # These simulate the staged FR3 (franka/, gitignored, staged by tools/assets/setup_fr3.py). Unstaged, they do not run and one
 # fr3_assets FAIL names them: a fresh checkout is red until the assets are staged, never silently smaller.
 FR3_ASSET = ROOT / "franka/urdf/fr3.urdf"
@@ -118,8 +120,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "rt/build-offline")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
-    parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1),
-                        help="concurrent timing-free checks (timing-sensitive ones always run alone)")
+    parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
+                        help="concurrent timing-free checks (timing-sensitive ones always run alone); more than ~8 "
+                             "gains nothing (the sequential part dominates) and only shrinks timing margins")
     args = parser.parse_args()
     if args.jobs < 1 or args.workers < 1:
         parser.error("--jobs and --workers must be positive")
@@ -161,8 +164,12 @@ def main() -> int:
                            logs=logs, env=env, timeout=240))
         # every console graph has exactly one authority source and can stream
         pool.append(("console_graphs", [sys.executable, str(ROOT / "arm_control/ui/arm_console.py"), "--self-check"], env, 180))
-        pool.append(("dora_arm", [sys.executable, str(ROOT / "tools/check/check_dora_arm.py")], env, 180))
-        pool.append(("sim_supervisor", [sys.executable, str(ROOT / "tools/check/check_sim_supervisor.py")], env, 180))
+        # dora_arm (supervisor deadman windows) and sim_supervisor (rate windows, >= .95x real time under its own readers)
+        # assert wall-clock behaviour: they run alone.
+        results.append(run("dora_arm", [sys.executable, str(ROOT / "tools/check/check_dora_arm.py")], logs=logs, env=env,
+                           timeout=180))
+        results.append(run("sim_supervisor", [sys.executable, str(ROOT / "tools/check/check_sim_supervisor.py")], logs=logs,
+                           env=env, timeout=180))
         pool.append(("scene_core", [sys.executable, str(ROOT / "tools/check/check_scene_core.py")], env, 120))
         results.append(run("trace_retention", [sys.executable,
                                                str(ROOT / "tools/check/check_trace_retention.py")],
@@ -197,6 +204,9 @@ def main() -> int:
             continue
         script, *extra = check.split()
         path = ROOT / "tools/check" / script
+        if check in TIMED:
+            results.append(run(check, [sys.executable, f"{path}.py", *extra], logs=logs, env=env, timeout=180))
+            continue
         pool.append((check.replace(" --", "_"), [sys.executable, f"{path}.py", *extra], env, 180))
     if not FR3_ASSET.is_file():
         results.append(dict(name="fr3_assets", status="FAIL", returncode=None, seconds=0.0, command=[], log="",
