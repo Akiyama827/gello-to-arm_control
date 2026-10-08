@@ -7,8 +7,8 @@ own model, so no pose crosses the wire.
 
 Wire (capability-negotiated, pose hold's pattern):
 * Command version 8 = the v6-sized joint word + a 21-double tail: `task_R` (3x3 row-major, the task axes as COLUMNS, robot BASE
-  frame), `kc[6]`, `dc[6]` (task-frame diagonals [x, y, z, rx, ry, rz]). 840 bytes. `CAP_CARTESIAN_TRAJECTORY = 1 << 5`; the hello
-  adds `cartesian=8`.
+  frame), `kc[6]`, `dc[6]` (task-frame diagonals [x, y, z, rx, ry, rz]). 840 bytes. `CAP_CARTESIAN_TRAJECTORY = 1 << 5`, advertised
+  in the IDENTITY capabilities only (no HELLO token; see review round 1).
 * `valid_cartesian_spec` / `cartesian_values` (C++ / Python, the same rules): all finite; `task_R` orthonormal within 1e-6 and
   det +1 within 1e-6; `kc` <= 1000 N/m, 100 N.m/rad; `dc` <= 200 N.s/m, 50 N.m.s/rad; nonnegative. Python also requires
   `frame == "base"`: a world-frame spec is refused before it is packed.
@@ -27,8 +27,8 @@ uses for `O_T_EE`, the measured pose) and refuses before the first read or on a 
 do not advertise it. **Unvalidated on hardware**: the per-tick cost of `model.pose` inside the 1 kHz loop, and the FK/measured
 agreement on the real arm, are hardware rungs (operator stops). Nothing here is qualified.
 
-Python: `pack_command(..., cartesian=...)` (exclusive with `pose_hold`); `RemoteRTClient.supports_cartesian` from the hello or
-the identity capabilities; `apply_command` refuses a Cartesian spec unless the server advertises v8 and the spec is base-frame.
+Python: `pack_command(..., cartesian=...)` (exclusive with `pose_hold`); `RemoteRTClient.supports_cartesian` from the identity
+capabilities; `apply_command` refuses a Cartesian spec unless the server advertises v8 and the spec is base-frame.
 
 Not in this slice: the PC side producing v8 (ArmController, supervisor, SDK, SimLink/twin FK(q_des) with the world->base
 conversion, the native reference refusing Cartesian legs) is slice 2; the bench's axial kc 2000 -> 1000 N/m and the sim dock
@@ -49,3 +49,20 @@ Checks (related only): all 22 RT ctest self-checks (WITH_FRANKA=OFF; the franka 
 * Python: golden parity with the C++ (11/11 lines); `python -m arm_control.contracts.impedance` (new, in the library suite)
   mirrors the C++ refusals index by index plus frame/keys; the client loopback demo against the fake server: no capability
   advertised, a base spec and a world spec are refused, a world spec is refused even when advertised; ruff.
+
+Review round 1: ACCEPT (22/22 ctest; WITH_FRANKA=ON compiles against libfranka 0.21.2 and `Model::pose(Frame, q, F_T_EE,
+EE_T_K)` is column-major; golden lines identical; 7 of 9 mutants caught). Taken:
+* The HELLO capability buffer (24 chars) cut a Franka's ` pose_hold=6 cartesian=8` to `cartesian=`, and the extra token spent
+  the 104-byte HELLO text so a dual-arm Franka's `rt=` could be truncated. The token is gone: the client already took the
+  capability from IDENTITY, which overrides the HELLO, and the server's decoder gates on its own flag. No safety effect.
+* The franka mock's `pose` ignored the frame and `F_T_EE`/`EE_T_K`, so a backend computing the FLANGE pose (about 0.1 m off
+  `O_T_EE` with the Hand, a ~100 N bias at kc 1000) passed. The mock now chains them along z with FR3-like offsets and the
+  check expects the EE (TCP) frame; mutants caught: a zero `F_T_EE`, `kStiffness`.
+* The UDP receive buffer is a union of every datagram `handle_datagram` accepts (each at an exact size), so it holds the
+  largest by construction; a buffer smaller than an accepted size (reviewer mutant: the old v6 buffer with an 840-byte v8
+  datagram -> `got` 840, decode reading 48 bytes past it) can no longer be written without dropping a member.
+* `apply_command` refuses a command with both tails as `RtLinkError` (was a `ValueError` from the packer); demo checks it.
+Open for slice 2 (operator decision; a control-law/gain question): after a v8 FAULT_PLANT or a lost stream the RT holds with the
+v8 word's joint kp/kd snapshot (as v5/v6). If Cartesian legs run with low joint kp and let kc carry the stiffness, that hold is
+soft (the FR3 floats under the control box's gravity compensation); a hold-gain floor or the leg's joint gains must be decided
+before the dock leg runs.

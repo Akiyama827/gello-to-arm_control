@@ -161,10 +161,8 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   }
   if (ctx.supports_pose_hold.load())
     std::snprintf(capability, sizeof(capability), " pose_hold=%u", POSE_HOLD_VERSION);
-  if (ctx.supports_cartesian.load()) {
-    const size_t used = std::strlen(capability);
-    std::snprintf(capability + used, sizeof(capability) - used, " cartesian=%u", CARTESIAN_VERSION);
-  }
+  // v8 is advertised by the IDENTITY capability bit only: the 104-byte HELLO text has no room for another token
+  // (a Franka's " pose_hold=6 cartesian=8" overflowed the capability buffer and pushed rt= out of the frame).
   rt_setup_names(ctx.rt_setup_failed.load(), rt_setup, sizeof(rt_setup));
   std::snprintf(hello, sizeof(hello),
                 "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s%s%s rt=%s",

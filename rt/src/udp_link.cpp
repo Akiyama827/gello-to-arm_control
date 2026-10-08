@@ -204,8 +204,15 @@ void udp_rx_thread(ServerCtx& ctx) {
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ctx.udp_fd.store(fd);
 
-  // Sized for the LARGEST datagram (v8): MSG_TRUNC reports a longer one's true size, which no decoder accepts.
-  CartesianCommandPacket received{};
+  // One member per datagram handle_datagram accepts (each at an EXACT size), so the buffer holds the largest by
+  // construction: MSG_TRUNC reports a longer datagram's true size, which no decoder accepts, and never reads past it.
+  union {
+    ObserveRequest observe;
+    ReferenceCommandPacket reference;
+    CommandPacket command;
+    PoseHoldCommandPacket pose_hold;
+    CartesianCommandPacket cartesian;
+  } received{};
   CommandFlow flow;
   while (!ctx.shutdown.load()) {
     sockaddr_in src = {};
