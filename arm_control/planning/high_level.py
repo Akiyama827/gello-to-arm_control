@@ -802,8 +802,11 @@ def _check_replan() -> None:
 
     ompl = OMPL([grazing, around])
     planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World())
+    timed_routes, plain_retime = [], planner._retime
+    planner._retime = lambda waypoints, *a: timed_routes.append(waypoints) or plain_retime(waypoints, *a)
     flown = planner.plan_joint(goal, start)
     assert ompl.calls == 2, ompl.calls
+    assert len(timed_routes) == 1 and timed_routes[0] is around, 'a grazing polyline reached the timing ladder'
     assert np.allclose(flown.positions[-1], goal)
     assert not any(World().in_collision(q) for q in flown.densify(1e-3)), 'a re-planned route was not certified'
     ompl = OMPL([grazing])

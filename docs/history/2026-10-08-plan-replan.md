@@ -24,7 +24,10 @@ this one in the planning-layout slice that follows.
 Review round 1 (ACCEPT, two findings closed here):
 * `_check_replan` never reached the re-plan after an exhausted timing ladder (its grazing route is always caught by the
   polyline pre-check): mutants "raise instead of re-plan" and "no pre-check" both survived. It now forces one ladder
-  exhaustion on a clear route (fresh route planned) and checks the refiner case; both mutants caught.
+  exhaustion on a clear route (fresh route planned) and checks the refiner case; both mutants caught. Round 2 (ACCEPT): "no
+  pre-check" still survived (a grazing route then fails the ladder and is re-planned anyway; the pre-check only saves the
+  ladder's cost); the first case now asserts the grazing polyline never reaches the ladder, and that mutant is caught. With a
+  refiner, a grazing seed costs up to 3 x the ladder's TrajOpt calls before the last failure: latency, not correctness.
 * The polyline pre-check is skipped when a refiner is set: TrajOpt's collision terms can push a grazing seed clear, and a
   seed it cannot fix fails the ladder, which re-plans as well.
 Noted, unchanged: if a later attempt's OMPL returns None, `plan_joint` returns None and drops the earlier certification
