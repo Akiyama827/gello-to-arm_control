@@ -11,7 +11,7 @@ from arm_control.planning.ik import PinocchioIK
 from arm_control.motion import JointTrajectory
 from arm_control.planning import PLANNER_DEFAULTS
 from arm_control.planning.retiming import (
-    BLEND_TOLERANCE_RAD, COLLISION_STEP_RAD, RETIMING_STEPS_RAD,
+    BLEND_TOLERANCE_RAD, COLLISION_STEP_RAD, RETIMING_STEPS_RAD, ROUTE_ATTEMPTS, RouteCollides,
     bound_trajectory, collision_checked_retiming, time_parameterize_blended,
 )
 
@@ -451,10 +451,15 @@ class ArmPlanner:
                 # the refiner's native spline timing. Both positions and
                 # velocities may change, so check the returned curve on
                 # every attempt. Exceptions propagate to the planner's hold.
-                seed = self._trajectory_refiner(
-                    seed.positions, self._max_vel * speed_scale,
-                    self._max_acc * speed_scale,
-                )
+                try:
+                    seed = self._trajectory_refiner(
+                        seed.positions, self._max_vel * speed_scale,
+                        self._max_acc * speed_scale,
+                    )
+                except RouteCollides as exc:
+                    # Its collision validation failed. A finer rung only re-densifies the same route's seed, so the ROUTE
+                    # fails: re-planned, at most ROUTE_ATTEMPTS refinements (other refiner errors propagate).
+                    raise _CertifyFailed(exc) from exc
             seed = bound_trajectory(seed, self._max_vel * speed_scale,
                                     self._max_acc * speed_scale)
             if not certify:
@@ -471,7 +476,7 @@ class ArmPlanner:
         raise _CertifyFailed(failure)
 
     # A route that cannot be certified is re-planned (a fresh OMPL route) at most this many times in all.
-    ROUTE_ATTEMPTS = 3
+    ROUTE_ATTEMPTS = ROUTE_ATTEMPTS
     # Tighten both geometric blending and timing resolution on contact.
     RETIMER_STEPS_RAD = RETIMING_STEPS_RAD
     CURVE_COLLISION_STEP_RAD = COLLISION_STEP_RAD
@@ -838,6 +843,35 @@ def _check_replan() -> None:
     planner._retime = lambda waypoints, *_: timed.append(waypoints) or flown
     planner.plan_joint(goal, start)
     assert ompl.calls == 1 and timed[0] is grazing, (ompl.calls, timed)
+    # ... and a refiner that finds the grazing seed in collision (RouteCollides) fails each rung, so the route is re-planned.
+    refined = []
+
+    def refiner(positions, vmax, amax):
+        refined.append(1)
+        if any(World().in_collision(q) for q in positions):
+            raise RouteCollides('trajectory fails canonical MuJoCo collision validation')
+        return time_parameterize_blended(positions, vmax, amax)
+
+    ompl = OMPL([grazing, around])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World(), trajectory_refiner=refiner)
+    flown = planner.plan_joint(goal, start)
+    assert ompl.calls == 2 and not any(World().in_collision(q) for q in flown.densify(1e-3)), ompl.calls
+    assert len(refined) == 2, f'a refiner collision must fail the route, not one rung: {len(refined)} refinements'
+
+    # Any other refiner failure is not a collision: it propagates at once, no re-plan.
+    def broken(positions, vmax, amax):
+        raise ValueError('TrajOpt optimization failed')
+
+    ompl = OMPL([around])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World(), trajectory_refiner=broken)
+    try:
+        planner.plan_joint(goal, start)
+    except RouteCollides:
+        raise AssertionError('a refiner optimization failure was reported as a collision')
+    except ValueError as exc:
+        assert 'optimization failed' in str(exc) and ompl.calls == 1, (exc, ompl.calls)
+    else:
+        raise AssertionError('a failed refinement was flown')
     print(f"re-plan: a grazing route or an exhausted timing ladder gets a fresh route; {ArmPlanner.ROUTE_ATTEMPTS} "
           "attempts at most; a refiner sees the grazing seed OK")
 

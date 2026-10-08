@@ -65,7 +65,7 @@ from arm_control.planning.jog import JogLimits, check_step
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.planning.ompl_planner import OMPLPlanner
 from arm_control.motion import JointTrajectory
-from arm_control.planning.retiming import finish_path, refinement_choice
+from arm_control.planning.retiming import plan_and_finish, refinement_choice
 from arm_control.node_utils import (
     ShutdownFlag,
     _load_mode_config,
@@ -768,10 +768,10 @@ def plan_trajectory(
         # near-zero path through, and the retimer's soft-launch taper turned
         # it into a 2-sample "plan" with a 5-day duration (seen on the bench).
         raise ValueError("already at the target (within 5 mrad)")
-    waypoints = ompl.plan(q_start, q_goal)
-    if waypoints is None:
+    trajectory = plan_and_finish(lambda: ompl.plan(q_start, q_goal), world, vmax, amax, refinement=refinement)
+    if trajectory is None:
         raise ValueError("no collision-free path found (try a different target)")
-    return finish_path(world, waypoints, vmax, amax, refinement=refinement)
+    return trajectory
 
 
 def _planner_init():

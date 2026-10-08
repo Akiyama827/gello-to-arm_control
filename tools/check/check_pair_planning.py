@@ -53,6 +53,46 @@ def crossing():
         )
         assert np.all(held.trajectories["y"].positions == -0.3)
         assert np.all(held.trajectories["y"].velocities == 0)
+        replan(planner)
+
+
+def replan(planner):
+    """The pair planner plans a FRESH route when the finished curve of one collides (plan_and_finish)."""
+    from unittest.mock import patch
+
+    from arm_control.planning.ompl_planner import OMPLPlanner
+    from arm_control.planning.retiming import RouteCollides
+
+    start, goal = {"x": np.array([-0.3]), "y": np.array([-0.3])}, {"x": np.array([0.3]), "y": np.array([0.3])}
+    grazing = np.array([[-0.3, -0.3], [0.3, 0.3]])          # straight through the crossing
+    around = np.array([[-0.3, -0.3], [0.3, -0.3], [0.3, 0.3]])
+
+    def routes(*seq):
+        calls = []
+        return calls, lambda self, s, g: (calls.append(1), seq[min(len(calls), len(seq)) - 1])[1]
+
+    calls, plan = routes(grazing, around)
+    with patch.object(OMPLPlanner, "plan", plan):
+        result = planner.plan(start, goal)
+    assert len(calls) == 2 and not any(planner.world.in_collision(q) for q in result.combined.densify(0.001)), calls
+    calls, plan = routes(grazing, None)
+    with patch.object(OMPLPlanner, "plan", plan):
+        try:
+            planner.plan(start, goal)
+        except RouteCollides:
+            assert len(calls) == 2
+        else:
+            raise AssertionError("a pair route through the crossing was flown")
+    calls, plan = routes(None)
+    with patch.object(OMPLPlanner, "plan", plan):
+        try:
+            planner.plan(start, goal)
+        except RouteCollides:
+            raise AssertionError("no route reported as a collision")
+        except ValueError as exc:
+            assert str(exc) == "no collision-free pair path found", exc
+        else:
+            raise AssertionError("a pair plan without a route")
 
 
 def fr3_sim():

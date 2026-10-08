@@ -14,6 +14,8 @@ from time import perf_counter
 
 import numpy as np
 
+from arm_control.planning.retiming import RouteCollides
+
 
 def _program(world, positions, *, state=False):
     from tesseract_robotics import tesseract_command_language as command
@@ -237,7 +239,7 @@ def _check_positions(world, positions):
 def _check_collision(world, positions, collision_fn=None):
     for q in positions:
         if world.in_collision(q) or (collision_fn is not None and collision_fn(q)):
-            raise ValueError('trajectory fails canonical MuJoCo collision validation')
+            raise RouteCollides('trajectory fails canonical MuJoCo collision validation')
 
 
 def _validate_timing(world, positions, t, q, v, a, vmax, amax, *, collision_fn=None):
@@ -533,6 +535,8 @@ def _self_check(native=False):
                            (q * np.nan, [1, 1])):
         try:
             refine_trajectory(world, seed, velocity, [1, 1])
+        except RouteCollides:
+            raise AssertionError('invalid input reported as a collision (it would be re-planned)')
         except ValueError:
             pass
         else:
@@ -553,7 +557,7 @@ def _self_check(native=False):
     try:
         _validate_timing(world, q, t, q.copy(), v, spline(t, 2),
                          np.ones(2), np.ones(2))
-    except ValueError:
+    except RouteCollides:  # a collision, so the caller may re-plan the route
         pass
     else:
         raise AssertionError('interior collision accepted')
