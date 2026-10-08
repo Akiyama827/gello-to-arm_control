@@ -662,9 +662,9 @@ server.
   - The supervisor needs `.[supervisor]` (pyarrow for the controller's
     codecs, pyyaml) plus Pinocchio.
   - Dora processes need `.[dora]`.
-  - `tools/bench/check_sdk_supervisor.py` drives all of it device-free,
+  - `tools/check/check_sdk_supervisor.py` drives all of it device-free,
     including from a clean numpy-only install.
-  - `tools/bench/check_supervisor_ledger.py` covers the ledger rules the fake
+  - `tools/check/check_supervisor_ledger.py` covers the ledger rules the fake
     server cannot provoke: completion without acceptance, ARM during a
     pending DISARM, and retention.
 - **One writer.** Until the Dora adapters delegate to the supervisor, a robot

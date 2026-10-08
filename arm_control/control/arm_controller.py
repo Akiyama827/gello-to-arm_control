@@ -26,7 +26,7 @@ The one rule that makes the split safe is ``plan_id``:
 3. Every result carries its plan_id back, so a late reply from a superseded
    plan is dropped rather than credited to the current one.
 
-Its checks are ``tools/bench/check_arm_controller.py`` (run it directly) and
+Its checks are ``tools/check/check_arm_controller.py`` (run it directly) and
 the doubles they share are ``arm_control.control.doubles``. They used to be the
 last third of this file.
 """

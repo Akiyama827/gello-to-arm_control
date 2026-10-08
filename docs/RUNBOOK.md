@@ -24,7 +24,7 @@ Do not assume every optional module imports without its dependency installed.
 
 ## Offline checks
 
-`python tools/bench/rt_offline_suite.py` builds the RT tree and runs every device-free check below, and every other one in
+`python tools/check/suite.py` builds the RT tree and runs every device-free check below, and every other one in
 `tools/` (a device-free check no suite runs is deleted). Individually, these use assert-based checks and do not arm hardware:
 
 ```bash
@@ -44,16 +44,16 @@ PYTHONPATH=. python -B tools/assets/setup_fr3.py --check
 PYTHONPATH=. python -B -m arm_control.model_bundle
 PYTHONPATH=. python -B -m arm_control.mukca
 PYTHONPATH=. python -B -m arm_control.kinematic_fit --self-check
-PYTHONPATH=. python -B tools/bench/check_rt_telemetry.py
-PYTHONPATH=. python -B tools/bench/check_arm_controller.py
+PYTHONPATH=. python -B tools/check/check_rt_telemetry.py
+PYTHONPATH=. python -B tools/check/check_arm_controller.py
 ```
 
 With a built `arm_rt_server` (fake backend, no hardware):
 
 ```bash
 PYTHONPATH=. python -B -m arm_control.plants.remote_rt.client   # loopback rung
-PYTHONPATH=. python -B tools/bench/rt/check_two_instances.py <build>/arm_rt_server
-PYTHONPATH=. python -B tools/bench/rt/torque_cap.py <build>/arm_rt_server
+PYTHONPATH=. python -B tools/check/rt/check_two_instances.py <build>/arm_rt_server
+PYTHONPATH=. python -B tools/check/rt/torque_cap.py <build>/arm_rt_server
 ```
 
 `check_two_instances.py` runs two fake instances at once: simultaneous
@@ -146,19 +146,19 @@ standalone executor node is no longer a supported process surface; its class
 remains available under `arm_control.control.trajectory_executor`.
 
 ```bash
-PYTHONPATH=. python tools/bench/check_execution_policy.py
-PYTHONPATH=. python tools/bench/check_node_shutdown.py
+PYTHONPATH=. python tools/check/check_execution_policy.py
+PYTHONPATH=. python tools/check/check_node_shutdown.py
 ```
 
 Console policy checks (no hardware):
 
 ```bash
-PYTHONPATH=. python tools/bench/check_console_authority.py
-PYTHONPATH=. python tools/inspect/check_console_controls.py
-PYTHONPATH=. python tools/inspect/check_console_page.py
-PYTHONPATH=. python tools/inspect/check_controller_mode_feedback.py
-PYTHONPATH=. python tools/bench/check_console_grasp.py
-PYTHONPATH=. python tools/bench/check_hand_grasp.py
+PYTHONPATH=. python tools/check/check_console_authority.py
+PYTHONPATH=. python tools/check/check_console_controls.py
+PYTHONPATH=. python tools/check/check_console_page.py
+PYTHONPATH=. python tools/check/check_controller_mode_feedback.py
+PYTHONPATH=. python tools/check/check_console_grasp.py
+PYTHONPATH=. python tools/check/check_hand_grasp.py
 PYTHONPATH=. python -m arm_control.console_server
 PYTHONPATH=. python nodes/arm_console.py --self-check
 PYTHONPATH=. python -m arm_control.control.arm_controller
@@ -331,14 +331,14 @@ empty-Hand virtual coordination use the experimental adapter described above.
 Device-free regression commands (planning/simulation checks need staged assets):
 
 ```bash
-PYTHONPATH=. python -B tools/bench/check_bimanual_contract.py
-PYTHONPATH=. python -B tools/bench/check_bimanual_sync.py
-PYTHONPATH=. python -B tools/bench/check_pair_planning.py
-PYTHONPATH=. python -B tools/bench/check_dual_console.py
-PYTHONPATH=. python -B tools/bench/check_cooperative.py
-PYTHONPATH=. python -B tools/bench/check_dual_modes.py [path/to/pair.yaml]
-PYTHONPATH=. python -B tools/bench/check_dual_modes.py [path/to/pair.yaml] --refine
-PYTHONPATH=. python -B tools/bench/check_refinement.py
+PYTHONPATH=. python -B tools/check/check_bimanual_contract.py
+PYTHONPATH=. python -B tools/check/check_bimanual_sync.py
+PYTHONPATH=. python -B tools/check/check_pair_planning.py
+PYTHONPATH=. python -B tools/check/check_dual_console.py
+PYTHONPATH=. python -B tools/check/check_cooperative.py
+PYTHONPATH=. python -B tools/check/check_dual_modes.py [path/to/pair.yaml]
+PYTHONPATH=. python -B tools/check/check_dual_modes.py [path/to/pair.yaml] --refine
+PYTHONPATH=. python -B tools/check/check_refinement.py
 ```
 
 The older `dataflows/dual_arm_sim.yml` deliberately runs two **independent**
@@ -398,8 +398,8 @@ Soft requires the updated compiled binding in the same environment as Dora:
 ```bash
 python -m pip install --no-deps -e rt/bindings
 PYTHONPATH=. python rt/bindings/pose_hold_check.py
-PYTHONPATH=. python tools/bench/check_pose_hold.py
-PYTHONPATH=. python tools/bench/check_pose_hold_sim.py [/path/to/arm_rt_servo.so] [--config <entry.yaml>]
+PYTHONPATH=. python tools/check/check_pose_hold.py
+PYTHONPATH=. python tools/check/check_pose_hold_sim.py [/path/to/arm_rt_servo.so] [--config <entry.yaml>]
 ```
 
 The simulation regression builds the plant with the sim's own builder from a
