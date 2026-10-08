@@ -125,14 +125,20 @@ class SimLink:
         """The simulated plant a robot config describes: its ``sim_*`` plant keys (``plants.mujoco.single``), its ``rt`` block for
         the instance id and freshness bounds, and the required ``sim_servo`` block."""
         from arm_control.config import arm_joints
+        from arm_control.plants.mujoco.scene_core import ScenePlant, describes_scene
         from arm_control.plants.mujoco.single import build_single_model_backend, open_jaws
 
         servo = dict(cfg.get("sim_servo") or {})
         if "state_hz" not in servo:
             raise ValueError("config has no sim_servo.state_hz: nothing is assumed")
-        plant = build_single_model_backend(cfg, control_period=1.0 / float(servo["state_hz"]))
-        open_jaws(plant, cfg)  # the Hand spawns open, as in the Dora plant node (MuJoCo's zero is a shut hand)
-        return cls(RtConfig.from_config(cfg), arm_joints(cfg), plant, servo=servo, observe=cfg.get("sim_observe"))
+        period = 1.0 / float(servo["state_hz"])
+        joints = arm_joints(cfg)
+        if describes_scene(cfg):  # the supervisor hosts the whole world and drives one actor of it (``sim_actor``)
+            plant = ScenePlant.from_config(cfg, len(joints), period=period)
+        else:
+            plant = build_single_model_backend(cfg, control_period=period)
+            open_jaws(plant, cfg)  # the Hand spawns open, as in the Dora plant node (MuJoCo's zero is a shut hand)
+        return cls(RtConfig.from_config(cfg), joints, plant, servo=servo, observe=cfg.get("sim_observe"))
 
     @property
     def num_motors(self) -> int:
@@ -346,12 +352,16 @@ class SimLink:
             return
         try:
             world = self._plant.observe()
-            actor = self.config.instance_id
+            # A scene names its actors (every one, by its world joint names); one model is this instance's own actor.
+            actors = world.get("actors") or {self.config.instance_id: list(world["joint_q"])}
+            actor_q = {a: {j: world["joint_q"][j] for j in names} for a, names in actors.items()}
+            actor_dq = {a: {j: world["joint_dq"][j] for j in names} for a, names in actors.items()}
             sample = dict(seq=self._obs_seq + 1, sim_time_s=world["sim_time_s"], observed_ns=time.monotonic_ns(),
                           model_revision=world["model_revision"], scene_revision=world.get("scene_revision"),
-                          actor_q={actor: world["joint_q"]}, actor_dq={actor: world["joint_dq"]},
+                          actor_q=actor_q, actor_dq=actor_dq,
                           gripper=world.get("gripper"), attachments=world.get("attachments"),
-                          constraints=world.get("constraints"), object_poses=None, inhand_pose=world.get("inhand_pose"),
+                          constraints=world.get("constraints"), object_poses=world.get("object_poses"),
+                          inhand_pose=world.get("inhand_pose"),
                           constraint_force=world.get("constraint_force"), ee_wrench=world.get("ee_wrench"),
                           topology=world.get("topology"), qpos=world.get("qpos"))
             with self._lock:
