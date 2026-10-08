@@ -68,11 +68,11 @@ separate acceptance steps.
 
 ## Bench inventory
 
-Every `tools/bench/rt/*.py` file has one role. **Regression** entries belong
-to the device-free C3 suite (`95ea1d9`); `native_reference.py` and
-`reference_upload.py` run there through their CTest self-check wrappers.
-**Diagnostic** entries are opt-in investigations or support modules, not
-routine pass gates. The current `controller_extension.py` regression exposes an
+Every `tools/check/rt/*.py` file is a **regression** run by the offline suite (`tools/check/suite.py`;
+`native_reference.py` and `reference_upload.py` through their CTest self-check wrappers) or a **helper** (`_` prefix) the
+regressions import. Opt-in measurements on a fake server live in `tools/diag/` (`constrained_cpu.py`, the loaded timing matrix;
+`tick_jitter.py`, the servo-tick period distribution behind the CTRL-040 constants proposal); the passive timing observer of a
+real server is `tools/hw/rt_timing.py`. The current `controller_extension.py` regression exposes an
 intermittent pending-COMMIT cancellation race (10/15 runs fail at `3c82090`);
 C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 `task/control/CTRL-034-pending-commit-cancel`). Reviewer bisection
@@ -81,9 +81,8 @@ C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 
 | File | Class | Scope |
 |---|---|---|
-| `bench_target.py` | diagnostic | Local/remote bench target helper |
+| `_bench_target.py` | helper | Local/remote bench target (imported by regressions) |
 | `check_two_instances.py` | regression | Two fake instance isolation |
-| `constrained_cpu.py` | diagnostic | Loaded timing matrix runner |
 | `controller_extension.py` | regression | Controller preset/payload transitions |
 | `pending_commit_cancel.py` | regression | Cancel racing a pending stream COMMIT frees the slot (forced orderings) |
 | `selection_unresolved.py` | regression | A stuck pending selection is reported after 250 ms (receipt, CANCEL, hold); the control run starves to CMD_LOST |
@@ -95,9 +94,8 @@ C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 | `clock_domain.py` | regression | HELLO `clk=mono:<host>:<boot>` (CTRL-041): keyed host+boot identity matches an independent HMAC, changes with boot id/host, absent when unreadable |
 | `group_execution.py` | regression | CTRL-040: two fake servers share a group record; one group deadline, per-member selection stamps, peer never commits, late commit, cancel after staging, peer process loss/cancel/fault, new group after a fault, second group/old epoch/wrong member refused. Bench timing values are not proposals |
 | `group_coordinator.py` | regression | CTRL-040 PC driver (`multi_arm/group.py`) with the APPROVED constants: start record from RT selection stamps (PC send skew kept apart), peer never commits, budget below MIN_LEAD, reference shorter than H, mixed clock domains refused, peer loss enforced within ~34 ms and reported within hold_ms |
-| `tick_jitter.py` | measurement | Servo-tick period distribution of a fake server from its state stream (input to the CTRL-040 constants proposal); not a pass/fail gate, not in the suite |
-| `envelope_age.py` | diagnostic | Timing collection helper |
-| `first_envelope_trace.py` | diagnostic | Opt-in client timeline helper |
+| `_envelope_age.py` | helper | Timing collection (imported by regressions) |
+| `_first_envelope_trace.py` | helper | Opt-in client timeline (imported by `pc_stall.py`) |
 | `mode_select.py` | regression | Mode wire parity and malformed packets |
 | `mode_select_supervisor.py` | regression | Mode handoff through fake RT |
 | `native_reference.py` | regression | Native reference and expiry through CTest |
@@ -111,13 +109,8 @@ C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 | `stream_races.py` | regression | Stream admission races |
 | `stream_supervisor.py` | regression | Stream SDK/supervisor flow |
 | `streamed_hold.py` | regression | Streamed-command stall guard |
-| `timing.py` | diagnostic | Passive server timing observation |
 | `torque_cap.py` | regression | Torque admission and protocol parity |
 
-No tool is classified as retired: the historical probes remain useful for
-diagnosis or legacy-compatibility checks, and `first_envelope_trace.py` is
-still imported by the active `pc_stall.py` trace path. There is therefore no
-retired-tool deletion commit in C4.
 
 ## Build
 
@@ -125,20 +118,20 @@ retired-tool deletion commit in C4.
 cmake -B build -G Ninja rt && cmake --build build          # fake + selfcheck
 cmake -B build -G Ninja -DWITH_FRANKA=ON rt && cmake --build build   # + FR3
 pip install -e rt/bindings                                  # optional: sim same-law
-PYTHONPATH=. python tools/bench/rt/torque_cap.py build/arm_rt_server  # offline caps + parity
+PYTHONPATH=. python tools/check/rt/torque_cap.py build/arm_rt_server  # offline caps + parity
 build/dm_command_selfcheck                                # native command dispatch, no devices
 build/dm_backend_selfcheck                                # DM lifecycle via intercepted CAN syscalls
 build/franka_backend_selfcheck                            # FR3 exception containment, scripted franka::
 build/fault_journal_selfcheck                             # first-cause fault journal ring
 build/ipc_selfcheck                                       # mailbox, command admission; also build with -fsanitize=thread
 build/stale_envelope_scope_selfcheck                      # prior ARM envelope cannot own a new reference
-PYTHONPATH=. python tools/bench/rt/stale_envelope_scope.py build/arm_rt_server  # 50 fake-RT collisions
+PYTHONPATH=. python tools/check/rt/stale_envelope_scope.py build/arm_rt_server  # 50 fake-RT collisions
 ```
 
 The consolidated device-free check is:
 
 ```bash
-python tools/bench/rt_offline_suite.py
+python tools/check/suite.py
 ```
 
 It builds with `WITH_FRANKA=OFF`, runs all 19 available C++ self-checks through
@@ -418,10 +411,10 @@ review-caught, all in the stale-authority class):
    rejection, passive observers, stop-epoch confirmation and session restart
    isolation. The original subset was GREEN 2026-07-27; the v5 additions are
    offline-verified against the fake backend only. Keep it green.
-   `tools/bench/rt/check_two_instances.py` runs two fake instances at once.
+   `tools/check/rt/check_two_instances.py` runs two fake instances at once.
 1. **Fake on the RT box**: same demo with `rt.host` pointed at the box.
    Proves the link, the kernel, and the service unit. Quantify with
-   `python tools/bench/rt/timing.py --host <box>` — it listens to the
+   `python tools/hw/rt_timing.py --host <box>` — it listens to the
    disarmed state stream (states only, sends one zero-gain packet) and
    reports the servo's per-tick wakeup jitter from the tick stamps.
 2. **FR3 gravity-float, then impedance-hold** — first hardware validation of
@@ -602,7 +595,7 @@ Offline schema check (no server/device):
 
 ```sh
 cmake --build build --target reference_protocol_selfcheck
-PYTHONPATH=. python tools/bench/rt/reference_protocol.py build/reference_protocol_selfcheck
+PYTHONPATH=. python tools/check/rt/reference_protocol.py build/reference_protocol_selfcheck
 ```
 
 
@@ -633,8 +626,8 @@ The test session executable alone enables it without a plant/servo thread.
 
 ```sh
 build/reference_upload_selfcheck
-PYTHONPATH=. python tools/bench/rt/reference_numerics.py build/reference_probe.so
-PYTHONPATH=. python tools/bench/rt/reference_upload.py build/reference_session_selfcheck
+PYTHONPATH=. python tools/check/rt/reference_numerics.py build/reference_probe.so
+PYTHONPATH=. python tools/check/rt/reference_upload.py build/reference_session_selfcheck
 ```
 
 ### RT selection and PC provider
@@ -672,7 +665,7 @@ use existing command/state packets, regardless of the advertised capability.
 
 ```sh
 build/reference_selection_selfcheck
-PYTHONPATH=. python tools/bench/rt/native_reference.py build/reference_runtime_selfcheck
+PYTHONPATH=. python tools/check/rt/native_reference.py build/reference_runtime_selfcheck
 ```
 
 The model-bound supervisor binds `TrajectoryReference` to selected feedback:
@@ -686,9 +679,9 @@ controller's new compensated hold target requires an explicit constant terminal
 admission; underflow never triggers that automatic recovery.
 
 ```sh
-PYTHONPATH=. python tools/bench/rt/reference_horizon.py build/reference_runtime_selfcheck
-PYTHONPATH=. python tools/bench/rt/reference_supervisor.py build/reference_runtime_selfcheck
-PYTHONPATH=. python tools/bench/check_sdk_supervisor.py --native --server build/arm_rt_server
+PYTHONPATH=. python tools/check/rt/reference_horizon.py build/reference_runtime_selfcheck
+PYTHONPATH=. python tools/check/rt/reference_supervisor.py build/reference_runtime_selfcheck
+PYTHONPATH=. python tools/check/check_sdk_supervisor.py --native --server build/arm_rt_server
 ```
 
 Checks cover command parity at the same RT sample, receipt ordering, deadline

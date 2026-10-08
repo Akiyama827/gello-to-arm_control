@@ -1,7 +1,7 @@
 # Application clients (CTRL-052)
 
 `arm_control/clients/` holds four thin clients over `ArmClient` (stdlib + numpy; the backend never imports it, checked by
-`tools/bench/rt/clients.py`). Run them against fake endpoints: `cd tools/bench/rt && PYTHONPATH=../../..:. python clients.py <build>/reference_runtime_selfcheck` (or `tools/bench/rt_offline_suite.py`).
+`tools/check/rt/clients.py`). Run them against fake endpoints: `cd tools/check/rt && PYTHONPATH=../../..:. python clients.py <build>/reference_runtime_selfcheck` (or `tools/check/suite.py`).
 
 | Client | Contract |
 |---|---|

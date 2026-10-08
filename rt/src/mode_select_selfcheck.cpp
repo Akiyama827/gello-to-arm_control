@@ -1,5 +1,5 @@
 // Mode-selection wire + authority unit check. No sockets, no threads: the
-// cross-language golden is compared against tools/bench/rt/mode_select.py, and
+// cross-language golden is compared against tools/check/rt/mode_select.py, and
 // the ArmMode gate is asserted directly so a regression in "which law may
 // actuate" fails here rather than on a robot.
 #include <cassert>
@@ -41,7 +41,7 @@ int main() {
   static_assert(sizeof(ModeSelectPayload) == 104, "mode select layout");
   static_assert(sizeof(ModeSelectReplyPayload) == 104, "mode status layout");
 
-  // --- wire goldens (must equal tools/bench/rt/mode_select.py exactly) ------
+  // --- wire goldens (must equal tools/check/rt/mode_select.py exactly) ------
   ModeSelectPayload sel{};
   sel.session_id = 123;
   sel.generation = 6;

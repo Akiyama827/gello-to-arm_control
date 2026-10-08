@@ -198,10 +198,10 @@ if(BUILD_TESTING)
   # the other free UDP/TCP ports. Their existing Python probes supply them.
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_test(NAME reference_session_selfcheck COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_SOURCE_DIR}/../tools/bench/rt/reference_upload.py
+    ${CMAKE_SOURCE_DIR}/../tools/check/rt/reference_upload.py
     $<TARGET_FILE:reference_session_selfcheck>)
   add_test(NAME reference_runtime_selfcheck COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_SOURCE_DIR}/../tools/bench/rt/native_reference.py
+    ${CMAKE_SOURCE_DIR}/../tools/check/rt/native_reference.py
     $<TARGET_FILE:reference_runtime_selfcheck>)
   set_tests_properties(reference_session_selfcheck reference_runtime_selfcheck
     PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/..")

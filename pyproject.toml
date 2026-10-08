@@ -9,7 +9,7 @@ description = "Reusable robot control, planning, plant backends and Dora adapter
 requires-python = ">=3.10"
 
 # HARD deps = what the minimal SDK imports: arm_control.sdk, .execution and
-# .motion need numpy and nothing else (tools/bench/check_sdk_supervisor.py
+# .motion need numpy and nothing else (tools/check/check_sdk_supervisor.py
 # asserts it). Everything that runs a controller or a Dora process is an extra.
 dependencies = [
     "numpy",
