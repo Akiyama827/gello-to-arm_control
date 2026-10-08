@@ -1,88 +1,48 @@
-"""Headless FR3 Soft disturbance check; pass the freshly built servo .so.
+"""Headless Soft (pose hold) disturbance check on the simulated arm a config describes; no hardware connection.
 
-No hardware connection. Numerical limits belong to the identified historical
-fixture, not to arbitrary nominal or calibrated FR3 descriptions.
+The plant is built by the same builder as the sim (plants/mujoco/single.build_single_model_backend), so it carries the robot's
+own description, step and reflected rotor inertia (`sim_armature`). Default: the library's FR3 example; a deployment passes its
+own entry config (the project suite runs it on each deployed arm's description). Optionally pass the freshly built servo .so.
 """
 import argparse
-import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import sys
-import xml.etree.ElementTree as ET
 
 import numpy as np
-
-FIXTURE_ID = "legacy-fr3-soft-20260907"
-FIXTURE_SHA256 = "94bd52bf6d1b5a87312a5edbf61f3ea91c8a34a1236e0e4cc1785611a5d4957d"
-# Historical evidence: URDF plus its 12 distinct referenced collision meshes.
-# Hash compact JSON [("urdf", source_sha), (sorted mesh URI, content_sha), ...].
-# URI labels, not resolved paths, keep an explicit --fixture copy relocatable.
-FIXTURE_FINGERPRINT = "7b8060b5c078bc95dfd6ed7cd39fd662e8086cbfeca08fce98f84a3091b607a1"
-
-
-def fixture_fingerprint(fixture: Path, source: bytes) -> str:
-    records = [("urdf", hashlib.sha256(source).hexdigest())]
-    names = sorted({m.attrib["filename"] for m in
-                    ET.fromstring(source).findall("./link/collision/geometry/mesh")})
-    for name in names:
-        records.append((name, hashlib.sha256((fixture.parent / name).read_bytes()).hexdigest()))
-    return hashlib.sha256(json.dumps(records, separators=(",", ":")).encode()).hexdigest()
 
 
 def main():
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("servo_binding", nargs="?", help="freshly built arm_rt_servo .so")
-    parser.add_argument("--fixture", type=Path, default=root / "franka/urdf/fr3.urdf",
-                        help=f"source URDF for {FIXTURE_ID}; meshes must resolve beside it")
+    parser.add_argument("--config", type=Path, default=root / "examples/configs/sim_arm.yaml", help="robot entry config")
+    parser.add_argument("--mode", type=Path, default=root / "examples/profiles/motion_franka.yaml",
+                        help="mode profile holding the Soft gain preset")
     args = parser.parse_args()
-    fixture = args.fixture.resolve()
-    if not fixture.is_file():
-        parser.error(f"fixture/provenance mismatch: missing URDF {fixture}; "
-                     "controller regression NOT RUN")
-    source = fixture.read_bytes()
-    digest = hashlib.sha256(source).hexdigest()
-    if digest != FIXTURE_SHA256:
-        parser.error(f"fixture/provenance mismatch for {FIXTURE_ID}: {fixture} "
-                     f"has SHA256 {digest}, expected {FIXTURE_SHA256}; "
-                     "controller regression NOT RUN. Supply --fixture with the "
-                     "historical URDF; these thresholds do not qualify another model.")
-    try:
-        fingerprint = fixture_fingerprint(fixture, source)
-    except OSError as exc:
-        parser.error(f"fixture/provenance mismatch; controller regression NOT RUN: {exc}")
-    if fingerprint != FIXTURE_FINGERPRINT:
-        parser.error("fixture/provenance mismatch; controller regression NOT RUN: "
-                     f"URDF/collision fingerprint {fingerprint}, expected {FIXTURE_FINGERPRINT}")
-    print(json.dumps(dict(fixture_id=FIXTURE_ID, fixture_path=str(fixture),
-                          fixture_sha256=digest, fixture_fingerprint=fingerprint,
-                          fixture_identity="verified")), flush=True)
     if args.servo_binding:
         spec = importlib.util.spec_from_file_location("arm_rt_servo", args.servo_binding)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         sys.modules["arm_rt_servo"] = module
 
-    from arm_control.config import load_config_tree
-    from arm_control.plants.mujoco.backend import MuJoCoBackend
+    from arm_control.config import load_config_tree, load_robot_config
+    from arm_control.plants.mujoco.single import build_single_model_backend
 
-    cfg = load_config_tree(root / "examples/configs/sim_arm.yaml")
-    mode = load_config_tree(root / "examples/profiles/motion_franka.yaml")
+    cfg = load_robot_config(args.config)
+    mode = load_config_tree(args.mode)
     soft = mode["gain_presets"]["soft"]["pose_hold"] | {"id": 1}
-    plant = MuJoCoBackend(
-        joint_names=cfg["arm"]["joints"], single_model_path=fixture,
-        timestep=.001, control_period=.01, ee_body=cfg["arm"]["ee_frame"],
-        enable_self_collision=True, default_joint_positions=cfg["sim_default_joint_positions"],
-        gravcomp_prefixes=("",), gripper_joints=tuple(cfg["arm"]["gripper_joints"]),
-    )
+    plant = build_single_model_backend(cfg, control_period=.01)
+    print(json.dumps(dict(config=str(args.config), model=str(plant.single_model_path), timestep=plant.timestep,
+                          arm_armature=plant.arm_armature)), flush=True)
     plant.load()
     assert plant.supports_pose_hold
     q0 = plant.data.qpos[plant._qadr].copy()
     p0 = plant.data.body(plant._ee_bid).xpos.copy()
     r0 = plant.data.body(plant._ee_bid).xquat.copy()
     cmd = dict(position=q0, velocity=np.zeros(7), torque=np.zeros(7),
-               kp=cfg["arm"]["kp"], kd=cfg["arm"]["kd"], pose_hold=soft)
+               kp=cfg.raw["arm"]["kp"], kd=cfg.raw["arm"]["kd"], pose_hold=soft)
     samples = []
     for tick in range(1000):
         # Push the elbow with a physical external joint torque, not a

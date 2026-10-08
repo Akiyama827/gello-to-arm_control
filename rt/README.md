@@ -97,14 +97,12 @@ C3 reports it as FAIL, and **CTRL-034** owns the behavior correction (branch
 | `group_coordinator.py` | regression | CTRL-040 PC driver (`multi_arm/group.py`) with the APPROVED constants: start record from RT selection stamps (PC send skew kept apart), peer never commits, budget below MIN_LEAD, reference shorter than H, mixed clock domains refused, peer loss enforced within ~34 ms and reported within hold_ms |
 | `tick_jitter.py` | measurement | Servo-tick period distribution of a fake server from its state stream (input to the CTRL-040 constants proposal); not a pass/fail gate, not in the suite |
 | `envelope_age.py` | diagnostic | Timing collection helper |
-| `first_envelope_probe.py` | diagnostic | First-envelope collision investigation |
 | `first_envelope_trace.py` | diagnostic | Opt-in client timeline helper |
 | `mode_select.py` | regression | Mode wire parity and malformed packets |
 | `mode_select_supervisor.py` | regression | Mode handoff through fake RT |
 | `native_reference.py` | regression | Native reference and expiry through CTest |
 | `pc_stall.py` | regression | PC stall and local cancel |
 | `reference_horizon.py` | regression | Bounded horizon execution |
-| `reference_mode_boundary.py` | diagnostic | Historical v5/v7 arbitration probe |
 | `reference_numerics.py` | regression | Native/Python Hermite parity |
 | `reference_protocol.py` | regression | v7 wire parity and malformed packets |
 | `reference_supervisor.py` | regression | Supervisor/native execution |

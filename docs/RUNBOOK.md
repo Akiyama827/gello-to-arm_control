@@ -24,7 +24,8 @@ Do not assume every optional module imports without its dependency installed.
 
 ## Offline checks
 
-These commands use existing assert-based checks and do not arm hardware:
+`python tools/bench/rt_offline_suite.py` builds the RT tree and runs every device-free check below, and every other one in
+`tools/` (a device-free check no suite runs is deleted). Individually, these use assert-based checks and do not arm hardware:
 
 ```bash
 PYTHONPATH=. python -B -m arm_control.config
@@ -397,22 +398,17 @@ Soft requires the updated compiled binding in the same environment as Dora:
 ```bash
 python -m pip install --no-deps -e rt/bindings
 PYTHONPATH=. python rt/bindings/pose_hold_check.py
-PYTHONPATH=. python tools/bench/check_pose_hold_contract.py
-PYTHONPATH=. python tools/bench/check_pose_hold_controller.py
-PYTHONPATH=. python tools/bench/check_pose_hold_sim.py /path/to/arm_rt_servo.so --fixture /path/to/historical/fr3.urdf
+PYTHONPATH=. python tools/bench/check_pose_hold.py
+PYTHONPATH=. python tools/bench/check_pose_hold_sim.py [/path/to/arm_rt_servo.so] [--config <entry.yaml>]
 ```
 
-The simulation regression identifies `legacy-fr3-soft-20260907` by source URDF
-SHA256 `94bd52bf6d1b5a87312a5edbf61f3ea91c8a34a1236e0e4cc1785611a5d4957d`.
-The check also fingerprints the URDF plus the bytes of its 12 distinct
-referenced collision meshes: `7b8060b5c078bc95dfd6ed7cd39fd662e8086cbfeca08fce98f84a3091b607a1`.
-Meshes must resolve relative to that file; a replaced/missing collision mesh
-refuses the regression. Visual-only meshes are excluded from this physics fixture.
-With no `--fixture`, it checks
-the standalone library-root URDF; a missing or different asset exits 2 with
-`fixture/provenance mismatch` before loading the controller. It does not run
-the historical numerical limits against generic FR3 or approved MUKCa models.
-This is a historical simulation regression, not FR3 #1 calibration validation.
+The simulation regression builds the plant with the sim's own builder from a
+robot entry config (default `examples/configs/sim_arm.yaml`, the staged generic
+FR3), so it carries that robot's description, step and `sim_armature`; a
+deployment passes `--config` for each deployed arm. Its limits are behavioural:
+a 1 N*m elbow push moves the elbow, the EE stays within 2 cm / 0.15 rad and
+recovers within 5 mm / 0.03 rad. The offline suite runs it. It is a simulation
+check of the compiled law, not hardware qualification.
 
 The single-model simulator advertises support only with an explicit EE body and
 the updated binding. Composed workcells do not advertise Soft. Remote Franka
