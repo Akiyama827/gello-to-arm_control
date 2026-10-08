@@ -220,6 +220,7 @@ class RtBackend:
         self._send_lock = threading.Lock()  # node thread + _ctl_loop PONG
         self._active_mask = 0
         self.supports_pose_hold = False
+        self.supports_cartesian = False
         self.identity: rtp.Identity | None = None
         self.session_id = 0
         self._arm_epoch = 0
@@ -370,6 +371,7 @@ class RtBackend:
         self.session_id = ident.session_id
         self._expected_identity = ident.identity_hash
         self.supports_pose_hold = bool(ident.capabilities & rtp.CAP_POSE_HOLD)
+        self.supports_cartesian = bool(ident.capabilities & rtp.CAP_CARTESIAN_TRAJECTORY)
 
     def enable_all(self) -> None:
         """Arm. The server holds the current pose until commands flow."""
@@ -478,9 +480,17 @@ class RtBackend:
         """Stream one joint-servo word (the full bridge contract — the server
         applies torque clamp + slew; nothing is dropped on this side).
         Returns the wire seq sent, or None if nothing left (closed, send error)."""
-        if command.get("cartesian") is not None:
-            raise RtLinkError("RT backend does not support the legacy cartesian command tail")
+        cartesian = command.get("cartesian")
+        if cartesian is not None:
+            # v8 (operator 2026-10-09): task frame + Kc/Dc in the robot BASE frame; the box computes the target as FK(q_des).
+            # A world-frame spec (the in-process controller's pose/task_R/kc/dc) is refused, never sent.
+            if not self.supports_cartesian:
+                raise RtLinkError("RT backend does not advertise the v8 Cartesian law (CAP_CARTESIAN_TRAJECTORY)")
+            if not isinstance(cartesian, dict) or cartesian.get("frame") != "base":
+                raise RtLinkError("a cartesian command must be a base-frame spec (frame: base, task_R, kc, dc)")
         pose_hold = command.get("pose_hold")
+        if pose_hold is not None and cartesian is not None:
+            raise RtLinkError("a command carries a pose-hold tail or a cartesian tail, not both")
         if pose_hold is not None and not self.supports_pose_hold:
             raise RtLinkError(f"RT backend does not advertise pose_hold={rtp.POSE_HOLD_VERSION}")
         if self._udp is None:
@@ -491,10 +501,10 @@ class RtBackend:
             np.asarray(command.get("torque", np.zeros(self.n)), dtype=float),
             np.asarray(command.get("kp", np.zeros(self.n)), dtype=float),
             np.asarray(command.get("kd", np.zeros(self.n)), dtype=float),
-            pose_hold=pose_hold,
+            pose_hold=pose_hold, cartesian=cartesian,
         )
 
-    def _send_command_raw(self, q, qd, tau, kp, kd, pose_hold=None) -> int | None:
+    def _send_command_raw(self, q, qd, tau, kp, kd, pose_hold=None, cartesian=None) -> int | None:
         self._cmd_seq = (self._cmd_seq + 1) & 0xFFFFFFFF
         pkt = rtp.pack_command(
             n=self.n,
@@ -508,6 +518,7 @@ class RtBackend:
             kp=kp[: self.n],
             kd=kd[: self.n],
             pose_hold=pose_hold,
+            cartesian=cartesian,
         )
         return self._send_command_packet(pkt)
 
@@ -889,6 +900,7 @@ class RtBackend:
             "holding_q": list(state.q_cmd) if state and state.holding else None,
             "backend": self.backend_name,
             "supports_pose_hold": self.supports_pose_hold,
+            "supports_cartesian": self.supports_cartesian,
             "state_age_s": age if rx_t > 0 else -1.0,
             "last_cmd_seq": state.last_cmd_seq if state else 0,
             "sent_cmd_seq": self._cmd_seq,
@@ -1151,6 +1163,27 @@ def _demo() -> None:
         assert backend.session_id and backend.identity.instance_id == "fake"
         assert backend.backend_name == "fake"
         assert not backend.supports_pose_hold
+        # v8: the fake has no geometry, so it does not advertise the Cartesian law, and the link refuses to send one
+        assert not backend.supports_cartesian
+        base_spec = {"frame": "base", "task_R": np.eye(3).tolist(), "kc": [100.0] * 3 + [10.0] * 3, "dc": [10.0] * 6}
+        for spec in (base_spec, {"pose": [0] * 7, "task_R": np.eye(3).tolist(), "kc": [0] * 6, "dc": [0] * 6}):
+            try:
+                backend.apply_command({"position": np.zeros(3), "cartesian": spec})
+                raise AssertionError("a cartesian command reached a server that does not advertise it")
+            except RtLinkError as exc:
+                assert "CAP_CARTESIAN_TRAJECTORY" in str(exc), exc
+        backend.supports_cartesian = True  # even when advertised, a world-frame spec is never sent
+        try:
+            backend.apply_command({"position": np.zeros(3), "cartesian": {"pose": [0] * 7}})
+            raise AssertionError("a world-frame cartesian spec was sent")
+        except RtLinkError as exc:
+            assert "base-frame" in str(exc), exc
+        try:
+            backend.apply_command({"position": np.zeros(3), "cartesian": base_spec, "pose_hold": {}})
+            raise AssertionError("a command with both tails was sent")
+        except RtLinkError as exc:
+            assert "not both" in str(exc), exc
+        backend.supports_cartesian = False
         assert not backend._control_roundtrip(rtp.CTL_STATUS).arg & rtp.FLAG_ARMED
         backend.set_active_mask(0b011)
         backend.enable_all()

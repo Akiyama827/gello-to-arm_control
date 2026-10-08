@@ -277,7 +277,7 @@ struct ReferenceEnvelopeBinding {
 };
 
 struct CommandEnvelope {
-  PoseHoldCommandPacket packet;
+  CommandIngress packet;
   uint64_t rx_ns;       // server clock at INGRESS (recvfrom return), never
                         // re-dated by a handler that was delayed afterwards
   uint64_t arm_gen;     // generation this packet's arm_epoch was checked against
@@ -538,6 +538,7 @@ struct ServerCtx {
     return rt_setup_required.load() && rt_setup_failed.load() != 0;
   }
   std::atomic<bool> supports_pose_hold{false};
+  std::atomic<bool> supports_cartesian{false};  // v8 (CAP_CARTESIAN_TRAJECTORY)
   std::atomic<int> backend_n{0};
   std::atomic<uint32_t> online_mask{0};
   std::atomic<uint32_t> active_mask{0};

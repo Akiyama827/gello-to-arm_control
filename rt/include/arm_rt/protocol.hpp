@@ -39,6 +39,10 @@ constexpr uint32_t MAGIC_OBS = 0x53424F41;   // bytes "AOBS"
 constexpr uint16_t VERSION = 5;
 constexpr uint16_t POSE_HOLD_VERSION = 6;
 constexpr uint16_t REFERENCE_VERSION = 7;
+// v8: a streamed joint command plus a Cartesian-impedance tail (task frame, Kc, Dc; 21 doubles). The RT computes the
+// target pose itself as FK(q_des) with the model it measures with, so no pose crosses the wire (operator 2026-10-09).
+constexpr uint16_t CARTESIAN_VERSION = 8;
+constexpr int CARTESIAN_VALUES = 21;
 constexpr uint16_t MAX_REFERENCE_KNOTS = 128;
 constexpr uint32_t REFERENCE_CHUNK_BYTES = 88;
 constexpr uint32_t MAX_REFERENCE_BYTES = 128 * (8 + 16 * 16);
@@ -57,6 +61,9 @@ constexpr uint32_t CAP_CALIBRATED_TASK_SPACE = 1u << 2;
 // where native reference is supported, so a bare (enable_reference: false)
 // deployment neither offers it nor sets the mode flags below.
 constexpr uint32_t CAP_MODE_SELECT = 1u << 4;
+// v8 Cartesian-impedance trajectory command: the backend can evaluate its EE pose at a commanded q (FK) and measures
+// the pose and Jacobian every tick. Never implied by another capability.
+constexpr uint32_t CAP_CARTESIAN_TRAJECTORY = 1u << 5;
 
 // StatePacket.flags bits
 constexpr uint32_t FLAG_ARMED = 1u << 0;
@@ -170,6 +177,13 @@ struct CommandPacket {
 struct PoseHoldCommandPacket {
   CommandPacket command;
   double pose_hold[15];
+};
+
+// v8 on the wire: the joint command, then R_task (3x3 row-major, the task axes as COLUMNS in the robot BASE frame),
+// Kc[6] and Dc[6] (task-frame diagonals [x,y,z,rx,ry,rz]).
+struct CartesianCommandPacket {
+  CommandPacket command;
+  double cartesian[CARTESIAN_VALUES];
 };
 
 // RT -> PC, UDP, streamed at --state-hz.
@@ -397,6 +411,7 @@ struct ReferenceStatePacket {
 static_assert(sizeof(CommandPacket) == 32 + 5 * 8 * MAX_JOINTS, "cmd layout");
 static_assert(sizeof(CommandPacket) == 672, "cmd size");
 static_assert(sizeof(PoseHoldCommandPacket) == 792, "pose hold cmd size");
+static_assert(sizeof(CartesianCommandPacket) == 840, "cartesian cmd size");
 static_assert(sizeof(StatePacket) == 888, "state size");
 static_assert(sizeof(ControlPacket) == 128, "ctl size");
 static_assert(sizeof(IdentityPayload) == 104, "identity size");
@@ -614,17 +629,48 @@ inline bool valid_pose_hold_spec(const double* s) {
   return s[13]>=0 && s[13]<=20 && s[14]>=0 && s[14]<=10;
 }
 
+// The v8 tail: finite; R_task orthonormal with det +1 (1e-6); Kc/Dc inside pose hold's reviewed envelope (operator
+// 2026-10-09: one envelope for every Cartesian law on the RT box).
+inline bool valid_cartesian_spec(const double* s) {
+  for (int i=0; i<CARTESIAN_VALUES; ++i) if (!std::isfinite(s[i])) return false;
+  const double* R = s;
+  for (int i=0; i<3; ++i)
+    for (int j=0; j<3; ++j) {
+      const double dot = R[3*i]*R[3*j] + R[3*i+1]*R[3*j+1] + R[3*i+2]*R[3*j+2];
+      if (std::fabs(dot - (i==j ? 1.0 : 0.0)) > 1e-6) return false;
+    }
+  const double det = R[0]*(R[4]*R[8]-R[5]*R[7]) - R[1]*(R[3]*R[8]-R[5]*R[6]) + R[2]*(R[3]*R[7]-R[4]*R[6]);
+  if (std::fabs(det - 1.0) > 1e-6) return false;
+  for (int i=0; i<6; ++i)
+    if (s[9+i]<0 || s[9+i]>(i<3 ? 1000 : 100) || s[15+i]<0 || s[15+i]>(i<3 ? 200 : 50)) return false;
+  return true;
+}
+
+// What ingress keeps of an accepted command: the joint word and whichever tail its version carries.
+struct CommandIngress {
+  CommandPacket command;
+  double pose_hold[15];
+  double cartesian[CARTESIAN_VALUES];
+};
+
 // Validate before granting flow ownership or refreshing the command deadman.
-inline bool decode_command(const void* bytes, size_t size, bool supports_pose_hold,
-                           PoseHoldCommandPacket& out) {
-  if(size!=sizeof(CommandPacket) && size!=sizeof(PoseHoldCommandPacket)) return false;
-  out={}; std::memcpy(&out,bytes,size);
+inline bool decode_command(const void* bytes, size_t size, bool supports_pose_hold, bool supports_cartesian,
+                           CommandIngress& out) {
+  if(size!=sizeof(CommandPacket) && size!=sizeof(PoseHoldCommandPacket) && size!=sizeof(CartesianCommandPacket))
+    return false;
+  out={}; std::memcpy(&out.command,bytes,sizeof(CommandPacket));
   const auto& cmd=out.command;
   if(cmd.magic!=MAGIC_CMD || cmd.n<1 || cmd.n>MAX_JOINTS) return false;
+  const char* tail = static_cast<const char*>(bytes) + sizeof(CommandPacket);
   if(cmd.version==VERSION) { if(size!=sizeof(CommandPacket)) return false; }
   else if(cmd.version==POSE_HOLD_VERSION) {
-    if(size!=sizeof(PoseHoldCommandPacket) || !supports_pose_hold ||
-       !valid_pose_hold_spec(out.pose_hold)) return false;
+    if(size!=sizeof(PoseHoldCommandPacket) || !supports_pose_hold) return false;
+    std::memcpy(out.pose_hold, tail, sizeof(out.pose_hold));
+    if(!valid_pose_hold_spec(out.pose_hold)) return false;
+  } else if(cmd.version==CARTESIAN_VERSION) {
+    if(size!=sizeof(CartesianCommandPacket) || !supports_cartesian) return false;
+    std::memcpy(out.cartesian, tail, sizeof(out.cartesian));
+    if(!valid_cartesian_spec(out.cartesian)) return false;
   } else return false;
   for(int j=0;j<cmd.n;++j)
     if(!std::isfinite(cmd.q_des[j]) || !std::isfinite(cmd.qd_des[j]) ||

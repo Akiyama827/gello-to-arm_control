@@ -58,7 +58,7 @@ class ScriptedBackend final : public Backend {
       state.dq[1] = -100;
     }
     if (tick == 3 || tick == 4) {
-      PoseHoldCommandPacket packet{};
+      CommandIngress packet{};
       auto& command = packet.command;
       command.n = 2;
       command.version = VERSION;

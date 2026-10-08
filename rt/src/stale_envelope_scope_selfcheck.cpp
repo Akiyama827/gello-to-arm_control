@@ -45,7 +45,7 @@ void commit(uint64_t session, uint32_t epoch, uint64_t ticket) {
 
 void envelope(uint64_t session, uint64_t epoch, uint32_t seq, double phase,
               uint32_t age_us = 0, uint64_t reference_id = 1) {
-  PoseHoldCommandPacket packet{};
+  CommandIngress packet{};
   packet.command.magic = MAGIC_CMD;
   packet.command.version = REFERENCE_VERSION;
   packet.command.n = 3;

@@ -22,12 +22,14 @@ MAGIC_OBS = 0x53424F41  # "AOBS"
 # servo-confirmed stop epoch. v6 is its pose-hold command. Older peers rejected.
 VERSION = 5
 POSE_HOLD_VERSION = 6
+CARTESIAN_VERSION = 8  # v8: joint command + task frame, Kc, Dc (21 doubles); the RT computes FK(q_des)
 MAX_JOINTS = 16
 ID_CHARS = 32
 
 CAP_POSE_HOLD = 1 << 0
 CAP_OBSERVER = 1 << 1
 CAP_CALIBRATED_TASK_SPACE = 1 << 2  # never advertised by any current backend
+CAP_CARTESIAN_TRAJECTORY = 1 << 5  # v8 Cartesian-impedance command
 
 FLAG_ARMED = 1 << 0
 FLAG_FAULTED = 1 << 1
@@ -60,6 +62,7 @@ _OBS_FMT = "<IHHII"  # 16
 
 CMD_SIZE = struct.calcsize(_CMD_FMT)
 POSE_HOLD_CMD_SIZE = CMD_SIZE + 15 * 8
+CARTESIAN_CMD_SIZE = CMD_SIZE + 21 * 8
 STATE_SIZE = struct.calcsize(_STATE_FMT)
 CTL_SIZE = struct.calcsize(_CTL_FMT)
 OBS_SIZE = struct.calcsize(_OBS_FMT)
@@ -117,7 +120,7 @@ def _padded(values, n_total: int = MAX_JOINTS) -> list[float]:
 
 def pack_command(
     *, n: int, seq: int, t_mono_ns: int, q_des, qd_des, tau_ff, kp, kd,
-    session_id: int, arm_epoch: int, pose_hold=None
+    session_id: int, arm_epoch: int, pose_hold=None, cartesian=None
 ) -> bytes:
     if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= MAX_JOINTS:
         raise ValueError("command n must be an integer in 1..16")
@@ -126,15 +129,21 @@ def pack_command(
         raise ValueError("command arrays must be finite and length n")
     if any(v < 0 for a in arrays[3:] for v in a):
         raise ValueError("command gains must be nonnegative")
-    tail = b""
+    if pose_hold is not None and cartesian is not None:
+        raise ValueError("a command carries a pose-hold tail or a cartesian tail, not both")
+    tail, version = b"", VERSION
     if pose_hold is not None:
         from arm_control.contracts.impedance import pose_hold_values
 
-        tail = struct.pack("<15d", *pose_hold_values(pose_hold))
+        tail, version = struct.pack("<15d", *pose_hold_values(pose_hold)), POSE_HOLD_VERSION
+    if cartesian is not None:
+        from arm_control.contracts.impedance import cartesian_values
+
+        tail, version = struct.pack("<21d", *cartesian_values(cartesian)), CARTESIAN_VERSION
     return struct.pack(
         _CMD_FMT,
         MAGIC_CMD,
-        POSE_HOLD_VERSION if pose_hold is not None else VERSION,
+        version,
         n,
         seq & 0xFFFFFFFF,
         arm_epoch & 0xFFFFFFFF,
@@ -670,6 +679,9 @@ def golden_lines() -> list[str]:
     struct.pack_into("<H", soft, 4, POSE_HOLD_VERSION)
     soft += struct.pack("<15d", 3, *([100.0] * 3 + [10.0] * 3),
                         *([20.0] * 3 + [2.0] * 3), 1.0, 3.0)
+    cart = bytearray(cmd)
+    struct.pack_into("<H", cart, 4, CARTESIAN_VERSION)
+    cart += struct.pack("<21d", 0, -1, 0, 1, 0, 0, 0, 0, 1, 1000, 200, 200, 20, 5, 5, 130, 40, 40, .5, .25, .25)
     identity = pack_control(
         ctl_type=CTL_IDENTITY, seq=0, arg=7, t_mono_ns=_GOLDEN_T,
         text=pack_identity(Identity("fr3_2", "libfranka-vendor", _GOLDEN_SESSION,
@@ -685,6 +697,8 @@ def golden_lines() -> list[str]:
         f"OBSERVE {pack_observe(1000).hex()}",
         f"POSE_HOLD {soft.hex()}",
         f"POSE_HOLD_SIZE {POSE_HOLD_CMD_SIZE}",
+        f"CARTESIAN {cart.hex()}",
+        f"CARTESIAN_SIZE {CARTESIAN_CMD_SIZE}",
     ]
 
 

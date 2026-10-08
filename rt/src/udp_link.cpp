@@ -45,7 +45,7 @@ bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_
     else std::fprintf(stderr, "[rt] observer table full; lease refused\n");
     return false;
   }
-  PoseHoldCommandPacket decoded{};
+  CommandIngress decoded{};
   ReferenceEnvelopeBinding binding{};
   if(got==ssize_t(sizeof(ReferenceCommandPacket))) {
     ReferenceCommandPacket r{};
@@ -58,7 +58,7 @@ bool handle_datagram(ServerCtx& ctx, CommandFlow& flow, const void* data, ssize_
     std::memcpy(c.tau_ff,r.tau_ff,sizeof(c.tau_ff));
     std::memcpy(c.kp,r.kp,sizeof(c.kp)); std::memcpy(c.kd,r.kd,sizeof(c.kd));
     binding={r.reference_id,r.revision,r.age_us,r.phase,r.valid_for_us,r.phase_window_us};
-  } else if (got < 0 || !decode_command(data, size_t(got), ctx.supports_pose_hold.load(), decoded))
+  } else if (got < 0 || !decode_command(data, size_t(got), ctx.supports_pose_hold.load(), ctx.supports_cartesian.load(), decoded))
     return false;
   const auto& pkt = decoded.command;
   // Wrong joint count is dropped HERE, before anything is published: the
@@ -204,7 +204,18 @@ void udp_rx_thread(ServerCtx& ctx) {
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ctx.udp_fd.store(fd);
 
-  PoseHoldCommandPacket received{};
+  // One member per datagram handle_datagram accepts (each at an EXACT size), so the buffer holds the largest by
+  // construction: MSG_TRUNC reports a longer datagram's true size, which no decoder accepts, and never reads past it.
+  union {
+    ObserveRequest observe;
+    ReferenceCommandPacket reference;
+    CommandPacket command;
+    PoseHoldCommandPacket pose_hold;
+    CartesianCommandPacket cartesian;
+  } received{};
+  static_assert(sizeof(received) >= sizeof(ObserveRequest) && sizeof(received) >= sizeof(ReferenceCommandPacket) &&
+                sizeof(received) >= sizeof(PoseHoldCommandPacket) && sizeof(received) >= sizeof(CartesianCommandPacket),
+                "the receive buffer must hold every datagram handle_datagram accepts");
   CommandFlow flow;
   while (!ctx.shutdown.load()) {
     sockaddr_in src = {};

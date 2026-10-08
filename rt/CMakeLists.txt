@@ -83,6 +83,11 @@ target_include_directories(torque_cap_selfcheck PRIVATE include)
 target_link_libraries(torque_cap_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
 target_compile_options(torque_cap_selfcheck PRIVATE -UNDEBUG)
 
+add_executable(cartesian_loop_selfcheck src/cartesian_loop_selfcheck.cpp src/rt_loop.cpp)
+target_include_directories(cartesian_loop_selfcheck PRIVATE include)
+target_link_libraries(cartesian_loop_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
+target_compile_options(cartesian_loop_selfcheck PRIVATE -UNDEBUG)
+
 add_executable(dm_command_selfcheck src/dm_command_selfcheck.cpp src/rt_loop.cpp)
 target_include_directories(dm_command_selfcheck PRIVATE include)
 target_link_libraries(dm_command_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
@@ -191,7 +196,7 @@ if(BUILD_TESTING)
       reference_selection_selfcheck clock_domain_selfcheck group_record_selfcheck
       mode_select_selfcheck mode_select_session_selfcheck
       stale_envelope_scope_selfcheck
-      controller_selfcheck)
+      controller_selfcheck cartesian_loop_selfcheck)
     add_test(NAME ${selfcheck} COMMAND $<TARGET_FILE:${selfcheck}>)
   endforeach()
   # These two self-check binaries are harnesses: one needs a socketpair FD,

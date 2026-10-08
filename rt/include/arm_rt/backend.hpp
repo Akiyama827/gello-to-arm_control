@@ -66,6 +66,11 @@ public:
 
   virtual bool supports_pose_hold() const { return false; }
 
+  // The v8 Cartesian law's target: this backend's EE pose (xyz, wxyz, base frame) at a COMMANDED q, with the same
+  // model read() measures with. Called on the RT thread after read(). False = no geometry: the law fails closed.
+  virtual bool supports_cartesian() const { return false; }
+  virtual bool ee_pose_at(const double* q, double* pose) { (void)q; (void)pose; return false; }
+
   // The kinematic model the RT side evaluates for task-space feedback (pose
   // hold's pose/Jacobian). "none" when the backend has no geometry. This is
   // reported, never a claim of calibration (see CAP_CALIBRATED_TASK_SPACE).

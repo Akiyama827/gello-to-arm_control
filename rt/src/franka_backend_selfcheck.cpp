@@ -3,6 +3,7 @@
 // throw, so libfranka and non-libfranka (Poco-like) failures are injectable.
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,7 +31,7 @@ struct NetLike : std::exception {
 namespace franka {
 struct Exception : std::runtime_error { using std::runtime_error::runtime_error; };
 enum class RealtimeConfig { kEnforce };
-enum class Frame { kEndEffector };
+enum class Frame { kFlange, kEndEffector, kStiffness };
 struct Duration {
   uint64_t ms = 0;
   uint64_t toMSec() const { return ms; }
@@ -41,6 +42,9 @@ struct RobotState {
   std::array<double, 7> q{}, dq{}, tau_J{}, tau_J_d{};
   std::array<double, 6> O_F_ext_hat_K{};
   std::array<double, 16> O_T_EE{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  // Non-identity, as on an FR3 with the Hand: the TCP 0.1034 m past the flange, K 0.01 m past the TCP.
+  std::array<double, 16> F_T_EE{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, .1034, 1};
+  std::array<double, 16> EE_T_K{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, .01, 1};
 };
 struct Torques {
   Torques(const std::array<double, 7>& t) : tau_J(t) {}
@@ -50,6 +54,14 @@ struct Torques {
 struct Model {
   std::array<double, 42> zeroJacobian(Frame, const RobotState&) const { return {}; }
   std::array<double, 7> coriolis(const RobotState&) const { return {}; }
+  // FK at q (column-major 4x4): a 90 deg turn about z and the translation (q0, q1, q2) to the flange, then libfranka's
+  // frame chain along z (kEndEffector adds F_T_EE, kStiffness also EE_T_K), so the backend's column-major -> xyz/wxyz
+  // mapping AND its frame/F_T_EE/EE_T_K choice are checkable.
+  std::array<double, 16> pose(Frame frame, const std::array<double, 7>& q, const std::array<double, 16>& F_T_EE,
+                              const std::array<double, 16>& EE_T_K) const {
+    const double z = q[2] + (frame == Frame::kFlange ? 0 : F_T_EE[14]) + (frame == Frame::kStiffness ? EE_T_K[14] : 0);
+    return {0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1, 0, q[0], q[1], z, 1};
+  }
 };
 struct ActiveControlBase {
   ActiveControlBase() { ++script.sessions; }
@@ -121,7 +133,15 @@ void check_backend() {
   assert(b);
   PlantState ps;
   double tau[7] = {};
+  // v8 target: FK at a COMMANDED q needs the flange/EE frames of a measured state first.
+  const double q_des[7] = {.1, .2, .3, 0, 0, 0, 0};
+  double pose[7] = {};
+  assert(b->supports_cartesian() && !b->ee_pose_at(q_des, pose));
   assert(b->read(ps));
+  assert(b->ee_pose_at(q_des, pose));
+  const double s = std::sqrt(.5);  // 90 deg about z: w = cos 45, z = sin 45
+  const double want[7] = {.1, .2, .3 + .1034, s, 0, 0, s};  // the EE (TCP) frame, as O_T_EE
+  for (int i = 0; i < 7; ++i) assert(std::fabs(pose[i] - want[i]) < 1e-12);
 
   const std::string net = "non-libfranka exception: Net Exception";
   script.hook = throw_at("readOnce", NetLike());  // idle stream

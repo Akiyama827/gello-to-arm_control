@@ -99,7 +99,7 @@ class ScriptedBackend final : public Backend {
     }
     if (tick == 1) arm_gen_value = uint32_t(begin_arm(*ctx));
     if (tick == 2) {  // tracking command with a known feedforward overshoot
-      PoseHoldCommandPacket packet{};
+      CommandIngress packet{};
       auto& command = packet.command;
       command.n = 2;
       command.version = VERSION;

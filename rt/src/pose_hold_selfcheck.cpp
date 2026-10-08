@@ -69,19 +69,20 @@ int main() {
   assert(hold.torque(16,large_q,large_dq,large_J,pose,large_bias,damping_spec,.5,large_tau));
   for(int j=0;j<5;++j) assert(std::abs(large_tau[j])<1e-10);
   assert(std::abs(large_tau[5]+3*large_dq[5])<1e-10);  // relative rank cutoff
-  PoseHoldCommandPacket packet{}, decoded{};
+  PoseHoldCommandPacket packet{};
+  CommandIngress decoded{};
   packet.command.magic=MAGIC_CMD; packet.command.version=VERSION; packet.command.n=7;
-  assert(decode_command(&packet,sizeof(CommandPacket),false,decoded));
+  assert(decode_command(&packet,sizeof(CommandPacket),false,false,decoded));
   for(double s:decoded.pose_hold) assert(s==0);
-  assert(!decode_command(&packet,sizeof(packet),true,decoded));
+  assert(!decode_command(&packet,sizeof(packet),true,false,decoded));
   packet.command.version=POSE_HOLD_VERSION;
   std::memcpy(packet.pose_hold,spec,sizeof(spec));
-  assert(decode_command(&packet,sizeof(packet),true,decoded));
-  assert(!decode_command(&packet,sizeof(packet),false,decoded));
-  assert(!decode_command(&packet,sizeof(CommandPacket),true,decoded));
-  assert(!decode_command(&packet,sizeof(packet)+1,true,decoded));
-  packet.pose_hold[1]=-1; assert(!decode_command(&packet,sizeof(packet),true,decoded));
+  assert(decode_command(&packet,sizeof(packet),true,false,decoded));
+  assert(!decode_command(&packet,sizeof(packet),false,false,decoded));
+  assert(!decode_command(&packet,sizeof(CommandPacket),true,false,decoded));
+  assert(!decode_command(&packet,sizeof(packet)+1,true,false,decoded));
+  packet.pose_hold[1]=-1; assert(!decode_command(&packet,sizeof(packet),true,false,decoded));
   packet.pose_hold[1]=100; packet.command.kp[0]=std::numeric_limits<double>::infinity();
-  assert(!decode_command(&packet,sizeof(packet),true,decoded));
+  assert(!decode_command(&packet,sizeof(packet),true,false,decoded));
   Eigen::internal::set_is_malloc_allowed(true);
 }
