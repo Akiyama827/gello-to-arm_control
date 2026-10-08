@@ -7,9 +7,7 @@ composed plant path ignored `sim_gravcomp` and its config said neither. Under th
 link's release and hold words carry no gravity), and the Dora node's spawn hold sagged.
 
 * `build_world`, composed branch: with `sim_gravcomp`, the arm's bodies (`scene.arm.prefix`, required) are gravity compensated
-  before the first compile (gravcomp is baked into the spec). The same prefix gives the arm joints `ARM_ARMATURE` (0.1, the
-  FR3's published reflected inertia, fingers excluded): what the single-model FR3 states as `sim_armature` and the workcell
-  plant always applies.
+  before the first compile (gravcomp is baked into the spec).
 * Project (parent): `configs/simulation/franka_bench.yaml` includes `robots/fr3/sim.yaml` (its own update rate and
   self-collision still win) and states `arm.plant_gravity_comp: true`.
 
@@ -18,3 +16,13 @@ feedforward 0.12 -> 0.0 rad; the supervised twin disarmed for 2 s 3.72 -> 0.0 ra
 (none on the base or the module). Sim time advances (1.004 s per s) and an armed move with no gravity feedforward tracks to
 0.8 mrad. Dora `sim bench`, 120 s startup smoke: all six nodes ready, perception registers the module (fit 1.00), no traceback;
 its "sim time behind wall clock" warnings are older than this change (23 both ways, A/B against the old config).
+
+Review round 1 (BLOCK on the record, behaviour verified): gravcomp on 30 `asm_` bodies only (19.0 kg; grafted modules keep
+`mod_`, so a carried payload stays the executor's `_payload_tau`); executor and plant agree (spawn hold 0.000 mrad; a
+double-count mutant drifts 69.8 mrad, plant gravcomp off 70.7 mrad). Corrected: my record and code comment claimed the composed
+arm also gets `ARM_ARMATURE` 0.1. It does not (that loop is workcell-only; measured `dof_armature` 0 on every `asm_` joint), so
+the bench is NOT the other FR3 twins' 0.5 ms / armature 0.1 plant; a 2 s step settles either way (4e-5 rad/s). Applying armature
+on the composed path would be its own decision. Taken in the parent: the include comment names the keys this path ignores;
+a guard check builds the bench world and enforces `sim_gravcomp` == `arm.plant_gravity_comp` for every simulation entry (the
+two-file invariant, else torque is double- or zero-counted, ~70 mrad). The parent's config commit is followed directly by its
+pin (amending the pushed commit would need a force-push).

@@ -81,7 +81,8 @@ def build_world(cfg, *, period: float):
         if cfg.get("sim_gravcomp", False):
             # The robot's twin models a control box that holds the arm up whether or not a host streams (the FR3 sim profile),
             # as the single-model and workcell plants already do: the ARM's bodies, by its prefix, never the base or modules.
-            # Set before the first compile -- gravcomp is baked into the spec. The same prefix gets the arm's armature.
+            # Set before the first compile -- gravcomp is baked into the spec. (Armature is NOT applied on this path: the
+            # backend's ARM_ARMATURE loop is workcell-only and sim_armature is single-model only.)
             prefix = str((scene_cfg.get("arm") or {}).get("prefix") or "")
             if not prefix:
                 raise ValueError("sim_gravcomp on a composed scene needs scene.arm.prefix (which bodies are the arm)")
