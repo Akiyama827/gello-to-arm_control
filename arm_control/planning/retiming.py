@@ -251,6 +251,7 @@ def finish_path(
     )
     return JointTrajectory(trajectory.times, positions, velocities)
 
+
 def _self_check():
     for angle in (0, 15, 90, 180):
         w = np.zeros((3, 2))

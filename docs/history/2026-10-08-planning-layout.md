@@ -20,3 +20,8 @@ Related checks run (library alone, FR3 assets linked): `python -m` planner, reti
 mujoco_collision, stack, assets, grasp_visual, multi_arm.cooperative, control.factory; `check_retiming`,
 `check_ui_scene_injection`, `check_pair_planning`, `check_dual_modes --refine`, `check_cooperative`, `arm_console --self-check`.
 All pass.
+
+Review round 1: ACCEPT. AST comparison of every moved definition against `7bbef24`: identical except the dropped lazy
+`projection` imports and the renamed self-check strings; no name collisions, no import cycle, importing `trajopt`, `retiming`
+or `planner` loads none of tesseract, rerun, mujoco, toppra or scipy. Patch targets proven by mutant (`check_retiming` on
+`retiming.collision_checked_retiming`; `scene_geoms`' rerun-blocked probe). Taken: trailing whitespace from the merge.

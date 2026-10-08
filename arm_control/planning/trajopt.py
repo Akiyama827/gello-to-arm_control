@@ -345,7 +345,7 @@ def refine_trajectory(world, seed_positions, vmax, amax, *,
 
 
 # Projection: Project one current MuJoCo collision snapshot into a Tesseract environment.
-# 
+#
 # Only limited scalar hinges at body origins are supported. Other joints are
 # frozen at the canonical world's held positions. Meshes use MuJoCo's convex
 # envelope semantics. The ground replacement bounds all reachable robot geometry.
@@ -560,7 +560,7 @@ def _self_check(native=False):
     if native:
         import mujoco
         from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
-    
+
         world = MuJoCoCollisionWorld.__new__(MuJoCoCollisionWorld)
         xml = (
             '<mujoco><worldbody><geom name="anchor" pos="0 0 1" size=".05"/>'
