@@ -403,11 +403,13 @@ class ArmPlanner:
             else:
                 waypoints = np.vstack([q_start, q_goal])
             stage_started = perf_counter()
-            if certify:
+            if certify and self._trajectory_refiner is None:
                 # OMPL validates each segment only every resolution_frac x the joint space's extent (~65 mrad on the
                 # FR3) and shortcutting makes long segments, so a route can graze an obstacle between its checks.
                 # Measured 2026-10-08: both failed sim-add legs had a colliding POLYLINE (12 and 78 samples at the
                 # certify step), so no retiming rung could pass. Such a route is not retimed: a fresh one is planned.
+                # Not with a refiner: TrajOpt's collision terms can push a grazing seed clear, and a route it cannot
+                # fix fails the ladder below, which re-plans as well.
                 straight = JointTrajectory(np.arange(len(waypoints), dtype=float), np.asarray(waypoints, float),
                                            np.zeros_like(np.asarray(waypoints, float)))
                 try:
@@ -813,7 +815,28 @@ def _check_replan() -> None:
     else:
         raise AssertionError('a route through the wall was flown')
     assert ompl.calls == ArmPlanner.ROUTE_ATTEMPTS, ompl.calls
-    print(f"re-plan: a grazing route is replaced by a fresh one; {ArmPlanner.ROUTE_ATTEMPTS} attempts at most OK")
+    # A clear polyline whose timing ladder runs out (a blended corner that bulges into an obstacle) is re-planned too.
+    ompl = OMPL([around, around])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World())
+    retime, ladders = planner._retime, []
+
+    def ladder_out_once(waypoints, speed_scale, certify):
+        ladders.append(len(waypoints))
+        if len(ladders) == 1:
+            raise _CertifyFailed(ValueError('interpolated trajectory collides between waypoints'))
+        return retime(waypoints, speed_scale, certify)
+
+    planner._retime = ladder_out_once
+    planner.plan_joint(goal, start)
+    assert ompl.calls == 2 and len(ladders) == 2, (ompl.calls, ladders)
+    # With a refiner the polyline pre-check is skipped: the refiner sees the grazing seed and may clear it.
+    ompl, timed = OMPL([grazing, around]), []
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World(), trajectory_refiner=object())
+    planner._retime = lambda waypoints, *_: timed.append(waypoints) or flown
+    planner.plan_joint(goal, start)
+    assert ompl.calls == 1 and timed[0] is grazing, (ompl.calls, timed)
+    print(f"re-plan: a grazing route or an exhausted timing ladder gets a fresh route; {ArmPlanner.ROUTE_ATTEMPTS} "
+          "attempts at most; a refiner sees the grazing seed OK")
 
 
 if __name__ == "__main__":
