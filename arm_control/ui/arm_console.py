@@ -60,12 +60,12 @@ from arm_control.messages import (
     unpack_motor_state,
     unpack_controller_event,
 )
-from arm_control.planning.high_level import build_collision_stack
+from arm_control.planning.planner import build_collision_stack
 from arm_control.planning.jog import JogLimits, check_step
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.planning.ompl_planner import OMPLPlanner
 from arm_control.motion import JointTrajectory
-from arm_control.planning.refinement import finish_path, refinement_choice
+from arm_control.planning.retiming import finish_path, refinement_choice
 from arm_control.node_utils import (
     ShutdownFlag,
     _load_mode_config,
@@ -817,7 +817,7 @@ def _run(
     import rerun as rr
 
     from arm_control.planning.ik import PinocchioIK
-    from arm_control.planning.preview_rerun import (
+    from arm_control.viz.preview import (
         MeasuredGhost,
         PreviewScene,
         RobotGhost,

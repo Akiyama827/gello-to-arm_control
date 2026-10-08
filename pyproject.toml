@@ -27,7 +27,7 @@ dora = ["pyarrow", "pyyaml", "dora-rs"]
 sim = ["mujoco"]
 # Shared joint-path retiming; imported only by planning processes.
 planning = ["toppra==0.6.10", "scipy"]
-# nodes/visualizer.py, planning/preview_rerun.py, simulation/rerun_scene.py.
+# nodes/visualizer.py, viz/preview.py, simulation/rerun_scene.py.
 # visualizer is in every dataflow, so in practice this is not optional at
 # RUNTIME — it is an extra only because the library imports it lazily.
 viz = ["rerun-sdk"]

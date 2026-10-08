@@ -508,7 +508,7 @@ def _self_check() -> None:
         pass
     else:
         raise AssertionError("an unknown preview method was swallowed")
-    print("preview_rerun self-check ok")
+    print("viz.preview self-check ok")
 
 
 if __name__ == "__main__":

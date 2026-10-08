@@ -22,7 +22,7 @@ def mesh_package_dirs(urdf_path: str | Path) -> list[str]:
     just dropped the grandparent whenever no ``package.xml`` was present. This
     is the union, which is to say the simpler one.
 
-    Lives here rather than in ``planning.preview_rerun``, where the surviving
+    Lives here rather than in ``viz.preview``, where the surviving
     copy was, because that module imports ``rerun`` at module scope and
     ``rerun-sdk`` is an optional ``[viz]`` extra: reaching in here for a path
     helper made ``grasp_visual`` -- and so the whole web console, which draws
@@ -181,13 +181,13 @@ def _self_check() -> None:
         "import sys, importlib;"
         "sys.modules['rerun'] = None;"
         "importlib.import_module('arm_control.grasp_visual');"
-        "assert 'arm_control.planning.preview_rerun' not in sys.modules;"
+        "assert 'arm_control.viz.preview' not in sys.modules;"
         "print('clean')"
     )
     out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     assert out.returncode == 0 and "clean" in out.stdout, (
         "grasp_visual must import with rerun absent -- it reached through "
-        "planning.preview_rerun for a path helper:\n" + out.stdout + out.stderr
+        "viz.preview for a path helper:\n" + out.stdout + out.stderr
     )
     print("assets self-check ok")
 

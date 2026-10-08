@@ -24,7 +24,7 @@ from arm_control.control.factory import (
     gain_vector,
     gripper_command_cfg,
 )
-from arm_control.planning.high_level import ArmPlanner, build_collision_stack, ompl_settings
+from arm_control.planning.planner import ArmPlanner, build_collision_stack, ompl_settings
 # Scene-derived obstacles, from the rerun-free module: a controller host must
 # not need a visualiser to servo, and this import used to drag `rerun` in at
 # module level for a function that logs nothing.
@@ -49,7 +49,7 @@ def build_preview(cfg, world, ik, urdf: str, joints: list[str], grip: list[str])
     preview_cfg = dict(cfg.get("planner") or {}).get("preview")
     if not preview_cfg or world is None:
         return None, None
-    from arm_control.planning.preview_rerun import (
+    from arm_control.viz.preview import (
         MeasuredGhost,
         PreviewScene,
         init_preview_stream,
@@ -72,7 +72,7 @@ def build_preview(cfg, world, ik, urdf: str, joints: list[str], grip: list[str])
     # Both go behind DeferredPreview: every Rerun call is queued and drained on
     # a daemon thread, so a viewer nobody opened costs dropped frames and never
     # a blocked caller. See its docstring for why that is not optional.
-    from arm_control.planning.preview_rerun import DeferredPreview
+    from arm_control.viz.preview import DeferredPreview
 
     preview, ghost = DeferredPreview(preview), DeferredPreview(ghost)
     print(
