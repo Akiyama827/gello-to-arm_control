@@ -49,11 +49,20 @@ clamped to [0, 0.08]. Also taken:
 Documented differences (no client impact): during an action the sim reports the MEASURED width and advances `sample_seq`, where
 the C++ synthesises a kinematic width and freezes the sequence (META `measured` is 0 while busy either way); HOME opens to 80 mm
 at 0.05 m/s where the real Hand sweeps; a failed GRASP keeps the target at the default cap, as SimHand did. Known: force-closing
-an EMPTY Hand at 70 N drives the finger joints 18 mm past their closed limit (soft joint limits); those samples are now rejected,
-so the twin's Hand reads stale until it opens -- a finger-limit stiffness item for the composed model, not the bridge.
+an EMPTY Hand at 70 N overshoots the closed limit for a moment (soft joint limits; min -0.0179 m): measured, 25 samples over
+84 ms are rejected (no STATE), then the width settles at an accepted 0.0 and the client stays connected throughout.
 Check strengthened (`check_sim_hand`): STATE withheld before any sample and for an out-of-envelope one, an overshoot clamped;
 META busy while acting; a blocked MOVE -> DONE 0 and stopped; HOME opens fully; grasped drops with the servo load and, loaded,
 outside the band; a 255-byte line disconnects; a Unicode-digit command is refused and the server lives on. Mutants caught (16):
 no busy, no freshness, GDONE for MOVE, stop on every disconnect, no epoch check, no effort floor, no band, busy ignoring
 `acting`, MOVE tolerance 5 cm, HOME closing, no per-line limit, STATE before a sample, no envelope, no clamp, a failed MOVE
 squeezing, GSTOP keeping a held grasp (reviewer). Equivalent survivors: DONE regardless of the epoch; `have_real` kept one tick.
+
+Review round 2: ACCEPT (B1 verified through `BridgeClient` on the composed bench world: MOVE 0.0 / 0.08, HOME and a 70 N empty
+force-close never drop the link; no STATE outside [0, 0.08]). Taken: the clamp assertion was vacuous (HOME's own `STATE 0.08000`
+answered it; the lines are now cleared first, and the no-clamp mutant is caught); numbers are ASCII-only (`re.ASCII`; a
+Unicode-digit number is refused, checked). Remaining parser divergences, none reachable from `BridgeClient` (single-space
+lines, no trailing whitespace): the sim is stricter than `istream` on whitespace (double space, tab, trailing space, `HOME\r`
+are refused), `CMD 7 ` reports token 7 where the C++ reports 0, and a token past uint64 parses here (then fails stale_epoch)
+where the C++ answers invalid_command. Untested, low value: the send timeout and an unterminated long line (it disconnects
+once its newline arrives).

@@ -144,6 +144,8 @@ def raw_cases(bridge, fingers):
         assert raw.take('REJECT') == 'REJECT 7 invalid_command'
         raw.send('CMD \u00b2 HOME')        # a Unicode digit: refused, and the server lives on
         assert raw.take('REJECT') == 'REJECT 0 invalid_command'
+        raw.send('CMD 1 MOVE \u0660.\u0660\u0664 0.05')   # Unicode digits in a number
+        assert raw.take('REJECT') == 'REJECT 1 invalid_command'
         assert raw.idle_epoch()
         # MOVE: accepted, busy while it runs, a second command is refused busy, DONE ok at the goal
         raw.send(f'CMD {epoch} MOVE 0.06 0.05')
@@ -209,6 +211,9 @@ def raw_cases(bridge, fingers):
         assert raw.take('DONE') == f'DONE {epoch} 1' and abs(sum(fingers.q) - .08) < .001, sum(fingers.q)
         # the sample envelope: an overshoot is clamped, a reading past it is no STATE and not measured
         fingers.report = .04025          # 80.5 mm
+        time.sleep(.2)
+        raw.pump()
+        raw.lines.clear()                # HOME's own 'STATE 0.08000' must not answer for the clamp
         wait(lambda: raw.pump() or 'STATE 0.08000 0' in raw.lines, 2, 'an overshoot clamped to 0.08')
         fingers.report = -.0001          # -0.2 mm
         time.sleep(.3)
