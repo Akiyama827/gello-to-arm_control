@@ -226,8 +226,12 @@ def start_mirror_thread(
 
         # Same app + recording as the plan preview: the twin's true scene and
         # the orchestrator's overlays merge into ONE viewer recording.
-        rr.init(DEFAULT_APP_ID, recording_id=DEFAULT_RECORDING_ID, spawn=False)
-        rr.connect_grpc()
+        try:
+            rr.init(DEFAULT_APP_ID, recording_id=DEFAULT_RECORDING_ID, spawn=False)
+            rr.connect_grpc()
+        except Exception as exc:  # noqa: BLE001 -- no viewer: the mirror is optional, say so once and stop
+            print(f"[rerun_scene] rerun unavailable ({exc}) — scene mirror disabled", flush=True)
+            return
         mirror = None
         bound = None
         period = 1.0 / max(1.0, float(hz))

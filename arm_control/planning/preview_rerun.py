@@ -56,28 +56,32 @@ def init_preview_stream(preview_cfg: dict | None, app_id: str = DEFAULT_APP_ID) 
     CAVEAT (bench): the gRPC sink's batcher BLOCKS the logging thread once its
     channel fills while no viewer is attached (observed: 5 s+ stalls) — on the
     real rig that is a deadman hazard. Launch the viewer BEFORE arming, or use
-    ``spawn: true``. A failed spawn falls back to a memory recording (preview
-    dropped, control loop unaffected).
+    ``spawn: true``. Any Rerun failure here (a failed spawn, no viewer to connect
+    to) falls back to a disabled recording: preview dropped, host process unaffected.
     """
     import rerun.blueprint as rrb
 
     cfg = dict(preview_cfg or {})
-    rr.init(
-        str(cfg.get("app_id", app_id)),
-        recording_id=str(cfg.get("recording_id", DEFAULT_RECORDING_ID)),
-        spawn=False,
-    )
-    if cfg.get("spawn"):
-        try:
+    try:
+        rr.init(
+            str(cfg.get("app_id", app_id)),
+            recording_id=str(cfg.get("recording_id", DEFAULT_RECORDING_ID)),
+            spawn=False,
+        )
+        if cfg.get("spawn"):
             rr.spawn(detach_process=False)
-        except Exception as exc:  # headless host — never stall the control loop
-            print(f"[preview] rerun spawn failed ({exc}) — preview disabled", flush=True)
-            rr.memory_recording()
-    elif cfg.get("connect"):
-        rr.connect_grpc(str(cfg["connect"]))
-    else:
-        rr.connect_grpc()  # the viewer another node (visualizer) spawned
-    rr.send_blueprint(rrb.Blueprint(rrb.Spatial3DView(origin="/")))
+        elif cfg.get("connect"):
+            rr.connect_grpc(str(cfg["connect"]))
+        else:
+            rr.connect_grpc()  # the viewer another node (visualizer) spawned
+        rr.send_blueprint(rrb.Blueprint(rrb.Spatial3DView(origin="/")))
+    except Exception as exc:  # noqa: BLE001 -- the preview is optional; it must never take its host process down
+        # Measured: with no viewer on the gRPC port, rr.init raised "unable to connect for 6s" (flushing an earlier
+        # recording of this process) and the arm planner worker died, failing the whole add transaction.
+        print(f"[preview] rerun unavailable ({exc}) — preview disabled", flush=True)
+        # A disabled default recording: every later log is a no-op. (memory_recording() needs the recording rr.init
+        # failed to make.)
+        rr.RecordingStream(str(cfg.get("app_id", app_id)), make_default=True, default_enabled=False)
 
 
 def log_frame_transform(entity_root: str, T: np.ndarray | None) -> None:
