@@ -23,6 +23,7 @@ that is not told them does not invent them.
 from __future__ import annotations
 
 from collections import deque
+from itertools import islice
 import secrets
 import threading
 import time
@@ -35,8 +36,15 @@ from arm_control.plants.remote_rt.client import RtConfig, RtLinkError
 _SERVO_KEYS = ("state_hz", "hold_ms", "fault_ms", "hold_kp", "hold_kd")
 
 
+# observe/1 bounds. The ring is memory and a read's scan; reads are bounded by the service (OBSERVE_LIMIT_MAX) because building
+# and serializing a batch runs in this process and competes with the tick for the interpreter (review: 4 tight readers of 1024
+# samples slowed the plant to 0.44x real time; at 64 it stayed at 1.0x).
+OBSERVE_RING_MAX_S = 10.0
+OBSERVE_LIMIT_MAX = 64
+
+
 class SimLink:
-    def __init__(self, config: RtConfig, joint_names, plant, *, servo: dict) -> None:
+    def __init__(self, config: RtConfig, joint_names, plant, *, servo: dict, observe: dict | None = None) -> None:
         missing = [k for k in _SERVO_KEYS if k not in servo]
         if missing:
             raise ValueError(f"sim_servo needs {', '.join(_SERVO_KEYS)} (missing: {', '.join(missing)}): nothing is assumed")
@@ -94,6 +102,23 @@ class SimLink:
         self._fault_code = 0
         self._latched_fault = ""
         self._state_seq = 0
+        # observe/1 (2026-10-08-scene-hosting-design.md): one observation every ``_obs_every`` ticks, from the tick that stepped
+        # the plant, into a bounded ring the tick never waits on. Off unless the config states ``sim_observe``.
+        self.observing = observe is not None
+        self.observe_rate_hz, self._obs_every, self._obs_tick = 0.0, 0, 0
+        self._obs: deque = deque(maxlen=1)
+        self._obs_seq = self._obs_errors = 0
+        if observe is not None:
+            try:
+                rate, ring_s = float(observe["rate_hz"]), float(observe["ring_s"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"sim_observe needs numeric rate_hz and ring_s: {exc}") from exc
+            if not (np.isfinite([rate, ring_s]).all() and 0 < rate <= hz and 0 < ring_s <= OBSERVE_RING_MAX_S):
+                raise ValueError(f"sim_observe: 0 < rate_hz <= sim_servo.state_hz ({hz:g}) and "
+                                 f"0 < ring_s <= {OBSERVE_RING_MAX_S:g} are required")
+            self._obs_every = int(np.ceil(hz / rate))
+            self.observe_rate_hz = hz / self._obs_every
+            self._obs = deque(maxlen=max(1, int(np.ceil(ring_s * self.observe_rate_hz))))
 
     @classmethod
     def from_config(cls, cfg) -> "SimLink":
@@ -107,7 +132,7 @@ class SimLink:
             raise ValueError("config has no sim_servo.state_hz: nothing is assumed")
         plant = build_single_model_backend(cfg, control_period=1.0 / float(servo["state_hz"]))
         open_jaws(plant, cfg)  # the Hand spawns open, as in the Dora plant node (MuJoCo's zero is a shut hand)
-        return cls(RtConfig.from_config(cfg), arm_joints(cfg), plant, servo=servo)
+        return cls(RtConfig.from_config(cfg), arm_joints(cfg), plant, servo=servo, observe=cfg.get("sim_observe"))
 
     @property
     def num_motors(self) -> int:
@@ -310,6 +335,46 @@ class SimLink:
             self._tick_snap = dict(snapshot, gen=(self._arm_epoch, self._stop_epoch))
         motor = self._plant.step(command)
         self._publish(now, motor=motor, command=command, snapshot=snapshot)
+        if self.observing:
+            self._observe()
+
+    def _observe(self) -> None:
+        """Record this tick's observation (every ``_obs_every`` ticks). Called right after the step, so every field is the world the
+        step left; never raises into the tick."""
+        self._obs_tick += 1
+        if self._obs_tick % self._obs_every:
+            return
+        try:
+            world = self._plant.observe()
+            actor = self.config.instance_id
+            sample = dict(seq=self._obs_seq + 1, sim_time_s=world["sim_time_s"], observed_ns=time.monotonic_ns(),
+                          model_revision=world["model_revision"], scene_revision=None,
+                          actor_q={actor: world["joint_q"]}, actor_dq={actor: world["joint_dq"]},
+                          gripper=None, attachments=None, constraints=None, object_poses=None,
+                          constraint_force=None, ee_wrench=None, topology=None)
+            with self._lock:
+                self._obs_seq += 1
+                self._obs.append(sample)
+        except Exception:  # noqa: BLE001 -- observation must not stop the plant
+            with self._lock:
+                self._obs_errors += 1
+
+    def observations(self, after: int = 0, limit: int = 64) -> dict:
+        """observe/1: the observations recorded after sequence ``after``, oldest first, at most ``limit``. ``latest_seq`` is the
+        cursor for the next read (the last sample returned; with none, ``after`` clamped to the newest, so a cursor from an earlier
+        process cannot stall a reader). ``dropped`` counts samples that fell off the ring before the reader came back (0 on a
+        first read); the plant never waits for a reader. Sequences are per supervisor PROCESS: a reader starts again from 0 when
+        its session changes (a new hello). ``limit`` is capped at OBSERVE_LIMIT_MAX. Samples are shared: do not mutate them."""
+        limit = min(max(1, int(limit)), OBSERVE_LIMIT_MAX)
+        with self._lock:  # sequences are contiguous, so the start index is arithmetic; islice walks to it (O(start + limit)),
+            # and a caught-up reader -- the common case -- returns before walking at all
+            caught_up = not self._obs or after >= self._obs[-1]["seq"]
+            start = 0 if caught_up else max(0, after - self._obs[0]["seq"] + 1)
+            ring = [] if caught_up else list(islice(self._obs, start, start + limit))
+            latest, errors, capacity = self._obs_seq, self._obs_errors, self._obs.maxlen
+        dropped = max(0, ring[0]["seq"] - after - 1) if ring and after > 0 else 0
+        return dict(schema="observe/1", samples=ring, latest_seq=ring[-1]["seq"] if ring else min(max(after, 0), latest),
+                    dropped=dropped, errors=errors, capacity=capacity, rate_hz=self.observe_rate_hz)
 
     def _publish(self, now: float, *, motor=None, command=None, snapshot=None) -> None:
         """Publish one state sample. ``snapshot`` is the authority the tick STEPPED the plant under, so a sample never reports a

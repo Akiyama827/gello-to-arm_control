@@ -71,6 +71,63 @@ def plant_model_checks(tmp):
         b.close()
 
 
+def observe_unit(tmp):
+    """observe/1 over SimLink: off unless stated; refused if malformed; decimated from the plant ticks; a bounded ring with an exact
+    cursor, ``dropped`` and ``limit``; every field from the tick that stepped the plant; a failing observation never stops a tick."""
+    cfg = RtConfig(instance_id='sim_arm', state_timeout_s=.5)
+    assert not SimLink(cfg, JOINTS, object(), servo=SERVO).observing
+    for bad in (dict(rate_hz=0, ring_s=1), dict(rate_hz=251, ring_s=1), dict(rate_hz=50, ring_s=0), dict(rate_hz=50),
+                dict(rate_hz='fast', ring_s=1), dict(rate_hz=float('nan'), ring_s=1), dict(rate_hz=50, ring_s=10.5)):
+        try:
+            SimLink(cfg, JOINTS, object(), servo=SERVO, observe=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted a bad sim_observe {bad}')
+    from types import SimpleNamespace
+    from arm_control.supervisor.runtime import RobotRuntime
+    plain = SimpleNamespace(_native=None, _stream_admission=None, link=SimpleNamespace())  # an RT link: no observe/1
+    assert 'observe' not in RobotRuntime.extensions.fget(plain), RobotRuntime.extensions.fget(plain)
+    p = plant(tmp / 'three.urdf')
+    p.load()
+    p.data.qvel[:] = 2.0   # the arm moves, so a stale position cannot pass for this tick's
+    link = SimLink(cfg, JOINTS, p, servo=SERVO, observe=dict(rate_hz=50, ring_s=.2))   # every 5th tick; 10 observations
+    assert (link.observe_rate_hz, link._obs.maxlen) == (50., 10), (link.observe_rate_hz, link._obs.maxlen)
+    for i in range(100):
+        link._tick(i * .004)
+        if (i + 1) % 5 == 0:  # an observing tick: the observation and the state sample come from the same step
+            last = link._obs[-1]
+            assert np.allclose([last['actor_q']['sim_arm'][j] for j in JOINTS], link.latest_state()[0].q), i
+            assert last['sim_time_s'] == float(p.data.time) and last['seq'] == (i + 1) // 5, (i, last['sim_time_s'], p.data.time)
+    first = link.observations(0)
+    assert first['schema'] == 'observe/1' and [o['seq'] for o in first['samples']] == list(range(11, 21)), first['samples']
+    assert (first['latest_seq'], first['dropped'], first['capacity'], first['rate_hz']) == (20, 0, 10, 50.), first
+    times = [o['sim_time_s'] for o in first['samples']]
+    assert np.allclose(np.diff(times), 5 * .004), times                                   # one per 5 plant ticks
+    assert link.observations(5)['dropped'] == 5                                          # 6..10 fell off the ring
+    page = link.observations(10, limit=3)
+    assert [o['seq'] for o in page['samples']] == [11, 12, 13] and page['latest_seq'] == 13, page
+    assert link.observations(20)['samples'] == [] and link.observations(20)['latest_seq'] == 20
+    assert link.observations(99)['latest_seq'] == 20                                     # a stale cursor is clamped
+    assert set(first['samples'][-1]['actor_q']['sim_arm']) == set(JOINTS) and first['samples'][-1]['object_poses'] is None
+    moved = [first['samples'][k]['actor_q']['sim_arm']['j1'] for k in (0, -1)]
+    assert abs(moved[1] - moved[0]) > 1e-6, moved                                    # the consistency check is not vacuous
+    big = SimLink(cfg, JOINTS, plant(tmp / 'three.urdf'), servo=SERVO, observe=dict(rate_hz=250, ring_s=1))
+    big._plant.load()
+    for i in range(300):
+        big._tick(i * .004)
+    capped = big.observations(0, limit=1000)
+    assert len(capped['samples']) == 64 and capped['latest_seq'] == capped['samples'][-1]['seq'] == 300 - 250 + 64, capped['latest_seq']
+    big._plant.close()
+    p.observe = lambda: 1 / 0
+    for i in range(100, 105):
+        link._tick(i * .004)                                                             # the tick survives a failing observation
+    assert link.observations(20)['errors'] == 1 and link.latest_state()[0].state_seq == 105
+    p.close()
+    print('observe/1 over SimLink: off unless stated, decimated, bounded ring, exact cursor/dropped/limit, one tick per sample: PASS',
+          flush=True)
+
+
 def link_unit(tmp):
     cfg = RtConfig(instance_id='sim_arm', state_timeout_s=.5)
     for bad in ({k: v for k, v in SERVO.items() if k != 'hold_ms'}, dict(SERVO, fault_ms=50), dict(SERVO, fault_ms=100),
@@ -360,6 +417,7 @@ def main():
     cfg_path = write_config(tmp, 0, 0)  # also writes three.urdf; the rt ports are unused by the sim plant
     plant_model_checks(tmp)
     link_unit(tmp)
+    observe_unit(tmp)
     link_races(tmp)
     try:
         SimLink.from_config(load_robot_config(cfg_path))  # the fixture config has no sim_servo yet
@@ -384,7 +442,8 @@ def main():
     text = text.replace("  native_reference: true\n", "")
     text += (f"sim_model_path: {tmp / 'three.urdf'}\nsim_gravcomp: true\nsim_timestep: 0.001\n"
              f"sim_servo: {{state_hz: {SERVO['state_hz']}, hold_ms: {SERVO['hold_ms']}, fault_ms: {SERVO['fault_ms']}, "
-             f"hold_kp: {SERVO['hold_kp']}, hold_kd: {SERVO['hold_kd']}}}\n")
+             f"hold_kp: {SERVO['hold_kp']}, hold_kd: {SERVO['hold_kd']}}}\n"
+             "sim_observe: {rate_hz: 250, ring_s: 2}\n")
     cfg_path.write_text(text)
     sock = tmp / 'sdk_arm.sock'
     log = open(tmp / 'supervisor.log', 'w')
@@ -409,6 +468,43 @@ def main():
         assert arm.extensions.get('controller') == 1 and arm.extensions.get('state_history') == 1 \
             and arm.extensions.get('trace') == 1, arm.extensions
         assert 'stream' not in arm.extensions and 'group' not in arm.extensions, arm.extensions
+        # observe/1: read-only, no claim needed; the cursor advances and never repeats a sample
+        assert arm.extensions.get('observe') == 1, arm.extensions
+        seen = wait(lambda: arm.observe()['samples'], what='an observation')
+        batch = arm.observe()
+        assert batch['rate_hz'] == 250. and batch['samples'][-1]['actor_q']['sdk_arm'].keys() == set(JOINTS), batch
+        later = wait(lambda: arm.observe(after=batch['latest_seq'])['samples'], what='a later observation')
+        assert later[0]['seq'] > batch['latest_seq'] and later[0]['sim_time_s'] > batch['samples'][-1]['sim_time_s'], later
+        assert seen
+        from arm_control.sdk import _observation
+        bad = dict(batch, samples=[dict(batch['samples'][-1], actor_q=[1, 2])])
+        try:
+            _observation(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('the SDK decoded an observation whose actor_q is not a mapping')
+        # A slow reader cannot slow the plant (design 2026-10-08 §3 rule 1): four tight readers at the cap, on their own
+        # connections, while the plant's own clock is measured from the observations (its sim time against wall time).
+        # Separate PROCESSES: reader threads in one process throttle each other on that process's own interpreter lock and
+        # never load the supervisor enough to show the effect.
+        loop = ("import sys\nfrom arm_control.sdk import ArmClient\nr = ArmClient('sdk_arm', socket_path=sys.argv[1])\n"
+                "while True:\n    r.observe(0, 1024)\n")
+        readers = [subprocess.Popen([sys.executable, '-c', loop, str(sock)], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, env=dict(os.environ)) for _ in range(4)]
+        time.sleep(.5)
+        t0, a = time.monotonic(), arm.observe(after=10**9)['latest_seq']
+        s0 = arm.observe(after=a - 1)['samples'][-1]['sim_time_s']
+        time.sleep(3.0)
+        t1, b = time.monotonic(), arm.observe(after=10**9)['latest_seq']
+        s1 = arm.observe(after=b - 1)['samples'][-1]['sim_time_s']
+        assert all(r.poll() is None for r in readers), 'a reader died: the plant was not under load'
+        for r in readers:
+            r.kill()
+            r.wait(timeout=5)
+        speed = (s1 - s0) / (t1 - t0)
+        assert speed >= .95, f'four observe readers slowed the plant to {speed:.3f}x real time'
+        print(f'observe/1 under 4 tight readers: plant at {speed:.3f}x real time', flush=True)
         assert arm.authority().lifecycle is Lifecycle.CONNECTED
         arm.claim()
         assert arm.authority().lifecycle is Lifecycle.CLAIMED
