@@ -1,6 +1,6 @@
 """The supervisor and SDK against an arm_rt_server on ANOTHER host running the FAKE backend (no robot, no FCI).
 
-    python tools/hw/remote_fake_rt.py --host 172.16.1.2 --udp 47950 --tcp 47951 [--native]
+    PYTHONPATH=. python tools/hw/remote_fake_rt.py --host 172.16.1.2 --udp 47950 --tcp 47951 [--native]
 
 The operator starts the server on scratch ports (``--backend fake``, instance ``sdk_arm``, joints j1,j2,j3; with ``--enable-reference``
 for ``--native``). This drives it only through ``arm_control.sdk`` via a supervisor process on this PC: claim, ARM (of the fake

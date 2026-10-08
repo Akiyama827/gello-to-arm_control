@@ -7,8 +7,8 @@ each bench printed, so a run on a different machine can be compared directly.
 
 No hardware, no deployment: fake backend only.
 
-    python tools/diag/constrained_cpu.py --build /tmp/arm_rt_build --count 20
-    python tools/diag/constrained_cpu.py --build /tmp/arm_rt_build --count 10 --hogs 0
+    PYTHONPATH=. python tools/diag/constrained_cpu.py --build /tmp/arm_rt_build --count 20
+    PYTHONPATH=. python tools/diag/constrained_cpu.py --build /tmp/arm_rt_build --count 10 --hogs 0
 """
 from __future__ import annotations
 
