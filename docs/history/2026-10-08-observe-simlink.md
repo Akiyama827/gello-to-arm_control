@@ -30,7 +30,7 @@ Review round 1 (BLOCK): the design's "a slow reader cannot slow the plant" was v
 samples per read, in the supervisor's process, competed with the tick for the interpreter: four tight readers slowed the plant to
 0.44x real time. Fixed:
 * a read returns at most `OBSERVE_LIMIT_MAX` = 64 samples;
-* the ring slice is O(limit) (sequences are contiguous, so the start index is arithmetic);
+* the start index is arithmetic (sequences are contiguous). A read costs O(start + limit), and a caught-up reader returns at once;
 * `ring_s` is bounded at 10 s.
 
 The bench now measures the plant's own clock (observation sim time against wall time) while four reader PROCESSES poll at the
@@ -44,3 +44,6 @@ Also from the review:
 * the SDK decoder checks `rate_hz`, `model_revision` and `actor_q`;
 * sequences are per process, and the docstring says so;
 * the design note's wording matches the code (`limit`, `capacity`, rules 7-8).
+
+Round 2 (ACCEPT), folded in: the load test asserts its readers are alive; caught-up reads return at once; the design states the
+minimum poll rate and describes the consistency rule as built; one malformed-reply test for the SDK decoder.

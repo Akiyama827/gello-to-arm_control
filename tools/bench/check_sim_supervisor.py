@@ -476,6 +476,14 @@ def main():
         later = wait(lambda: arm.observe(after=batch['latest_seq'])['samples'], what='a later observation')
         assert later[0]['seq'] > batch['latest_seq'] and later[0]['sim_time_s'] > batch['samples'][-1]['sim_time_s'], later
         assert seen
+        from arm_control.sdk import _observation
+        bad = dict(batch, samples=[dict(batch['samples'][-1], actor_q=[1, 2])])
+        try:
+            _observation(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('the SDK decoded an observation whose actor_q is not a mapping')
         # A slow reader cannot slow the plant (design 2026-10-08 §3 rule 1): four tight readers at the cap, on their own
         # connections, while the plant's own clock is measured from the observations (its sim time against wall time).
         # Separate PROCESSES: reader threads in one process throttle each other on that process's own interpreter lock and
@@ -490,6 +498,7 @@ def main():
         time.sleep(3.0)
         t1, b = time.monotonic(), arm.observe(after=10**9)['latest_seq']
         s1 = arm.observe(after=b - 1)['samples'][-1]['sim_time_s']
+        assert all(r.poll() is None for r in readers), 'a reader died: the plant was not under load'
         for r in readers:
             r.kill()
             r.wait(timeout=5)

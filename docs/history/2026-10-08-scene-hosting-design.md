@@ -52,7 +52,8 @@ readers, not writers.
 
 ## 3. The observe/1 contract
 
-Negotiated like `trace/1`: the supervisor advertises `observe: 1` in `hello.extensions` only when its link is a scene host. A
+Negotiated like `trace/1`: the supervisor advertises `observe: 1` in `hello.extensions` only when its link observes (a single-model
+`SimLink` with `sim_observe` stated, step 1; a scene host, step 2). A
 client that sees no `observe/1` gets `Refused` and must not fall back to anything else.
 
 **Operation** `observe(after: int = 0, limit: int = 64) -> ObservationBatch`; `limit` is capped at 64 (rule 7). It takes no ownership and no claim; any session may
@@ -94,15 +95,17 @@ at most `limit` samples.
 2. **Decimation:** one observation every `ceil(plant_rate / rate_hz)` plant ticks. The default `rate_hz` is 100, stated in the
    scene-host config, never hardcoded. 100 Hz covers every current reader: perception samples at 1 Hz, and the planner and
    coordinator react at 10–100 Hz.
-3. **Consistency:** every field of one observation comes from the same plant tick, taken under the same snapshot lock as the
-   controller's state sample. No field is assembled across ticks.
+3. **Consistency:** every field of one observation comes from the same plant tick. The plant is touched only by the tick thread
+   (step, then publish, then observe), so no other thread can change it in between. A scene host with other writers must keep that
+   confinement, or take observations under the lock its writers take. No field is assembled across ticks.
 4. **Read-only:** `observe/1` has no write operation. Scene mutations are not observations (§4, D1).
 5. **No secrets of authority:** observations carry no session ids or execution ids. Authority is read with `authority()`, as today.
 6. **Size bound:** an observation is bounded by the scene (actors × joints + objects + constraints). The ring holds `N` observations;
    `N` is stated in config (`ring_s`, at most 10 s), with a suggested 2 s at `rate_hz`.
 7. **Read bound:** a read returns at most 64 observations. Building and serializing a batch runs in the supervisor's process and
    competes with the plant tick for the interpreter. Measured (review of step 1): four tight readers taking 1024 samples per read
-   slowed the plant to 0.44x real time. At 64 it stays at 1.0x, and the bench holds that.
+   slowed the plant to 0.44x real time. At 64 it stays at 1.0x, and the bench holds that. So a reader must poll at least
+   `rate_hz / 64` times a second, or it drops samples (1.3 Hz at 83.3 Hz; 15.6 Hz at 1 kHz). The Dora adapter's timer must respect it.
 8. **Sequences are per process:** a reader whose session changes (a new hello) starts again from 0.
 
 **Dora adapter.** A `scene_observer` node polls `observe(after=cursor)` at its timer, and republishes each sample to the outputs

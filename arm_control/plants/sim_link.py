@@ -366,9 +366,11 @@ class SimLink:
         first read); the plant never waits for a reader. Sequences are per supervisor PROCESS: a reader starts again from 0 when
         its session changes (a new hello). ``limit`` is capped at OBSERVE_LIMIT_MAX. Samples are shared: do not mutate them."""
         limit = min(max(1, int(limit)), OBSERVE_LIMIT_MAX)
-        with self._lock:  # O(limit): sequences in the ring are contiguous, so the first wanted sample's index is arithmetic
-            start = 0 if not self._obs else max(0, after - self._obs[0]["seq"] + 1)
-            ring = list(islice(self._obs, start, start + limit))
+        with self._lock:  # sequences are contiguous, so the start index is arithmetic; islice walks to it (O(start + limit)),
+            # and a caught-up reader -- the common case -- returns before walking at all
+            caught_up = not self._obs or after >= self._obs[-1]["seq"]
+            start = 0 if caught_up else max(0, after - self._obs[0]["seq"] + 1)
+            ring = [] if caught_up else list(islice(self._obs, start, start + limit))
             latest, errors, capacity = self._obs_seq, self._obs_errors, self._obs.maxlen
         dropped = max(0, ring[0]["seq"] - after - 1) if ring and after > 0 else 0
         return dict(schema="observe/1", samples=ring, latest_seq=ring[-1]["seq"] if ring else min(max(after, 0), latest),
