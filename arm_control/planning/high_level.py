@@ -123,6 +123,14 @@ def build_collision_stack(
     return world, ompl
 
 
+class _CertifyFailed(Exception):
+    """No retiming rung of one route certified; carries the last certification error."""
+
+    def __init__(self, error: ValueError):
+        super().__init__(str(error))
+        self.error = error
+
+
 class ArmPlanner:
     """Compose IK + (optionally OMPL) + blended time-parameterization.
 
@@ -375,17 +383,6 @@ class ArmPlanner:
             print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
             return JointTrajectory(times=times, positions=positions, velocities=velocities)
 
-        if self._ompl is not None and collision_check:
-            stage_started = perf_counter()
-            waypoints = self._ompl.plan(q_start, q_goal)
-            print(f'[planner:{self.arm_id}] stage=OMPL elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
-            if waypoints is None:
-                return None
-        else:
-            waypoints = np.vstack([q_start, q_goal])
-        # Blended retiming: continuous velocity along the whole path — the
-        # per-segment trapezoids stopped at EVERY OMPL waypoint and crawled.
-        #
         # Certify only where a path was actually CLEARED. Without OMPL the
         # waypoints are a bare start->goal line nothing collision-checked, so
         # a complaint would report the absence of planning rather than a curve
@@ -395,7 +392,51 @@ class ArmPlanner:
         # widening this condition to those cost a self-check ("colliding
         # candidate was selected") while writing it.
         certify = collision_check and self._world is not None and self._ompl is not None
-        stage_started = perf_counter()
+        failure = None
+        for attempt in range(self.ROUTE_ATTEMPTS if certify else 1):
+            if self._ompl is not None and collision_check:
+                stage_started = perf_counter()
+                waypoints = self._ompl.plan(q_start, q_goal)
+                print(f'[planner:{self.arm_id}] stage=OMPL elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
+                if waypoints is None:
+                    return None
+            else:
+                waypoints = np.vstack([q_start, q_goal])
+            stage_started = perf_counter()
+            if certify:
+                # OMPL validates each segment only every resolution_frac x the joint space's extent (~65 mrad on the
+                # FR3) and shortcutting makes long segments, so a route can graze an obstacle between its checks.
+                # Measured 2026-10-08: both failed sim-add legs had a colliding POLYLINE (12 and 78 samples at the
+                # certify step), so no retiming rung could pass. Such a route is not retimed: a fresh one is planned.
+                straight = JointTrajectory(np.arange(len(waypoints), dtype=float), np.asarray(waypoints, float),
+                                           np.zeros_like(np.asarray(waypoints, float)))
+                try:
+                    self._certify_curve(straight)
+                except ValueError as exc:
+                    failure = exc
+                    print(f'[planner:{self.arm_id}] route {attempt + 1}/{self.ROUTE_ATTEMPTS} grazes an obstacle '
+                          'between OMPL\'s checks; re-planning', flush=True)
+                    continue
+            try:
+                seed = self._retime(waypoints, speed_scale, certify)
+            except _CertifyFailed as exc:
+                failure = exc.error
+                print(f'[planner:{self.arm_id}] route {attempt + 1}/{self.ROUTE_ATTEMPTS}: no certified timing; '
+                      're-planning', flush=True)
+                continue
+            failure = None
+            break
+        if failure is not None:
+            # Every attempt was rejected. This does not prove that no collision-free trajectory exists.
+            raise failure
+        print(f'[planner:{self.arm_id}] stage=seed_retiming '
+              f'elapsed_s={perf_counter() - stage_started:.6f} '
+              f'samples={len(seed.times)}', flush=True)
+        print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
+        return seed
+
+    def _retime(self, waypoints, speed_scale, certify):
+        """Time one route, tightening blends and timing on contact; raises _CertifyFailed when no rung certifies."""
         failure = None
         for ds in self.RETIMER_STEPS_RAD:
             seed = time_parameterize_blended(
@@ -415,27 +456,20 @@ class ArmPlanner:
             seed = bound_trajectory(seed, self._max_vel * speed_scale,
                                     self._max_acc * speed_scale)
             if not certify:
-                break
+                return seed
             try:
                 self._certify_curve(seed)
             except ValueError as exc:
                 # Retry the same route with finer samples: a corner's cubic
                 # can depart from the cleared polyline. Refinement may also
                 # change the curve, so every attempt needs its own check.
-                # Exhausting this ladder rejects this candidate; it does not
-                # prove that no collision-free trajectory exists.
                 failure = exc
                 continue
-            failure = None
-            break
-        if failure is not None:
-            raise failure
-        print(f'[planner:{self.arm_id}] stage=seed_retiming '
-              f'elapsed_s={perf_counter() - stage_started:.6f} '
-              f'samples={len(seed.times)}', flush=True)
-        print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
-        return seed
+            return seed
+        raise _CertifyFailed(failure)
 
+    # A route that cannot be certified is re-planned (a fresh OMPL route) at most this many times in all.
+    ROUTE_ATTEMPTS = 3
     # Tighten both geometric blending and timing resolution on contact.
     RETIMER_STEPS_RAD = RETIMING_STEPS_RAD
     CURVE_COLLISION_STEP_RAD = COLLISION_STEP_RAD
@@ -742,7 +776,48 @@ def _check_curve_certificate() -> None:
     print("curve collision certificate: catches between-waypoint contact OK")
 
 
+def _check_replan() -> None:
+    """A route that grazes an obstacle between OMPL's checks is re-planned, never flown; attempts are bounded."""
+
+    class IK:
+        hard_limits = (np.full(2, -5.), np.full(2, 5.))
+
+    class World:  # a wall at x in (0.4, 0.6) below y = 0.5
+        def in_collision(self, q):
+            return bool(0.4 < q[0] < 0.6 and q[1] < 0.5)
+
+    start, goal = np.zeros(2), np.array([1., 0.])
+    grazing = np.vstack([start, goal])                          # straight through the wall: both knots clear
+    around = np.vstack([start, [0., 1.], [1., 1.], goal])       # over it
+
+    class OMPL:
+        def __init__(self, routes):
+            self.routes, self.calls = list(routes), 0
+
+        def plan(self, q_start, q_goal):
+            self.calls += 1
+            return self.routes[min(self.calls, len(self.routes)) - 1]
+
+    ompl = OMPL([grazing, around])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World())
+    flown = planner.plan_joint(goal, start)
+    assert ompl.calls == 2, ompl.calls
+    assert np.allclose(flown.positions[-1], goal)
+    assert not any(World().in_collision(q) for q in flown.densify(1e-3)), 'a re-planned route was not certified'
+    ompl = OMPL([grazing])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World())
+    try:
+        planner.plan_joint(goal, start)
+    except ValueError as exc:
+        assert 'between waypoints' in str(exc), exc
+    else:
+        raise AssertionError('a route through the wall was flown')
+    assert ompl.calls == ArmPlanner.ROUTE_ATTEMPTS, ompl.calls
+    print(f"re-plan: a grazing route is replaced by a fresh one; {ArmPlanner.ROUTE_ATTEMPTS} attempts at most OK")
+
+
 if __name__ == "__main__":
     _check_curve_certificate()
+    _check_replan()
     _self_check()
     _check_route_selection()
