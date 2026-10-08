@@ -31,8 +31,8 @@ degeneracy report is computed from the UNPINNED Jacobian, so it is named
 rather than hidden, and any other near-degenerate direction the dataset
 happens to have is named next to it.
 
-Link geometry is deliberately NOT fitted. tools/bench/compare_flange_fk.py
-answers that question separately and far more cheaply, and giving this fit
+Link geometry is deliberately NOT fitted. A flange-FK comparison against the
+vendor model answers that question separately and far more cheaply, and giving this fit
 per-link freedom would let it absorb the very thing it is measuring.
 """
 from __future__ import annotations
