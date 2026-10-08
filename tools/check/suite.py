@@ -8,6 +8,7 @@ The only server spawned by these checks is the local fake backend.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -117,9 +118,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "rt/build-offline")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
+    parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1),
+                        help="concurrent timing-free checks (timing-sensitive ones always run alone)")
     args = parser.parse_args()
-    if args.jobs < 1:
-        parser.error("--jobs must be positive")
+    if args.jobs < 1 or args.workers < 1:
+        parser.error("--jobs and --workers must be positive")
     build = args.build_dir.resolve()
     logs = build / "offline-logs"
     logs.mkdir(parents=True, exist_ok=True)
@@ -130,7 +133,7 @@ def main() -> int:
     dirty = bool(git("status", "--porcelain"))
     print(f"RT OFFLINE SUITE revision={revision} dirty={dirty} root={ROOT}", flush=True)
 
-    results = []
+    results, pool = [], []  # pool: (name, command, env, timeout) entries free of timing, run concurrently
     results.append(run("configure", ["cmake", "-S", str(ROOT / "rt"), "-B",
                                      str(build), "-G", "Ninja", "-DWITH_FRANKA=OFF",
                                      "-DBUILD_TESTING=ON"], logs=logs, env=env,
@@ -156,16 +159,11 @@ def main() -> int:
                                           str(ROOT / "tools/check/check_dual_group.py"),
                                           "--server", server],
                            logs=logs, env=env, timeout=240))
-        results.append(run("console_graphs", [sys.executable, str(ROOT / "arm_control/ui/arm_console.py"), "--self-check"],
-                           logs=logs, env=env, timeout=180))  # every console graph has exactly one authority source and can stream
-        results.append(run("dora_arm", [sys.executable,
-                                        str(ROOT / "tools/check/check_dora_arm.py")],
-                           logs=logs, env=env, timeout=180))
-        results.append(run("sim_supervisor", [sys.executable,
-                                              str(ROOT / "tools/check/check_sim_supervisor.py")],
-                           logs=logs, env=env, timeout=180))
-        results.append(run("scene_core", [sys.executable, str(ROOT / "tools/check/check_scene_core.py")],
-                           logs=logs, env=env, timeout=120))
+        # every console graph has exactly one authority source and can stream
+        pool.append(("console_graphs", [sys.executable, str(ROOT / "arm_control/ui/arm_console.py"), "--self-check"], env, 180))
+        pool.append(("dora_arm", [sys.executable, str(ROOT / "tools/check/check_dora_arm.py")], env, 180))
+        pool.append(("sim_supervisor", [sys.executable, str(ROOT / "tools/check/check_sim_supervisor.py")], env, 180))
+        pool.append(("scene_core", [sys.executable, str(ROOT / "tools/check/check_scene_core.py")], env, 120))
         results.append(run("trace_retention", [sys.executable,
                                                str(ROOT / "tools/check/check_trace_retention.py")],
                            logs=logs, env=env, timeout=120))
@@ -199,19 +197,23 @@ def main() -> int:
             continue
         script, *extra = check.split()
         path = ROOT / "tools/check" / script
-        results.append(run(check.replace(" --", "_"), [sys.executable, f"{path}.py", *extra], logs=logs,
-                           env=env, timeout=180))
+        pool.append((check.replace(" --", "_"), [sys.executable, f"{path}.py", *extra], env, 180))
     if not FR3_ASSET.is_file():
         results.append(dict(name="fr3_assets", status="FAIL", returncode=None, seconds=0.0, command=[], log="",
                             reason=f"{FR3_ASSET} not staged (tools/assets/setup_fr3.py); not run: {sorted(NEEDS_FR3)}"))
         print(f"FAIL fr3_assets: {results[-1]['reason']}", flush=True)
     for check in MODULE_CHECKS:
         module, *extra = check.split()
-        results.append(run(check.replace(" --", "_"), [sys.executable, "-m", module, *extra], logs=logs, env=env, timeout=180))
+        pool.append((check.replace(" --", "_"), [sys.executable, "-m", module, *extra], env, 180))
     for check in SCRIPT_CHECKS:
         script, *extra = check.split()
-        results.append(run(Path(script).stem + "".join(e.replace("--", "_") for e in extra), [sys.executable, str(ROOT / script),
-                           *extra], logs=logs, env=env, timeout=120))
+        pool.append((Path(script).stem + "".join(e.replace("--", "_") for e in extra),
+                     [sys.executable, str(ROOT / script), *extra], env, 120))
+
+    # The timing-sensitive entries above (fake RT servers, protocol deadlines) ran one at a time on a quiet machine; the rest
+    # are independent processes on ephemeral ports and run concurrently. Results keep submission order.
+    with ThreadPoolExecutor(args.workers) as executor:
+        results += list(executor.map(lambda job: run(job[0], job[1], logs=logs, env=job[2], timeout=job[3]), pool))
 
     summary = {"revision": revision, "dirty": dirty, "root": str(ROOT),
                "build_dir": str(build), "results": results,
