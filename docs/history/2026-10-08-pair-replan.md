@@ -39,3 +39,11 @@ re-planning is probabilistic, not guaranteed (the simplifier can pull routes tow
 Noted, unchanged: with Cartesian targets `collision_fn` is the task-path validator, so a task-path deviation also raises
 `RouteCollides`; only the cooperative path passes targets and it does not re-plan. Worst-case console planning is about 3x
 per click against its fixed 180 s pool timeout (trajopt mode).
+Review round 2: ACCEPT. Taken, as the reviewer proposed: a refiner `RouteCollides` now fails the ROUTE at once instead of one
+rung. A finer rung only re-densifies the same route's seed, and measured on the FR3 the four rungs cost about 4.5 s of
+TrajOpt per route (0.9/0.7/1.2/1.7 s), so rung retries would have made the worst case 12 refinements; now it is at most 3
+(one per route). Also: a refiner failure other than a collision propagates with exactly one OMPL call (asserted), and the
+console's no-route case now fails if a plan comes back. Mutants caught: refiner catches any ValueError; refiner collision
+retried per rung (5 refinements); console without its None guard. Hardware reach: only the opt-in `refinement: trajopt`
+entries (`{sim,real}_franka_workcell_add_trajopt`, `run.py ... --refine trajopt`) run ArmPlanner with a refiner; deployed
+defaults use OMPL with no refiner. No planning deadline exists, so a longer plan blocks longer.

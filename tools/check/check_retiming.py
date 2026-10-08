@@ -141,6 +141,8 @@ def main():
         raise AssertionError('no route reported as a collision')
     except ValueError as exc:
         assert str(exc) == 'no collision-free path found (try a different target)', exc
+    else:
+        raise AssertionError('the console returned a plan without a route')
     # Exact extrema must still catch the old endpoint-position/velocity bug.
     old = JointTrajectory([0., .05], [[0.], [0.]], [[0.], [.1]])
     assert np.isclose(old.bounds()['qdd_abs_max'][0], 8.)
