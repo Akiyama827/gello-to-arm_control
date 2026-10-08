@@ -12,7 +12,7 @@ import pinocchio as pin
 
 from arm_control.config import RobotConfig
 from arm_control.grasp_visual import VisualFK
-from arm_control.planning import preview_rerun as preview
+from arm_control.viz import preview
 from arm_control.ui import arm_console as console
 from arm_control.viz import visualizer
 

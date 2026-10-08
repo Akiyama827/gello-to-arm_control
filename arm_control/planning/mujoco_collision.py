@@ -19,13 +19,8 @@ import numpy as np
 
 from arm_control import frames
 from arm_control.planning import PLANNER_DEFAULTS
-# URDF->MuJoCo staging is neither planning nor plant: both load the same staged
-# file. Re-exported so this module's own users keep working after the move.
-from arm_control.simulation.mujoco_model import (  # noqa: F401
-    _explicit_geom_names,
-    build_mujoco_model,
-    build_planning_model,
-)
+# URDF->MuJoCo staging is neither planning nor plant: both load the same staged file.
+from arm_control.simulation.mujoco_model import _explicit_geom_names, build_planning_model
 
 
 # The transform itself lives in arm_control.frames; this name is local use.
@@ -271,7 +266,7 @@ class MuJoCoCollisionWorld:
         )
         if workspace_xy is not None:
             from types import SimpleNamespace
-            from arm_control.planning.projection import _workspace_bound
+            from arm_control.planning.trajopt import _workspace_bound
 
             bounds = np.asarray(workspace_xy, dtype=float)
             if bounds.shape != (2, 2) or not np.isfinite(bounds).all() or not np.all(bounds[0] < bounds[1]):

@@ -480,7 +480,7 @@ class VisualFK:
     def add_static_scene(self, cfg, *, geoms=None) -> None:
         """Append supplied fixed meshes, or resolve them from config."""
         if geoms is None:
-            from arm_control.planning.preview_rerun import static_scene_geoms
+            from arm_control.viz.preview import static_scene_geoms
 
             geoms = static_scene_geoms(cfg)
         for body, _name, mesh_path, T in geoms:

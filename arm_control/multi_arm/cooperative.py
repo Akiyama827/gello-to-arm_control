@@ -16,7 +16,7 @@ from arm_control import frames
 from arm_control.config import ee_frame
 from arm_control.motion import JointTrajectory
 from arm_control.planning.ik import PinocchioIK
-from arm_control.planning.refinement import finish_path
+from arm_control.planning.retiming import finish_path
 
 # Empty-Hand virtual preparation may retain a small measured endpoint residual.
 # These limits admit capture only; they do not relax path or live closure checks.

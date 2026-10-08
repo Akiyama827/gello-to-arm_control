@@ -4,7 +4,7 @@ Split out of ``planning.stack`` so a controller host can import a servo
 without importing a planner. That was already the intent: ``arm_controller``
 reaches for ``build_executor`` precisely to avoid loading IK, OMPL, a
 collision world or a scene. But it reached for it THROUGH ``planning.stack``,
-which imports ``preview_rerun``, which imports ``rerun`` at module level --
+which imports ``viz.preview``, which imports ``rerun`` at module level --
 and ``rerun-sdk`` is an optional ``[viz]`` extra. A headless install without
 that extra therefore died at import, in the one node that most needs to run
 without a display. (The comment on that import in ``stack.py`` claimed the
@@ -252,8 +252,8 @@ def _self_check() -> None:
         "arm_control.scene",
         "arm_control.data",
         "arm_control.planning.stack",
-        "arm_control.planning.high_level",
-        "arm_control.planning.preview_rerun",
+        "arm_control.planning.planner",
+        "arm_control.viz.preview",
         "arm_control.planning.ik",
         "arm_control.planning.mujoco_collision",
     )

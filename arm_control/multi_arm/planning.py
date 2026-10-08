@@ -12,7 +12,7 @@ from arm_control.motion import JointTrajectory
 from arm_control.multi_arm.types import ArmPlan, BimanualPlan
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.planning.ompl_planner import OMPLPlanner
-from arm_control.planning.refinement import finish_path, refinement_choice
+from arm_control.planning.retiming import finish_path, refinement_choice
 
 
 @dataclass

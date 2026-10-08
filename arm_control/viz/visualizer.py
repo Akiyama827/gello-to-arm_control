@@ -35,7 +35,7 @@ from arm_control.config import load_robot_config_dict
 from arm_control.joint_motor_map import gripper_motor_to_finger
 # Same scene draw as the teleop preview — one implementation, so the two Rerun
 # recordings can never disagree about where the dock stands.
-from arm_control.planning.preview_rerun import log_static_scene
+from arm_control.viz.preview import log_static_scene
 from arm_control.messages import (
     unpack_motor_state,
     unpack_json_message,

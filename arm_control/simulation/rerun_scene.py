@@ -219,7 +219,7 @@ def start_mirror_thread(
         source = lambda: (model, fixed)  # noqa: E731
 
     def _run() -> None:
-        from arm_control.planning.preview_rerun import (
+        from arm_control.viz.preview import (
             DEFAULT_APP_ID,
             DEFAULT_RECORDING_ID,
         )

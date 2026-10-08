@@ -6,7 +6,7 @@ seam and builds the controller through ``build_arm_controller`` from
 ``arm_control.control.factory`` (the one recipe the supervisor and the pair
 runtime share) — NOT through
 ``planning.stack``, which would drag in the IK, the OMPL instance, the
-collision world, and (through ``preview_rerun``) a hard ``rerun`` import that
+collision world, and (through ``viz.preview``) a hard ``rerun`` import that
 this node has no display for. The factory exists so a headless install without
 the optional ``[viz]`` extra can still servo.
 

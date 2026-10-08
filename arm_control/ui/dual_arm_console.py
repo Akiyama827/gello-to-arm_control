@@ -30,7 +30,7 @@ from arm_control.multi_arm.config import load_pair_config, scene_for_mode
 from arm_control.multi_arm.coordinator import BimanualCoordinator
 from arm_control.multi_arm.diagnostics import PairFaultTrace
 from arm_control.multi_arm.simulation import SharedSimulation
-from arm_control.planning.refinement import refinement_choice
+from arm_control.planning.retiming import refinement_choice
 from arm_control.multi_arm.cooperative import (
     CooperativeKinematics,
     RigidGrasps,

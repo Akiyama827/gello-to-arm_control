@@ -504,7 +504,7 @@ def _self_check() -> None:
     is exactly the straight line and any bow is the sampler's own error --
     no URDF, no solver tolerance to hide behind.
 
-    Run: python -m arm_control.planning.high_level
+    Run: python -m arm_control.planning.planner
     """
     q0 = np.array([1.0, 0.0, 0.0, 0.0])
     q1 = np.array([0.0, 1.0, 0.0, 0.0])
@@ -682,7 +682,7 @@ def _self_check() -> None:
             pass
         else:
             raise AssertionError('ranking accepted invalid joint bounds')
-    print(f"high_level self-check OK: {len(traj.positions)} samples, bow {bow:.2e} m")
+    print(f"planner self-check OK: {len(traj.positions)} samples, bow {bow:.2e} m")
 
 
 def _check_route_selection() -> None:
