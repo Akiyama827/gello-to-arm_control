@@ -64,6 +64,7 @@ uint32_t capabilities(const ServerCtx& ctx) {
   // rides on native-reference support, so a bare (enable_reference: false)
   // deployment neither offers the opcode nor sets the mode flags.
   return CAP_OBSERVER | (ctx.supports_pose_hold.load() ? CAP_POSE_HOLD : 0u) |
+    (ctx.supports_cartesian.load() ? CAP_CARTESIAN_TRAJECTORY : 0u) |
     (ctx.supports_reference.load()
        ? uint32_t(CAP_REFERENCE_HORIZON | CAP_MODE_SELECT) : 0u);
 }
@@ -160,6 +161,10 @@ void serve_client(ServerCtx& ctx, int fd, uint64_t session) {
   }
   if (ctx.supports_pose_hold.load())
     std::snprintf(capability, sizeof(capability), " pose_hold=%u", POSE_HOLD_VERSION);
+  if (ctx.supports_cartesian.load()) {
+    const size_t used = std::strlen(capability);
+    std::snprintf(capability + used, sizeof(capability) - used, " cartesian=%u", CARTESIAN_VERSION);
+  }
   rt_setup_names(ctx.rt_setup_failed.load(), rt_setup, sizeof(rt_setup));
   std::snprintf(hello, sizeof(hello),
                 "%s hold_ms=%.0f fault_ms=%.0f active=0x%X%s%s%s rt=%s",

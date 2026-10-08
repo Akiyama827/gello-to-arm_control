@@ -4,6 +4,7 @@
 // rt_backend's _demo diffs the two automatically. If this ever disagrees, the
 // wire is broken: fix protocol.hpp + plants/remote_rt/protocol.py in the same
 // commit and bump VERSION.
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
@@ -117,12 +118,36 @@ int main() {
   soft.pose_hold[13]=1; soft.pose_hold[14]=3;
   print_hex("POSE_HOLD", &soft, sizeof(soft));
   std::printf("POSE_HOLD_SIZE %zu\n",sizeof(soft));
-  PoseHoldCommandPacket decoded{};
+  // v8: the joint command + task frame (90 deg about z), Kc and Dc at their pose-hold-envelope maxima/typical values.
+  CartesianCommandPacket cart{};
+  cart.command=cmd; cart.command.version=CARTESIAN_VERSION;
+  const double golden_cart[CARTESIAN_VALUES]={0,-1,0, 1,0,0, 0,0,1, 1000,200,200,20,5,5, 130,40,40,.5,.25,.25};
+  std::memcpy(cart.cartesian,golden_cart,sizeof(golden_cart));
+  print_hex("CARTESIAN", &cart, sizeof(cart));
+  std::printf("CARTESIAN_SIZE %zu\n",sizeof(cart));
+  {
+    CommandIngress in{};
+    if (!decode_command(&cart,sizeof(cart),true,true,in) ||
+        std::memcmp(in.cartesian,golden_cart,sizeof(golden_cart))) return 1;
+    if (decode_command(&cart,sizeof(cart),true,false,in)) return 1;           // capability not advertised
+    if (decode_command(&cart,sizeof(cart)-8,true,true,in)) return 1;          // short
+    if (decode_command(&cart,sizeof(CommandPacket),true,true,in)) return 1;   // v8 header, no tail
+    PoseHoldCommandPacket six{}; six.command=cart.command;                    // v8 header on a v6-sized packet
+    if (decode_command(&six,sizeof(six),true,true,in)) return 1;
+    struct Bad { int at; double value; };
+    for (Bad bad : {Bad{0, 1.1}, Bad{8, -1.0}, Bad{9, 1000.0001}, Bad{12, 100.0001}, Bad{15, 200.0001},
+                    Bad{18, 50.0001}, Bad{10, -1e-9}, Bad{20, -1e-9}, Bad{4, NAN}, Bad{16, INFINITY}}) {
+      CartesianCommandPacket mutated = cart;
+      mutated.cartesian[bad.at] = bad.value;
+      if (decode_command(&mutated,sizeof(mutated),true,true,in)) return 1;    // R not orthonormal / det -1 / out of envelope
+    }
+  }
+  CommandIngress decoded{};
   for (uint16_t legacy : {uint16_t(1), uint16_t(2), uint16_t(3), uint16_t(4)}) {
     cmd.version=legacy;
-    if (decode_command(&cmd,sizeof(cmd),true,decoded)) return 1;
+    if (decode_command(&cmd,sizeof(cmd),true,false,decoded)) return 1;
     soft.command.version=legacy;
-    if (decode_command(&soft,sizeof(soft),true,decoded)) return 1;
+    if (decode_command(&soft,sizeof(soft),true,false,decoded)) return 1;
   }
   return 0;
 }

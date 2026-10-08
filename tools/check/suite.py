@@ -69,7 +69,7 @@ NEEDS_FR3 = {"check_cooperative", "check_dual_console", "check_dual_modes", "che
 # then), simulation.mujoco_backend (a shim re-running a subset of plants.mujoco.backend --self-check).
 MODULE_CHECKS = (
     "arm_control.assets", "arm_control.calibration_console", "arm_control.config", "arm_control.console_assets",
-    "arm_control.console_server", "arm_control.control.factory", "arm_control.control.gains", "arm_control.control.integral",
+    "arm_control.console_server", "arm_control.contracts.impedance", "arm_control.control.factory", "arm_control.control.gains", "arm_control.control.integral",
     "arm_control.control.jog_hold", "arm_control.control.leg_settling", "arm_control.control.reference",
     "arm_control.end_effectors.franka_adapter --demo", "arm_control.end_effectors.hand_move", "arm_control.execution.codec", "arm_control.execution.contract", "arm_control.frames",
     "arm_control.messages", "arm_control.motion.types", "arm_control.mukca", "arm_control.node_utils",

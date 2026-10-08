@@ -109,6 +109,7 @@ void rt_loop(ServerCtx& ctx) {
   ctx.requested_active_mask.store(backend->active_mask());
   std::snprintf(ctx.backend_name, sizeof(ctx.backend_name), "%s", backend->name());
   ctx.supports_pose_hold.store(backend->supports_pose_hold());
+  ctx.supports_cartesian.store(backend->supports_cartesian());
   // Only THIS thread moves to the isolated core; the comms threads keep the
   // default mask (the housekeeping cores, once isolcpus removes this one).
   // Published before backend_ready, so no ARM is admitted ahead of it.
@@ -139,7 +140,7 @@ void rt_loop(ServerCtx& ctx) {
   CommandEnvelope envelope = {};  // this tick's mailbox copy
   ArmStart arm_start = {};
   CommandAuthority authority;     // RT-owned; tracking + deadline derive here
-  const PoseHoldCommandPacket& incoming = authority.current.packet;
+  const CommandIngress& incoming = authority.current.packet;
   const CommandPacket& cmd=incoming.command;
   Controller controller;
   StatePacket out = {};
@@ -624,6 +625,15 @@ void rt_loop(ServerCtx& ctx) {
           if(!controller.pose(n, ps, incoming.pose_hold, backend->tick_s(),
                               backend->supports_pose_hold())) {
             ctx.latch(FAULT_PLANT, "pose hold requires valid measured pose/J/model state", seen_gen);
+            faulted=true;
+          }
+        } else if(cmd.version==CARTESIAN_VERSION) {
+          // Operator 2026-10-09: lost pose/J/FK mid-leg latches FAULT_PLANT and holds (as pose hold).
+          double pose_des[7];
+          const bool fk = backend->ee_pose_at(cmd.q_des, pose_des);
+          if(!controller.cartesian(n, ps, cmd, incoming.cartesian, fk ? pose_des : nullptr,
+                                   backend->supports_cartesian())) {
+            ctx.latch(FAULT_PLANT, "cartesian law requires valid measured pose/J and FK(q_des)", seen_gen);
             faulted=true;
           }
         } else {

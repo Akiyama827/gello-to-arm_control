@@ -42,7 +42,9 @@
 //    library from the control box (seconds of blocking network work). read()
 //    then fills PlantState's Jacobian and external-wrench estimate from it —
 //    the Cartesian sensing the impedance law and contact detection need.
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <string>
@@ -124,6 +126,26 @@ public:
   // Pose/Jacobian come from the model library libfranka downloads from THIS
   // robot's control box: the vendor model, independent of any PC-side URDF.
   const char* task_model() const override { return "libfranka-vendor"; }
+  bool supports_cartesian() const override { return true; }
+
+  // FK at a COMMANDED q with the same vendor model and the flange/EE frames of the last measured state, so the v8
+  // law's target and its measured pose come from one model (O_T_EE is this model at the measured q).
+  bool ee_pose_at(const double* q, double* pose) override {
+    if (!have_frames_) return false;
+    try {
+      std::array<double, FR3_N> qa{};
+      std::copy_n(q, FR3_N, qa.begin());
+      const std::array<double, 16> T = model_.pose(franka::Frame::kEndEffector, qa, F_T_EE_, EE_T_K_);
+      const Eigen::Map<const Eigen::Matrix4d> transform(T.data());
+      const Eigen::Quaterniond orientation(transform.block<3,3>(0,0));
+      for (int i = 0; i < 3; ++i) pose[i] = transform(i, 3);
+      pose[3] = orientation.w(); pose[4] = orientation.x(); pose[5] = orientation.y(); pose[6] = orientation.z();
+      for (int i = 0; i < 7; ++i) if (!std::isfinite(pose[i])) return false;
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  }
 
   bool read(PlantState& out) override {
     try {
@@ -132,6 +154,9 @@ public:
                   : robot_.readOnce();          // idle stream, no session
       out.n = FR3_N;
       out.robot_time_ms = state.time.toMSec();
+      F_T_EE_ = state.F_T_EE;
+      EE_T_K_ = state.EE_T_K;
+      have_frames_ = true;
       out.cmd_success_rate = state.control_command_success_rate;
       for (int j = 0; j < FR3_N; ++j) {
         out.q[j] = state.q[j];
@@ -267,6 +292,8 @@ private:
   bool active_ = false;
   bool need_recovery_ = false;
   double last_tau_ref_[MAX_JOINTS] = {};
+  std::array<double, 16> F_T_EE_{}, EE_T_K_{};  // the last measured state's frames, for ee_pose_at
+  bool have_frames_ = false;
   std::string fault_;
 };
 

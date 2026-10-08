@@ -51,7 +51,7 @@ class CommandBackend final : public Backend {
       begin_arm(*ctx);
     }
     if (tick == 2) {
-      PoseHoldCommandPacket packet{};
+      CommandIngress packet{};
       auto& cmd = packet.command;
       cmd.n = 2;
       cmd.version = VERSION;
@@ -70,7 +70,7 @@ class CommandBackend final : public Backend {
     if (tick == 6) {
       assert(ctx->fault_code == FAULT_CMD_LOST);
       // A fresh stray zero-gain packet cannot change the latched hold.
-      PoseHoldCommandPacket stray{};
+      CommandIngress stray{};
       stray.command.n = 2;
       ctx->cmd_in.write(CommandEnvelope{stray, mono_ns(), ctx->arm_gen.load(), SESSION});
     }
@@ -130,7 +130,7 @@ class CommandBackend final : public Backend {
     measured=state;
     if(tick==1) begin_arm(*ctx);
     if(tick==2 || tick==4 || tick==5) {
-      PoseHoldCommandPacket packet{};
+      CommandIngress packet{};
       packet.command.n=2;
       packet.command.version=tick==4?VERSION:POSE_HOLD_VERSION;
       packet.command.seq=uint32_t(tick);
