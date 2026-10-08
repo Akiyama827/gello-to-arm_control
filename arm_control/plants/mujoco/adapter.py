@@ -188,8 +188,9 @@ def main() -> None:
                             )
                 elif etype == "INPUT" and not arm_slices and eid == "motor_command":
                     single = unpack_motor_command(event["value"], n)
-                    if core.set_single(single, time.monotonic()):
-                        _warn_undamped(single)
+                    if not core.set_single(single, time.monotonic()):
+                        continue  # disarmed: as before the move, this iteration neither steps nor publishes
+                    _warn_undamped(single)
                 elif etype == "STOP":
                     break
 

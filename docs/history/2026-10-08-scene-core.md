@@ -15,15 +15,24 @@ node and the coming supervisor scene link are its two front ends. The code moved
   * stepping, and the sim-time-behind-wall accounting.
 * The node keeps only Dora: event decoding, message packing, publication timers and the debug-force printout. Its `main` lost 248
   lines and gained 18.
-* `MuJoCoBackend.observe()` adds the scene fields for observe/1: the raw `qpos` (valid with the model revision), the scene revision,
-  attachments and constraints, the in-hand pose, the constraint reactions, the topology, the gripper and the EE wrench. A field the
-  world cannot have is None.
+* `MuJoCoBackend.observe()` adds the scene fields for observe/1: the raw `qpos` (valid with the model revision); in any scene,
+  composed or workcell, the in-hand pose, the constraint reactions and the topology (without its `schema`, as the node publishes
+  it); in a workcell scene also the scene revision, attachments and constraints; the gripper and the EE wrench. A field the world
+  cannot have is None.
+* One behaviour change, kept as it was: the review's differential harness found that a single-model `motor_command` received
+  while disarmed had stopped skipping that iteration's step and publish. The `continue` is restored, so the node matches base.
 
 Checked:
 * `tools/bench/check_scene_core.py` (new, in the offline suite) checks the moved rules directly: a silent slice's gains are zeroed
   (and only that slice's); the warning is said once, even while another slice keeps a shared Cartesian term active; stall credit;
   the ARM gate; Soft expiry; a change to a world without a scene is refused. Mutants killed: no stall credit, a warning every tick,
   every slice zeroed, the ARM gate ignored.
+* Review round 1 (BLOCK): `observe()` returned no in-hand pose, constraint reactions or topology in a composed scene (it tested
+  the workcell overlay only), and 8 of 9 reviewer mutants survived the bench. Fixed: the composed probe on
+  `sim_franka_bench.yaml` now returns all three, with values matching what the node publishes. The bench now also checks a stale
+  revision refused with nothing applied, a zeroed slice clearing the Cartesian term, a slice write carrying it, disarm clearing
+  velocity, Soft and Cartesian, Soft expiry zeroing velocity, stall credit never touching an uncommanded slice, and the drift
+  warning's rate limit; all 9 reviewer mutants are killed.
 * Live, base (1095b1c) against this branch:
   * `sim-add` (workcell path): the plant's log lines are identical (actuators, slices, jaws, both slices' applied gains), with no
     tracebacks.

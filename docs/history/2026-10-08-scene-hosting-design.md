@@ -83,12 +83,14 @@ at most `limit` samples.
 | `scene_revision` | the SceneState revision (the optimistic-concurrency counter) | `scene_state.revision` |
 | `actor_q` | `{actor: {joint: q}}`, named, every actor | `motor_state_*`, `sim_qpos` (actor part) |
 | `actor_dq` | same shape, velocities | `motor_state_*` (velocity part) |
-| `gripper` | `{actor: {width_m, grasped}}` | `gripper_state` |
+| `gripper` | `{positions, efforts}` of the finger joints (one gripper per world today; keyed by actor when D2 adds a second) | `gripper_state` |
 | `attachments`, `constraints` | as in `scene_state` today | `scene_state` |
-| `object_poses` | `{object: [x, y, z, qw, qx, qy, qz]}` in the world frame | `sim_qpos` (object part), `inhand_pose` (derived by the reader) |
+| `object_poses` | `{object: [x, y, z, qw, qx, qy, qz]}` in the world frame (None until step 2b) | `sim_qpos` (object part) |
+| `inhand_pose` | the held module in the EE-body frame, `[x, y, z, qw, qx, qy, qz]` (plant truth) | `inhand_pose` |
+| `qpos` | the raw plant `qpos`, valid with `model_revision` | `sim_qpos` |
 | `constraint_force` | `{constraint: [fx, fy, fz, tx, ty, tz]}` | `constraint_force` |
-| `ee_wrench` | `{actor: [fx, fy, fz, tx, ty, tz]}` | `ee_wrench` |
-| `topology` | the topology record as published today | `topology_state` |
+| `ee_wrench` | `{frame, wrench: [fx, fy, fz, tx, ty, tz]}` (one EE per world today; keyed by actor when D2 adds a second) | `ee_wrench` |
+| `topology` | the topology record as published today (without `schema`) | `topology_state` |
 
 **Rules**
 1. **The plant never waits for a reader.** The ring overwrites, and a slow reader sees `dropped`. This is the trace/1 rule.
