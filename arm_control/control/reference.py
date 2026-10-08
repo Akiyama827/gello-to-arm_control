@@ -27,9 +27,6 @@ from arm_control.motion import JointTrajectory, TrajectoryPoint
 class TrajectoryReference:
     trajectory: JointTrajectory
     t_start: float | None
-    #: Precomputed world EE poses, one per knot (FK of the knots). The
-    #: controller owns no kinematics, so they ride with the plan.
-    cartesian_poses: np.ndarray | None = None
     # Native execution supplies the already selected RT sample. It owns phase;
     # a PC clock and PC interpolation cannot also own this released reference.
     sample_source: Callable[[], TrajectoryPoint] | None = None
@@ -64,22 +61,12 @@ class TrajectoryReference:
     def end(self) -> TrajectoryPoint:
         return self.trajectory.sample_at(self.end_phase)
 
-    def cartesian_pose(self, t_now: float):
-        """The precomputed pose of the knot segment being commanded, or None."""
-        poses = self.cartesian_poses
-        if poses is None:
-            return None
-        times = self.trajectory.times
-        tau = np.clip(self.elapsed(t_now), times[0], times[-1])
-        idx = int(np.searchsorted(times, tau, side="right")) - 1
-        return poses[max(0, min(idx, len(poses) - 1))]
 
 
 def _self_check() -> None:
     traj = JointTrajectory([0.0, 0.5, 1.0], np.array([[0.0], [0.5], [1.0]]),
                            np.array([[0.0], [1.5], [0.0]]))
-    poses = np.arange(3 * 7, dtype=float).reshape(3, 7)
-    ref = TrajectoryReference(traj, 10.0, poses)
+    ref = TrajectoryReference(traj, 10.0)
     times = np.linspace(9.5, 11.5, 41)
     forward = [ref.sample(t) for t in times]
     shuffled = np.random.default_rng(0).permutation(len(times))
@@ -91,14 +78,10 @@ def _self_check() -> None:
     assert np.array_equal(ref.sample(99.0).position, [1.0])       # endpoint retained
     assert np.array_equal(ref.sample(99.0).velocity, [0.0])
     assert np.array_equal(ref.end.position, [1.0])
-    assert ref.cartesian_pose(10.0)[0] == 0 and ref.cartesian_pose(10.6)[0] == 7
-    assert ref.cartesian_pose(50.0)[0] == 14 and ref.cartesian_pose(0.0)[0] == 0
-    assert TrajectoryReference(traj, 0.0).cartesian_pose(0.3) is None
     point = traj.sample_at(.6)
-    native = TrajectoryReference(traj, None, poses, lambda: point)
+    native = TrajectoryReference(traj, None, sample_source=lambda: point)
     for clock in (-1e6, 0., 1e6):
         assert native.sample(clock) is point and native.elapsed(clock) == .6
-        assert native.cartesian_pose(clock)[0] == 7
     for start, source in ((None, None), (0., lambda: point)):
         try:
             TrajectoryReference(traj, start, sample_source=source)
@@ -106,7 +89,7 @@ def _self_check() -> None:
             pass
         else:
             raise AssertionError('ambiguous reference clock accepted')
-    print("control.reference: pure sampling, endpoint retention, knot poses OK")
+    print("control.reference: pure sampling, endpoint retention OK")
 
 
 if __name__ == "__main__":

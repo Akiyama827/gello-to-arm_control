@@ -174,7 +174,7 @@ class ArmController:
         self.last_command: JointServoCommand | None = None
         self._hold_anchor: JointServoCommand | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
-        self._last_cartesian_pose: np.ndarray | None = None
+        self._cartesian_live = False  # the Cartesian law is on: holds keep it, aimed at FK(hold q_des)
         self._pose_hold: dict | None = None
         self.supports_pose_hold = False
 
@@ -580,13 +580,13 @@ class ArmController:
                         self.executor.hold_command(arm, q_des=goal, integral_bias=self.integral.bias)
                         if goal is not None else None
                     )
-                self._cartesian_now = self._last_cartesian_pose = None
+                self._cartesian_now, self._cartesian_live = None, False
         if self._running and self._reference is not None:
             point = self._reference.sample(self.exec_time)
             bias = self.integral.update(*cycle, point.position, arm.position, self.executor.kp)
             command = self.executor.step(point, arm, integral_bias=bias)
             self._hold_anchor = None  # motion streams: next hold re-anchors
-            if self._send(command, self._cartesian_for_time(self.exec_time)) is False:
+            if self._send(command, True) is False:
                 return
             if self.execution_policy is None:
                 self._check_completion(arm)
@@ -602,14 +602,14 @@ class ArmController:
             bias = self.integral.update(*cycle, jog, arm.position, self.executor.kp)
             command = self.executor.hold_command(arm, q_des=jog, integral_bias=bias)
             self._hold_anchor = None   # a jog moves: the next hold re-anchors
-            self._send(command, self._last_cartesian_pose)
+            self._send(command, self._cartesian_live)
             return
         # No trajectory released: hold the anchor. This is the keepalive the
         # plant's deadman needs while the planner searches, while an operator
         # reviews a gated plan, and while a gripper/tilt/graft request is out.
         command = self._anchored_hold(cycle, refresh=expired)
         if command is not None:
-            self._send(command, self._last_cartesian_pose)
+            self._send(command, self._cartesian_live)
 
     # -- leg lifecycle -------------------------------------------------------
     @property
@@ -694,8 +694,7 @@ class ArmController:
         start = self.exec_time
         source = self._reference_source
         self._reference = TrajectoryReference(
-            self._pending_traj, None if source else start,
-            self._plan.get("cartesian_poses"), source)
+            self._pending_traj, None if source else start, sample_source=source)
         self._settling.begin(None if source else start + self._reference.duration_sec)
         self._completion_sample_at = None
         self._stream_sent_at = None
@@ -742,7 +741,7 @@ class ArmController:
         self.executor.set_gains(kp=self._track_kp.copy(), kd=self._track_kd.copy())
         self.last_command = None
         self._cartesian_now = None
-        self._last_cartesian_pose = None
+        self._cartesian_live = False
         self._pose_hold = spec
         self._reset_integral()  # the pose-hold law ignores tau_ff
         self._report_mode()
@@ -828,7 +827,7 @@ class ArmController:
             and np.max(np.abs(self.last_state.velocity)) < .01
         )
         if self.execution_policy is not None:
-            self._cartesian_now = self._last_cartesian_pose = None
+            self._cartesian_now, self._cartesian_live = None, False
         if self._pose_hold is not None:
             self._pose_hold = None
             self.last_command = None
@@ -923,7 +922,7 @@ class ArmController:
             # A failed settle must not turn into another motion or release an
             # attached object. Freeze at the measured pose with zero velocity.
             self.last_command = self._hold_anchor = self._static_hold()
-            self._cartesian_now = self._last_cartesian_pose = None
+            self._cartesian_now, self._cartesian_live = None, False
             self._pending_traj = None
             self.frozen = True
             self._finish_leg(ok=False, reason=reason, completion=progress)
@@ -998,16 +997,9 @@ class ArmController:
             self._hold_anchor = self.executor.hold_command(state, integral_bias=bias)
         return self._hold_anchor
 
-    def _cartesian_for_time(self, t_now: float):
-        """The precomputed world EE pose for the sample being commanded.
-
-        The controller owns no kinematics, so the Cartesian impedance target
-        (which is FK(q_des)) rides along with the plan rather than being
-        re-derived here from a model this node is not allowed to load.
-        """
-        return None if self._reference is None else self._reference.cartesian_pose(t_now)
-
-    def _send(self, command: JointServoCommand, cartesian_pose) -> bool:
+    def _send(self, command: JointServoCommand, cartesian: bool) -> bool:
+        """``cartesian``: this word may carry the loaded leg's Cartesian spec. The spec has no pose: the plant aims the
+        spring at FK(q_des) with its own model, so a hold keeps it on the hold's own q_des."""
         aborted = False
         if self.execution_policy is not None:
             if not self.execution_policy.command_valid(command, self.n_arm):
@@ -1022,18 +1014,13 @@ class ArmController:
                 if command is None or not self.execution_policy.command_valid(command, self.n_arm):
                     self._fault("invalid measured hold command")
                     return False
-                cartesian_pose = None
+                cartesian = False
                 aborted = True
         self.last_command = command
-        cartesian = None
-        if self._cartesian_now is not None and cartesian_pose is not None:
-            self._last_cartesian_pose = np.asarray(cartesian_pose, dtype=float)
-            cartesian = {
-                "pose": self._last_cartesian_pose,
-                "task_R": self._cartesian_now["task_R"],
-                "kc": self._cartesian_now["kc"],
-                "dc": self._cartesian_now["dc"],
-            }
+        spec = None
+        if self._cartesian_now is not None and cartesian:
+            self._cartesian_live = True
+            spec = self._cartesian_now
         self.node.send_output(
             "motor_command",
             pack_arm_gripper_command(
@@ -1047,7 +1034,7 @@ class ArmController:
                 else self._finger_cmd,
                 self.gripper["gains"],
                 self.gripper["mimic"],
-                cartesian=cartesian,
+                cartesian=spec,
                 pose_hold=self._pose_hold,
             ),
         )

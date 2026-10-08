@@ -1295,6 +1295,18 @@ class MuJoCoBackend:
         )
         self._jacp = np.zeros((3, self.model.nv))
         self._jacr = np.zeros((3, self.model.nv))
+        # The Cartesian law's frames, as the RT box has them. The robot BASE is the body the EE's kinematic chain hangs off: the
+        # parent of the chain's first jointed body (the FR3's fr3_link0 = libfranka's O frame). Found from the EE, not from
+        # joint_names[0], which in a composed world may be another actor's. The target FK(q_des) runs on a scratch state.
+        self._base_bid, self.ee_chain_joints = -1, []
+        body = self._ee_bid
+        while body > 0:
+            if self.model.body_jntnum[body] > 0:
+                self._base_bid = int(self.model.body_parentid[body])
+                start = self.model.body_jntadr[body]
+                self.ee_chain_joints[:0] = [self.model.joint(j).name for j in range(start, start + self.model.body_jntnum[body])]
+            body = int(self.model.body_parentid[body])
+        self._fk_data = mujoco.MjData(self.model)
         self._gripper_act = [
             self.model.actuator(f"{n}_servo").id for n in gripper_present
         ]
@@ -1556,22 +1568,40 @@ class MuJoCoBackend:
         self._last_command["pose_hold"] = soft
 
     @property
+    def supports_cartesian(self) -> bool:
+        """The cartesian_impedance law can run: an EE on a jointed chain, and the compiled law to call."""
+        return (getattr(self, "_base_bid", -1) >= 0 and _servo is not None and hasattr(_servo, "cartesian_torque")
+                and all(j in self.joint_names for j in self.ee_chain_joints))
+
+    @property
     def supports_pose_hold(self) -> bool:
         return (self.scene is None and self.workcell_scene is None
                 and getattr(self, "_ee_bid", -1) >= 0
                 and _servo is not None and hasattr(_servo, "PoseHold"))
 
-    def _cartesian_tau_ff(self, tau_ff: np.ndarray, cart: dict) -> np.ndarray:
-        """Fold the task-frame Cartesian impedance into tau_ff.
+    def _ee_pose_at(self, q_des: np.ndarray) -> np.ndarray:
+        """World EE pose ``[x, y, z, qw, qx, qy, qz]`` at the planned joints ``q_des``, everything else as measured: the RT's
+        ``ee_pose_at``, on this model."""
+        fk = self._fk_data
+        fk.qpos[:] = self.data.qpos
+        fk.mocap_pos[:], fk.mocap_quat[:] = self.data.mocap_pos, self.data.mocap_quat
+        fk.qpos[self._qadr] = q_des
+        mujoco.mj_kinematics(self.model, fk)
+        return np.r_[fk.xpos[self._ee_bid], fk.xquat[self._ee_bid]]
 
-        The twin computes J and the EE pose ITSELF, from MuJoCo, exactly as
-        the RT loop computes them from libfranka — the PC only ever sends the
-        target and the stiffness. Keeping that split honest here is the point:
-        a sim that took a PC-computed Jacobian would not be testing the thing
-        the robot actually runs.
+    def _cartesian_tau_ff(self, tau_ff: np.ndarray, cart: dict, q_des: np.ndarray) -> np.ndarray:
+        """Fold the task-frame Cartesian impedance into tau_ff: the RT box's v8 law, on the twin.
+
+        The PC sends only the task frame (robot BASE frame) and the stiffness. The twin computes J, the EE pose and the target
+        FK(q_des) ITSELF, from MuJoCo, exactly as the RT loop computes them from libfranka; MuJoCo's frame is the world, so the
+        task frame is rotated by the base body's measured orientation. A sim that took a PC-computed target or Jacobian would
+        not be testing the thing the robot runs.
         """
-        if self._ee_bid < 0 or _servo is None:
+        if self._ee_bid < 0 or self._base_bid < 0 or _servo is None:
             return tau_ff  # no EE configured, or no compiled law to call
+        if cart.get("frame") != "base":
+            raise ValueError("the Cartesian spec is in the robot BASE frame")
+        target = self._ee_pose_at(q_des)
         mujoco.mj_jacBody(self.model, self.data, self._jacp, self._jacr, self._ee_bid)
         # 6 x n row-major, ACTUATED columns only — the layout servo_law.hpp
         # documents. Rows the arm cannot drive would just be noise in J^T f.
@@ -1580,11 +1610,11 @@ class MuJoCoBackend:
         return _servo.cartesian_torque(
             tau_ff=tau_ff,
             J=jac,
-            R_task=cart["task_R"],
+            R_task=self.data.xmat[self._base_bid].reshape(3, 3) @ np.asarray(cart["task_R"], dtype=float),
             x=body.xpos,
             quat=body.xquat,  # MuJoCo quats are [w,x,y,z], like the law's
-            x_des=cart["pose"][:3],
-            quat_des=cart["pose"][3:7],
+            x_des=target[:3],
+            quat_des=target[3:7],
             # Twist from the SAME J, so the damping term can never disagree
             # with the stiffness term about what the EE is doing.
             twist=jac @ self.data.qvel[self._vadr],
@@ -1625,7 +1655,7 @@ class MuJoCoBackend:
             kp, kd = np.zeros(self.num_motors), np.zeros(self.num_motors)
         cart = cmd.get("cartesian")
         if cart is not None:
-            tau_ff = self._cartesian_tau_ff(tau_ff, cart)
+            tau_ff = self._cartesian_tau_ff(tau_ff, cart, cmd["position"])
         # Torque is computed at the FULL planned width and written only to the
         # joints that currently have an actuator: a module still in its nest is
         # commanded (the bridge does not know or care) and that command lands

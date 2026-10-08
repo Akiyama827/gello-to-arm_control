@@ -30,6 +30,7 @@ import time
 
 import numpy as np
 
+from arm_control.contracts.impedance import cartesian_values
 from arm_control.plants.remote_rt import protocol as rtp
 from arm_control.plants.remote_rt.client import RtConfig, RtLinkError
 
@@ -141,6 +142,11 @@ class SimLink:
         return cls(RtConfig.from_config(cfg), joints, plant, servo=servo, observe=cfg.get("sim_observe"))
 
     @property
+    def supports_cartesian(self) -> bool:
+        """The plant runs the cartesian_impedance law (known once the plant is loaded: the model is compiled at load)."""
+        return bool(getattr(self._plant, "supports_cartesian", False))
+
+    @property
     def num_motors(self) -> int:
         return self.n
 
@@ -150,7 +156,8 @@ class SimLink:
         joint_hash = rtp.joint_order_hash(self.joint_names)
         self.session_id = secrets.randbits(63) | 1
         self.identity = rtp.Identity(self.config.instance_id, self.config.task_model, self.session_id, joint_hash,
-                                     rtp.identity_hash(self.config.instance_id, joint_hash), 0, self.n)
+                                     rtp.identity_hash(self.config.instance_id, joint_hash),
+                                     rtp.CAP_CARTESIAN_TRAJECTORY if self.supports_cartesian else 0, self.n)
         self._stop.clear()
         self._publish(time.monotonic())
         self._thread = threading.Thread(target=self._run, name=f"sim-link-{self.config.instance_id}", daemon=True)
@@ -216,11 +223,20 @@ class SimLink:
 
     # -- commands ----------------------------------------------------------------------------------------------
     def apply_command(self, command) -> int | None:
-        if command.get("cartesian") is not None or command.get("pose_hold") is not None:
-            raise RtLinkError("the simulated link supports joint commands only")
+        if command.get("pose_hold") is not None:
+            raise RtLinkError("the simulated link does not run pose hold")
+        spec = command.get("cartesian")
+        if spec is not None:
+            # The RT link's v8 rules: refused unless the plant runs the law, base frame only, the pose-hold envelope.
+            if not self.supports_cartesian:
+                raise RtLinkError("this simulated plant does not run the Cartesian law (no EE chain of its own)")
+            values = cartesian_values(spec)
+            spec = dict(frame="base", task_R=np.reshape(values[:9], (3, 3)), kc=np.array(values[9:15]),
+                        dc=np.array(values[15:21]))
         n = self.n
         cmd = {key: np.asarray(command.get(key, np.zeros(n)), dtype=float).reshape(-1)[:n].copy()
                for key in ("position", "velocity", "torque", "kp", "kd")}
+        cmd["cartesian"] = spec
         with self._lock:
             self._cmd_seq = (self._cmd_seq + 1) & 0xFFFFFFFF
             if self._armed and not self._fault_code:  # a disarmed or faulted servo ignores commands
@@ -261,7 +277,7 @@ class SimLink:
         return {"armed": bool(state and state.armed), "state_fresh": not stale, "latched_fault": fault,
                 "any_fault": bool(fault) or bool(state and state.faulted), "holding": bool(state and state.holding),
                 "holding_q": list(state.q_cmd) if state and state.holding else None, "backend": self.backend_name,
-                "supports_pose_hold": False, "state_age_s": age if rx_t > 0 else -1.0,
+                "supports_pose_hold": False, "supports_cartesian": self.supports_cartesian, "state_age_s": age if rx_t > 0 else -1.0,
                 "last_cmd_seq": state.last_cmd_seq if state else 0, "sent_cmd_seq": self._cmd_seq,
                 "online_mask": state.online_mask if state else 0, "active_mask": (1 << self.n) - 1,
                 "instance_id": self.config.instance_id, "session_id": f"{self.session_id:016x}",

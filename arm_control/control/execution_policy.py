@@ -10,6 +10,7 @@ import math
 
 import numpy as np
 
+from arm_control.contracts.impedance import cartesian_values
 from arm_control.control.gains import validate_torque_limits
 from arm_control.motion import JointTrajectory
 
@@ -32,10 +33,14 @@ class ExecutionPolicy:
     position_upper: np.ndarray | None = None
     velocity_limits: np.ndarray | None = None
     acceleration_limits: np.ndarray | None = None
+    # The least joint kp (N.m/rad, every joint) a cartesian_impedance leg may carry: the RT's fault/stale hold keeps only the
+    # joint law, so a leg whose stiffness lives in K_c alone would hold limp (operator 2026-10-09). None: no Cartesian legs.
+    cartesian_kp_min: float | None = None
 
     def __post_init__(self):
         for field in fields(self):
-            if field.name in ("torque_limits", "velocity_limits", "acceleration_limits", "position_lower", "position_upper"):
+            if field.name in ("torque_limits", "velocity_limits", "acceleration_limits", "position_lower", "position_upper",
+                              "cartesian_kp_min"):
                 continue
             value = float(getattr(self, field.name))
             if not math.isfinite(value) or value <= 0:
@@ -66,6 +71,11 @@ class ExecutionPolicy:
                 object.__setattr__(self, name, value)
             if np.any(self.position_lower >= self.position_upper):
                 raise ValueError("execution_policy position bounds must be ordered")
+        if self.cartesian_kp_min is not None:
+            value = float(self.cartesian_kp_min)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("execution_policy.cartesian_kp_min must be finite and positive")
+            object.__setattr__(self, "cartesian_kp_min", value)
 
     @property
     def period(self):
@@ -130,18 +140,19 @@ class ExecutionPolicy:
         for key in ("kp", "kd"):
             if plan[key].shape != (n_arm,) or np.any(plan[key] < 0):
                 return f"trajectory {key} must be a nonnegative joint vector"
-        cartesian, poses = plan.get("cartesian"), plan.get("cartesian_poses")
-        if cartesian is not None or poses is not None:
-            if cartesian is None or poses is None:
-                return "Cartesian trajectory needs both poses and impedance settings"
-            if poses.shape != (len(t), 7) or not np.isfinite(poses).all():
-                return "Cartesian trajectory poses must be finite sample-by-7 values"
-            for key, shape in (("task_R", (3, 3)), ("kc", (6,)), ("dc", (6,))):
-                value = np.asarray(cartesian.get(key), dtype=float)
-                if value.shape != shape or not np.isfinite(value).all():
-                    return f"Cartesian trajectory {key} must be finite with shape {shape}"
-                if key != "task_R" and np.any(value < 0):
-                    return f"Cartesian trajectory {key} must be nonnegative"
+        poses = plan.get("cartesian_poses")  # visualisation only: the plant's target is FK(q_des)
+        if poses is not None and (poses.shape != (len(t), 7) or not np.isfinite(poses).all()):
+            return "Cartesian trajectory poses must be finite sample-by-7 values"
+        if plan.get("cartesian") is not None:
+            try:
+                cartesian_values(plan["cartesian"])
+            except (TypeError, ValueError) as exc:
+                return f"Cartesian impedance spec refused: {exc}"
+            if self.cartesian_kp_min is None:
+                return "this robot's execution policy admits no Cartesian legs (no cartesian_kp_min)"
+            if np.any(plan["kp"] < self.cartesian_kp_min):
+                return (f"a Cartesian leg needs joint kp >= {self.cartesian_kp_min:g} on every joint: the fault hold keeps "
+                        "only the joint law")
         return self.start_error(q[0], measured)
 
     def start_error(self, start, measured):

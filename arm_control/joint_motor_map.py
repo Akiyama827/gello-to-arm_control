@@ -85,16 +85,14 @@ def pack_arm_gripper_command(
     (the FR3's Franka Hand is its own device, driven by grasp requests): the
     command is then arm joints only, with no gripper slot appended.
 
-    ``cartesian`` is the optional EE-level impedance block (target pose +
-    task-frame K_c/D_c dict, see ``messages.pack_cartesian_block``). It has no
+    ``cartesian`` is the optional EE-level impedance spec (base-frame task frame +
+    K_c/D_c, see ``messages.pack_cartesian_block``; the plant targets FK(q_des)). It has no
     per-motor structure, so the gripper mapping above does not touch it.
     """
     tail = (
         None
         if cartesian is None
-        else pack_cartesian_block(
-            cartesian["pose"], cartesian["task_R"], cartesian["kc"], cartesian["dc"]
-        )
+        else pack_cartesian_block(cartesian)
     )
     if mimic_cfg is None:
         return pack_motor_command(

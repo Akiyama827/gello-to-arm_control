@@ -5,15 +5,15 @@ import numpy as np
 import pyarrow as pa
 
 from ._arrow import _pack, _unpack, _check_length
-from .impedance import POSE_HOLD_SIZE, pose_hold_values, unpack_pose_hold_values
+from .impedance import CARTESIAN_SIZE, POSE_HOLD_SIZE, cartesian_values, pose_hold_values, unpack_pose_hold_values
 
 _MS = 8  # pos, vel, pos_cmd, vel_cmd, tor_cmd, kp, kd, tor_fb
 _MC = 5
-# Optional Cartesian-impedance tail on motor_command: 7 target pose
-# [x,y,z,qw,qx,qy,qz] + 9 task-frame rotation (3x3 ROW-MAJOR) + 6 K_c + 6 D_c.
-# Appended AFTER the n*_MC interleaved motor block, so a command without it is
-# byte-identical to what this module has always packed.
-_CART = 28
+# Optional Cartesian-impedance tail on motor_command: the RT v8 tail (``impedance.cartesian_values``): 9 task-frame rotation
+# (3x3 ROW-MAJOR, robot BASE frame) + 6 K_c + 6 D_c. No target pose: every plant computes it as FK(q_des) with its own model
+# (operator 2026-10-09). Appended AFTER the n*_MC interleaved motor block, so a command without it is byte-identical to what
+# this module has always packed.
+_CART = CARTESIAN_SIZE
 
 
 def pack_motor_state(pos, vel, pos_cmd, vel_cmd, tor_cmd, kp, kd, torque) -> pa.Array:
@@ -59,38 +59,20 @@ def unpack_motor_state(arrow: pa.Array, n: int) -> dict:
     }
 
 
-def pack_cartesian_block(pose, task_R, kc, dc) -> np.ndarray:
-    """The optional Cartesian-impedance tail as a flat 28-float array.
+def pack_cartesian_block(spec: dict) -> np.ndarray:
+    """The optional Cartesian-impedance tail of a validated base-frame spec ``{frame: "base", task_R, kc, dc}``.
 
-    ``pose``   target EE pose, ``[x,y,z,qw,qx,qy,qz]``, WORLD frame (the frame
-               the plant's Jacobian and EE pose are in).
-    ``task_R`` 3x3 ROW-MAJOR rotation whose COLUMNS are the task frame's axes
-               in world coordinates. K_c/D_c are diagonals IN THAT FRAME, so a
-               dock's stiffness is stated once (stiff along the insertion axis)
-               and never re-derived per dock orientation.
-    ``kc``/``dc`` 6 each: ``[kx,ky,kz,krx,kry,krz]`` task-frame diagonals,
-               N/m and N·m/rad (damping N·s/m and N·m·s/rad).
-
-    Sent as a matrix, not a quaternion, because the servo law consumes a
-    row-major 3x3 — one less convention to get wrong at either end.
+    ``task_R`` is a 3x3 rotation whose COLUMNS are the task frame's axes in the robot BASE frame; ``kc``/``dc`` are task-frame
+    diagonals ``[x, y, z, rx, ry, rz]`` (N/m, N.m/rad; N.s/m, N.m.s/rad), so a dock's stiffness is stated once (stiff along the
+    insertion axis). A matrix, not a quaternion, because the servo law consumes a row-major 3x3.
     """
-    out = np.concatenate(
-        [
-            np.asarray(pose, dtype=float).ravel(),
-            np.asarray(task_R, dtype=float).ravel(),
-            np.asarray(kc, dtype=float).ravel(),
-            np.asarray(dc, dtype=float).ravel(),
-        ]
-    )
-    if out.size != _CART:
-        raise ValueError(f"cartesian block must be 7+9+6+6={_CART} floats, got {out.size}")
-    return out
+    return np.asarray(cartesian_values(spec), dtype=float)
 
 
 def pack_motor_command(pos, vel, tor, kp, kd, cartesian=None, *, pose_hold=None) -> pa.Array:
     """Interleaved 5-float-per-motor command, plus an OPTIONAL Cartesian tail.
 
-    ``cartesian`` is the 28-float block from :func:`pack_cartesian_block` (or
+    ``cartesian`` is the 21-float block from :func:`pack_cartesian_block` (or
     None). Omitting it produces exactly the array this function has always
     produced — that is what makes the block optional for graphs that never
     send one. Alternatively, ``pose_hold`` is a validated 15-float spec
@@ -119,7 +101,7 @@ def pack_motor_command(pos, vel, tor, kp, kd, cartesian=None, *, pose_hold=None)
 def unpack_motor_command(arrow: pa.Array, n: int) -> dict:
     """Inverse of :func:`pack_motor_command`; ``cartesian`` is None when absent.
 
-    The LENGTH is the presence flag: n*5 = no Cartesian block, n*5+28 = one.
+    The LENGTH is the presence flag: n*5 = no tail, n*5+21 = a base-frame Cartesian spec, n*5+15 = pose hold.
     Anything else is a layout bug and raises, same as before.
     """
     flat_raw = _unpack(arrow)
@@ -136,10 +118,10 @@ def unpack_motor_command(arrow: pa.Array, n: int) -> dict:
         "cartesian": None
         if tail.size != _CART
         else {
-            "pose": tail[:7],
-            "task_R": tail[7:16].reshape(3, 3),
-            "kc": tail[16:22],
-            "dc": tail[22:28],
+            "frame": "base",
+            "task_R": tail[0:9].reshape(3, 3),
+            "kc": tail[9:15],
+            "dc": tail[15:21],
         },
         "pose_hold": unpack_pose_hold_values(tail) if tail.size == POSE_HOLD_SIZE else None,
     }

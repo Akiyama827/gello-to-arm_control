@@ -331,6 +331,12 @@ class ScenePlant:
             hand = SimHandBridge(int(spec["port"]), bind=str(spec.get("bind", "127.0.0.1")))
         return cls(world, str(actor), list(joints), period=period, idle_timeout=float(idle), hand=hand)
 
+    @property
+    def supports_cartesian(self) -> bool:
+        """The world's EE chain is this actor's: a Cartesian spec from it drives its own arm, never another actor's."""
+        mine = set(list(self.backend.joint_names)[self._span])
+        return bool(self.backend.supports_cartesian and set(self.backend.ee_chain_joints) <= mine)
+
     def load(self) -> None:
         self.backend.load()
         if self.hand is not None and self.hand._server is None:
@@ -347,7 +353,7 @@ class ScenePlant:
 
     def step(self, command: dict) -> dict:
         now = time.monotonic()
-        self._core.set_slice(self.actor, dict(command, cartesian=None), now)
+        self._core.set_slice(self.actor, dict(command, cartesian=command.get("cartesian")), now)
         state = self._core.tick(now)
         if self.hand is not None:  # the Hand's own device, on this thread: a sample after the step, a command for the next
             finger = self.hand.on_sample(self.backend.gripper_positions(), self.backend.gripper_efforts(), now)

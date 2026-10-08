@@ -5,6 +5,7 @@ import numpy as np
 import pyarrow as pa
 
 from ._arrow import _pack, _unpack, _check_length, pack_json_message, unpack_json_message
+from .impedance import cartesian_values
 
 
 def pack_trajectory(times, positions, velocities) -> pa.Array:
@@ -60,6 +61,12 @@ def _completion_body(completion) -> dict | None:
     }
 
 
+def _cartesian_lists(spec: dict) -> tuple[list, list, list]:
+    """A validated base-frame spec as ``(task_R rows, kc, dc)`` lists; ValueError otherwise."""
+    values = cartesian_values({k: np.asarray(v, dtype=float).tolist() if k != "frame" else v for k, v in spec.items()})
+    return [values[0:3], values[3:6], values[6:9]], values[9:15], values[15:21]
+
+
 def pack_plan(
     *,
     plan_id: str,
@@ -113,21 +120,16 @@ def pack_plan(
         "kd": np.asarray(kd, dtype=float).ravel().tolist(),
         "completion": _completion_body(completion),
         "model_token": None if model_token is None else str(model_token),
-        # FK of every sample, precomputed in WORLD. The controller owns no
-        # kinematics by design, and the Cartesian impedance target is exactly
-        # FK(q_des) -- so it ships with the samples rather than being re-derived
-        # downstream from a model the controller is not allowed to load.
+        # FK of every sample, precomputed in WORLD, for previews and logs. Not a control target.
         "cartesian_poses": (
             None if cartesian_poses is None
             else np.asarray(cartesian_poses, dtype=float).reshape(len(times), 7).tolist()
         ),
+        # The cartesian_impedance law's settings, robot BASE frame (``impedance.cartesian_values`` checks them): the plant
+        # targets FK(q_des) with its own model, so ``cartesian_poses`` above is visualisation only.
         "cartesian": (
             None if cartesian is None
-            else {
-                "task_R": np.asarray(cartesian["task_R"], dtype=float).reshape(3, 3).tolist(),
-                "kc": np.asarray(cartesian["kc"], dtype=float).ravel().tolist(),
-                "dc": np.asarray(cartesian["dc"], dtype=float).ravel().tolist(),
-            }
+            else dict(zip(("task_R", "kc", "dc"), _cartesian_lists(cartesian)), frame="base")
         ),
     }
     return pack_json_message("plan", body)
@@ -148,9 +150,8 @@ def unpack_plan(payload: pa.Array) -> dict:
         if spec.get("goal_q") is not None:
             spec["goal_q"] = np.asarray(spec["goal_q"], dtype=float)
     if body.get("cartesian") is not None:
-        body["cartesian"] = {
-            k: np.asarray(v, dtype=float) for k, v in body["cartesian"].items()
-        }
+        task_R, kc, dc = _cartesian_lists(body["cartesian"])
+        body["cartesian"] = dict(frame="base", task_R=np.asarray(task_R), kc=np.asarray(kc), dc=np.asarray(dc))
     return body
 
 
