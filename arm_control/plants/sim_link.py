@@ -348,10 +348,12 @@ class SimLink:
             world = self._plant.observe()
             actor = self.config.instance_id
             sample = dict(seq=self._obs_seq + 1, sim_time_s=world["sim_time_s"], observed_ns=time.monotonic_ns(),
-                          model_revision=world["model_revision"], scene_revision=None,
+                          model_revision=world["model_revision"], scene_revision=world.get("scene_revision"),
                           actor_q={actor: world["joint_q"]}, actor_dq={actor: world["joint_dq"]},
-                          gripper=None, attachments=None, constraints=None, object_poses=None,
-                          constraint_force=None, ee_wrench=None, topology=None)
+                          gripper=world.get("gripper"), attachments=world.get("attachments"),
+                          constraints=world.get("constraints"), object_poses=None, inhand_pose=world.get("inhand_pose"),
+                          constraint_force=world.get("constraint_force"), ee_wrench=world.get("ee_wrench"),
+                          topology=world.get("topology"), qpos=world.get("qpos"))
             with self._lock:
                 self._obs_seq += 1
                 self._obs.append(sample)
