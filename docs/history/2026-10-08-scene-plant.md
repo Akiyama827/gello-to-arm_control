@@ -29,10 +29,10 @@ supervisor over a single-model sim plant), `python -m` scene_core, backend, sim_
 
 On the real composed world (`configs/entries/sim_franka_bench.yaml` with the project's factories, scratch, not a check): actors
 `assembler` (7) and `base` (2); the module's free body pose; in-hand pose, topology, gripper, EE wrench and constraint forces all
-present. Holding the spawn pose with kp 200 and NO torque feedforward sags 0.12 rad in 1 s: the composed path bakes no plant
-gravity compensation (the workcell adapter does, for the arm actor), so today's graph holds the arm with the controller's gravity
-feedforward. For step 2c (open): the supervised path must carry the same feedforward, or the composed plant must compensate
-the arm as the workcell path does. That is a plant-model / control decision for the operator, not made here.
+present. Holding the spawn pose with kp 200 and NO torque feedforward sags 0.12 rad (joint 4) in 1 s. That is this world's physics, not
+the adapter: the config sets no `plant_gravity_comp` and the composed path bakes no body gravcomp (0 bodies), so the arm is
+held by the controller's gravity feedforward (`build_executor` ships full RNEA when `plant_gravity_comp` is false), today in the
+Dora graph and equally through the supervisor, whose executor is built from the same config. Step 2c verifies it live.
 
 Next (2c): `sim_bench` under the supervisor: its config gains `rt.instance_id`, `sim_servo`, `sim_observe`, `sim_actor:
 assembler`; the Dora `scene_observer` replaces `mujoco_interface`'s outputs; `sim_bridge`'s gripper path waits for D1.
