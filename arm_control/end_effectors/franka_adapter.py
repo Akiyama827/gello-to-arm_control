@@ -553,10 +553,6 @@ def _demo() -> None:
     assert imm["ok"] and imm["reason"] == "released"
     assert fsm.poll({"is_grasped": False}, 2, False, 106.0) is None
 
-    from tools.check.check_hand_grasp import check_active_stop, check_parameters, check_socket
-    check_parameters()
-    check_active_stop()
-    check_socket()
     print("[franka_gripper] demo OK — FSM verdicts + wire framing")
 
 

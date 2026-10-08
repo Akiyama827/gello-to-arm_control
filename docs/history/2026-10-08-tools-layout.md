@@ -19,3 +19,11 @@ they were written with.
 
 Checked: the suite passes with the same entries as before the move, and the moved `hw/` and `diag/` tools import and parse
 arguments (`--help`).
+
+## Follow-up: no library module imports the repo's `tools/`
+
+`franka_adapter --demo` imported `tools.check.check_hand_grasp` and re-ran three of its checks. That made a library module
+depend on the repo's tool tree and broke under a project path, where the project's own `tools` package shadows this one.
+`check_hand_grasp` is its own suite entry and runs all of them, so the demo now checks only the FSM it owns. `kinematic_fit`'s
+docstring no longer names a project file. `grep -rn "from tools\." arm_control` is empty. Related checks run:
+`franka_adapter --demo`, `check_hand_grasp`.
