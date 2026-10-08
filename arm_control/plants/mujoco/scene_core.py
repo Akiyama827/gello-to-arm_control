@@ -322,14 +322,13 @@ class ScenePlant:
             raise ValueError("a scene plant needs idle_timeout_sec (the other actors' deadman): nothing is assumed")
         world = build_world(cfg, period=period)
         hand = None
-        if cfg.get("sim_hand"):
+        if cfg.get("sim_hand") is not None:
             from arm_control.end_effectors.sim_hand_bridge import SimHandBridge
 
             spec = dict(cfg.get("sim_hand"))
             if "port" not in spec:
                 raise ValueError("sim_hand needs port (where the Hand's protocol is served): nothing is assumed")
-            hand = SimHandBridge(int(spec["port"]), bind=str(spec.get("bind", "127.0.0.1")),
-                                 default_force_n=float(world[0].gripper_force_n))
+            hand = SimHandBridge(int(spec["port"]), bind=str(spec.get("bind", "127.0.0.1")))
         return cls(world, str(actor), list(joints), period=period, idle_timeout=float(idle), hand=hand)
 
     def load(self) -> None:

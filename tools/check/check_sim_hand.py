@@ -23,6 +23,8 @@ class FakeFingers:
         self.target = self.q.copy()
         self.force = 0.
         self.object_w: float | None = None
+        self.unloaded = False            # the object rides without loading the servos (a dropping module)
+        self.report: float | None = None  # a forced per-finger reading (the envelope cases)
         self.lock = threading.Lock()
 
     def apply(self, targets, force_n):
@@ -36,8 +38,8 @@ class FakeFingers:
             blocked = self.q < floor
             self.q = np.maximum(self.q, floor)
             pushing = blocked & (self.target < floor)
-            effort = np.where(pushing, self.force / 2 if self.force else 6., 0.)
-            return self.q.copy(), effort
+            effort = np.where(pushing & (not self.unloaded), self.force / 2 if self.force else 6., 0.)
+            return (self.q.copy() if self.report is None else np.full(2, self.report)), effort
 
 
 PAUSED = threading.Event()   # set: the plant sends no samples (a stalled device)
@@ -137,12 +139,19 @@ def raw_cases(bridge, fingers):
         raw.send('CMD 1 MOVE 0.07 0.05' if epoch != 1 else 'CMD 0 MOVE 0.07 0.05')
         assert 'stale_epoch' in raw.take('REJECT'), raw.lines
         raw.send('BOGUS')
-        assert 'invalid_command' in raw.take('REJECT')
+        assert raw.take('REJECT') == 'REJECT 0 invalid_command'
+        raw.send('CMD 7 BOGUS')
+        assert raw.take('REJECT') == 'REJECT 7 invalid_command'
+        raw.send('CMD \u00b2 HOME')        # a Unicode digit: refused, and the server lives on
+        assert raw.take('REJECT') == 'REJECT 0 invalid_command'
+        assert raw.idle_epoch()
         # MOVE: accepted, busy while it runs, a second command is refused busy, DONE ok at the goal
         raw.send(f'CMD {epoch} MOVE 0.06 0.05')
         assert raw.take('ACCEPT') == f'ACCEPT {epoch} accepted'
         raw.send(f'CMD {epoch + 1} MOVE 0.07 0.05')
         assert 'busy' in raw.take('REJECT')
+        time.sleep(.15)
+        assert raw.meta()[2] == 1 and raw.meta()[3] == 0, f'META while acting: {raw.meta()}'
         assert raw.take('DONE') == f'DONE {epoch} 1', raw.lines
         assert abs(sum(fingers.q) - .06) < .001
         time.sleep(.2)
@@ -164,6 +173,19 @@ def raw_cases(bridge, fingers):
         assert raw.take('GDONE') == 'GDONE 1' and raw.take('DONE') == f'DONE {epoch} 1'
         assert fingers.force == 40., fingers.force
         wait(lambda: raw.pump() or any(ln == 'STATE 0.05700 1' for ln in raw.lines), 2, 'STATE grasped')
+        # the hold breaks when the servos unload (the module slipping) and when the object is gone
+        fingers.unloaded = True
+        wait(lambda: not bridge.real_grasped, 2, 'grasped dropping with the servo load')
+        fingers.unloaded = False
+        wait(lambda: bridge.real_grasped, 2, 'grasped back with the load')
+        fingers.object_w = .02           # still loaded, but closed past the band [0.025, 0.065]
+        wait(lambda: abs(sum(fingers.q) - .02) < 1e-4, 2, 'the fingers settling on the smaller object')
+        time.sleep(.1)
+        for _ in range(5):               # loaded and settled: only the band can say "not grasped"
+            assert not bridge.real_grasped, 'a loaded grasp outside the epsilon band reported grasped'
+            time.sleep(.05)
+        fingers.object_w = .057
+        wait(lambda: bridge.real_grasped, 2, 'grasped back inside the band')
         # a disconnect with nothing committed keeps the grasp holding
         raw.close()
         raw = Raw(bridge.addr[1])
@@ -174,6 +196,28 @@ def raw_cases(bridge, fingers):
         stop_epoch = int(raw.take('STOPPING').split()[1])
         assert stop_epoch > epoch
         wait(lambda: fingers.force == 0. and not bridge.real_grasped, 2, 'the grasp released by GSTOP')
+        # a MOVE blocked by the object: DONE 0, and the fingers stop where they are
+        epoch = raw.idle_epoch()
+        raw.send(f'CMD {epoch} MOVE 0.052 0.1')   # 5 mm short of the object: blocked
+        raw.take('ACCEPT')
+        assert raw.take('DONE') == f'DONE {epoch} 0', raw.lines
+        assert abs(bridge._fingers.cmd_w - sum(fingers.q)) < .001, 'a failed MOVE keeps squeezing'
+        # HOME opens fully
+        epoch = raw.idle_epoch()
+        raw.send(f'CMD {epoch} HOME')
+        raw.take('ACCEPT')
+        assert raw.take('DONE') == f'DONE {epoch} 1' and abs(sum(fingers.q) - .08) < .001, sum(fingers.q)
+        # the sample envelope: an overshoot is clamped, a reading past it is no STATE and not measured
+        fingers.report = .04025          # 80.5 mm
+        wait(lambda: raw.pump() or 'STATE 0.08000 0' in raw.lines, 2, 'an overshoot clamped to 0.08')
+        fingers.report = -.0001          # -0.2 mm
+        time.sleep(.3)
+        raw.pump()                       # drain what was sent before the bad reading
+        raw.lines.clear()
+        time.sleep(.35)
+        raw.pump()
+        assert not any(ln.startswith('STATE') for ln in raw.lines) and raw.meta()[3] == 0, raw.lines
+        fingers.report = None
         # GRASP on nothing: GDONE 0 (an empty close is not blocked short of the command)
         fingers.object_w = None
         epoch = raw.idle_epoch()
@@ -211,6 +255,11 @@ def raw_cases(bridge, fingers):
         # a fresh sample is required after an action: the next command is admitted only once META says measured
         raw = Raw(bridge.addr[1])
         raw.idle_epoch()
+        # an oversized line disconnects
+        raw.send('X' * 255)              # one 256-byte read holding a complete line at the 255-byte limit
+        wait(lambda: not bridge._adm.client, 2, 'the oversized line disconnecting')
+        raw = Raw(bridge.addr[1])
+        raw.idle_epoch()
     finally:
         raw.close()
 
@@ -239,9 +288,15 @@ def main():
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
-    bridge = SimHandBridge(port, default_force_n=45.)
+    bridge = SimHandBridge(port)
     stop = threading.Event()
     bridge.start()
+    # before any sample: META only, no STATE (the C++ withholds it until a usable sample)
+    first = Raw(port)
+    time.sleep(.35)
+    first.pump()
+    assert first.meta() is not None and not any(ln.startswith('STATE') for ln in first.lines), first.lines
+    first.close()
     thread = threading.Thread(target=plant, args=(bridge, fingers, stop), daemon=True)
     thread.start()
     try:

@@ -33,3 +33,27 @@ grasp end to end. Mutants caught: no busy check, no freshness, GDONE for MOVE, s
 (equivalent): reporting DONE regardless of the epoch -- a stop or disconnect always clears the running action first; kept
 because the C++ server has it. On the real composed bench world (scratch): the server starts with the plant, `MOVE 0.04` ->
 ACCEPT, DONE 1, the twin's fingers 0.08 -> 0.04 m.
+
+Review round 1 (BLOCK, reproduced on the composed bench world): the sim sent the raw finger width, which leaves [0, 0.08] at a
+full open or close (-0.00001, 0.0802; -0.0179 when force-closing an empty Hand at 70 N), and `BridgeClient` drops the link on
+any STATE outside [0, 0.08] -- something the real bridge never sends. Fixed by porting the C++ `observe_state`: a sample that
+is non-finite, below -1e-5 or above 0.082 is rejected (no STATE, not fresh, logged at most every 2 s); otherwise the width is
+clamped to [0, 0.08]. Also taken:
+* a Unicode-digit token (`CMD ² HOME`) killed the server thread; the parser now takes ASCII tokens and `istream`-shaped numbers
+  only, and an unparseable line's REJECT carries the token exactly when the C++ would (`CMD 7 BOGUS` -> 7, else 0);
+* `GSTOP` must match exactly (no strip); a newline-terminated line of 255+ bytes disconnects, as the C++'s bounded read does;
+* TCP_NODELAY and a 0.2 s send timeout per client (the C++ SO_SNDTIMEO): a client that stops reading is disconnected;
+* a MOVE blocked short of its goal answers DONE 0 and the fingers stop where they are (no squeeze at the default cap);
+* a failed bind closes its socket; `close()` resets the server so `load()` could start it again; `sim_hand: {}` is refused
+  (port required) instead of silently disabling the Hand; the dead `default_force_n` is gone.
+Documented differences (no client impact): during an action the sim reports the MEASURED width and advances `sample_seq`, where
+the C++ synthesises a kinematic width and freezes the sequence (META `measured` is 0 while busy either way); HOME opens to 80 mm
+at 0.05 m/s where the real Hand sweeps; a failed GRASP keeps the target at the default cap, as SimHand did. Known: force-closing
+an EMPTY Hand at 70 N drives the finger joints 18 mm past their closed limit (soft joint limits); those samples are now rejected,
+so the twin's Hand reads stale until it opens -- a finger-limit stiffness item for the composed model, not the bridge.
+Check strengthened (`check_sim_hand`): STATE withheld before any sample and for an out-of-envelope one, an overshoot clamped;
+META busy while acting; a blocked MOVE -> DONE 0 and stopped; HOME opens fully; grasped drops with the servo load and, loaded,
+outside the band; a 255-byte line disconnects; a Unicode-digit command is refused and the server lives on. Mutants caught (16):
+no busy, no freshness, GDONE for MOVE, stop on every disconnect, no epoch check, no effort floor, no band, busy ignoring
+`acting`, MOVE tolerance 5 cm, HOME closing, no per-line limit, STATE before a sample, no envelope, no clamp, a failed MOVE
+squeezing, GSTOP keeping a held grasp (reviewer). Equivalent survivors: DONE regardless of the epoch; `have_real` kept one tick.

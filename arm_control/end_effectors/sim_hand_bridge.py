@@ -27,12 +27,17 @@ project's SimHand/SimHandMove retire when ``sim_bench`` runs on this server (ste
 from __future__ import annotations
 
 import math
+import re
 import select
 import socket
 import threading
 import time
 
 MAX_WIDTH_M = 0.08          # FR3 Hand travel
+CLOSED_TOL_M = 1e-5         # the C++ observe_state's sample envelope: below -1e-5 or above 0.082 the sample is rejected
+OPEN_TOL_M = 2e-3           # (no STATE, not fresh); inside it the width is clamped to [0, 0.08]
+SEND_TIMEOUT_S = 0.2        # the C++ server's SO_SNDTIMEO: a client that stops reading is disconnected
+_NUMBER = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\Z")   # what `istream >> double` reads, ASCII only
 HOME_SPEED_MPS = 0.05
 FRESH_S = 0.6               # a measured sample older than this is stale (the C++ server's freshness bound)
 STATE_PERIOD_S = 0.1
@@ -46,14 +51,13 @@ EFFORT_FLOOR_N = 2.0        # a held module keeps the servos loaded (5-12 N meas
 
 def parse_command(line: str) -> dict | None:
     """``CMD <token> MOVE w s`` | ``CMD <token> HOME`` | ``CMD <token> GRASP w s f eps_in eps_out``, as the C++ parser."""
-    parts = line.split()
-    if len(parts) < 3 or parts[0] != "CMD" or not parts[1].isdigit():
+    parts = line.split(" ")
+    if len(parts) < 3 or parts[0] != "CMD" or not (parts[1].isascii() and parts[1].isdigit()):
         return None
     verb, args = parts[2], parts[3:]
-    try:
-        values = [float(v) for v in args]
-    except ValueError:
+    if not all(_NUMBER.match(v) for v in args):
         return None
+    values = [float(v) for v in args]
     action = dict(token=int(parts[1]), kind=verb, w=0., s=0., f=0., ei=0., eo=0.)
     if verb == "HOME":
         return action if not values else None
@@ -122,8 +126,7 @@ class _Admission:
 class _Fingers:
     """SimHand's finger physics (plant thread only): per tick, the finger command to apply, and an action's verdict."""
 
-    def __init__(self, default_force_n: float) -> None:
-        self.default_force_n = float(default_force_n)
+    def __init__(self) -> None:
         self.mode = "idle"          # idle | move | grasp | holding
         self.action: dict | None = None
         self.cmd_w: float | None = None
@@ -167,7 +170,10 @@ class _Fingers:
             return None
         if self.mode == "move":
             self.mode = "idle"
-            return abs(width - target) <= MOVE_TOL_M   # blocked short of the goal = franka's move() failure
+            if abs(width - target) <= MOVE_TOL_M:
+                return True
+            self.cmd_w = width   # blocked short of the goal: franka's move() fails and the fingers stop where they are
+            return False
         ok = (target - self.action["ei"] <= width <= target + self.action["eo"]) and width > target + CONTACT_TOL_M
         if ok:  # hold under force: both fingers drive shut at the commanded force, contact decides where they stop
             self.mode, self.cmd_w, self.force_n = "holding", 0.0, self.action["f"]
@@ -186,11 +192,11 @@ class SimHandBridge:
     """The ``hand_bridge`` protocol over a hosted world's fingers. ``on_sample`` runs on the plant thread, once per tick, after
     the step; the server thread only parses, admits and reports. One lock, as the C++ server's ``mx``."""
 
-    def __init__(self, port: int, *, bind: str = "127.0.0.1", default_force_n: float) -> None:
+    def __init__(self, port: int, *, bind: str = "127.0.0.1") -> None:
         self.addr = (bind, int(port))
         self._lock = threading.Lock()
         self._adm = _Admission()
-        self._fingers = _Fingers(default_force_n)
+        self._fingers = _Fingers()
         self._acting: dict | None = None
         self.have_real, self.real_t, self.real_w, self.real_grasped, self.sample_seq = False, 0.0, 0.0, False, 0
         self.grasp_seq, self.grasp_ok, self.done_seq, self.done_token, self.done_ok = 0, False, 0, 0, False
@@ -201,9 +207,14 @@ class SimHandBridge:
     # -- lifecycle -------------------------------------------------------------------------------------------
     def start(self) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(self.addr)
-        server.listen(1)
+        try:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(self.addr)
+            server.listen(1)
+        except OSError:
+            server.close()
+            raise
+        self._stop.clear()
         server.settimeout(0.2)
         self._server = server
         self._thread = threading.Thread(target=self._accept_loop, name="sim-hand-bridge", daemon=True)
@@ -216,6 +227,7 @@ class SimHandBridge:
             self._thread.join(timeout=2.0)
         if self._server is not None:
             self._server.close()
+        self._server = self._thread = None
 
     # -- the plant thread ------------------------------------------------------------------------------------
     def on_sample(self, positions, efforts, now: float):
@@ -230,9 +242,15 @@ class SimHandBridge:
                 adm.acting = adm.dispatch_committed = False
                 self._acting, adm.stopping, self.have_real = None, False, False
                 return self._fingers.command()
-            self.have_real, self.real_t, self.real_w = True, now, width
-            self.real_grasped = self._fingers.grasped(width, efforts)
-            self.sample_seq += 1
+            if not math.isfinite(width) or width < -CLOSED_TOL_M or width > MAX_WIDTH_M + OPEN_TOL_M:
+                self.have_real = False   # the C++ observe_state: no STATE, not fresh, until a usable sample
+                if now - getattr(self, "_rejected_at", -1e9) > 2.0:
+                    self._rejected_at = now
+                    print(f"[sim_hand] rejected measured width {width:.6g} m (no STATE until a sample is usable)", flush=True)
+            else:
+                self.have_real, self.real_t, self.real_w = True, now, min(max(width, 0.0), MAX_WIDTH_M)
+                self.real_grasped = self._fingers.grasped(width, efforts)
+                self.sample_seq += 1
             if self._acting is not None:
                 ok = self._fingers.tick(width, now)
                 if ok is not None:
@@ -258,9 +276,11 @@ class SimHandBridge:
                 client, _ = self._server.accept()
             except (socket.timeout, OSError):
                 continue
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            client.settimeout(SEND_TIMEOUT_S)   # a send that cannot complete disconnects, as SO_SNDTIMEO does
             try:
                 self._serve(client)
-            except OSError:
+            except OSError:  # includes the send timeout
                 pass
             finally:
                 client.close()
@@ -287,7 +307,10 @@ class SimHandBridge:
                 buf += data
                 while b"\n" in buf:
                     raw, buf = buf.split(b"\n", 1)
-                    client.sendall(self._handle(raw.decode(errors="replace").strip()).encode())
+                    if len(raw) >= 255:  # the C++ reads at most 255 bytes per line
+                        print("[sim_hand] oversized line -- disconnecting", flush=True)
+                        return
+                    client.sendall(self._handle(raw.decode(errors="replace")).encode())
                 if len(buf) >= 255:
                     print("[sim_hand] oversized line -- disconnecting", flush=True)
                     return
@@ -320,7 +343,10 @@ class SimHandBridge:
                 return f"STOPPING {self._adm.epoch}\n"
         action = parse_command(line)
         if action is None:
-            token = line.split()[1] if len(line.split()) > 1 and line.split()[1].isdigit() else "0"
+            # as the C++: the token is reported only once `CMD <token> <verb>` read and the token parsed
+            parts = line.split(" ")
+            token = parts[1] if (len(parts) >= 3 and parts[0] == "CMD" and parts[1].isascii()
+                                 and parts[1].isdigit()) else "0"
             return f"REJECT {token} invalid_command\n"
         with self._lock:
             error = self._adm.admit(action, self.have_real and time.monotonic() - self.real_t < FRESH_S)
