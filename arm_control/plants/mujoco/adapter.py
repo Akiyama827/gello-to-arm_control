@@ -34,7 +34,6 @@ from arm_control.messages import (
     pack_motor_state,
     pack_scene_result,
     pack_scene_state,
-    scene_state_from_payload,
     scene_state_payload,
     unpack_motor_command,
     unpack_json_message,
@@ -42,16 +41,9 @@ from arm_control.messages import (
 )
 from arm_control.node_utils import (
     ShutdownFlag,
-    _zeros,
-    entry_point,
     install_signal_handlers,
-    scene_injections,
 )
-from arm_control.plants.mujoco.composer import (
-    build_scene_backend,
-    build_workcell_backend,
-)
-from arm_control.plants.mujoco.single import build_single_model_backend, open_jaws
+from arm_control.plants.mujoco.scene_core import SceneCore, build_world
 
 
 def _without_schema(payload: dict) -> dict:
@@ -95,86 +87,11 @@ def main() -> None:
     idle_timeout = float(cfg.get("idle_timeout_sec", 0.1))
     debug_forces = os.environ.get('MUJOCO_DEBUG_FORCES', '0') == '1'
 
-    # Injected by the GRAPH, resolved for BOTH scene paths. This used to sit
-    # inside the `if scene_path:` branch below, so the composed-scene path
-    # could inject nothing -- and once a chain_factory became mandatory for a
-    # scene with objects (2026-09-03) that path raised at startup on every
-    # run. Every composed-scene scenario was dead from that day.
-    injections = scene_injections()
-
-    scene_path = os.environ.get("WORKCELL_SCENE")
     scene_cfg = cfg.get("scene")
-    if scene_path:
-        loader = entry_point("WORKCELL_LOADER")
-        # What an assembly chain IS belongs to the project with modules; this
-        # plant grafts bodies and asks whether they landed seated, but defines
-        # neither the topology nor the mate. An object-free scene needs neither.
-        backend, arm_slices, joint_names, n = build_workcell_backend(
-            scene_path,
-            control_period=period,
-            timestep=float(cfg.get("sim_timestep", 0.001)),
-            launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
-            enable_self_collision=bool(cfg.get("sim_self_collision", False)),
-            loader=loader,
-            chain_factory=injections["chain_factory"],
-        )
-        print(
-            f"[mujoco_interface] generic workcell: {n} actuators, slices={arm_slices}",
-            flush=True,
-        )
-    elif scene_cfg and scene_cfg.get("arm"):
-        # `scene.arm` is what makes a scene block a COMPOSED PLANT scene, and
-        # the truthiness of `scene:` alone is not: a real-arm config carries a
-        # partial `scene:` describing the docking base as a static fixture for
-        # the visualizer and the planner's obstacle set, while its plant is one
-        # model. Branching on `scene_cfg` alone sent that config down this path
-        # and died with `KeyError: 'arm'` inside _model_spec -- which is how
-        # `view.py sim franka motion` was broken.
-        backend, arm_slices, joint_names, n = build_scene_backend(
-            scene_cfg,
-            control_period=period,
-            launch_viewer=bool(cfg.get("sim_launch_viewer", False)),
-            enable_self_collision=bool(cfg.get("sim_self_collision", False)),
-            **injections,
-        )
-        print(
-            f"[mujoco_interface] composed scene: {n} actuators, slices={arm_slices}",
-            flush=True,
-        )
-    else:
-        if scene_cfg:
-            # Say so out loud. A partial scene block is legitimate (see above)
-            # but "the plant ignored part of your config" must never be silent.
-            print(
-                f"[mujoco_interface] scene block present but names no `arm` "
-                f"({sorted(scene_cfg)}) — running SINGLE-MODEL. That block is "
-                f"for other consumers (visualizer, planner obstacles); a "
-                f"composed plant scene needs scene.arm.",
-                flush=True,
-            )
-        # Single-model mode (view/motion graphs): one MJCF/URDF, plain
-        # ``motor_command`` in / ``motor_state`` out, no welds, no ground.
-        joint_names = list(cfg.joint_names)
-        n = len(joint_names) if joint_names else cfg.num_motors
-        arm_slices = {}
-        backend = build_single_model_backend(cfg, control_period=period)
-        print(f"[mujoco_interface] single model: {backend.model_path}", flush=True)
-    backend.load()
-
-    # THE PLANT DECLARES THE STARTING STATE. On the bench the arm is wherever
-    # it is and the host reads it; in the twin the plant spawns it somewhere
-    # defined. MuJoCo's implicit zero is not a declaration, it is an accident --
-    # and for the FR3's Hand zero means SHUT, so every graph started with the
-    # jaws closed around whatever they were parked over. Measured: at the bench
-    # grasp pose the shut jaws bury 29.85 mm into the module, the contact
-    # solver pushes back, and the approach settles ~0.039 rad short of target
-    # forever (the planner never sees it -- it checks collisions at the grasp
-    # profile's finger width, not the plant's actual one). Open to the arm's
-    # own configured width, exactly as run_workcell_add_demo.py does.
-    # NB the count comes from the PLANT, not gripper_joints(cfg): that list is
-    # deliberately EMPTY for an arm whose gripper is its own device (the FR3's
-    # Hand), while the composed scene still has the finger joints.
-    open_jaws(backend, cfg)
+    # The world and its per-tick rules (slices, deadmans, gripper, scene changes, stepping) live in plants/mujoco/scene_core,
+    # shared with the supervisor's scene link. This node is its Dora front end: messages in, messages out, publication timers.
+    backend, arm_slices, joint_names, n = build_world(cfg, period=period)
+    core = SceneCore(backend, arm_slices, n, period=period, idle_timeout=idle_timeout)
 
     # Mirror the twin's ground truth (module/base/fixtures) into Rerun so ONE
     # viewer shows sim truth + plan previews. Fully thread-isolated: with no
@@ -195,31 +112,6 @@ def main() -> None:
     shutdown = ShutdownFlag()
     install_signal_handlers(shutdown)
 
-    command = {
-        # The SPAWN POSE, read back from the plant — not zeros. The comment
-        # below has always said "hold at the spawn pose"; the code held at
-        # q=0, which for any arm whose spawn pose is not the origin is not a
-        # hold at all but a full-authority move to the origin. Measured on the
-        # FR3 scene: the arm slams off its ready pose at up to 30 rad/s during
-        # the pre-arm window, and whether it has wrecked the scene by the time
-        # the operator arms is a race against sim_bridge's park taking over.
-        # That is the "start pose is in collision per the plan world" the
-        # planner intermittently refused on. Pre-existing, law-independent
-        # (the old Python PD does it too) — found while A/B-ing the servo law.
-        "position": backend.motor_state()["position"].copy(),
-        "velocity": _zeros(n),
-        "torque": _zeros(n),
-        # Gentle hold at the spawn pose until real commands arrive: with zero
-        # gains the arm free-falls during graph startup and settles into a
-        # tangle downstream planners then refuse to start from.
-        "kp": _zeros(n) + 60.0,
-        "kd": _zeros(n) + 2.0,
-        # Optional Cartesian-impedance target + task-frame K_c/D_c. None until
-        # a command carries one; None = joint-space PD only, i.e. today.
-        "cartesian": None,
-    }
-    last_cmd_time: dict[str, float] = {arm: 0.0 for arm in arm_slices}
-    idle_warned: dict[str, bool] = {arm: False for arm in arm_slices}
     last_gain_sig: dict[str, tuple] = {}
     _plant_err_at = [0.0]
     last_step = 0.0
@@ -229,46 +121,8 @@ def main() -> None:
     last_wrench_pub = 0.0
     last_eqf_pub = 0.0
     last_scene_pub = 0.0
-    _slow_warned_at = [0.0]
-    _slow_debt = [0.0]   # debt at last warning (warn only on NEW drift)
-    _sim_steps = [0]
-    _wall_t0 = [0.0]
     model_revision_sent = False
-    last_single_command = 0.0
-    single_armed: bool | None = None  # None: legacy graphs do not wire authority.
-    _stall = [0.0]   # seconds this node spent NOT listening, since last step
 
-    def _credit_stall(seconds: float) -> None:
-        """Forgive time this node spent blocked inside its own work.
-
-        The idle timer's rule is "wall time passed and no command arrived, so
-        the commander is dead". That premise is FALSE while this node is
-        blocked in a model recompile: nobody was listening, and no sim time
-        passed either -- the loop is single-threaded, so the physics was
-        frozen right along with the event drain. Charging the stall to the
-        commander zeroed the arm's gains for a beat on every graft (measured:
-        4 windows per add, 0.27-0.35 s, and the BASE slice reported the same
-        gap in the same second from a different process, which is the tell
-        that it was the plant and not the arm path).
-
-        Deadman safety is preserved: the clock restarts at the resume, so a
-        commander that really did die is still caught one timeout later --
-        during a window in which the plant was not advancing anyway.
-        """
-        if seconds > 0.0:
-            _stall[0] += float(seconds)
-
-    def _zero_slice(arm: str) -> None:
-        info = arm_slices[arm]
-        s, m = info["start"], info["n"]
-        command["torque"][s : s + m] = 0.0
-        command["kp"][s : s + m] = 0.0
-        command["kd"][s : s + m] = 0.0
-        # The Cartesian spring decays WITH the joint gains. Leaving it live
-        # while kp/kd go to zero is the worst of both: a limp arm still being
-        # pulled toward a target nobody is refreshing.
-        command["cartesian"] = None
-        command["pose_hold"] = None
 
     try:
         while not shutdown.stop_requested:
@@ -278,12 +132,7 @@ def main() -> None:
                 eid = event.get("id", "")
 
                 if etype == "INPUT" and eid == "arm" and not arm_slices:
-                    single_armed = bool(unpack_json_message(event["value"]).get("armed", False))
-                    if not single_armed:
-                        command["pose_hold"] = None
-                        command["cartesian"] = None
-                        for key in ("kp", "kd", "torque", "velocity"):
-                            command[key] = np.zeros(n)
+                    core.set_single_armed(bool(unpack_json_message(event["value"]).get("armed", False)))
                 elif etype == "INPUT" and eid == "motor_command_gripper":
                     # Finger servo targets (not an arm slice): drive the
                     # scene's gripper joints so closing is physical. A nonzero
@@ -292,21 +141,11 @@ def main() -> None:
                     # fingers. Reuses the motor_command torque field rather
                     # than adding a second gripper message.
                     gripper_cmd = unpack_motor_command(event["value"], 2)
-                    backend.apply_gripper_command(
-                        gripper_cmd["position"],
-                        force_n=float(max(abs(t) for t in gripper_cmd["torque"])),
-                    )
+                    core.apply_gripper(gripper_cmd["position"], force_n=max(abs(t) for t in gripper_cmd["torque"]))
                 elif etype == "INPUT" and eid == "scene_command" and backend.scene_state:
                     request = unpack_scene_command(event["value"])
                     try:
-                        if request["revision"] <= backend.scene_state.revision:
-                            raise ValueError("stale scene revision")
-                        next_state = scene_state_from_payload(
-                            backend.scene_state, request["state"], request["revision"]
-                        )
-                        _t_compile = time.monotonic()
-                        backend.apply_scene_state(next_state)
-                        _credit_stall(time.monotonic() - _t_compile)
+                        payload = core.apply_scene(request)
                     except (KeyError, TypeError, ValueError) as exc:
                         node.send_output(
                             "scene_result",
@@ -316,7 +155,6 @@ def main() -> None:
                             ),
                         )
                     else:
-                        payload = scene_state_payload(backend.scene_state)
                         node.send_output(
                             "scene_result",
                             pack_scene_result(
@@ -327,12 +165,8 @@ def main() -> None:
                 elif etype == "INPUT" and eid.startswith("motor_command_"):
                     arm = eid.removeprefix("motor_command_")
                     if arm in arm_slices:
-                        info = arm_slices[arm]
-                        s, m = info["start"], info["n"]
-                        sub = unpack_motor_command(event["value"], m)
-                        last_cmd_time[arm] = time.monotonic()
-                        for key in ("position", "velocity", "torque", "kp", "kd"):
-                            command[key][s : s + m] = sub[key]
+                        sub = unpack_motor_command(event["value"], arm_slices[arm]["n"])
+                        core.set_slice(arm, sub, time.monotonic())
                         # What the plant is actually GIVEN, whenever it
                         # changes. Every servo diagnosis upstream of here is
                         # guesswork without it: the sender's gains and the
@@ -352,17 +186,11 @@ def main() -> None:
                                 f"|tau_ff|max={float(np.max(np.abs(sub['torque']))):.3f}",
                                 flush=True,
                             )
-                        # Cartesian impedance is an EE-level term, so it has no
-                        # slice — the arm that owns the configured EE body owns
-                        # it. Last writer wins; in every scene we run, exactly
-                        # one arm ever sends one.
-                        command["cartesian"] = sub["cartesian"]
                 elif etype == "INPUT" and not arm_slices and eid == "motor_command":
-                    if single_armed is False:
-                        continue
-                    command = unpack_motor_command(event["value"], n)
-                    last_single_command = time.monotonic()
-                    _warn_undamped(command)
+                    single = unpack_motor_command(event["value"], n)
+                    if not core.set_single(single, time.monotonic()):
+                        continue  # disarmed: as before the move, this iteration neither steps nor publishes
+                    _warn_undamped(single)
                 elif etype == "STOP":
                     break
 
@@ -382,44 +210,10 @@ def main() -> None:
             if now - last_step > period:
                 last_step = now
 
-            if _stall[0] > 0.0:
-                # Push every idle deadline forward by the blocked time, so the
-                # test below asks "has the commander been quiet while we were
-                # LISTENING?" rather than "has wall time passed?".
-                for arm in last_cmd_time:
-                    if last_cmd_time[arm] > 0.0:
-                        last_cmd_time[arm] += _stall[0]
-                _stall[0] = 0.0
-
-            for arm in arm_slices:
-                if last_cmd_time[arm] > 0.0 and now - last_cmd_time[arm] > idle_timeout:
-                    # Say it out loud. A silent slice going limp looks
-                    # downstream like a servo that cannot track: the arm sags
-                    # off its target and whoever measures next reads the sag
-                    # as tracking error. Once per gap, not per tick.
-                    info = arm_slices[arm]
-                    span = slice(info['start'], info['start'] + info['n'])
-                    active_effort = any(np.any(command[key][span]) for key in ('kp', 'kd', 'torque'))
-                    active_effort = active_effort or command.get('pose_hold') is not None or command.get('cartesian') is not None
-                    if not idle_warned[arm] and active_effort:
-                        idle_warned[arm] = True
-                        print(
-                            f"[mujoco_interface] {arm}: no command for "
-                            f"{now - last_cmd_time[arm]:.2f} s — zeroing gains "
-                            f"(idle_timeout_sec={idle_timeout})",
-                            flush=True,
-                        )
-                    _zero_slice(arm)
-                elif last_cmd_time[arm] > 0.0:
-                    idle_warned[arm] = False
-
-            if (not arm_slices and command.get("pose_hold") is not None
-                    and now - last_single_command > idle_timeout):
-                # A stopped commander cannot leave an unrefreshed Soft mode.
-                command["pose_hold"] = None
-                command["position"] = backend.data.qpos[backend._qadr].copy()
-                command["velocity"] = np.zeros(n)
-            state = backend.step(command)
+            # Deadmans (each slice's idle timeout, crediting time this node spent blocked; the single-model Soft expiry),
+            # one step, and the sim-time-behind-wall accounting: SceneCore.tick.
+            state = core.tick(now)
+            command = core.command
             # The PLANT's own view of its steady error, straight from the
             # servo's inputs: no bridge, no decimation, no orchestrator. If
             # this reads ~0 while the orchestrator reports a residual, the
@@ -475,29 +269,6 @@ def main() -> None:
                         })),
                         flush=True,
                     )
-            # Warn on CUMULATIVE drift, not single-step spikes: viewer sync
-            # steps legitimately take ~14 ms 15x/s while the physics has
-            # ample headroom (0.04 ms/step measured) and queued timer ticks
-            # drain back-to-back afterwards — per-step warnings cried wolf
-            # every second. True lag = wall elapsed vs sim time advanced.
-            _sim_steps[0] += 1
-            if _wall_t0[0] == 0.0:
-                _wall_t0[0] = now
-            debt = (now - _wall_t0[0]) - _sim_steps[0] * period
-            if (
-                debt > 0.5
-                and debt - _slow_debt[0] > 0.25
-                and now - _slow_warned_at[0] > 5.0
-            ):
-                _slow_warned_at[0] = now
-                _slow_debt[0] = debt
-                print(
-                    f"[mujoco_interface] sim time {debt:.1f} s behind wall "
-                    "clock and falling further (plant-clock pacing keeps "
-                    "execution safe; motion plays in slow motion)",
-                    flush=True,
-                )
-
             pos_cmd = np.zeros(n, dtype=np.float64)
             echoed = np.asarray(state.get("position_cmd", []), dtype=np.float64)
             pos_cmd[: min(n, echoed.size)] = echoed[: min(n, echoed.size)]

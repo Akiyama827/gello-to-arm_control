@@ -1825,14 +1825,31 @@ class MuJoCoBackend:
         return self.motor_state()
 
     def observe(self) -> dict:
-        """This tick's world by name, for observe/1: plant time, model revision, and the position and velocity of every motor and
-        finger joint. A single-model plant has no objects, attachments or constraints; those are a scene host's fields."""
+        """This tick's world by name, for observe/1: plant time, model revision, the raw ``qpos`` (valid with that revision), and
+        the position and velocity of every motor and finger joint. Any scene (composed or workcell) adds the in-hand pose,
+        the constraint reactions and the topology; a workcell scene also adds its revision, attachments and constraints; a world with fingers adds the gripper; an EE
+        body adds the external wrench. A field the world cannot have is None."""
         self.load()
         q, dq = {}, {}
         for name in dict.fromkeys([*self.joint_names, *self.gripper_joints]):
             joint = self.model.joint(name)
             q[name], dq[name] = float(self.data.qpos[joint.qposadr[0]]), float(self.data.qvel[joint.dofadr[0]])
-        return dict(sim_time_s=float(self.data.time), model_revision=int(self.model_revision), joint_q=q, joint_dq=dq)
+        world = dict(sim_time_s=float(self.data.time), model_revision=int(self.model_revision), joint_q=q, joint_dq=dq,
+                     qpos=self.data.qpos.tolist(), scene_revision=None, attachments=None, constraints=None, inhand_pose=None,
+                     constraint_force=None, topology=None, gripper=None, ee_wrench=None)
+        if self.scene_state is not None:  # a workcell world: the runtime overlay
+            from arm_control.messages import scene_state_payload
+            payload = scene_state_payload(self.scene_state)
+            world.update(scene_revision=payload["revision"], attachments=payload["attachments"],
+                         constraints=payload["constraints"])
+        if self.scene is not None or self.scene_state is not None:  # any scene, composed or workcell: what the node publishes
+            topology = {k: v for k, v in self.topology_state().items() if k != "schema"}  # as published (_without_schema)
+            world.update(inhand_pose=self.inhand_pose(), constraint_force=self.active_constraint_reactions(), topology=topology)
+        if getattr(self, "_gripper_act", None):
+            world["gripper"] = dict(positions=self.gripper_positions().tolist(), efforts=self.gripper_efforts().tolist())
+        if self.ee_body:
+            world["ee_wrench"] = dict(frame="world", wrench=self.ee_wrench().tolist())
+        return world
 
     def motor_state(self) -> dict[str, np.ndarray]:
         self.load()

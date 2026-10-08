@@ -127,6 +127,8 @@ def main() -> int:
         results.append(run("sim_supervisor", [sys.executable,
                                               str(ROOT / "tools/bench/check_sim_supervisor.py")],
                            logs=logs, env=env, timeout=180))
+        results.append(run("scene_core", [sys.executable, str(ROOT / "tools/bench/check_scene_core.py")],
+                           logs=logs, env=env, timeout=120))
         results.append(run("trace_retention", [sys.executable,
                                                str(ROOT / "tools/bench/check_trace_retention.py")],
                            logs=logs, env=env, timeout=120))

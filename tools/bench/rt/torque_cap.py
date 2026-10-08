@@ -6,6 +6,7 @@ From the library root:
 """
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -18,9 +19,18 @@ from arm_control.plants.dm.backend import (
 from arm_control.plants.remote_rt.protocol import golden_lines
 
 
+def unused_port(kind: int) -> int:
+    with socket.socket(socket.AF_INET, kind) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 def main(binary: Path) -> None:
     binary = binary.resolve(strict=True)
-    local = ["--bind", "127.0.0.1", "--udp-port", "49810", "--tcp-port", "49811"]
+    # Free ports, not fixed ones: a fixed 49810 failed the suite once ("udp bind: Address already in use") while another
+    # process held it.
+    local = ["--bind", "127.0.0.1", "--udp-port", str(unused_port(socket.SOCK_DGRAM)),
+             "--tcp-port", str(unused_port(socket.SOCK_STREAM))]
     invalid = ("", "junk", "27junk", "nan", "inf", "-inf", "0", "-1", "1e999", "1e-999")
     for value in invalid:
         result = subprocess.run(
