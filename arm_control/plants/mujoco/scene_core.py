@@ -285,10 +285,12 @@ class ScenePlant:
     it the supervised actor's slice of a ``SceneCore`` -- the same world code the Dora plant node runs. Each step writes the
     actor's slice (``SimLink`` writes every tick: a command, a hold or a release word, so the slice's own idle deadman never
     fires for it) and steps the whole world once. The other actors keep the world's spawn hold until their own writers exist
-    (step 3, D1); the gripper keeps its spawn opening. Driven by ``SimLink``'s one servo thread, as ``SceneCore`` requires.
+    (step 3, D1). With ``sim_hand`` the world also serves the Hand's own protocol (``SimHandBridge``: the real
+    ``hand_bridge`` wire, backed by these fingers; D1, operator 2026-10-08); without it the gripper keeps its spawn opening.
+    Driven by ``SimLink``'s one servo thread, as ``SceneCore`` requires.
     """
 
-    def __init__(self, world, actor: str, joints: list, *, period: float, idle_timeout: float) -> None:
+    def __init__(self, world, actor: str, joints: list, *, period: float, idle_timeout: float, hand=None) -> None:
         backend, slices, names, n = world
         if actor not in slices:
             raise ValueError(f"sim_actor {actor!r} is not an actor of this world (actors: {sorted(slices)})")
@@ -306,6 +308,9 @@ class ScenePlant:
         self.actor, self.backend, self._slices = actor, backend, dict(slices)
         self._span = slice(start, start + width)
         self._core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
+        self.hand = hand
+        if hand is not None and backend.gripper_positions().size != 2:
+            raise ValueError("sim_hand needs a world with the Hand's two finger joints")
 
     @classmethod
     def from_config(cls, cfg, joints: list, *, period: float) -> "ScenePlant":
@@ -315,12 +320,26 @@ class ScenePlant:
         idle = cfg.get("idle_timeout_sec")
         if idle is None:
             raise ValueError("a scene plant needs idle_timeout_sec (the other actors' deadman): nothing is assumed")
-        return cls(build_world(cfg, period=period), str(actor), list(joints), period=period, idle_timeout=float(idle))
+        world = build_world(cfg, period=period)
+        hand = None
+        if cfg.get("sim_hand"):
+            from arm_control.end_effectors.sim_hand_bridge import SimHandBridge
+
+            spec = dict(cfg.get("sim_hand"))
+            if "port" not in spec:
+                raise ValueError("sim_hand needs port (where the Hand's protocol is served): nothing is assumed")
+            hand = SimHandBridge(int(spec["port"]), bind=str(spec.get("bind", "127.0.0.1")),
+                                 default_force_n=float(world[0].gripper_force_n))
+        return cls(world, str(actor), list(joints), period=period, idle_timeout=float(idle), hand=hand)
 
     def load(self) -> None:
         self.backend.load()
+        if self.hand is not None and self.hand._server is None:
+            self.hand.start()
 
     def close(self) -> None:
+        if self.hand is not None:
+            self.hand.close()
         self.backend.close()
 
     def _mine(self, state: dict) -> dict:
@@ -330,7 +349,12 @@ class ScenePlant:
     def step(self, command: dict) -> dict:
         now = time.monotonic()
         self._core.set_slice(self.actor, dict(command, cartesian=None), now)
-        return self._mine(self._core.tick(now))
+        state = self._core.tick(now)
+        if self.hand is not None:  # the Hand's own device, on this thread: a sample after the step, a command for the next
+            finger = self.hand.on_sample(self.backend.gripper_positions(), self.backend.gripper_efforts(), now)
+            if finger is not None:
+                self._core.apply_gripper(finger[0], force_n=finger[1])
+        return self._mine(state)
 
     def motor_state(self) -> dict:
         return self._mine(self.backend.motor_state())
