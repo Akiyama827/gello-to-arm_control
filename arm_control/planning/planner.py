@@ -11,7 +11,7 @@ from arm_control.planning.ik import PinocchioIK
 from arm_control.motion import JointTrajectory
 from arm_control.planning import PLANNER_DEFAULTS
 from arm_control.planning.retiming import (
-    BLEND_TOLERANCE_RAD, COLLISION_STEP_RAD, RETIMING_STEPS_RAD, ROUTE_ATTEMPTS,
+    BLEND_TOLERANCE_RAD, COLLISION_STEP_RAD, RETIMING_STEPS_RAD, ROUTE_ATTEMPTS, RouteCollides,
     bound_trajectory, collision_checked_retiming, time_parameterize_blended,
 )
 
@@ -451,10 +451,14 @@ class ArmPlanner:
                 # the refiner's native spline timing. Both positions and
                 # velocities may change, so check the returned curve on
                 # every attempt. Exceptions propagate to the planner's hold.
-                seed = self._trajectory_refiner(
-                    seed.positions, self._max_vel * speed_scale,
-                    self._max_acc * speed_scale,
-                )
+                try:
+                    seed = self._trajectory_refiner(
+                        seed.positions, self._max_vel * speed_scale,
+                        self._max_acc * speed_scale,
+                    )
+                except RouteCollides as exc:  # its collision validation failed: a failed rung (other errors propagate)
+                    failure = exc
+                    continue
             seed = bound_trajectory(seed, self._max_vel * speed_scale,
                                     self._max_acc * speed_scale)
             if not certify:
@@ -838,6 +842,16 @@ def _check_replan() -> None:
     planner._retime = lambda waypoints, *_: timed.append(waypoints) or flown
     planner.plan_joint(goal, start)
     assert ompl.calls == 1 and timed[0] is grazing, (ompl.calls, timed)
+    # ... and a refiner that finds the grazing seed in collision (RouteCollides) fails each rung, so the route is re-planned.
+    def refiner(positions, vmax, amax):
+        if any(World().in_collision(q) for q in positions):
+            raise RouteCollides('trajectory fails canonical MuJoCo collision validation')
+        return time_parameterize_blended(positions, vmax, amax)
+
+    ompl = OMPL([grazing, around])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World(), trajectory_refiner=refiner)
+    flown = planner.plan_joint(goal, start)
+    assert ompl.calls == 2 and not any(World().in_collision(q) for q in flown.densify(1e-3)), ompl.calls
     print(f"re-plan: a grazing route or an exhausted timing ladder gets a fresh route; {ArmPlanner.ROUTE_ATTEMPTS} "
           "attempts at most; a refiner sees the grazing seed OK")
 

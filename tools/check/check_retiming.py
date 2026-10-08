@@ -122,6 +122,25 @@ def main():
             assert 'final curve collision' in str(exc)
         else:
             raise AssertionError('console bypassed final curve validation')
+    # ... and plans a FRESH route when one's finished curve collides; no route is the operator's "no path", not a collision.
+    from arm_control.planning.retiming import RouteCollides
+    wall = SimpleNamespace(lower=np.full(2, -2.), upper=np.full(2, 2.), in_collision=lambda q: bool(.4 < q[0] < .6 and q[1] < .5))
+    s, g = np.zeros(2), np.array([1., 0.])
+
+    def routes(*seq):
+        calls = []
+        return calls, SimpleNamespace(plan=lambda a, b: (calls.append(1), seq[min(len(calls), len(seq)) - 1])[1])
+
+    calls, ompl = routes(np.vstack([s, g]), np.vstack([s, [0, 1], [1, 1], g]))
+    flown = plan_trajectory(wall, ompl, s, g, np.ones(2), np.full(2, 2.))
+    assert len(calls) == 2 and not any(wall.in_collision(q) for q in flown.densify(COLLISION_STEP_RAD)), calls
+    calls, ompl = routes(None)
+    try:
+        plan_trajectory(wall, ompl, s, g, np.ones(2), np.full(2, 2.))
+    except RouteCollides:
+        raise AssertionError('no route reported as a collision')
+    except ValueError as exc:
+        assert str(exc) == 'no collision-free path found (try a different target)', exc
     # Exact extrema must still catch the old endpoint-position/velocity bug.
     old = JointTrajectory([0., .05], [[0.], [0.]], [[0.], [.1]])
     assert np.isclose(old.bounds()['qdd_abs_max'][0], 8.)
@@ -133,7 +152,7 @@ def main():
     times, positions, velocities, _ = build_replay(
         t, q, np.zeros(7), {'vel_cap': .4}, max_acc=.8)
     check_curve(JointTrajectory(times, positions, velocities), vmax, amax)
-    print('TOPPRA: small moves, corners, cusps, finite inputs, 40 random paths, collision retries, console seam: PASS')
+    print('TOPPRA: small moves, corners, cusps, finite inputs, 40 random paths, collision retries, console seam and re-plan: PASS')
 
 
 if __name__ == '__main__':
