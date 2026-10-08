@@ -63,3 +63,14 @@ Soft always uses; Soft refuses without it): generic FR3 6.9 mm peak / 0.026 rad/
   description are run by the project suite the next slice (P1) creates. Until then they are run by nothing.
 * Outside the tree: `inspect/check_console_page.py` needs `node` on PATH; the Soft checks need `arm_rt_servo` installed (Soft
   refuses without it).
+
+## Review round 2 (BLOCK) and fixes
+
+* Three flag self-checks were still unrun: `end_effectors.franka_adapter --demo` (FSM verdicts and wire framing over a socket),
+  `plants.mujoco.backend --demo` (the servo law, bit-identical to the C++ over 50 cases) and `--scene-demo` (scene composition).
+  Added to `MODULE_CHECKS`. The reviewer confirmed every other `__main__` is run or correctly excluded.
+* The reviewer reproduced the Soft root cause independently (generic FR3, old hand-built plant: armature 0 → 61.7 mm and 18.4 rad/s;
+  0.1 → 6.9 mm and 0.034 rad/s); the limits are byte-identical.
+* Noted, not this slice: `build_single_model_backend` does not read `sim_self_collision` (`robots/fr3/sim.yaml` declares it true;
+  only the scene core reads it), so the single-model sim silently runs without self-collision. Open item for the single-source
+  config work.

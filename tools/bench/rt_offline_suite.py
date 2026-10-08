@@ -62,20 +62,21 @@ CHECKS = (
 FR3_ASSET = ROOT / "franka/urdf/fr3.urdf"
 NEEDS_FR3 = {"check_cooperative", "check_dual_console", "check_dual_modes", "check_dual_modes --refine", "check_pair_planning",
              "check_pose_hold_sim", "check_refinement"}
-# Module self-checks: `python -m <module> [args]`. Not here: the node CLIs (they run a node), kinematic_fit and model_bundle (they
-# read the project's FT description; the project suite runs them), simulation.mujoco_backend (a shim re-running a subset of
-# plants.mujoco.backend --self-check).
+# Module self-checks: `python -m <module> [args]`. Not here: node CLIs without a self-check flag (they run a node), kinematic_fit
+# and model_bundle (they read the project's FT description; the project suite P1 creates is to run them, nothing runs them until
+# then), simulation.mujoco_backend (a shim re-running a subset of plants.mujoco.backend --self-check).
 MODULE_CHECKS = (
     "arm_control.assets", "arm_control.calibration_console", "arm_control.config", "arm_control.console_assets",
     "arm_control.console_server", "arm_control.control.factory", "arm_control.control.gains", "arm_control.control.integral",
     "arm_control.control.jog_hold", "arm_control.control.leg_settling", "arm_control.control.reference",
-    "arm_control.end_effectors.hand_move", "arm_control.execution.codec", "arm_control.execution.contract", "arm_control.frames",
+    "arm_control.end_effectors.franka_adapter --demo", "arm_control.end_effectors.hand_move", "arm_control.execution.codec", "arm_control.execution.contract", "arm_control.frames",
     "arm_control.messages", "arm_control.motion.types", "arm_control.mukca", "arm_control.node_utils",
     "arm_control.operator_console", "arm_control.planning.high_level", "arm_control.planning.ik", "arm_control.planning.jog",
     "arm_control.planning.mujoco_collision", "arm_control.planning.preview_rerun", "arm_control.planning.retiming",
     "arm_control.planning.scene_geoms", "arm_control.planning.trajectory", "arm_control.planning.trajopt",
     "arm_control.planning.trajopt --native", "arm_control.plants.base", "arm_control.plants.dm.backend",
-    "arm_control.plants.franka.backend", "arm_control.plants.mujoco.backend --self-check",
+    "arm_control.plants.franka.backend", "arm_control.plants.mujoco.backend --self-check", "arm_control.plants.mujoco.backend --demo",
+    "arm_control.plants.mujoco.backend --scene-demo",
     "arm_control.plants.remote_rt.observation", "arm_control.plants.remote_rt.protocol", "arm_control.rt_protocol",
     "arm_control.scene", "arm_control.simulation.rerun_scene", "arm_control.ui.hand_panel", "arm_control.ui.jog_panel",
     "arm_control.ui.operator_arm --self-check", "arm_control.viz.visualizer --self-check",
