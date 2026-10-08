@@ -206,7 +206,13 @@ class RobotRuntime:
         if callable(getattr(self.link, 'recent_states', None)):
             result['state_history'] = 1
             result['trace'] = 1
+        if getattr(self.link, 'observing', False):
+            result['observe'] = 1
         return result
+
+    def observe(self, after: int = 0, limit: int = 64) -> dict:
+        """observe/1: the plant's world, read-only and without ownership (2026-10-08-scene-hosting-design.md)."""
+        return self.link.observations(after, limit)
 
     def trace_samples(self, after: int = 0) -> dict:
         """trace/1: controller ticks recorded after sequence ``after``, oldest first (read-only, no ownership needed).

@@ -110,6 +110,19 @@ def _trace(value):
     return value
 
 
+def _observation(value):
+    value = _need(_mapping(value), "schema", "samples", "latest_seq", "dropped", "errors", "capacity", "rate_hz")
+    if value["schema"] != "observe/1":
+        raise ValueError(f"unexpected observation schema {value['schema']!r}")
+    for key in ("latest_seq", "dropped", "errors", "capacity"):
+        if type(value[key]) is not int:
+            raise ValueError(f"{key} is not an integer")
+    for sample in _mappings(value["samples"]):
+        if type(_need(sample, "seq", "sim_time_s", "observed_ns", "actor_q")["seq"]) is not int:
+            raise ValueError("observation seq is not an integer")
+    return value
+
+
 def _generation(reply):
     gen = reply["gen"]
     if type(gen) is not int:
@@ -387,6 +400,16 @@ class ArmClient:
         if self.extensions.get('trace') != 1:
             raise Refused('supervisor does not advertise trace/1')
         return _dec(_trace, self._channel.call('trace_samples', after=int(after)))
+
+    # -- negotiated observe/1 ---------------------------------------------------
+    def observe(self, after: int = 0, limit: int = 64) -> dict:
+        """The plant's world, read-only, no ownership: observations after sequence ``after`` (oldest first, at most ``limit``),
+        ``latest_seq`` the cursor for the next read, ``dropped`` the samples that fell off the ring before this read, ``rate_hz``
+        the publication rate. Each observation is one plant tick: ``sim_time_s``, ``model_revision``, ``actor_q``/``actor_dq``
+        by actor and joint name; fields a plant cannot provide are None, never a stale copy."""
+        if self.extensions.get('observe') != 1:
+            raise Refused('supervisor does not advertise observe/1')
+        return _dec(_observation, self._channel.call('observe', after=int(after), limit=int(limit)))
 
     # -- negotiated state_history/1 ---------------------------------------------
     def state_history(self) -> dict:

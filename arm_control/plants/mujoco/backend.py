@@ -1824,6 +1824,16 @@ class MuJoCoBackend:
                     self.viewer = None  # window closed — keep simulating
         return self.motor_state()
 
+    def observe(self) -> dict:
+        """This tick's world by name, for observe/1: plant time, model revision, and the position and velocity of every motor and
+        finger joint. A single-model plant has no objects, attachments or constraints; those are a scene host's fields."""
+        self.load()
+        q, dq = {}, {}
+        for name in dict.fromkeys([*self.joint_names, *self.gripper_joints]):
+            joint = self.model.joint(name)
+            q[name], dq[name] = float(self.data.qpos[joint.qposadr[0]]), float(self.data.qvel[joint.dofadr[0]])
+        return dict(sim_time_s=float(self.data.time), model_revision=int(self.model_revision), joint_q=q, joint_dq=dq)
+
     def motor_state(self) -> dict[str, np.ndarray]:
         self.load()
         position_cmd = (
