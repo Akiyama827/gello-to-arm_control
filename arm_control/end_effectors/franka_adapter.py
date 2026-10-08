@@ -553,7 +553,7 @@ def _demo() -> None:
     assert imm["ok"] and imm["reason"] == "released"
     assert fsm.poll({"is_grasped": False}, 2, False, 106.0) is None
 
-    from tools.bench.check_hand_grasp import check_active_stop, check_parameters, check_socket
+    from tools.check.check_hand_grasp import check_active_stop, check_parameters, check_socket
     check_parameters()
     check_active_stop()
     check_socket()
