@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping
@@ -190,14 +191,45 @@ class SceneState:
         self.revision += 1
 
 
+def scene_files(source: str | Path) -> list[Path]:
+    """The scene file and every file it includes, at any depth, in merge order. Asset paths in a scene are relative to the scene
+    file, so every included file must exist in the scene's own directory. An include from elsewhere is refused here, before the
+    config loader's fallback to the deployment root can resolve it."""
+    source = Path(source).resolve()
+    out: list[Path] = []
+
+    def walk(path: Path, chain: tuple[Path, ...]) -> None:
+        if path in chain:
+            raise ValueError(f"{source}: circular scene include through {path.name}")
+        includes = (yaml.safe_load(path.read_text()) or {}).get("include") or []
+        for name in [includes] if isinstance(includes, (str, Path)) else includes:
+            included = (path.parent / str(name)).resolve()
+            if included.parent != source.parent or not included.is_file():
+                raise ValueError(f"{path}: include {name!r} must be a file in the scene's own directory "
+                                 f"{source.parent} (its asset paths are relative)")
+            walk(included, (*chain, path))
+        if path not in out:
+            out.append(path)
+
+    walk(source, ())
+    return out
+
+
+def scene_sha256(source: str | Path) -> str:
+    """Content hash of a scene, every included file counted: what a model token and a provenance record must change with. A scene
+    with no includes hashes to sha256 of its bytes, as before includes existed, so its existing tokens are unchanged."""
+    files = scene_files(source)
+    if len(files) == 1:
+        return hashlib.sha256(files[0].read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(path.name.encode() + b"\0" + hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
 def scene_tree(source: Path) -> dict:
-    """A scene file resolved through its ``include:`` list (several arms on one bench share one bench file). Asset paths in a scene
-    are relative to the scene file, so an included scene file must sit in the includer's directory."""
-    includes = (yaml.safe_load(source.read_text()) or {}).get("include") or []
-    for name in [includes] if isinstance(includes, str) else includes:
-        # ponytail: checks the top level only; a shared scene file that itself includes another is not supported
-        if Path(str(name)).parent != Path("."):
-            raise ValueError(f"{source}: include {name!r} must be in the scene's own directory (its asset paths are relative)")
+    """A scene file resolved through its ``include:`` list (several arms on one bench share one bench file)."""
+    scene_files(source)  # validates every include before resolving
     return load_config_tree(source)
 
 
@@ -312,13 +344,21 @@ assembly: {ignored: true}
         spec = load_scene(root / "arm.yaml")
         assert spec.actor_names == ("welder", "turntable") and spec.object_names == ("first", "second")
         (root / "sub").mkdir()
-        (root / "elsewhere.yaml").write_text("version: 1\ninclude: [sub/shared.yaml]\n")
-        try:
-            load_scene(root / "elsewhere.yaml")
-        except ValueError as exc:
-            assert "own directory" in str(exc), exc
-        else:
-            raise AssertionError("an include from another directory was accepted")
+        for bad in ("include: [sub/shared.yaml]", "include: [README.md]",   # elsewhere; a bare name the root fallback would find
+                    "include: [nested.yaml]"):                              # a nested include from elsewhere
+            (root / "nested.yaml").write_text("version: 1\ninclude: [sub/shared.yaml]\n")
+            (root / "elsewhere.yaml").write_text(f"version: 1\n{bad}\n")
+            try:
+                load_scene(root / "elsewhere.yaml")
+            except ValueError as exc:
+                assert "own directory" in str(exc), exc
+            else:
+                raise AssertionError(f"an include from another directory was accepted: {bad}")
+        # The hash covers every included file; a scene without includes hashes as its bytes did before.
+        assert scene_sha256(scene_path) == hashlib.sha256(scene_path.read_bytes()).hexdigest()
+        before = scene_sha256(root / "arm.yaml")
+        (root / "shared.yaml").write_text(text.replace("[1, 0, 0]", "[1, 0.5, 0]", 1))
+        assert scene_sha256(root / "arm.yaml") != before, "an edit to an included scene file left the hash unchanged"
     print("scene: OK")
 
 
