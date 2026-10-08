@@ -11,7 +11,7 @@ from arm_control.planning.ik import PinocchioIK
 from arm_control.motion import JointTrajectory
 from arm_control.planning import PLANNER_DEFAULTS
 from arm_control.planning.retiming import (
-    BLEND_TOLERANCE_RAD, COLLISION_STEP_RAD, RETIMING_STEPS_RAD,
+    BLEND_TOLERANCE_RAD, COLLISION_STEP_RAD, RETIMING_STEPS_RAD, ROUTE_ATTEMPTS,
     bound_trajectory, collision_checked_retiming, time_parameterize_blended,
 )
 
@@ -471,7 +471,7 @@ class ArmPlanner:
         raise _CertifyFailed(failure)
 
     # A route that cannot be certified is re-planned (a fresh OMPL route) at most this many times in all.
-    ROUTE_ATTEMPTS = 3
+    ROUTE_ATTEMPTS = ROUTE_ATTEMPTS
     # Tighten both geometric blending and timing resolution on contact.
     RETIMER_STEPS_RAD = RETIMING_STEPS_RAD
     CURVE_COLLISION_STEP_RAD = COLLISION_STEP_RAD

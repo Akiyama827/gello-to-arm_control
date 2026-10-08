@@ -12,7 +12,7 @@ from arm_control.motion import JointTrajectory
 from arm_control.multi_arm.types import ArmPlan, BimanualPlan
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.planning.ompl_planner import OMPLPlanner
-from arm_control.planning.retiming import finish_path, refinement_choice
+from arm_control.planning.retiming import plan_and_finish, refinement_choice
 
 
 @dataclass
@@ -147,24 +147,27 @@ class PairPlanner:
             simplify_time_sec=0.15,
             resolution_frac=0.002,
         )
-        path = planner.plan(start[indices], goal[indices])
-        if path is None:
-            raise ValueError("no collision-free pair path found")
-        full_path = np.asarray([expand(q) for q in path])
         if np.max(np.abs(goal - start)) < 1e-10:
             combined = JointTrajectory(
                 [0.0, 0.1], np.vstack([start, start]), np.zeros((2, len(start)))
             )
         else:
-            combined = finish_path(
+
+            def route():
+                path = planner.plan(start[indices], goal[indices])
+                return None if path is None else np.asarray([expand(q) for q in path])
+
+            combined = plan_and_finish(
+                route,
                 self.world,
-                full_path,
                 self.vmax,
                 self.amax,
                 refinement=self.refinement,
                 active_indices=indices,
                 label="pair",
             )
+            if combined is None:
+                raise ValueError("no collision-free pair path found")
         return self.motion(combined)
 
     def motion(self, combined):
