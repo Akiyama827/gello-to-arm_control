@@ -83,7 +83,8 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
     if op == 'observe':
         if runtime.extensions.get('observe') != 1:
             raise Refused('observe/1 is unavailable')
-        return runtime.observe(max(0, int(args.get('after') or 0)), max(1, min(int(args.get('limit') or 64), 1024)))
+        limit = args.get('limit')
+        return runtime.observe(max(0, int(args.get('after') or 0)), 64 if limit is None else int(limit))  # capped by the link
     if op == 'state_history':
         if runtime.extensions.get('state_history') != 1:
             raise Refused('state_history/1 is unavailable')

@@ -25,3 +25,22 @@ Checked: `check_sim_supervisor.py`.
 * The process part: `observe/1` advertised; samples read without a claim; the cursor advances.
 
 Mutants killed: an observation taken before the step, no decimation, no `dropped`, no `limit`.
+
+Review round 1 (BLOCK): the design's "a slow reader cannot slow the plant" was violated. Building and serializing up to 1024
+samples per read, in the supervisor's process, competed with the tick for the interpreter: four tight readers slowed the plant to
+0.44x real time. Fixed:
+* a read returns at most `OBSERVE_LIMIT_MAX` = 64 samples;
+* the ring slice is O(limit) (sequences are contiguous, so the start index is arithmetic);
+* `ring_s` is bounded at 10 s.
+
+The bench now measures the plant's own clock (observation sim time against wall time) while four reader PROCESSES poll at the
+cap: 1.000x. With the cap removed (mutant) the same bench measures 0.713x and fails. Reader threads in one process do not show
+the effect; they throttle each other.
+
+Also from the review:
+* the unit drives the arm, so a stale position cannot pass for the tick's (that mutant survived before);
+* `observe/1` is not advertised for a link that does not observe;
+* the cap is tested;
+* the SDK decoder checks `rate_hz`, `model_revision` and `actor_q`;
+* sequences are per process, and the docstring says so;
+* the design note's wording matches the code (`limit`, `capacity`, rules 7-8).

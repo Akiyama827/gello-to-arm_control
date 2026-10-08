@@ -117,9 +117,13 @@ def _observation(value):
     for key in ("latest_seq", "dropped", "errors", "capacity"):
         if type(value[key]) is not int:
             raise ValueError(f"{key} is not an integer")
+    if isinstance(value["rate_hz"], bool) or not isinstance(value["rate_hz"], (int, float)):
+        raise ValueError("rate_hz is not a number")
     for sample in _mappings(value["samples"]):
-        if type(_need(sample, "seq", "sim_time_s", "observed_ns", "actor_q")["seq"]) is not int:
+        sample = _need(sample, "seq", "sim_time_s", "observed_ns", "model_revision", "actor_q")
+        if type(sample["seq"]) is not int:
             raise ValueError("observation seq is not an integer")
+        _mapping(sample["actor_q"])
     return value
 
 

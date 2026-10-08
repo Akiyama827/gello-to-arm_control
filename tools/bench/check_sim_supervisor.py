@@ -77,15 +77,20 @@ def observe_unit(tmp):
     cfg = RtConfig(instance_id='sim_arm', state_timeout_s=.5)
     assert not SimLink(cfg, JOINTS, object(), servo=SERVO).observing
     for bad in (dict(rate_hz=0, ring_s=1), dict(rate_hz=251, ring_s=1), dict(rate_hz=50, ring_s=0), dict(rate_hz=50),
-                dict(rate_hz='fast', ring_s=1), dict(rate_hz=float('nan'), ring_s=1)):
+                dict(rate_hz='fast', ring_s=1), dict(rate_hz=float('nan'), ring_s=1), dict(rate_hz=50, ring_s=10.5)):
         try:
             SimLink(cfg, JOINTS, object(), servo=SERVO, observe=bad)
         except ValueError:
             pass
         else:
             raise AssertionError(f'accepted a bad sim_observe {bad}')
+    from types import SimpleNamespace
+    from arm_control.supervisor.runtime import RobotRuntime
+    plain = SimpleNamespace(_native=None, _stream_admission=None, link=SimpleNamespace())  # an RT link: no observe/1
+    assert 'observe' not in RobotRuntime.extensions.fget(plain), RobotRuntime.extensions.fget(plain)
     p = plant(tmp / 'three.urdf')
     p.load()
+    p.data.qvel[:] = 2.0   # the arm moves, so a stale position cannot pass for this tick's
     link = SimLink(cfg, JOINTS, p, servo=SERVO, observe=dict(rate_hz=50, ring_s=.2))   # every 5th tick; 10 observations
     assert (link.observe_rate_hz, link._obs.maxlen) == (50., 10), (link.observe_rate_hz, link._obs.maxlen)
     for i in range(100):
@@ -105,6 +110,15 @@ def observe_unit(tmp):
     assert link.observations(20)['samples'] == [] and link.observations(20)['latest_seq'] == 20
     assert link.observations(99)['latest_seq'] == 20                                     # a stale cursor is clamped
     assert set(first['samples'][-1]['actor_q']['sim_arm']) == set(JOINTS) and first['samples'][-1]['object_poses'] is None
+    moved = [first['samples'][k]['actor_q']['sim_arm']['j1'] for k in (0, -1)]
+    assert abs(moved[1] - moved[0]) > 1e-6, moved                                    # the consistency check is not vacuous
+    big = SimLink(cfg, JOINTS, plant(tmp / 'three.urdf'), servo=SERVO, observe=dict(rate_hz=250, ring_s=1))
+    big._plant.load()
+    for i in range(300):
+        big._tick(i * .004)
+    capped = big.observations(0, limit=1000)
+    assert len(capped['samples']) == 64 and capped['latest_seq'] == capped['samples'][-1]['seq'] == 300 - 250 + 64, capped['latest_seq']
+    big._plant.close()
     p.observe = lambda: 1 / 0
     for i in range(100, 105):
         link._tick(i * .004)                                                             # the tick survives a failing observation
@@ -429,7 +443,7 @@ def main():
     text += (f"sim_model_path: {tmp / 'three.urdf'}\nsim_gravcomp: true\nsim_timestep: 0.001\n"
              f"sim_servo: {{state_hz: {SERVO['state_hz']}, hold_ms: {SERVO['hold_ms']}, fault_ms: {SERVO['fault_ms']}, "
              f"hold_kp: {SERVO['hold_kp']}, hold_kd: {SERVO['hold_kd']}}}\n"
-             "sim_observe: {rate_hz: 50, ring_s: 2}\n")
+             "sim_observe: {rate_hz: 250, ring_s: 2}\n")
     cfg_path.write_text(text)
     sock = tmp / 'sdk_arm.sock'
     log = open(tmp / 'supervisor.log', 'w')
@@ -458,10 +472,30 @@ def main():
         assert arm.extensions.get('observe') == 1, arm.extensions
         seen = wait(lambda: arm.observe()['samples'], what='an observation')
         batch = arm.observe()
-        assert batch['rate_hz'] == 50. and batch['samples'][-1]['actor_q']['sdk_arm'].keys() == set(JOINTS), batch
+        assert batch['rate_hz'] == 250. and batch['samples'][-1]['actor_q']['sdk_arm'].keys() == set(JOINTS), batch
         later = wait(lambda: arm.observe(after=batch['latest_seq'])['samples'], what='a later observation')
         assert later[0]['seq'] > batch['latest_seq'] and later[0]['sim_time_s'] > batch['samples'][-1]['sim_time_s'], later
         assert seen
+        # A slow reader cannot slow the plant (design 2026-10-08 §3 rule 1): four tight readers at the cap, on their own
+        # connections, while the plant's own clock is measured from the observations (its sim time against wall time).
+        # Separate PROCESSES: reader threads in one process throttle each other on that process's own interpreter lock and
+        # never load the supervisor enough to show the effect.
+        loop = ("import sys\nfrom arm_control.sdk import ArmClient\nr = ArmClient('sdk_arm', socket_path=sys.argv[1])\n"
+                "while True:\n    r.observe(0, 1024)\n")
+        readers = [subprocess.Popen([sys.executable, '-c', loop, str(sock)], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, env=dict(os.environ)) for _ in range(4)]
+        time.sleep(.5)
+        t0, a = time.monotonic(), arm.observe(after=10**9)['latest_seq']
+        s0 = arm.observe(after=a - 1)['samples'][-1]['sim_time_s']
+        time.sleep(3.0)
+        t1, b = time.monotonic(), arm.observe(after=10**9)['latest_seq']
+        s1 = arm.observe(after=b - 1)['samples'][-1]['sim_time_s']
+        for r in readers:
+            r.kill()
+            r.wait(timeout=5)
+        speed = (s1 - s0) / (t1 - t0)
+        assert speed >= .95, f'four observe readers slowed the plant to {speed:.3f}x real time'
+        print(f'observe/1 under 4 tight readers: plant at {speed:.3f}x real time', flush=True)
         assert arm.authority().lifecycle is Lifecycle.CONNECTED
         arm.claim()
         assert arm.authority().lifecycle is Lifecycle.CLAIMED

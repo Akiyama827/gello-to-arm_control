@@ -23,6 +23,7 @@ that is not told them does not invent them.
 from __future__ import annotations
 
 from collections import deque
+from itertools import islice
 import secrets
 import threading
 import time
@@ -33,6 +34,13 @@ from arm_control.plants.remote_rt import protocol as rtp
 from arm_control.plants.remote_rt.client import RtConfig, RtLinkError
 
 _SERVO_KEYS = ("state_hz", "hold_ms", "fault_ms", "hold_kp", "hold_kd")
+
+
+# observe/1 bounds. The ring is memory and a read's scan; reads are bounded by the service (OBSERVE_LIMIT_MAX) because building
+# and serializing a batch runs in this process and competes with the tick for the interpreter (review: 4 tight readers of 1024
+# samples slowed the plant to 0.44x real time; at 64 it stayed at 1.0x).
+OBSERVE_RING_MAX_S = 10.0
+OBSERVE_LIMIT_MAX = 64
 
 
 class SimLink:
@@ -105,8 +113,9 @@ class SimLink:
                 rate, ring_s = float(observe["rate_hz"]), float(observe["ring_s"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"sim_observe needs numeric rate_hz and ring_s: {exc}") from exc
-            if not (np.isfinite([rate, ring_s]).all() and 0 < rate <= hz and ring_s > 0):
-                raise ValueError(f"sim_observe: 0 < rate_hz <= sim_servo.state_hz ({hz:g}) and ring_s > 0 are required")
+            if not (np.isfinite([rate, ring_s]).all() and 0 < rate <= hz and 0 < ring_s <= OBSERVE_RING_MAX_S):
+                raise ValueError(f"sim_observe: 0 < rate_hz <= sim_servo.state_hz ({hz:g}) and "
+                                 f"0 < ring_s <= {OBSERVE_RING_MAX_S:g} are required")
             self._obs_every = int(np.ceil(hz / rate))
             self.observe_rate_hz = hz / self._obs_every
             self._obs = deque(maxlen=max(1, int(np.ceil(ring_s * self.observe_rate_hz))))
@@ -354,9 +363,12 @@ class SimLink:
         """observe/1: the observations recorded after sequence ``after``, oldest first, at most ``limit``. ``latest_seq`` is the
         cursor for the next read (the last sample returned; with none, ``after`` clamped to the newest, so a cursor from an earlier
         process cannot stall a reader). ``dropped`` counts samples that fell off the ring before the reader came back (0 on a
-        first read); the plant never waits for a reader."""
-        with self._lock:
-            ring = [o for o in self._obs if o["seq"] > after][:max(1, int(limit))]
+        first read); the plant never waits for a reader. Sequences are per supervisor PROCESS: a reader starts again from 0 when
+        its session changes (a new hello). ``limit`` is capped at OBSERVE_LIMIT_MAX. Samples are shared: do not mutate them."""
+        limit = min(max(1, int(limit)), OBSERVE_LIMIT_MAX)
+        with self._lock:  # O(limit): sequences in the ring are contiguous, so the first wanted sample's index is arithmetic
+            start = 0 if not self._obs else max(0, after - self._obs[0]["seq"] + 1)
+            ring = list(islice(self._obs, start, start + limit))
             latest, errors, capacity = self._obs_seq, self._obs_errors, self._obs.maxlen
         dropped = max(0, ring[0]["seq"] - after - 1) if ring and after > 0 else 0
         return dict(schema="observe/1", samples=ring, latest_seq=ring[-1]["seq"] if ring else min(max(after, 0), latest),
