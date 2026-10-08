@@ -27,10 +27,22 @@ Not in this suite, by design:
 * `python -m arm_control.kinematic_fit --self-check` and `-m arm_control.model_bundle` read the project's FT description through
   `CONTROL_ROOT`. Without it the first fails and the second prints SKIPPED and exits 0; the project suite runs both. With the
   project root, kinematic_fit passes.
-* `check_pose_hold_sim.py` needs the historical `legacy-fr3-soft-20260907` URDF fixture, which no repo holds (copies exist only
-  on this PC). It passes against that fixture. Whether to commit the fixture to project evidence or keep it a by-hand check is an
-  operator decision.
+* `check_pose_hold_sim.py` needed a historical URDF fixture no repo holds; superseded by the follow-up below (it now runs).
 * `nodes/arm_console.py --self-check` is the same self-check as `console_graphs`. `examples/run_console.py --check` and
   `tools/assets/setup_fr3.py --check` exit 0 whether or not assets are staged: they are status reports, not gates.
 * Hardware or network tools (`check_remote_fake_rt.py`, `bench/dm/read_params.py`, `rt/timing.py`) and opt-in measurements
   (`rt/constrained_cpu.py`, `rt/tick_jitter.py`) move to `hw/` and `diag/` in L2.
+
+## Soft simulation check re-targeted (follow-up, operator: "the proposal seems correct")
+
+`check_pose_hold_sim.py` pinned a historical URDF (`legacy-fr3-soft-20260907`, in no repo) by hash. Run against the selected
+descriptions to drop that pin, it diverged on the library's staged generic FR3 (EE 6.2 cm off, 18 rad/s still moving at the end)
+while passing on FR3 #1's deployed description (5.2 mm, 0.002 rad/s). Root cause: the check built its own plant without the robot's
+`sim_armature` (0.1, Franka's reflected rotor inertia, `robots/fr3/sim.yaml`), which the sim applies
+(`plants/mujoco/single.py`). The generic franka_description's `fr3_link7` inertia is ~4e-7 kg*m^2 (the deployed description's is
+~2e-4), so without armature the wrist is near-massless under Soft's rotational damping. Not a defect of Soft or of the sim path.
+
+The check now builds the plant with `build_single_model_backend` from an entry config (`--config`, default the library example),
+with no fixture and no hash; the limits are unchanged. Measured with a freshly built `arm_rt_servo` (the compiled RT law the sim's
+Soft always uses; Soft refuses without it): generic FR3 6.9 mm peak / 0.026 rad/s at the end, FR3 #1 description 5.3 mm /
+0.002 rad/s, both PASS. It joins the suite; the project suite runs it on each deployed arm's description.
