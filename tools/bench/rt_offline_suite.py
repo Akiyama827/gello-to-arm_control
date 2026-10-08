@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and run the device-free RT, SDK, and fast regression checks.
+"""Build and run the device-free RT, SDK, and fast regression checks, and every other device-free check in this tree.
 
 Run from any directory: python tools/bench/rt_offline_suite.py
 The only server spawned by these checks is the local fake backend.
@@ -45,6 +45,21 @@ REGRESSIONS = (
     ("sdk_channel", "sdk_channel.py", "server"),
     ("cancel_on_ack", "cancel_on_ack.py", "reference_runtime_selfcheck"),
     ("lifecycle_states", "lifecycle_states.py", "reference_runtime_selfcheck"),
+)
+# Device-free checks that need no build: run whether or not the build passed. A device-free check no suite runs is deleted.
+CHECKS = (
+    "check_arm_controller", "check_bimanual_contract", "check_bimanual_sync", "check_closure_record",
+    "check_console_authority", "check_console_grasp", "check_cooperative", "check_dual_console", "check_dual_modes",
+    "check_execution_policy", "check_hand_grasp", "check_motion_profiles", "check_node_shutdown", "check_pair_planning",
+    "check_pose_hold", "check_refinement", "check_retiming", "check_rt_telemetry", "check_stream", "check_supervisor_ledger",
+    "inspect/check_console_controls", "inspect/check_console_page", "inspect/check_controller_mode_feedback",
+    "inspect/check_ui_scene_injection",
+)
+# Module self-checks (python -m <module>); the ones that need a project description run in the project's suite.
+MODULE_CHECKS = (
+    "arm_control.config", "arm_control.frames", "arm_control.scene", "arm_control.messages", "arm_control.planning.jog",
+    "arm_control.plants.base", "arm_control.plants.franka.backend", "arm_control.plants.remote_rt.protocol",
+    "arm_control.console_assets", "arm_control.mukca",
 )
 
 
@@ -153,6 +168,15 @@ def main() -> int:
             if name == "stale_envelope_scope":
                 command += ["--repetitions", "3"]  # the 50-run network gate is separate
             results.append(run(name, command, logs=logs, env=env, timeout=300))
+
+    for check in CHECKS:
+        path = ROOT / "tools" / (check if "/" in check else f"bench/{check}")
+        results.append(run(Path(check).name, [sys.executable, str(path.with_suffix(".py"))], logs=logs, env=env,
+                           timeout=180))
+    for module in MODULE_CHECKS:
+        results.append(run(module, [sys.executable, "-m", module], logs=logs, env=env, timeout=120))
+    results.append(run("run_console", [sys.executable, str(ROOT / "examples/run_console.py"), "--self-check"], logs=logs,
+                       env=env, timeout=120))
 
     summary = {"revision": revision, "dirty": dirty, "root": str(ROOT),
                "build_dir": str(build), "results": results,

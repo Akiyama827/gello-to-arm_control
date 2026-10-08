@@ -37,6 +37,7 @@ class StubLink:
         self.accept, self.stop_delay_s = accept, stop_delay_s
         self.config = SimpleNamespace(state_timeout_s=0.5)
         self.backend_name, self.supports_pose_hold, self.rt_setup = "stub", False, "ok"
+        self.hold_ms = None  # the link contract: an RT HELLO without hold_ms (no streamed-gap deadline)
         self.identity, self.session_id = SimpleNamespace(model_id=""), SESSION
         self._hash = identity_hash(RobotIdentity("sdk_arm", JOINTS, "rt"))
         self.q = np.zeros(3)

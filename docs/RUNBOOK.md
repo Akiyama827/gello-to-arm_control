@@ -24,7 +24,8 @@ Do not assume every optional module imports without its dependency installed.
 
 ## Offline checks
 
-These commands use existing assert-based checks and do not arm hardware:
+`python tools/bench/rt_offline_suite.py` builds the RT tree and runs every device-free check below, and every other one in
+`tools/` (a device-free check no suite runs is deleted). Individually, these use assert-based checks and do not arm hardware:
 
 ```bash
 PYTHONPATH=. python -B -m arm_control.config
@@ -397,8 +398,7 @@ Soft requires the updated compiled binding in the same environment as Dora:
 ```bash
 python -m pip install --no-deps -e rt/bindings
 PYTHONPATH=. python rt/bindings/pose_hold_check.py
-PYTHONPATH=. python tools/bench/check_pose_hold_contract.py
-PYTHONPATH=. python tools/bench/check_pose_hold_controller.py
+PYTHONPATH=. python tools/bench/check_pose_hold.py
 PYTHONPATH=. python tools/bench/check_pose_hold_sim.py /path/to/arm_rt_servo.so --fixture /path/to/historical/fr3.urdf
 ```
 
