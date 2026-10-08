@@ -213,6 +213,9 @@ void udp_rx_thread(ServerCtx& ctx) {
     PoseHoldCommandPacket pose_hold;
     CartesianCommandPacket cartesian;
   } received{};
+  static_assert(sizeof(received) >= sizeof(ObserveRequest) && sizeof(received) >= sizeof(ReferenceCommandPacket) &&
+                sizeof(received) >= sizeof(PoseHoldCommandPacket) && sizeof(received) >= sizeof(CartesianCommandPacket),
+                "the receive buffer must hold every datagram handle_datagram accepts");
   CommandFlow flow;
   while (!ctx.shutdown.load()) {
     sockaddr_in src = {};

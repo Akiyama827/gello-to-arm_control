@@ -66,3 +66,7 @@ Open for slice 2 (operator decision; a control-law/gain question): after a v8 FA
 v8 word's joint kp/kd snapshot (as v5/v6). If Cartesian legs run with low joint kp and let kc carry the stiffness, that hold is
 soft (the FR3 floats under the control box's gravity compensation); a hold-gain floor or the leg's joint gains must be decided
 before the dock leg runs.
+
+Review round 2: ACCEPT (all five responses verified; HELLO of a Franka-like server is 98 chars with pose_hold=6, IDENTITY bit 5
+set; mutants `frameignored`, `kFlange`, swapped `F_T_EE`/`EE_T_K` caught). Taken: the NIT that dropping the union's v8 member
+went undetected -- a `static_assert` that the buffer holds every accepted datagram now fails the build (checked).
