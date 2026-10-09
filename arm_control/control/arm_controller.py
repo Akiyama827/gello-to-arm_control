@@ -170,7 +170,8 @@ class ArmController:
         # A streamed target (console jog, setpoint/1) moves no faster than planned motion may: saturated per tick at the
         # policy's velocity/acceleration limits (operator 2026-10-09). No policy limits (the legacy DM path): unsaturated.
         policy = execution_policy
-        self._jog_ramp = (JogRamp(policy.velocity_limits, policy.acceleration_limits)
+        self._jog_ramp = (JogRamp(policy.velocity_limits, policy.acceleration_limits,
+                                  lower=policy.position_lower, upper=policy.position_upper)
                           if policy is not None and policy.velocity_limits is not None
                           and policy.acceleration_limits is not None else None)
 

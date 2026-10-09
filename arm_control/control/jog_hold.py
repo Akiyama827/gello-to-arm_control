@@ -80,9 +80,13 @@ class JogRamp:
     term (no jerk limit is stated anywhere; the RT server slews torque). Velocity is not fed forward: the command stays the
     joint law's hold word, as the in-process jog was."""
 
-    def __init__(self, v_max, a_max) -> None:
+    def __init__(self, v_max, a_max, *, lower=None, upper=None) -> None:
         self.v_max = np.asarray(v_max, dtype=float).ravel()
         self.a_max = np.asarray(a_max, dtype=float).ravel()
+        # the joint position envelope (the policy's): the ramp's braking may carry it past a target, never further past a limit
+        # than the target or the current command is (an arm already beyond a stop may still be jogged off it, smoothly)
+        self.lower = None if lower is None else np.asarray(lower, dtype=float).ravel()
+        self.upper = None if upper is None else np.asarray(upper, dtype=float).ravel()
         if self.v_max.shape != self.a_max.shape or not (np.isfinite(self.v_max).all() and np.isfinite(self.a_max).all()
                                                          and (self.v_max > 0).all() and (self.a_max > 0).all()):
             raise ValueError("jog ramp limits must be finite, positive and one per joint")
@@ -108,7 +112,14 @@ class JogRamp:
         # (a fixed target's last tick); else brake through and come back (a target that jumped to just ahead of the ramp)
         over = ((error - v * dt) * error < 0) & (np.abs(error / dt - self.v) <= self.a_max * dt)
         v[over] = error[over] / dt
-        self.q, self.v = self.q + v * dt, v
+        q = self.q + v * dt
+        if self.lower is not None and self.upper is not None:
+            # never further past a limit than the target is, or than the command already was (a jog off a stop moves smoothly)
+            low = np.minimum(self.lower, np.minimum(target, self.q))
+            high = np.maximum(self.upper, np.maximum(target, self.q))
+            stopped = (q < low) | (q > high)
+            q, v[stopped] = np.clip(q, low, high), 0.  # at the limit it stops, as a position saturation does
+        self.q, self.v = q, v
         return self.q.copy()
 
 
@@ -131,6 +142,16 @@ def _ramp_check() -> None:
             v = (q_next - q) / dt
             assert (np.abs(v) <= v_max + 1e-9).all() and (np.abs(v - last_v) / dt <= a_max + 1e-9).all(), (sigma, v, last_v)
             q, last_v = q_next, v
+    for start in (.0123, .05, .1337, .21, .3):  # a target ON a limit (or a jump to just ahead of the ramp): never commanded past it
+        ramp = JogRamp([.4], [.8], lower=[-2.], upper=[1.])
+        q = np.array([1. - start])
+        for k in range(400):
+            q = ramp.step([1.] if k < 30 or start > .2 else [1. - start / 2 if k < 31 else 1.], q, dt)
+            assert q[0] <= 1., (start, k, q)
+        assert q[0] == 1., (start, q)
+    escape = JogRamp([.4], [.8], lower=[-2.], upper=[1.])  # already past the stop: jogged further OFF it, never snapped to it
+    first = escape.step([1.04], [1.05], dt)[0]
+    assert 1.05 > first > 1.0499, first
     small = JogRamp([1.], [2.])
     for k in range(1, 101):  # a console joint jog: its target moves 0.15 rad/s; followed at that speed, a few mrad behind
         q = small.step([.0015 * k], [0.], dt)

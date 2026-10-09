@@ -35,3 +35,13 @@ Review round 1: BLOCK. Taken:
   and random-walk streams (sigma 1/10/50 mrad per tick).
 * NITs: the console lag figure (13 mrad at the FR3's limits, not "a few"); the `[:n_arm]` slice was a no-op (removed); the
   bounds are per tick (stated).
+
+Review round 2: BLOCK. The strict snap left a fixed target's last tick braking THROUGH by ~a dt^2 (1e-5 rad at the FR3's
+0.4/0.8): a setpoint ON a joint limit (admitted) then commanded past the envelope and the controller stopped and DISARMed (3 of
+5 distances; the round-1 ramp held) -- and a target that jumps to just ahead of the ramp brakes through by up to v^2/2a (0.16
+rad). Taken (the reviewer's option b, the root): the ramp carries the policy's position envelope and never commands further
+past a limit than the target or its own current command is -- at a limit it stops, as a position saturation does; an arm already
+beyond a stop is still jogged off it smoothly. Speed and acceleration stay within the limits away from a limit (fuzz: worst
+1.0x); the stop onto a limit is the one exception. `check_jog_ramp` S3: a setpoint on a limit from five distances at 0.4/0.8 is
+reached, never passed, the arm stays ARMed (mutant "no envelope" caught at 1.0000059); the self-check covers the jump-ahead and
+the escape from beyond a stop.
