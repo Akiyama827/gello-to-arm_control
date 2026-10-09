@@ -361,6 +361,20 @@ class ArmClient:
             raise Refused('supervisor does not advertise load_model/1')
         return int(self._channel.call('load_model_set', revision=int(revision), model=model))
 
+    # -- negotiated scene_action/1 ----------------------------------------------
+    def scene_claim(self) -> bool:
+        """Take the hosted world's scene lease (one writing session, released when this connection ends)."""
+        if self.extensions.get('scene_action') != 1:
+            raise Refused('supervisor does not advertise scene_action/1')
+        return bool(self._channel.call('scene_claim'))
+
+    def scene_apply(self, request_id: str, revision: int, state: dict) -> dict:
+        """An optimistic scene change (``scene_state`` payload at ``revision``, which must be above the world's). Returns
+        ``request_id`` and the world's ``scene_state`` after it; a stale revision is Refused."""
+        if self.extensions.get('scene_action') != 1:
+            raise Refused('supervisor does not advertise scene_action/1')
+        return self._channel.call('scene_apply', request_id=str(request_id), revision=int(revision), state=state)
+
     # -- negotiated stream/1 ----------------------------------------------------
     def _stream_call(self, op, **args):
         if self.extensions.get('stream') != 1:

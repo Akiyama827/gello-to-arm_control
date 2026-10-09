@@ -1856,7 +1856,7 @@ class MuJoCoBackend:
     def observe(self) -> dict:
         """This tick's world by name, for observe/1: plant time, model revision, the raw ``qpos`` (valid with that revision), and
         the position and velocity of every motor and finger joint. Any scene (composed or workcell) adds the in-hand pose,
-        the constraint reactions and the topology; a workcell scene also adds its revision, attachments and constraints; a world with fingers adds the gripper; an EE
+        the constraint reactions and the topology; a workcell scene also adds its revision, attachments and constraints (and the whole scene_state echo); a world with fingers adds the gripper; an EE
         body adds the external wrench. A field the world cannot have is None."""
         self.load()
         q, dq = {}, {}
@@ -1869,13 +1869,14 @@ class MuJoCoBackend:
                    self.data.qpos[self.model.jnt_qposadr[j]: self.model.jnt_qposadr[j] + 7].tolist()
                    for j in range(self.model.njnt) if self.model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE}
         world = dict(sim_time_s=float(self.data.time), model_revision=int(self.model_revision), joint_q=q, joint_dq=dq,
-                     qpos=self.data.qpos.tolist(), scene_revision=None, attachments=None, constraints=None, inhand_pose=None,
+                     qpos=self.data.qpos.tolist(), scene_revision=None, attachments=None, constraints=None, scene_state=None,
+                     inhand_pose=None,
                      constraint_force=None, topology=None, gripper=None, ee_wrench=None, object_poses=objects or None)
         if self.scene_state is not None:  # a workcell world: the runtime overlay
             from arm_control.messages import scene_state_payload
             payload = scene_state_payload(self.scene_state)
             world.update(scene_revision=payload["revision"], attachments=payload["attachments"],
-                         constraints=payload["constraints"])
+                         constraints=payload["constraints"], scene_state=payload)
         if self.scene is not None or self.scene_state is not None:  # any scene, composed or workcell: what the node publishes
             topology = {k: v for k, v in self.topology_state().items() if k != "schema"}  # as published (_without_schema)
             world.update(inhand_pose=self.inhand_pose(), constraint_force=self.active_constraint_reactions(), topology=topology)

@@ -23,6 +23,7 @@ that is not told them does not invent them.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from itertools import islice
 import secrets
 import threading
@@ -125,9 +126,10 @@ class SimLink:
             self._obs = deque(maxlen=max(1, int(np.ceil(ring_s * self.observe_rate_hz))))
 
     @classmethod
-    def from_config(cls, cfg) -> "SimLink":
+    def from_config(cls, cfg, *, cohost_of=None) -> "SimLink":
         """The simulated plant a robot config describes: its ``sim_*`` plant keys (``plants.mujoco.single``), its ``rt`` block for
-        the instance id and freshness bounds, and the required ``sim_servo`` block."""
+        the instance id and freshness bounds, and the required ``sim_servo`` block. ``cohost_of``: a ``SharedWorld`` another
+        link in this process hosts; this config's ``sim_actor`` is then driven in that world, which it never steps."""
         from arm_control.config import arm_joints
         from arm_control.plants.mujoco.scene_core import ScenePlant, describes_scene
         from arm_control.plants.mujoco.single import build_single_model_backend, open_jaws
@@ -137,7 +139,9 @@ class SimLink:
             raise ValueError("config has no sim_servo.state_hz: nothing is assumed")
         period = 1.0 / float(servo["state_hz"])
         joints = arm_joints(cfg)
-        if describes_scene(cfg):  # the supervisor hosts the whole world and drives one actor of it (``sim_actor``)
+        if cohost_of is not None:
+            plant = ScenePlant.cohost(cohost_of, cfg, joints, period=period)
+        elif describes_scene(cfg):  # the supervisor hosts the whole world and drives one actor of it (``sim_actor``)
             plant = ScenePlant.from_config(cfg, joints, period=period)
         else:
             plant = build_single_model_backend(cfg, control_period=period)
@@ -160,6 +164,17 @@ class SimLink:
     def _backend(self):
         """The MuJoCo backend under the plant (a scene's world, or the one model itself): the Hand's fingers live there."""
         return getattr(self._plant, "backend", self._plant)
+
+    def clock(self) -> float:
+        """This plant's clock for its supervisor's controller: a hosted world's (``SharedWorld.clock``: paused with the world),
+        else the wall clock."""
+        shared = getattr(self._plant, "shared", None)
+        return time.monotonic() if shared is None else shared.clock()
+
+    @property
+    def scene_world(self):
+        """The ``SharedWorld`` this link HOSTS (steps), for co-hosted actors and scene_action/1; None otherwise."""
+        return self._plant.shared if getattr(self._plant, "host", False) else None
 
     @property
     def supports_cartesian(self) -> bool:
@@ -298,7 +313,9 @@ class SimLink:
     def motor_health(self) -> dict:
         state, rx_t = self.latest_state()
         now = time.monotonic()
-        age = now - rx_t if rx_t > 0 else float("inf")
+        shared = getattr(self._plant, "shared", None)
+        # a world paused for a scene change publishes nothing, and nothing in it moved: the pause is not staleness
+        age = max(0.0, now - rx_t - (0.0 if shared is None else shared.stalled(now))) if rx_t > 0 else float("inf")
         stale = age > self.config.state_timeout_s
         fault = self._latched_fault or (f"sim state stream stale ({age:.2f}s)" if stale and rx_t > 0 else "")
         return {"armed": bool(state and state.armed), "state_fresh": not stale, "latched_fault": fault,
@@ -385,10 +402,13 @@ class SimLink:
         motor = self._plant.step(command)
         if self._hand is not None:
             backend = self._backend
-            finger = self._hand.on_sample(backend.gripper_positions(), backend.gripper_efforts(), now)
-            if finger is not None:
-                backend.apply_gripper_command(finger[0], force_n=float(finger[1]))
-        self._publish(now, motor=motor, command=command, snapshot=snapshot)
+            shared = getattr(self._plant, "shared", None)
+            with shared.lock if shared is not None else nullcontext():  # a co-hosted actor reads the same world
+                finger = self._hand.on_sample(backend.gripper_positions(), backend.gripper_efforts(), now)
+                if finger is not None:
+                    backend.apply_gripper_command(finger[0], force_n=float(finger[1]))
+        # stamped AFTER the step: a step that waited out a paused world must not publish a sample dated before the pause
+        self._publish(time.monotonic(), motor=motor, command=command, snapshot=snapshot)
         if self.observing:
             self._observe()
 
@@ -408,7 +428,8 @@ class SimLink:
                           model_revision=world["model_revision"], scene_revision=world.get("scene_revision"),
                           actor_q=actor_q, actor_dq=actor_dq,
                           gripper=world.get("gripper"), attachments=world.get("attachments"),
-                          constraints=world.get("constraints"), object_poses=world.get("object_poses"),
+                          constraints=world.get("constraints"), scene_state=world.get("scene_state"),
+                          object_poses=world.get("object_poses"),
                           inhand_pose=world.get("inhand_pose"),
                           constraint_force=world.get("constraint_force"), ee_wrench=world.get("ee_wrench"),
                           topology=world.get("topology"), qpos=world.get("qpos"))

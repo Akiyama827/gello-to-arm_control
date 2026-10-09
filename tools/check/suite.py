@@ -53,7 +53,7 @@ CHECKS = (
     "check_arm_controller", "check_bimanual_contract", "check_cartesian_sim", "check_bimanual_sync", "check_closure_record",
     "check_console_authority", "check_console_grasp", "check_cooperative", "check_dual_console", "check_dual_modes",
     "check_dual_modes --refine", "check_execution_policy", "check_hand_grasp", "check_load_model", "check_motion_profiles", "check_node_shutdown",
-    "check_pair_planning", "check_pose_hold", "check_pose_hold_sim", "check_refinement", "check_retiming", "check_rt_telemetry",
+    "check_pair_planning", "check_pose_hold", "check_pose_hold_sim", "check_refinement", "check_retiming", "check_rt_telemetry", "check_scene_cohost",
     "check_stream", "check_supervisor_ledger",
     "check_console_controls", "check_console_page", "check_controller_mode_feedback", "check_ui_scene_injection",
 )

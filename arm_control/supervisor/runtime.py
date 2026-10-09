@@ -174,6 +174,7 @@ class RobotRuntime:
         self.controller = self._build_controller()
         self._payload = PayloadState(0, PayloadValue(0.))
         self._load_model_revision = -1  # controller_load_model: none installed (the construction model's RNEA)
+        self._scene_owner = None  # scene_action/1: the one session that may change the hosted world's scene
         self._presets = resolve_presets(cfg.get('control_mode') or {}, self.joints,
                                        self.controller.executor.kp, self.controller.executor.kd)
         self._soft_ids = itertools.count(1)
@@ -218,6 +219,9 @@ class RobotRuntime:
             result['trace'] = 1
         if getattr(self.link, 'observing', False):
             result['observe'] = 1
+        world = getattr(self.link, 'scene_world', None)
+        if world is not None and world.backend.scene_state:
+            result['scene_action'] = 1
         if self._native is None:  # setpoints are words on the streamed path; a native reference plays only its own curve
             result['setpoint'] = 1
         return result
@@ -225,6 +229,30 @@ class RobotRuntime:
     def observe(self, after: int = 0, limit: int = 64) -> dict:
         """observe/1: the plant's world, read-only and without ownership (2026-10-08-scene-hosting-design.md)."""
         return self.link.observations(after, limit)
+
+    def scene_claim(self, session: str) -> bool:
+        """scene_action/1: take the hosted world's scene lease (one writing session; released when that session ends). Separate
+        from the arm's claim: the scene writer (a grafter) is not the arm's owner."""
+        with self._cv:
+            if session in self._closed_sessions:
+                raise Refused('session closed')
+            if self._scene_owner not in (None, session):
+                raise Refused('the scene lease is held by another session')
+            self._scene_owner = session
+        return True
+
+    def scene_apply(self, session: str, request_id: str, revision: int, state: dict) -> dict:
+        """scene_action/1: an optimistic scene change on the hosted world (``SceneCore.apply_scene``: stale revision refused).
+        Runs on the caller's thread under the world's lock, never on this loop: a recompile stalls the world's servo threads (the
+        stall is credited to the slice deadmans), not the controller."""
+        with self._cv:
+            if self._scene_owner != session:
+                raise Refused('scene_apply needs the scene lease (scene_claim)')
+        try:
+            scene = self.link.scene_world.apply_scene(dict(revision=int(revision), state=state))
+        except (KeyError, TypeError, ValueError) as exc:  # stale, or a malformed state (the plant node answered ok=False)
+            raise Refused(f'scene change refused: {exc!r}') from None
+        return dict(request_id=str(request_id), scene_state=scene)
 
     def trace_samples(self, after: int = 0) -> dict:
         """trace/1: controller ticks recorded after sequence ``after``, oldest first (read-only, no ownership needed).
@@ -809,7 +837,9 @@ class RobotRuntime:
     def _build_controller(self) -> ArmController:
         return build_arm_controller(
             self.cfg, _Node(self), arm_id=self.instance_id, require_policy=True,
-            clock=time.monotonic, plant_reports_health=True,
+            # the plant's clock: wall time for a real arm; a sim world's own (it stands still while the world is paused for a
+            # scene change, as plant time did for the plant-clocked controller this supervisor replaced)
+            clock=getattr(self.link, 'clock', time.monotonic), plant_reports_health=True,
             reference_source=(None if self._native is None else lambda: self._native.point))
 
     # -- lifecycle ---------------------------------------------------------------
@@ -870,6 +900,8 @@ class RobotRuntime:
         and its ownership is released on the loop."""
         with self._cv:
             self._closed_sessions.add(session)
+            if self._scene_owner == session:
+                self._scene_owner = None
         self._ops.put((self._owner_lost, (session,), Future()))
 
     def claim(self, session: str) -> Authority:
@@ -1377,7 +1409,7 @@ class RobotRuntime:
                 if seq is not None:
                     sent.append(seq)
                     if sent_for is not None and self._native is None:
-                        c.streamed_command_sent(sent_for, command['position'], time.monotonic())
+                        c.streamed_command_sent(sent_for, command['position'], c._clock())
             elif topic == "controller_event":
                 events.append(unpack_controller_event(value))
         c.node.sent = []
@@ -1778,7 +1810,9 @@ class RobotRuntime:
                 c.on_motor_state(pack_motor_state_dict(link.motor_state(state=state)))
                 # Arrival freshness survives a delayed tick (RemoteHardware's seam).
                 if c._last_state_at is not None:
-                    c._last_state_at = rx
+                    # rx is wall time; the controller may run on a sim world's clock (paused with the world): carry the
+                    # sample's AGE across, never the wall stamp itself, or every pause would shorten every later age
+                    c._last_state_at = c._clock() - (time.monotonic() - rx)
         self._publish()
         for ex in list(self._executions.values()):
             self._expire(ex)

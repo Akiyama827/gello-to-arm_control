@@ -19,7 +19,7 @@ finger actuators, so the Hand path (``franka_adapter`` + ``HandGraspFsm``) is on
 Not modelled, because it cannot happen here: a lost device session and a failed stop (``stop_failed``). The sim's stop
 completes on the next plant tick.
 
-The finger physics is the project's measured SimHand model (``assembly/runtime/sim_bridge.py``), moved here so the hosted
+The finger physics is the project's measured SimHand model (from its ``sim_bridge``, deleted 2026-10-09), moved here so the hosted
 world owns it: the width command RAMPS at the commanded speed (a raw target slams the pads off a curved hull); a GRASP's
 verdict is width-only like ``franka::Gripper::grasp`` (settled within the epsilon band AND blocked short of the command,
 which an empty close is not); a held grasp hands the fingers to force mode at the commanded force (a position target only

@@ -18,9 +18,11 @@ from pathlib import Path
 
 
 def start_supervisor(config: Path, env: dict, *, overlays=(), control_mode: Path | None = None, plant: str = "sim",
-                     cwd: Path | None = None, stopped=lambda: False, timeout_s: float = 60.0):
+                     cwd: Path | None = None, stopped=lambda: False, timeout_s: float = 60.0, cohosts: dict | None = None):
     """Start the supervisor and wait until its socket answers; return ``(process, env for the graph)``. RuntimeError (with the
-    log's path) if it exits, does not come up within ``timeout_s``, or ``stopped()`` turns true meanwhile."""
+    log's path) if it exits, does not come up within ``timeout_s``, or ``stopped()`` turns true meanwhile. ``cohosts``
+    (sim): ``{PREFIX: staged config path}``, another actor of the same world served by this process; the graph env gains
+    ``PREFIX_CONFIG`` and ``PREFIX_SOCKET`` for each."""
     import yaml
 
     from arm_control.config import load_config_tree
@@ -34,13 +36,15 @@ def start_supervisor(config: Path, env: dict, *, overlays=(), control_mode: Path
     merged_path = workdir / "supervised_arm.yaml"
     merged_path.write_text(yaml.safe_dump(merged))
     sock = workdir / "arm.sock"
+    cohosts = dict(cohosts or {})
+    co_socks = {prefix: workdir / f"{prefix.lower()}.sock" for prefix in cohosts}
     log = open(workdir / "supervisor.log", "w")
     # The supervisor writes its log FILE directly (never a pipe: a stalled or suspended reader must never block the control
     # loop's prints); the launcher TAILS that file to echo the controller's own lines (a fault, a refused ARM, a stale stream) to
     # the operator's terminal.
     proc = subprocess.Popen(
         [sys.executable, "-u", "-m", "arm_control.supervisor.service", "--config", str(merged_path), "--socket", str(sock),
-         "--plant", plant],
+         "--plant", plant, *[f"--cohost={cohosts[p]}={co_socks[p]}" for p in cohosts]],
         env=dict(env, ARM_CONTROL_CONFIG=str(merged_path)), cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
         start_new_session=True)  # its own session: a Ctrl-C reaches the graph, and the supervisor outlives it long enough to be stopped after
     proc._workdir, proc._log = workdir, log
@@ -69,19 +73,28 @@ def start_supervisor(config: Path, env: dict, *, overlays=(), control_mode: Path
                 raise RuntimeError(f"stopped while the supervisor was starting; see {workdir / 'supervisor.log'}")
             if time.monotonic() > deadline:
                 raise RuntimeError(f"the supervisor did not come up in {timeout_s:g} s; see {workdir / 'supervisor.log'}")
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                probe.connect(str(sock))
+            if all(_answers(path) for path in (sock, *co_socks.values())):
                 break
-            except OSError:
-                time.sleep(0.2)
-            finally:
-                probe.close()
+            time.sleep(0.2)
     except BaseException:  # a failure or an interrupt (Ctrl-C) mid-start: never leave it running, keep the log it names
         stop_supervisor(proc, keep_log=True)
         raise
     print(f"[supervisor] up on {sock} (config {merged_path})", flush=True)
-    return proc, dict(env, ARM_CONTROL_CONFIG=str(merged_path), ARM_CONTROL_SOCKET=str(sock))
+    graph_env = dict(env, ARM_CONTROL_CONFIG=str(merged_path), ARM_CONTROL_SOCKET=str(sock))
+    for prefix, path in cohosts.items():
+        graph_env[f"{prefix}_CONFIG"], graph_env[f"{prefix}_SOCKET"] = str(path), str(co_socks[prefix])
+    return proc, graph_env
+
+
+def _answers(path: Path) -> bool:
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect(str(path))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
 
 
 def stop_supervisor(proc, *, keep_log: bool = False) -> None:

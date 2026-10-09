@@ -16,7 +16,9 @@ What to publish, and when, stays with the front end.
 """
 from __future__ import annotations
 
+from functools import cached_property
 import os
+import threading
 import time
 
 import numpy as np
@@ -278,19 +280,78 @@ class SceneCore:
         return pos_cmd
 
 
+#: the longest a scene change may pause a hosted world and still be excused (staleness, the controller clock); measured 0.35 s
+#: for a storage-release recompile. ponytail: one bound for every world; per-world if a heavier scene ever needs more.
+PAUSE_EXCUSE_MAX_S = 5.0
+
+
+class SharedWorld:
+    """One composed world and its ``SceneCore``, shared by every supervised actor this process hosts (scene-hosting D1(a)/D2(a),
+    operator 2026-10-09: the FR3 and the base in one sim world, each on its own supervisor). The HOST actor's servo thread steps
+    it; the others write their slice and read the state the last step left. Every write, step and read is under ``lock``."""
+
+    def __init__(self, world, *, period: float, idle_timeout: float) -> None:
+        backend, slices, names, n = world
+        if not (np.isfinite(idle_timeout) and idle_timeout > 0):
+            raise ValueError("idle_timeout_sec must be finite and positive")
+        self.backend, self.slices, self.names = backend, dict(slices), list(names)
+        self.core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
+        self.lock = threading.Lock()
+        self.last: dict | None = None  # the backend state after the last step
+        self.host_steps = 0  # how many times the host has stepped the world
+        # (seconds the world has been paused for scene changes, start of the change in progress or None): ONE attribute, so a
+        # reader on another thread never sees a finished pause counted twice
+        self._pause = (0.0, None)
+        self._clock_lock, self._clock_last = threading.Lock(), float("-inf")
+
+    def apply_scene(self, request: dict) -> dict:
+        """scene_action/1: an optimistic scene change, between steps (``SceneCore.apply_scene``). The world is paused while
+        it is rebuilt (every actor's servo waits on the lock): that time is not plant time (``clock``)."""
+        with self.lock:
+            paused, _ = self._pause
+            started = time.monotonic()
+            self._pause = (paused, started)
+            try:
+                return self.core.apply_scene(request)
+            finally:  # what clock() excused, no more: a pause past the cap must not turn the clock back when it ends
+                self._pause = (paused + min(time.monotonic() - started, PAUSE_EXCUSE_MAX_S), None)
+
+    def stalled(self, now: float) -> float:
+        """Seconds the world has been paused by the scene change in progress (0 when none is), at most PAUSE_EXCUSE_MAX_S:
+        a recompile that hangs longer is a stalled plant, and staleness and the controller clock resume."""
+        _, started = self._pause
+        return 0.0 if started is None else min(max(0.0, now - started), PAUSE_EXCUSE_MAX_S)
+
+    def clock(self) -> float:
+        """The world's time on the wall clock's scale: monotonic time less every pause for a scene change, so it stands still
+        while the world does. A supervisor's controller deadlines run on it (a 0.35 s recompile is no stale state in a world
+        that did not move), as SceneCore's slice deadmen are credited the same stall."""
+        with self._clock_lock:
+            now = time.monotonic()
+            paused, started = self._pause  # ONE read: a pause ending between two reads would count twice, then not at all
+            value = now - paused - (0.0 if started is None else min(max(0.0, now - started), PAUSE_EXCUSE_MAX_S))
+            # the time read and the pause read are two operations: a pause starting or ending between them is off by the
+            # microseconds between the two, either way; never let that show as the clock running back
+            self._clock_last = max(self._clock_last, value)
+            return self._clock_last
+
+
 class ScenePlant:
     """One actor of a scene world, as the plant behind a ``SimLink`` (scene hosting, step 2b; 2026-10-08-scene-hosting-design.md).
 
     The supervisor hosts the world: ``SimLink`` keeps its authority, deadman and observe/1 rules unchanged, and this adapter gives
     it the supervised actor's slice of a ``SceneCore`` -- the same world code the Dora plant node runs. Each step writes the
     actor's slice (``SimLink`` writes every tick: a command, a hold or a release word, so the slice's own idle deadman never
-    fires for it) and steps the whole world once. The other actors keep the world's spawn hold until their own writers exist
-    (step 3, D1). The Hand (``sim_hand``) is served by ``SimLink`` for every sim plant, from the world's ``backend``.
-    Driven by ``SimLink``'s one servo thread, as ``SceneCore`` requires.
+    fires for it); the HOST actor's step also steps the whole world once, a co-hosted actor's (``cohost``) reads the state the
+    host's last step left (one host tick of latency). Actors with no supervisor keep the world's spawn hold. The Hand
+    (``sim_hand``) is served by ``SimLink`` for every sim plant, from the world's ``backend``. Every touch of the world is under
+    the ``SharedWorld`` lock.
     """
 
-    def __init__(self, world, actor: str, joints: list, *, period: float, idle_timeout: float) -> None:
-        backend, slices, names, n = world
+    def __init__(self, world, actor: str, joints: list, *, period: float, idle_timeout: float, host: bool = True) -> None:
+        """``world``: a ``build_world`` tuple (this actor hosts it) or a ``SharedWorld`` another actor hosts (``host=False``)."""
+        shared = world if isinstance(world, SharedWorld) else SharedWorld(world, period=period, idle_timeout=idle_timeout)
+        backend, slices, names = shared.backend, shared.slices, shared.names
         if actor not in slices:
             raise ValueError(f"sim_actor {actor!r} is not an actor of this world (actors: {sorted(slices)})")
         width = len(joints)
@@ -302,11 +363,14 @@ class ScenePlant:
         world_joints = list(names)[start: start + width]
         if not all(w.endswith(j) for w, j in zip(world_joints, joints)):
             raise ValueError(f"sim_actor {actor!r} joints {world_joints} are not the arm config's {list(joints)} in order")
-        if not (np.isfinite(idle_timeout) and idle_timeout > 0):
-            raise ValueError("idle_timeout_sec must be finite and positive")
         self.actor, self.backend, self._slices = actor, backend, dict(slices)
         self._span = slice(start, start + width)
-        self._core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
+        self.shared, self.host = shared, bool(host)
+        self._core = shared.core
+        self._driven = False  # a co-host: its supervisor has written a non-release command
+        # a co-host: the world's idle timeout in this actor's own steps (25 at 250 Hz and 0.1 s)
+        self._max_unstepped = max(1, int(np.ceil(idle_timeout / period)))
+        self._host_seen, self._unstepped = 0, 0
 
     @classmethod
     def from_config(cls, cfg, joints: list, *, period: float) -> "ScenePlant":
@@ -318,32 +382,74 @@ class ScenePlant:
             raise ValueError("a scene plant needs idle_timeout_sec (the other actors' deadman): nothing is assumed")
         return cls(build_world(cfg, period=period), str(actor), list(joints), period=period, idle_timeout=float(idle))
 
-    @property
+    @classmethod
+    def cohost(cls, shared: SharedWorld, cfg, joints: list, *, period: float) -> "ScenePlant":
+        """Another actor (``sim_actor``) of a world this process already hosts: it writes its slice, the host steps the world."""
+        actor = cfg.get("sim_actor")
+        if not actor:
+            raise ValueError("a co-hosted actor needs sim_actor (the world's actor its supervisor drives): nothing is assumed")
+        return cls(shared, str(actor), list(joints), period=period, idle_timeout=shared.core.idle_timeout, host=False)
+
+    @cached_property  # first read at SimLink.open, the world loaded: the EE chain never changes, and a recompile must not race it
     def supports_cartesian(self) -> bool:
-        """The world's EE chain is this actor's: a Cartesian spec from it drives its own arm, never another actor's."""
+        """The world's EE chain is this actor's: a Cartesian spec from it drives its own arm, never another actor's. A co-host
+        takes joint commands only (refused at admission, not at the step)."""
+        if not self.host:
+            return False
         mine = set(list(self.backend.joint_names)[self._span])
         return bool(self.backend.supports_cartesian and set(self.backend.ee_chain_joints) <= mine)
 
     def load(self) -> None:
-        self.backend.load()
+        if self.host:
+            self.backend.load()
 
     def close(self) -> None:
-        self.backend.close()
+        if self.host:
+            with self.shared.lock:  # never under a scene change still running at shutdown
+                self.backend.close()
 
     def _mine(self, state: dict) -> dict:
         return {"position": np.asarray(state["position"], float)[self._span].copy(),
                 "velocity": np.asarray(state["velocity"], float)[self._span].copy()}
 
     def step(self, command: dict) -> dict:
-        now = time.monotonic()
-        self._core.set_slice(self.actor, dict(command, cartesian=command.get("cartesian")), now)
-        return self._mine(self._core.tick(now))
+        with self.shared.lock:
+            now = time.monotonic()  # inside the lock: a step that waited out a pause must not write a pre-pause time
+            if self.host:
+                self._core.set_slice(self.actor, dict(command, cartesian=command.get("cartesian")), now)
+                self.shared.last = self._core.tick(now)
+                self.shared.host_steps += 1
+                return self._mine(self.shared.last)
+            if command.get("cartesian") is not None:
+                raise ValueError("a co-hosted actor takes joint commands only (the world's Cartesian law is the host's)")
+            # A co-host whose world has stopped stepping (the host failed or is gone) is a failed plant, not a fresh one. Counted
+            # in this actor's OWN steps, not in time: a stall of the whole process (GC, descheduling) stops both servo threads
+            # alike and must not fault anyone; this many co-host steps with no host step proves the host alone stopped.
+            if self.shared.host_steps != self._host_seen:
+                self._host_seen, self._unstepped = self.shared.host_steps, 0
+            else:
+                self._unstepped += 1
+                if self._unstepped > self._max_unstepped:
+                    raise RuntimeError(f"the hosting actor has not stepped the world in {self._unstepped} of this actor's steps")
+            # Until its supervisor first drives it, a co-hosted actor keeps the world's spawn hold: SimLink's disarmed release
+            # word would otherwise drop it limp from start-up to the first ARM (the base has no gravity compensation).
+            released = not any(np.any(command[k]) for k in ("kp", "kd", "torque"))
+            if not (released and not self._driven):
+                self._driven = True
+                self._core.set_slice(self.actor, dict(command, cartesian=None), now)
+            # before the host's first step (start-up) there is no stepped state yet: the world as loaded
+            return self._mine(self.shared.last if self.shared.last is not None else self.backend.motor_state())
 
     def motor_state(self) -> dict:
-        return self._mine(self.backend.motor_state())
+        with self.shared.lock:
+            return self._mine(self.backend.motor_state())
+
+    def apply_scene(self, request: dict) -> dict:
+        return self.shared.apply_scene(request)
 
     def observe(self) -> dict:
-        world = self.backend.observe()
+        with self.shared.lock:
+            world = self.backend.observe()
         names = list(self.backend.joint_names)
         world["actors"] = {a: names[s["start"]: s["start"] + s["n"]] for a, s in self._slices.items()}
         return world
