@@ -170,7 +170,7 @@ class ArmController:
         # A streamed target (console jog, setpoint/1) moves no faster than planned motion may: saturated per tick at the
         # policy's velocity/acceleration limits (operator 2026-10-09). No policy limits (the legacy DM path): unsaturated.
         policy = execution_policy
-        self._jog_ramp = (JogRamp(policy.velocity_limits[:self.n_arm], policy.acceleration_limits[:self.n_arm])
+        self._jog_ramp = (JogRamp(policy.velocity_limits, policy.acceleration_limits)
                           if policy is not None and policy.velocity_limits is not None
                           and policy.acceleration_limits is not None else None)
 
@@ -399,6 +399,10 @@ class ArmController:
         """
         refusal = self.jog_refusal()
         if refusal is None:
+            if self._jog_ramp is not None and not self._jog.active:
+                # a NEW jog (none live: never, expired, cleared, a leg released or cancelled) starts at the measured pose, at
+                # rest -- never from a ramp a cleared jog left behind, even within the tick it was cleared in
+                self._jog_ramp.reset()
             self._jog.set(unpack_jog(value)["q"], self._clock())
         return refusal
 

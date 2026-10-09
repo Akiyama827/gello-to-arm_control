@@ -75,7 +75,8 @@ class JogRamp:
     """Saturate a streamed joint target per control tick (the standard joint-limits saturation: ros2_control's
     JointSaturationLimiter, libfranka's rate limiter): the commanded target moves toward the requested one at no more than the
     policy's velocity limit, changes speed by no more than its acceleration limit, and brakes so it stops at the target (speed
-    capped by the remaining distance, as braking at the acceleration limit requires). A big step from a slow client becomes a ramp; a console jog (0.15 rad/s) is followed at its speed, a few mrad behind. No jerk
+    capped by the remaining distance, as braking at the acceleration limit requires). A big step from a slow client becomes a ramp; a console jog (0.15 rad/s) is followed at its speed, behind by about v^2/2a
+    (13 mrad at the FR3's 0.4/0.8), braking to a stop after release. The bounds are per control tick. No jerk
     term (no jerk limit is stated anywhere; the RT server slews torque). Velocity is not fed forward: the command stays the
     joint law's hold word, as the in-process jog was."""
 
@@ -103,25 +104,33 @@ class JogRamp:
         step = self.a_max * dt
         cap = np.minimum(self.v_max, step * (np.sqrt(.25 + 2.0 * np.abs(error) / (step * dt)) - .5))
         v = np.clip(np.clip(error / dt, -cap, cap), self.v - self.a_max * dt, self.v + self.a_max * dt)
-        over = (error - v * dt) * error < 0       # the acceleration bound would carry it past the target: stop there
+        # the acceleration bound would carry it past the target: stop there when that is itself within the acceleration limit
+        # (a fixed target's last tick); else brake through and come back (a target that jumped to just ahead of the ramp)
+        over = ((error - v * dt) * error < 0) & (np.abs(error / dt - self.v) <= self.a_max * dt)
         v[over] = error[over] / dt
         self.q, self.v = self.q + v * dt, v
         return self.q.copy()
 
 
 def _ramp_check() -> None:
-    dt = .01
-    for target in np.random.default_rng(0).uniform(-1., 1., (100, 2)):
-        # one step, held: rises at <= 2 rad/s^2, cruises at <= 1 rad/s, stops on the target. The only acceleration over the limit
-        # is the final stopping tick, from at most 2 a dt (0.04 rad/s here): the discrete remainder of braking.
-        ramp, q, last_v = JogRamp([1., 1.], [2., 2.]), np.zeros(2), np.zeros(2)
-        for _ in range(300):
+    dt, rng = .01, np.random.default_rng(0)
+    v_max, a_max = np.array([1., .4]), np.array([2., .8])  # per-joint limits (the FR3 policy is 0.4/0.8)
+    for target in rng.uniform(-1., 1., (100, 2)):  # a step, held: speed and acceleration within the limits, lands on target
+        ramp, q, last_v = JogRamp(v_max, a_max), np.zeros(2), np.zeros(2)
+        for _ in range(600):
             q_next = ramp.step(target, q if ramp.q is None else ramp.q, dt)
             v = (q_next - q) / dt
-            over = np.abs(v - last_v) / dt > 2. + 1e-9
-            assert np.abs(v).max() <= 1. + 1e-9 and (np.abs(last_v[over]) <= 2 * 2. * dt + 1e-9).all(), (target, v, last_v)
+            assert (np.abs(v) <= v_max + 1e-9).all() and (np.abs(v - last_v) / dt <= a_max + 1e-9).all(), (target, v, last_v)
             q, last_v = q_next, v
         assert np.allclose(q, target), (q, target)
+    for sigma in (.001, .01, .05):  # a jittery stream (a policy client): the target random-walks every tick
+        ramp, q, last_v, target = JogRamp(v_max, a_max), np.zeros(2), np.zeros(2), np.zeros(2)
+        for _ in range(2000):
+            target = target + rng.normal(0., sigma, 2)
+            q_next = ramp.step(target, q if ramp.q is None else ramp.q, dt)
+            v = (q_next - q) / dt
+            assert (np.abs(v) <= v_max + 1e-9).all() and (np.abs(v - last_v) / dt <= a_max + 1e-9).all(), (sigma, v, last_v)
+            q, last_v = q_next, v
     small = JogRamp([1.], [2.])
     for k in range(1, 101):  # a console joint jog: its target moves 0.15 rad/s; followed at that speed, a few mrad behind
         q = small.step([.0015 * k], [0.], dt)
