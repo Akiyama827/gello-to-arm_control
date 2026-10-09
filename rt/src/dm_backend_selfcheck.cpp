@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "arm_rt/backend.hpp"
@@ -21,7 +22,17 @@ std::unique_ptr<Backend> make_dm_backend(const std::string&, uint32_t, double);
 }
 namespace {
 constexpr int fake_fd = 12345;
-std::vector<canfd_frame> sent;
+constexpr int probe_fd = 12346;  // the backend's second, unfiltered socket (the shared-bus checks)
+int sockets = 0;                 // per backend: the first is the motor socket, the second the probe
+std::vector<canfd_frame> sent, probe_queue;
+bool is_fd(int fd) { return fd == fake_fd || fd == probe_fd; }
+canfd_frame frame_on(uint32_t can_id, uint8_t first_byte) {
+  canfd_frame f{};
+  f.can_id = can_id;
+  f.len = 8;
+  f.data[0] = first_byte;
+  return f;
+}
 canfd_frame feedback[2];
 int pending;
 bool fail_read, fail_second_command, fail_second_enable;
@@ -51,9 +62,12 @@ void assert_disabled() {
 }  // namespace
 
 extern "C" {
-int __wrap_socket(int domain, int, int) { assert(domain == PF_CAN); return fake_fd; }
+int __wrap_socket(int domain, int, int) {
+  assert(domain == PF_CAN);
+  return sockets++ % 2 ? probe_fd : fake_fd;
+}
 int __wrap_setsockopt(int fd, int, int, const void*, socklen_t) {
-  assert(fd == fake_fd); return 0;
+  assert(is_fd(fd)); return 0;
 }
 int __wrap_ioctl(int fd, unsigned long request, ...) {
   assert(fd == fake_fd && request == SIOCGIFINDEX);
@@ -63,8 +77,8 @@ int __wrap_ioctl(int fd, unsigned long request, ...) {
   va_end(args);
   return 0;
 }
-int __wrap_bind(int fd, const sockaddr*, socklen_t) { assert(fd == fake_fd); return 0; }
-int __wrap_close(int fd) { assert(fd == fake_fd); return 0; }
+int __wrap_bind(int fd, const sockaddr*, socklen_t) { assert(is_fd(fd)); return 0; }
+int __wrap_close(int fd) { assert(is_fd(fd)); return 0; }
 ssize_t __wrap_write(int fd, const void* data, size_t size) {
   assert(fd == fake_fd && size == CANFD_MTU);
   const auto& frame = *static_cast<const canfd_frame*>(data);
@@ -83,7 +97,13 @@ ssize_t __wrap_write(int fd, const void* data, size_t size) {
   return ssize_t(size);
 }
 ssize_t __wrap_recv(int fd, void* out, size_t size, int flags) {
-  assert(fd == fake_fd && size >= CANFD_MTU && flags == MSG_DONTWAIT);
+  assert(is_fd(fd) && size >= CANFD_MTU && flags == MSG_DONTWAIT);
+  if (fd == probe_fd) {  // an empty bus unless a case puts frames on it
+    if (probe_queue.empty()) { errno = EAGAIN; return -1; }
+    std::memcpy(out, &probe_queue.back(), CANFD_MTU);
+    probe_queue.pop_back();
+    return CANFD_MTU;
+  }
   if (fail_read) { errno = ENETDOWN; return -1; }
   if (!pending) { errno = EAGAIN; return -1; }
   std::memcpy(out, &feedback[--pending], CANFD_MTU);
@@ -156,5 +176,31 @@ int main() {
   sent.clear();
   command.n = 1;
   assert(!backend->write_command(command, 100, torque) && sent.empty());
-  std::puts("PASS DM backend: native frames, batch admission, activation, write/read failure disable");
+  backend.reset();
+
+  // Shared bus (operator 2026-10-09: one can0 for the base and this arm, ids colliding, one robot powered at a time).
+  const char* spec = "mit_selfcheck;1:4340:0x11:12.5:20:28,2:4340p:0x12:12.5:20:28";
+  // Another driver commands one of our ids before this server sent anything: no backend, and not one frame sent.
+  sent.clear();
+  sockets = 0;
+  probe_queue = {frame_on(2, 0)};
+  assert(!make_dm_backend(spec, 3, 27) && sent.empty());
+  // Our own frames looped back to the probe after we started, and foreign ids, are fine; one of OUR ids answering on a
+  // Master ID that is not ours (the other robot's motor, powered) latches a fault before anything is enabled.
+  sockets = 0;
+  probe_queue.clear();
+  auto shared = make_dm_backend(spec, 3, 27);
+  assert(shared);
+  queue_feedback();
+  assert(shared->read(state));
+  probe_queue = {frame_on(1, 0), frame_on(0x11, 0x11), frame_on(0x07, 0x07), frame_on(0x00, 0x17)};
+  queue_feedback();
+  assert(shared->read(state));  // our echo, our own reply, another device's id 7, an id 7 reply on Master 0: fine
+  probe_queue = {frame_on(0x00, 0x11)};  // motor id 1 answering on Master 0x00: the DM arm's motor 1, powered
+  queue_feedback();
+  assert(!shared->read(state));
+  assert(std::string(shared->fault_text()).find("another robot is powered") != std::string::npos);
+  for (const auto& frame : sent) assert(!special(frame, 0xfc));
+  std::puts("PASS DM backend: native frames, batch admission, activation, write/read failure disable, shared-bus "
+            "interlock (another driver before start, another robot's motor powered)");
 }
