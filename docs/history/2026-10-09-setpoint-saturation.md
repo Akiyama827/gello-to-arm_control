@@ -45,3 +45,9 @@ beyond a stop is still jogged off it smoothly. Speed and acceleration stay withi
 1.0x); the stop onto a limit is the one exception. `check_jog_ramp` S3: a setpoint on a limit from five distances at 0.4/0.8 is
 reached, never passed, the arm stays ARMed (mutant "no envelope" caught at 1.0000059); the self-check covers the jump-ahead and
 the escape from beyond a stop.
+
+Review round 3: ACCEPT (limit, stale-ramp and fuzz harnesses re-run; escape from beyond a stop smooth; never past a limit). NITs
+taken: the stop onto a limit spans the clipped tick and the next, up to about 2x the acceleration limit (stated, not changed);
+the ramp refuses a malformed envelope loudly (unreachable from the controller, whose policy validates it). Named: jogging off a
+stop from beyond a POLICY limit stays impossible through the jog path (every q_des beyond the envelope fails command_valid,
+unchanged from before).

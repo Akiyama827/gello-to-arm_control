@@ -87,6 +87,10 @@ class JogRamp:
         # than the target or the current command is (an arm already beyond a stop may still be jogged off it, smoothly)
         self.lower = None if lower is None else np.asarray(lower, dtype=float).ravel()
         self.upper = None if upper is None else np.asarray(upper, dtype=float).ravel()
+        if (self.lower is None) != (self.upper is None) or (self.lower is not None and not (
+                self.lower.shape == self.upper.shape == self.v_max.shape and np.isfinite(self.lower).all()
+                and np.isfinite(self.upper).all() and (self.lower <= self.upper).all())):
+            raise ValueError("jog ramp envelope: both bounds or neither, finite, lower <= upper, one per joint")
         if self.v_max.shape != self.a_max.shape or not (np.isfinite(self.v_max).all() and np.isfinite(self.a_max).all()
                                                          and (self.v_max > 0).all() and (self.a_max > 0).all()):
             raise ValueError("jog ramp limits must be finite, positive and one per joint")
@@ -118,7 +122,9 @@ class JogRamp:
             low = np.minimum(self.lower, np.minimum(target, self.q))
             high = np.maximum(self.upper, np.maximum(target, self.q))
             stopped = (q < low) | (q > high)
-            q, v[stopped] = np.clip(q, low, high), 0.  # at the limit it stops, as a position saturation does
+            # at the limit it stops, as a position saturation does: the stop (the clipped tick and the next) is the one place the
+            # acceleration exceeds its limit, by up to 2x
+            q, v[stopped] = np.clip(q, low, high), 0.
         self.q, self.v = q, v
         return self.q.copy()
 
