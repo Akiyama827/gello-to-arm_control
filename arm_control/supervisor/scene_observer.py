@@ -63,7 +63,7 @@ def main() -> None:
 
     from arm_control.config import load_robot_config
     from arm_control.contracts.scene import pack_scene_result, pack_scene_state, unpack_scene_command
-    from arm_control.messages import pack_json_message
+    from arm_control.contracts import pack_json_message
     from arm_control.node_utils import ShutdownFlag, install_signal_handlers, next_event_gil_friendly
     from arm_control.sdk import ArmClient, Refused, SupervisorError
 

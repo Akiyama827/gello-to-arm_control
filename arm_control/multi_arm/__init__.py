@@ -10,7 +10,6 @@ those endpoints:
 - ``interface``      the backend-neutral public surface consumers depend on
 - ``coordinator``    pair lifecycle, staging barrier, cancel/fault propagation
 - ``synchronization`` observable start-timing records for coordinated release
-- ``adapter``        the Dora transport seam
 - ``planning``       shared-world joint planning and common retiming
 - ``cooperative``    fixed-grasp object kinematics and checked object-path planning
 - ``supervised``     an ArmHandle over one arm's supervisor (the SDK)
@@ -25,7 +24,6 @@ remain consumer policy.
 
 from arm_control.multi_arm.interface import (
     ArmHandle,
-    BimanualInterface,
 )
 from arm_control.multi_arm.types import (
     ArmControlState,
@@ -41,7 +39,6 @@ __all__ = [
     "ArmControlState",
     "ArmHandle",
     "ArmPlan",
-    "BimanualInterface",
     "BimanualPlan",
     "BimanualState",
     "PairLifecycle",

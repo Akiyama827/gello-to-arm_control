@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 
 from arm_control.control.arm_controller import ArmController
-from arm_control.messages import pack_plan
+from arm_control.contracts.motion import pack_plan
 from arm_control.motion import JointServoCommand
 
 
@@ -93,7 +93,7 @@ def _controller(**kw) -> "ArmController":
 
 
 def _state(n: int = 7, vel: float = 0.0, pos: float = 0.0):
-    from arm_control.messages import pack_motor_state_dict
+    from arm_control.contracts.motor import pack_motor_state_dict
 
     return pack_motor_state_dict(
         {k: np.zeros(n) for k in

@@ -11,10 +11,6 @@
 # arm config, which is the canonical answer for whichever arm is loaded.
 include: [../../robots/fr3/control_mode.yaml]   # controller ceilings and gain presets, shared with real FR3 modes
 
-plant:
-  mode: command
-  listen_mode: false
-
 controller:
   # Runtime guards belong in the deployment config's execution_policy block.
   # Joint stiffness (N·m/rad). Matches arm.kp in the FR3 calibration.yaml —

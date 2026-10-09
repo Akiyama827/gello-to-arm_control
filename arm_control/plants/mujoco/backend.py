@@ -1882,7 +1882,7 @@ class MuJoCoBackend:
                      inhand_pose=None,
                      constraint_force=None, topology=None, gripper=None, ee_wrench=None, object_poses=objects or None)
         if self.scene_state is not None:  # a workcell world: the runtime overlay
-            from arm_control.messages import scene_state_payload
+            from arm_control.contracts.scene import scene_state_payload
             payload = scene_state_payload(self.scene_state)
             world.update(scene_revision=payload["revision"], attachments=payload["attachments"],
                          constraints=payload["constraints"], scene_state=payload)
@@ -2017,44 +2017,6 @@ class MuJoCoBackend:
                 continue
             out[name] = self.equality_reaction(name).tolist()
         return out
-
-    def release_constraint_if_force_exceeds(
-        self,
-        name: str,
-        axis_world,
-        threshold_n: float,
-    ) -> bool:
-        """Disable a named equality once its axial reaction exceeds a threshold."""
-        axis = np.asarray(axis_world, dtype=float).ravel()
-        norm = float(np.linalg.norm(axis))
-        threshold = float(threshold_n)
-        if axis.shape != (3,) or not np.isfinite(axis).all() or norm <= 0.0:
-            raise ValueError("axis_world must be a finite non-zero 3-vector")
-        if not np.isfinite(threshold) or threshold <= 0.0:
-            raise ValueError("threshold_n must be positive and finite")
-        if not self.constraint_active(name):
-            return False
-        axial = abs(float(self.equality_reaction(name)[:3] @ (axis / norm)))
-        if axial <= threshold:
-            return False
-        self.set_constraint(name, False)
-        return True
-
-    def aggregate_inertial(self, body_names: list[str]) -> dict[str, list[float] | float]:
-        self.load()
-        bodies = [self.data.body(name) for name in body_names]
-        masses = np.asarray([self.model.body_mass[body.id] for body in bodies])
-        mass = float(masses.sum())
-        if mass <= 0.0:
-            raise ValueError("aggregate bodies must have positive total mass")
-        com = sum((m * body.xipos for m, body in zip(masses, bodies)), np.zeros(3)) / mass
-        inertia = np.zeros((3, 3))
-        for m, body in zip(masses, bodies):
-            local = np.diag(self.model.body_inertia[body.id])
-            rot = body.ximat.reshape(3, 3)
-            delta = body.xipos - com
-            inertia += rot @ local @ rot.T + m * (delta @ delta * np.eye(3) - np.outer(delta, delta))
-        return {"mass": mass, "com": com.tolist(), "inertia": inertia.tolist()}
 
     # -- weld topology ----------------------------------------------------
     def _eq_id(self, name: str) -> int:

@@ -9,11 +9,11 @@ import numpy as np
 
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.doubles import _FakeExecutor
-from arm_control.messages import pack_motor_state, pack_plan, pack_control_update, unpack_controller_event
+from arm_control.contracts.motion import pack_plan, pack_control_update, unpack_controller_event
+from arm_control.contracts.motor import pack_motor_state
 from arm_control.multi_arm import (
     ArmPlan,
     BimanualPlan,
-    BimanualInterface,
 )
 from arm_control.multi_arm.coordinator import BimanualCoordinator
 from arm_control.control.inprocess import QueueControllerNode
@@ -214,9 +214,8 @@ def check_barrier_and_completion():
     h.settle()
     assert h.coord.lifecycle is P.COMPLETE and h.coord.pair_state().ok() is True
     refused(lambda: h.coord.stage_pair(p), "consumed")
-    robot = BimanualInterface(h.coord)
-    assert robot.left.arm_id == a and robot.right.arm_id == b
-    assert robot.state().arms()[b].position.shape == (6,)
+    assert tuple(h.coord.arms) == (a, b)
+    assert h.coord.state().arms()[b].position.shape == (6,)
 
 
 def check_rejections():
@@ -296,104 +295,11 @@ def check_lost_ack_and_fault():
     assert not h.controllers["fr3_1"]._running
 
 
-def check_topic_adapter():
-    from collections import deque
-    from arm_control.contracts.motion import (
-        pack_controller_event,
-        unpack_control_update,
-        unpack_controller_event,
-    )
-    from arm_control.contracts.multi_arm import pack_pair_plan, pack_pair_command
-    from arm_control.multi_arm.adapter import TopicArmHandle, run
-
-    h = Harness()
-    pair = h.pair()
-
-    class Node:
-        def __init__(self):
-            self.inputs, self.sent = deque(), []
-
-        def add(self, topic, value):
-            self.inputs.append(dict(type="INPUT", id=topic, value=value))
-
-        def next(self, timeout):
-            h.t += 0.001
-            return self.inputs.popleft() if self.inputs else dict(type="STOP")
-
-        def send_output(self, topic, value):
-            self.sent.append((topic, value))
-
-    node = Node()
-    for a, c in h.controllers.items():
-        node.add(
-            f"controller_event_{a}",
-            pack_controller_event(
-                kind="mode", reason="joint", runtime_state=c.runtime_state
-            ),
-        )
-        node.add(f"motor_state_{a}", measured(c.n_arm))
-    node.add(
-        "bimanual_plan",
-        pack_pair_plan(
-            pair_id=pair.pair_id,
-            plans={a: p.payload for a, p in pair.members().items()},
-        ),
-    )
-    for a, c in h.controllers.items():
-        plan_id = pair.members()[a].plan_id
-        node.add(
-            f"controller_event_{a}",
-            pack_controller_event(
-                kind="plan_staged",
-                plan_id=plan_id,
-                runtime_state=dict(c.runtime_state, plan_id=plan_id),
-            ),
-        )
-    node.add("bimanual_command", pack_pair_command(pair_id="pair", action="execute"))
-    run(node, list(h.controllers), clock=lambda: h.t)
-    for a, p in pair.members().items():
-        assert sum(t == f"plan_{a}" for t, _ in node.sent) == 1
-        controls = [
-            unpack_control_update(v) for t, v in node.sent if t == f"control_{a}"
-        ]
-        assert any(c.get("execute") == p.plan_id for c in controls)
-        assert any(c.get("cancel_plan_id") == p.plan_id for c in controls)
-
-    # Runtime heartbeats cannot freshen stale motor data; restart drops old q.
-    c = h.controllers["fr3_1"]
-    handle = TopicArmHandle(node, c.arm_id, clock=lambda: h.t)
-    event = unpack_controller_event(
-        pack_controller_event(
-            kind="mode", reason="joint", runtime_state=c.runtime_state
-        )
-    )
-    handle.observe_event(event)
-    handle.observe_motor_state(dict(position=np.zeros(9), velocity=np.zeros(9)))
-    assert len(handle.state().position) == 7
-    observed = handle.state().observed_at
-    h.t += 2
-    handle.observe_event(event)
-    assert handle.state().observed_at == observed
-    handle.observe_event(
-        dict(event, runtime_state=dict(c.runtime_state, session_id="new"))
-    )
-    assert handle.state().position is None
-    try:
-        pack_controller_event(
-            kind="mode", runtime_state=dict(c.runtime_state, armed="false")
-        )
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("malformed runtime heartbeat admitted")
-
-
 def main():
     check_barrier_and_completion()
     check_rejections()
     check_partial_release_and_cancellation()
     check_lost_ack_and_fault()
-    check_topic_adapter()
     print(
         "bimanual contract: PASS (7+6 DOF, ACK barrier, model/session/freshness, "
         "gain rejection, partial release, observed cancel, stale IDs, fault)"

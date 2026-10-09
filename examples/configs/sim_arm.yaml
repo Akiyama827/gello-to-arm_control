@@ -27,14 +27,8 @@ include:
 
 # --- Plant: MuJoCo, no libfranka, no FCI, no RT box -------------------------
 # WHICH plant runs is the LAUNCHER's choice, not a key here: the supervisor's
-# `--plant sim` (examples/run_console.py), and that is the whole switch. (Three keys
-# used to sit here pretending otherwise -- `real_backend: mujoco`,
-# `sim_backend: mujoco`, `listen_mode: true`. Nothing in this graph read any
-# of them, and `real_backend` is worse than inert: on a HARDWARE graph it
-# names the SocketCAN interface to open, so "mujoco" was an instruction to
-# open a CAN device by that name. `examples/run_console.py --self-check` now
-# refuses an entry key no code reads.)
-update_rate_hz: 100
+# `--plant sim` (examples/run_console.py), and that is the whole switch.
+# `examples/run_console.py --self-check` refuses an entry key no code reads.
 
 rerun_app_id: arm_control_sim_demo
 motor_log_path: /tmp/arm_control_sim_demo.csv

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 def child(kind: str, stop: str, directory: Path) -> None:
     import numpy as np
 
-    from arm_control.messages import pack_motor_state
+    from arm_control.contracts.motor import pack_motor_state
 
     class Node:
         polls = 0
@@ -50,10 +50,29 @@ def child(kind: str, stop: str, directory: Path) -> None:
             assert topic != "motor_command", "disarmed shutdown emitted motion"
 
     if kind == "logger":
+        # The trace logger of a supervised graph: one supervisor tick (trace/1) becomes one CSV row.
+        import arm_control.sdk
         from arm_control.viz import motor_state_logger as adapter
 
-        adapter._load_cfg = lambda: {"num_motors": 7,
-                                    "motor_log_path": str(directory / "state.csv")}
+        class Arm:
+            identity = SimpleNamespace(joint_names=[f"motor_{i}" for i in range(7)])
+            served = False
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def trace_samples(self, after):
+                z = [0.0] * 7
+                samples = [] if Arm.served else [dict(seq=1, pc_monotonic=1.0, q_rt=z, dq_rt=z, tau_meas_rt=z,
+                                                      q_cmd_pc=z, q_cmd_rt=z, dq_cmd_rt=z, tau_cmd_rt=z)]
+                Arm.served = True
+                return dict(samples=samples, latest_seq=1, dropped=0, errors=0)
+
+            def close(self):
+                pass
+
+        arm_control.sdk.ArmClient = Arm
+        adapter._load_cfg = lambda: {"rt": {"instance_id": "arm"}, "motor_log_path": str(directory / "state.csv")}
     elif kind == "replay":
         from arm_control.control import replay_adapter as adapter
 
@@ -116,7 +135,7 @@ def child(kind: str, stop: str, directory: Path) -> None:
         Node.next = next_connected
     adapter.Node = Node
     try:
-        adapter.main()
+        (adapter.trace_main if kind == "logger" else adapter.main)()
     finally:
         if kind == "hand":
             assert closed.is_set(), "Hand socket was not closed"

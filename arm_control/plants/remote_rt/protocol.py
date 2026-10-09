@@ -5,8 +5,8 @@ Hand-mirrored, byte-exact, enforced: ``python -m arm_control.plants.remote_rt.pr
 prints the same lines — ``rt_backend``'s ``_demo`` diffs them automatically.
 Any field change edits BOTH files in one commit and versions its packet variant.
 
-This module is a peer of ``messages.py``, not part of it: ``messages`` is the
-Dora-graph Arrow contract, this is the PC<->RT-machine UDP/TCP contract.
+This module is a peer of ``arm_control.contracts``, not part of it: ``contracts`` is
+the Dora-graph Arrow contract, this is the PC<->RT-machine UDP/TCP contract.
 """
 from __future__ import annotations
 

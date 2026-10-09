@@ -1,6 +1,5 @@
 # The simulated FR3 (single-model MuJoCo plant), stated once for the Dora plant node and the supervisor's simulated link.
 sim_model_path: franka/urdf/fr3.urdf
-sim_update_rate_hz: 100
 # 0.5 ms (operator decision 2026-10-06). The joint-7 instability that prompted it had a second cause, found in review: this
 # single-model plant lacked the arm's reflected rotor inertia that the workcell plant always applied (ARM_ARMATURE 0.1, Franka's
 # own published MJCF value); `sim_armature` states it for the FR3 (other robots keep their description's own, default 0). Measured on the FR3 wrist (mass-matrix diagonal ~0.0018 kg m^2): without

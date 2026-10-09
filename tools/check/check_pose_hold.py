@@ -7,7 +7,8 @@ import numpy as np
 from arm_control.contracts.impedance import pose_hold_values, unpack_pose_hold_values
 from arm_control.contracts.motor import pack_motor_command
 from arm_control.control.doubles import _controller, _plan_msg, _state
-from arm_control.messages import pack_control_update, unpack_motor_command, pack_jog
+from arm_control.contracts.motion import pack_control_update, pack_jog
+from arm_control.contracts.motor import unpack_motor_command
 
 
 def contract():

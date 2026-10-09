@@ -13,7 +13,6 @@ arm:
 franka:
   gripper:
     open_width_m: 0.075
-hardware_update_rate_hz: 100
 viz_publish_rate_hz: 60
 rerun_fk_rate_hz: 30
 rerun_plot_window_s: 10.0
