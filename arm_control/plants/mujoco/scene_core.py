@@ -298,7 +298,7 @@ class SharedWorld:
         self.core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
         self.lock = threading.Lock()
         self.last: dict | None = None  # the backend state after the last step
-        self.last_step_t: float | None = None  # when the host last stepped the world, on the world clock (pauses excluded)
+        self.host_steps = 0  # how many times the host has stepped the world
         # (seconds the world has been paused for scene changes, start of the change in progress or None): ONE attribute, so a
         # reader on another thread never sees a finished pause counted twice
         self._pause = (0.0, None)
@@ -312,8 +312,8 @@ class SharedWorld:
             self._pause = (paused, started)
             try:
                 return self.core.apply_scene(request)
-            finally:
-                self._pause = (paused + time.monotonic() - started, None)
+            finally:  # what clock() excused, no more: a pause past the cap must not turn the clock back when it ends
+                self._pause = (paused + min(time.monotonic() - started, PAUSE_EXCUSE_MAX_S), None)
 
     def stalled(self, now: float) -> float:
         """Seconds the world has been paused by the scene change in progress (0 when none is), at most PAUSE_EXCUSE_MAX_S:
@@ -328,10 +328,6 @@ class SharedWorld:
         now = time.monotonic()
         paused, _ = self._pause
         return now - paused - self.stalled(now)
-
-    def stepped_within(self, seconds: float) -> bool:
-        """Whether the host stepped the world in the last ``seconds`` of world time (every pause for a scene change excused)."""
-        return self.last_step_t is not None and self.clock() - self.last_step_t <= seconds
 
 
 class ScenePlant:
@@ -366,6 +362,9 @@ class ScenePlant:
         self.shared, self.host = shared, bool(host)
         self._core = shared.core
         self._driven = False  # a co-host: its supervisor has written a non-release command
+        # a co-host: the world's idle timeout in this actor's own steps (25 at 250 Hz and 0.1 s)
+        self._max_unstepped = max(1, int(np.ceil(idle_timeout / period)))
+        self._host_seen, self._unstepped = 0, 0
 
     @classmethod
     def from_config(cls, cfg, joints: list, *, period: float) -> "ScenePlant":
@@ -387,7 +386,10 @@ class ScenePlant:
 
     @cached_property  # first read at SimLink.open, the world loaded: the EE chain never changes, and a recompile must not race it
     def supports_cartesian(self) -> bool:
-        """The world's EE chain is this actor's: a Cartesian spec from it drives its own arm, never another actor's."""
+        """The world's EE chain is this actor's: a Cartesian spec from it drives its own arm, never another actor's. A co-host
+        takes joint commands only (refused at admission, not at the step)."""
+        if not self.host:
+            return False
         mine = set(list(self.backend.joint_names)[self._span])
         return bool(self.backend.supports_cartesian and set(self.backend.ee_chain_joints) <= mine)
 
@@ -409,15 +411,22 @@ class ScenePlant:
             now = time.monotonic()  # inside the lock: a step that waited out a pause must not write a pre-pause time
             if self.host:
                 self._core.set_slice(self.actor, dict(command, cartesian=command.get("cartesian")), now)
-                self.shared.last, self.shared.last_step_t = self._core.tick(now), self.shared.clock()
+                self.shared.last = self._core.tick(now)
+                self.shared.host_steps += 1
                 return self._mine(self.shared.last)
-            if self.shared.last_step_t is None:  # the host has not stepped yet (start-up): nothing to fail, nothing to write
+            if self.shared.host_steps == 0:  # the host has not stepped yet (start-up): nothing to fail, nothing to write
                 return self._mine(self.backend.motor_state())
             if command.get("cartesian") is not None:
                 raise ValueError("a co-hosted actor takes joint commands only (the world's Cartesian law is the host's)")
-            # A co-host whose world has stopped stepping (the host failed or is gone) is a failed plant, not a fresh one.
-            if not self.shared.stepped_within(self._core.idle_timeout):
-                raise RuntimeError("the hosting actor has not stepped the world")
+            # A co-host whose world has stopped stepping (the host failed or is gone) is a failed plant, not a fresh one. Counted
+            # in this actor's OWN steps, not in time: a stall of the whole process (GC, descheduling) stops both servo threads
+            # alike and must not fault anyone; this many co-host steps with no host step proves the host alone stopped.
+            if self.shared.host_steps != self._host_seen:
+                self._host_seen, self._unstepped = self.shared.host_steps, 0
+            else:
+                self._unstepped += 1
+                if self._unstepped > self._max_unstepped:
+                    raise RuntimeError(f"the hosting actor has not stepped the world in {self._unstepped} of this actor's steps")
             # Until its supervisor first drives it, a co-hosted actor keeps the world's spawn hold: SimLink's disarmed release
             # word would otherwise drop it limp from start-up to the first ARM (the base has no gravity compensation).
             released = not any(np.any(command[k]) for k in ("kp", "kd", "torque"))

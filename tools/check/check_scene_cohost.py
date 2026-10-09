@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -166,6 +167,29 @@ def in_process(host_path, peer_path) -> None:
         changes.join()
         core._log = print
         assert not zeroed, zeroed
+        # A stall of the whole process (descheduling, GC) stops every servo alike: nobody faults (review 2: a time-based
+        # dead-host rule latched the co-host on a 150 ms stall, for the rest of the run).
+        for _ in range(3):
+            subprocess.run(["sh", "-c", f"kill -STOP {os.getpid()}; sleep .25; kill -CONT {os.getpid()}"], check=True)
+            time.sleep(.1)
+        assert not peer.latest_state()[0].faulted and not host.latest_state()[0].faulted, (
+            peer.motor_health()["latched_fault"], host.motor_health()["latched_fault"])
+        # A pause past the excuse cap stalls the plant but never turns the world clock back when it ends.
+        from arm_control.plants.mujoco import scene_core
+        cap, scene_core.PAUSE_EXCUSE_MAX_S = scene_core.PAUSE_EXCUSE_MAX_S, .1
+        try:
+            change = threading.Thread(target=pause, args=(shared, .3))
+            change.start()
+            time.sleep(.2)
+            before = shared.clock()
+            change.join()
+            assert shared.clock() >= before, (shared.clock(), before)
+        finally:
+            scene_core.PAUSE_EXCUSE_MAX_S = cap
+        for link in (host, peer):  # the over-cap pause may fairly fault a link; clear it as an operator would
+            link.safe_stop()
+            link.enable_all()
+        time.sleep(.3)
         assert not peer.latest_state()[0].faulted and not host.latest_state()[0].faulted, (peer.motor_health()["latched_fault"], host.motor_health()["latched_fault"])
         sim_t = shared.backend.data.time
         driven.pop(peer)
@@ -190,7 +214,8 @@ def in_process(host_path, peer_path) -> None:
             peer.close()
         host.close()
     print("co-host in process: two links, one world, each tracks its own slice; a co-host keeps its spawn hold until driven; a "
-          "scene change pauses the world clock and no slice deadman; a stopped world faults its co-host; the co-host never "
+          "scene change pauses the world clock and no slice deadman; process stalls fault nobody; the clock never runs back; "
+          "a stopped world faults its co-host; the co-host never "
           "steps or closes it: PASS", flush=True)
 
 

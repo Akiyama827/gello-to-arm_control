@@ -101,8 +101,25 @@ Review round 1 (opus): BLOCK, fixed:
   - the host closes the world under its lock;
   - a co-host whose start fails is closed before the world;
   - the stale sim_bridge pointer is fixed;
-  - the sim base states MuJoCo's joint ranges (`prepare_model(joint_limits=True)`);
+  - the sim base's body list states MuJoCo's joint ranges (`prepare_model(joint_limits=True)`; no admission envelope, see round 2);
   - records corrected (below, the migrations doc, the track list).
+
+Review round 2 (opus): BLOCK, fixed:
+* MUST: the co-host's dead-host rule was time-based (0.1 s of world time), so a 150 ms stall of the whole process faulted the
+  co-host for the rest of the run (in sim the base is ARMed once). It now counts the co-host's OWN steps since the host's
+  last step and faults past the world's idle timeout in those steps (25 at 250 Hz). A process-wide stall stops both servos
+  alike. The check stalls the process three times for 0.25 s (SIGSTOP), and no link faults.
+* SHOULD: a pause past the 5 s cap turned the world clock back when it ended (the full pause was added, the capped one was
+  excused). Only the capped part is added now; the check pauses past a lowered cap and asserts the clock never runs back.
+* NITs:
+  - a co-host's `supports_cartesian` is False, so a Cartesian request is refused at admission, not as a plant fault at the
+    step;
+  - corrected below: the sim base's staged ranges set NO policy position envelope (the module joint is unbounded and
+    `build_execution_policy` bounds only all-finite tables). The ranges are recorded on the model, nothing else reads them.
+* Known, not changed:
+  - `arm.state()` validity (`robot_state`, `rt.state_timeout_s` 0.5 s) is not pause-excused, so a pause over 0.5 s would show
+    no q to SDK readers (base_client's base_health) for its length. Harmless at today's 0.35 s.
+  - `_plant_failed` dates its failure sample with the pre-step time (cosmetic).
 
 OPEN:
 * `BaseDriver`'s in-process executor and `base_command` path have no node any more. They stay as the self-checked decision core
