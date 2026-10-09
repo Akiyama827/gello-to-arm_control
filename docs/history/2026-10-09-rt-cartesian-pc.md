@@ -58,3 +58,20 @@ found no collision-free goal branch" for the perception pregrasp (base [0.379, 0
 The sideways pregrasp at the bench's PROPOSED module placement folds the FR3 onto its own base. Owner: operator (bench scenario
 geometry). Blocking: the dock leg cannot be reached in sim, so the K_c 1000 seat error is unmeasured, and step 2c (sim_bench
 under the supervisor) cannot run end to end until the placement or the grasp approach changes.
+
+Bench pick, investigated after the operator delegated the fix (2026-10-09); all changes REVERTED, findings only. Owner: the
+bench task (project), decisions marked. Blocking: the sim dock re-measure and step 2c's end-to-end run.
+1. Pregrasp: the CAD-registered mount (scene v3, 2026-08-06) sits 7 cm nearer the module than the 2026-07-30 placement SWEEP
+   assumed (pick radius 0.479 vs 0.55). Moving module, pedestal and fallback targets 7 cm along world -y (r 0.549) gives 28/28
+   collision-free pregrasp branches (0/14 before) and the leg plans and executes end to end. Config-only; the placement is
+   PROPOSED, so it is a bench decision.
+2. Grasp: FR3 #1's description carries the wrist camera (fr3_gemini305 + holder, added with the model bundles after the sweep).
+   In the sideways grasp it hangs below the hand and hits the 8 x 8 cm pedestal (0/32 grasp branches free). Raising pedestal and
+   module together does not help (the camera keeps its offset); a pedestal reaching only 1 cm toward the arm from the module's
+   centre clears it by 3 mm, which is not a fixture. This applies to the real arm too: the side grasp needs a fixture designed
+   around the camera, or another grasp. Decision: fixture design / grasp.
+3. A 180 deg grasp roll (camera on top; parallel jaws are symmetric) plans the pregrasp, but the twin's wrist then never settles
+   (joint 7 0.26 rad off and moving at 0.2 rad/s after the 5 s settle; fingers at 3-14 mm, 70-86 N while idle; the plant falls
+   behind wall clock). Unverified cause; consistent with the open item "no armature on the composed bench arm" (the
+   single-model FR3 showed the same joint-7 instability before `sim_armature`). The roll also changes the in-hand pose the dock
+   ladder was swept for. Decision: armature on the composed arm (own item), then whether to roll.
