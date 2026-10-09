@@ -48,7 +48,7 @@ def main() -> None:
     from arm_control.config import load_robot_config
     from arm_control.messages import pack_json_message
     from arm_control.node_utils import ShutdownFlag, install_signal_handlers, next_event_gil_friendly
-    from arm_control.sdk import ArmClient
+    from arm_control.sdk import ArmClient, SupervisorError
 
     shutdown = ShutdownFlag()
     install_signal_handlers(shutdown)
@@ -57,8 +57,8 @@ def main() -> None:
         raise SystemExit("config has no rt.instance_id: this node observes one supervised world")
     arm = ArmClient(instance_id, socket_path=os.environ.get("ARM_CONTROL_SOCKET") or None)
     node, observer, last = Node(), SceneObserver(), 0.0
-    print(f"[scene_observer] {instance_id}: observe/1 at {arm.observe(0, 1)['rate_hz']:g} Hz", flush=True)
     try:
+        print(f"[scene_observer] {instance_id}: observe/1 at {arm.observe(0, 1)['rate_hz']:g} Hz", flush=True)
         while not shutdown.stop_requested:
             event = next_event_gil_friendly(node)
             if event is not None and event["type"] == "STOP":
@@ -69,6 +69,8 @@ def main() -> None:
             last = now
             for topic, body in observer.messages(arm.observe(observer.cursor), now):
                 node.send_output(topic, pack_json_message(topic, body))
+    except (SupervisorError, OSError, TimeoutError) as exc:  # a refused observe/1 (Refused) or a vanished supervisor
+        raise SystemExit(f"[scene_observer] {instance_id}: the world is no longer observable: {exc}") from None
     finally:
         arm.close()
 

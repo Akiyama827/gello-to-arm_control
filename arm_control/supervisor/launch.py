@@ -41,30 +41,32 @@ def start_supervisor(config: Path, env: dict, *, overlays=(), control_mode: Path
         start_new_session=True)  # its own session: a Ctrl-C reaches the graph, and the supervisor outlives it long enough to be stopped after
     proc._workdir, proc._log = workdir, log
     deadline = time.monotonic() + timeout_s
-    while True:
-        if proc.poll() is not None:
-            raise RuntimeError(f"the supervisor exited ({proc.returncode}); see {workdir / 'supervisor.log'}")
-        if stopped():
-            stop_supervisor(proc)
-            raise RuntimeError("stopped while the supervisor was starting")
-        if time.monotonic() > deadline:
-            stop_supervisor(proc)
-            raise RuntimeError(f"the supervisor did not come up; see {workdir / 'supervisor.log'}")
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            probe.connect(str(sock))
-            break
-        except OSError:
-            time.sleep(0.2)
-        finally:
-            probe.close()
+    try:
+        while True:
+            if proc.poll() is not None:
+                raise RuntimeError(f"the supervisor exited ({proc.returncode}); see {workdir / 'supervisor.log'}")
+            if stopped():
+                raise RuntimeError(f"stopped while the supervisor was starting; see {workdir / 'supervisor.log'}")
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"the supervisor did not come up in {timeout_s:g} s; see {workdir / 'supervisor.log'}")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(str(sock))
+                break
+            except OSError:
+                time.sleep(0.2)
+            finally:
+                probe.close()
+    except BaseException:  # a failure or an interrupt (Ctrl-C) mid-start: never leave it running, keep the log it names
+        stop_supervisor(proc, keep_log=True)
+        raise
     print(f"[supervisor] up on {sock} (config {merged_path})", flush=True)
     return proc, dict(env, ARM_CONTROL_CONFIG=str(merged_path), ARM_CONTROL_SOCKET=str(sock))
 
 
-def stop_supervisor(proc) -> None:
+def stop_supervisor(proc, *, keep_log: bool = False) -> None:
     """SIGTERM (the supervisor DISARMs the plant on the way out), then kill if it does not stop. Safe with None and twice. A clean
-    stop removes its work directory; a failure keeps its log."""
+    stop removes its work directory unless ``keep_log``; a failure always keeps it."""
     if proc is None:
         return
     if proc.poll() is None:
@@ -77,7 +79,7 @@ def stop_supervisor(proc) -> None:
         proc._log.close()
     except Exception:  # noqa: BLE001
         pass
-    if proc.returncode in (0, -signal.SIGTERM):
+    if proc.returncode in (0, -signal.SIGTERM) and not keep_log:
         import shutil
 
         shutil.rmtree(proc._workdir, ignore_errors=True)
