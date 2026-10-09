@@ -344,6 +344,11 @@ class ArmClient:
         return _dec(codec.controller_state_from, self._controller_call(
             'controller_select', preset_id=preset_id))
 
+    def hold(self, reason: str = 'hold'):
+        """Stop whatever runs (executions, a setpoint) and hold the measured pose, still ARMed; clears the hold a failed settle
+        freezes in. Returns the controller state."""
+        return _dec(codec.controller_state_from, self._controller_call('controller_hold', reason=reason))
+
     def set_payload(self, payload):
         return _dec(codec.payload_state_from, self._controller_call(
             'controller_payload', payload=codec.encode(payload)))

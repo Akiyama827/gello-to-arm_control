@@ -47,6 +47,8 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
             return enc(runtime.controller_state())
         if op == 'controller_select':
             return enc(runtime.select_control_preset(session, str(args['preset_id'])))
+        if op == 'controller_hold':
+            return enc(runtime.hold(session, str(args.get('reason') or 'hold')))
         if op == 'controller_payload':
             return enc(runtime.set_payload(session, codec.payload_from(args['payload'])))
     if op.startswith('stream_'):

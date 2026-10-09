@@ -398,7 +398,7 @@ class ArmController:
 
     def jog_refusal(self) -> str | None:
         """Why a jog would be dropped now (None = it would be taken). Pure."""
-        return ("stopped" if self.stopped else "frozen (cancel to clear)" if self.frozen
+        return ("stopped" if self.stopped else "frozen after a failed settle (cancel/hold, or DISARM, clears it)" if self.frozen
                 else "not armed" if not self.armed else "no fresh measured pose since ARM" if not self.ready_sent
                 else "Soft (pose hold) is selected" if self._pose_hold is not None
                 else "a plan is running" if self._running else None)

@@ -261,6 +261,36 @@ def main():
         assert failed and failed[0]['ok'] is False and 'superseded by a jog' in failed[0]['reason'], failed
         # a target beyond the policy's abort_pos_err_rad (0.35 here) is refused, not taken and then dropped by the controller
         refused(np.asarray(arm.state().q) + [.5, 0, 0], 'abort_pos_err_rad')
+        # a failed settle freezes the controller (a completion goal the plan never reaches): setpoints and plans are refused until
+        # the console's Stop (an untargeted cancel) clears it through the supervisor (`hold`), still ARMed -- as in-process
+        qf = np.asarray(arm.state().q)
+        frozen_plan = pack_plan(plan_id='f1', phase='move', gated=False, times=[0., .5], positions=np.stack([qf, qf]),
+                                velocities=np.zeros((2, 3)), kp=KP.tolist(), kd=KD.tolist(),
+                                completion=dict(vel_tol=.05, goal_q=(qf + [.1, 0, 0]).tolist(), residual_max=.005))
+        bridge.on_plan(frozen_plan)
+        pump(lambda: [e for e in cap.events('leg_result') if e['plan_id'] == 'f1'], 'leg_result f1 (settle timeout)', 15.)
+        assert [e for e in cap.events('leg_result') if e['plan_id'] == 'f1'][0]['ok'] is False
+        refused(qf, 'frozen')
+        unfrozen, supervisor_hold = [], arm.hold
+        arm.hold = lambda reason='hold': (unfrozen.append(reason), supervisor_hold(reason))[1]
+        bridge.on_control(pack_control_update(cancel=True, reason='operator'))
+        assert arm.setpoint(np.asarray(arm.state().q)) > 0 and handle.state().armed, 'Stop did not clear the frozen hold'
+        bridge.on_control(pack_control_update(hold=True, reason='milestone'))  # the planner's milestone hold never unfreezes
+        assert unfrozen == ['operator'], unfrozen
+        bridge.on_control(pack_control_update(cancel=True, arm=False, reason='disarm'))  # the console's DISARM: no unfreeze RPC first
+        assert unfrozen == ['operator'], f'a DISARM waited on the unfreeze: {unfrozen}'
+        pump(lambda: not handle.state().armed and bridge._armed_sent is False, 'the DISARM edge')
+        bridge.on_control(pack_control_update(arm=True))
+        pump(lambda: handle.state().armed and bridge._armed_sent, 'ARMed again')
+        end = time.monotonic() + 5.
+        while True:  # a fresh pose since the new ARM
+            try:
+                arm.setpoint(np.asarray(arm.state().q))
+                break
+            except Refused as exc:
+                assert 'fresh measured pose' in str(exc) and time.monotonic() < end, exc
+                time.sleep(.02)
+        time.sleep(.5)
         # the gripper is not served by an arm supervisor: refused with a notice, a burst makes one notice
         before = len(cap.events('mode'))
         for _ in range(5):
@@ -277,8 +307,10 @@ def main():
         # stop: cancel and DISARM
         bridge.on_control(pack_control_update(stop=True, reason='operator stop'))
         pump(lambda: not handle.state().armed and bridge._armed_sent is False, 'the DISARM edge')
+        assert unfrozen == ['operator'], f'stop called the supervisor hold (its DISARM cancels): {unfrozen}'
         assert not arm.authority().arm_epoch
-        assert [unpack_json_message(v)['armed'] for t, v in cap.out if t == 'arm'] == [False, True, False]
+        # start, ARM, the DISARM-button test and its re-ARM, then stop
+        assert [unpack_json_message(v)['armed'] for t, v in cap.out if t == 'arm'] == [False, True, False, True, False]
         refused(reached, 'not armed')
         # an owner that leaves takes its setpoint with it: the arm holds where it is, not at the departed owner's target
         arm.arm()

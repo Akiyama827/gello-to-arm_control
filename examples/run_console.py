@@ -32,8 +32,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from arm_control.supervisor.launch import start_supervisor, stop_supervisor  # noqa: E402  (after the path bootstrap)
 
+# One arm: the FR3 through its SUPERVISOR over a simulated plant (CTRL-053; the in-process controller graph is retired).
 SINGLE = REPO_ROOT / "dataflows" / "sim_franka_motion.yml"
-SUPERVISED = REPO_ROOT / "dataflows" / "sim_franka_motion_supervised.yml"
 SUPERVISED_PROFILE = REPO_ROOT / "examples" / "profiles" / "sim_supervised.yaml"
 MODE_PROFILE = REPO_ROOT / "examples" / "profiles" / "motion_franka.yaml"
 PAIR_CONFIG = REPO_ROOT / "examples" / "configs" / "dual_arm.yaml"
@@ -119,8 +119,6 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=7520, help="dual console loopback port")
     parser.add_argument("--check", action="store_true",
                         help="report readiness and exit, launching nothing")
-    parser.add_argument("--supervised", action="store_true",
-                        help="the arm's SUPERVISOR is the control authority (over the same MuJoCo plant): starts it with the graph")
     parser.add_argument("--no-viewer", action="store_true", help="do not start a Rerun viewer (headless runs)")
     args = parser.parse_args()
 
@@ -141,7 +139,7 @@ def main() -> int:
 
     ready, hint = assets_ready()
     config = args.config if args.config.is_absolute() else REPO_ROOT / args.config
-    graph = SUPERVISED if args.supervised else SINGLE
+    graph = SINGLE
 
     if args.check or not ready:
         print(f"config: {config}  {'ok' if config.is_file() else 'MISSING'}")
@@ -195,13 +193,12 @@ def main() -> int:
 
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _stop)
-    if args.supervised:
-        try:
-            supervisor, env = start_supervisor(config, env, overlays=(SUPERVISED_PROFILE,), control_mode=MODE_PROFILE,
-                                               cwd=REPO_ROOT, stopped=lambda: bool(stopped_by))
-        except RuntimeError as exc:
-            print(f"[run_console] {exc}", file=sys.stderr)
-            return 128 + stopped_by[0] if stopped_by else 1
+    try:
+        supervisor, env = start_supervisor(config, env, overlays=(SUPERVISED_PROFILE,), control_mode=MODE_PROFILE,
+                                           cwd=REPO_ROOT, stopped=lambda: bool(stopped_by))
+    except RuntimeError as exc:
+        print(f"[run_console] {exc}", file=sys.stderr)
+        return 128 + stopped_by[0] if stopped_by else 1
     if stopped_by:
         stop_supervisor(supervisor)
         return 128 + stopped_by[0]
@@ -307,8 +304,7 @@ def _terminate_graph(proc, grace_s: float = 8.0) -> None:
 
 def _self_check() -> None:
     """The launcher's own claims: the files it points at have to exist."""
-    assert SINGLE.is_file(), SINGLE
-    assert SUPERVISED.is_file() and SUPERVISED_PROFILE.is_file() and MODE_PROFILE.is_file()
+    assert SINGLE.is_file() and SUPERVISED_PROFILE.is_file() and MODE_PROFILE.is_file(), SINGLE
     assert PAIR_CONFIG.is_file(), PAIR_CONFIG
     assert OBJECT_CONFIG.is_file(), OBJECT_CONFIG
     assert DEFAULT_CONFIG.is_file(), DEFAULT_CONFIG
