@@ -52,3 +52,19 @@ Checks:
   `plants/base.py`.
 * Rebuilt `rt/build-offline` (the stale `hand_bridge` / `hand_dm_selfcheck` binaries removed).
 * `ruff`.
+
+Review round 1 (opus): ACCEPT, 3 SHOULDs taken:
+* Record SHAs filled at merge.
+* `hand_bridge_selfcheck` builds only `WITH_FRANKA` again (pre-A2), so the offline suite, configured `WITH_FRANKA=OFF`, no
+  longer runs it. A scratch build `WITH_FRANKA=ON` against the local libfranka passed (hand_bridge built,
+  `hand_bridge_selfcheck` PASS). Open: put a `WITH_FRANKA` build into the offline suite. Until then the track list's
+  FR3-Hand rebuild row covers it.
+* The project launcher refuses a bare `run.py real`: a hardware graph is always named.
+NITs taken: stale comments (`node_utils`, `dm_read_params`, project docs and configs); `sim modular` no longer needs the
+FR3 description staged.
+
+FAIL, not this slice: the library suite's `console_graphs` (`arm_console.py --self-check`: "no arm_controller found in
+any graph") fails identically at `c9ed6e4`. The earlier CTRL-053 slices moved the library graphs onto supervisors; that
+self-check still looks for the retired in-process controller.
+* Owner: the CTRL-053 graph-retirement follow-up (point it at `supervised_arm`, or retire it).
+* Blocking: it blocks no merge, but the library suite stays red until then.

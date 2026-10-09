@@ -40,8 +40,7 @@ class canfd_frame(ctypes.Structure):
     ]
 
 
-# linux/can.h — same values (and the same hard-won ordering) as
-# arm_control/plants/dm/socketcan.py. DM motors reply FD/BRS, so a
+# linux/can.h values. DM motors reply FD/BRS, so a
 # reader without CAN_RAW_FD_FRAMES sees silence, not an error.
 CANFD_BRS, CANFD_ESI, CANFD_FDF = 0x01, 0x02, 0x04
 
