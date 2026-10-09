@@ -12,8 +12,8 @@ unchanged, so the profile is a generic controller profile, base-frame, with noth
   does not offer the profile, so a Cartesian request to it is refused, never silently run as joints).
 * Supervisor (`supervisor/runtime.py`): `offered_profiles(link, native=..., cartesian_kp_min=...)` -- `cartesian_impedance` when
   the link runs the law (`supports_cartesian`: the RT client from the IDENTITY bit, SimLink from its plant), the supervisor is
-  not on the native reference, and the robot's policy states the joint-kp floor (review round 1). The generic `admission_refusal` then refuses it everywhere else ("controller profile 'cartesian_impedance' not
-  offered"). Admission passes `request.cartesian.spec()` into the controller's plan, where `ExecutionPolicy` applies the joint
+  not on the native reference, and the robot's policy states the joint-kp floor (review round 1). The generic
+  `admission_refusal` then refuses it everywhere else ("controller profile 'cartesian_impedance' not offered"). Admission passes `request.cartesian.spec()` into the controller's plan, where `ExecutionPolicy` applies the joint
   kp floor (supervisors always have a policy).
 * SDK handle (`multi_arm/supervised.plan_request`, hence `SdkArmHandle` and `DoraArmBridge`): a plan's base-frame `cartesian`
   spec becomes the profile instead of being refused; a spec without `frame: base` is refused.
@@ -35,14 +35,15 @@ Checks (related only):
   `check_arm_controller`; ruff.
 
 Review round 1: ACCEPT. Taken:
-* (SHOULD) "Streamed only" rested on one guard, and no check pinned it where it is wired: removing both native guards let the
-  dual fixture ADMIT a Cartesian member on the native path, whose upload is joints only. Now also refused at submission, first,
+* (SHOULD) "Streamed only" rested on one guard, and no check pinned it where it is wired: removing both conditions in
+  `offered_profiles` (`supports_cartesian` and native) let the dual fixture ADMIT a Cartesian member on the native path, whose upload is joints only. Now also refused at submission, first,
   with its own reason ("Cartesian legs are streamed only; this supervisor plays the native reference"); `check_dual_supervisor`
   pins that reason (its fixture runs --enable-reference; the old comment blaming the fake server's missing law was wrong).
   Mutant "no submission guard" caught. Remaining survivor, accepted: `start()` passing native=False into `offered_profiles`
   only changes what is advertised; the submission guard still refuses.
 * (SHOULD) The profile was advertised on a robot whose policy has no `cartesian_kp_min`, where every such request is refused:
-  now not offered (checked).
+  now not offered (unit-checked on `offered_profiles`; a wrong floor passed at `start()` would only change what is advertised:
+  the controller's policy still refuses).
 * `law_pc`: the check now reads the 64-tick ring DURING the leg (no lost ticks, > 100 executing ticks all
   cartesian_impedance, every later tick joint) and covers a Cartesian plan staged ON_RELEASE while the arm holds (its hold
   words are the joint law). Mutant "law from the loaded plan, not the word sent" caught. `last_law` is the last word SENT (after
@@ -50,3 +51,7 @@ Review round 1: ACCEPT. Taken:
 * `plan_request` validates a dict spec's exact keys (`cartesian_values`): an extra world-frame `pose` or a non-mapping is refused
   as ValueError (checked), not dropped or raised as AttributeError.
 * `cartesian_values` reports a flat or scalar matrix/gain as ValueError (was TypeError); checked.
+
+Review round 2: ACCEPT (m1 accepted as advertising-only: `_submit` is the only admission path and its guard refuses; m2, m4,
+m12 caught by `check_sim_supervisor`; "no submission guard" caught by `check_dual_supervisor`; related checks pass). Wording
+nits above taken.
