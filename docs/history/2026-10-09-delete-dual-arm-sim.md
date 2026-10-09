@@ -9,3 +9,5 @@ Deleted: `dataflows/dual_arm_sim.yml`, `examples/configs/sim_arm_b.yaml` (its se
 run_console self-check's port comparison against it; RUNBOOK says so. Project: `configs/entries/sim_console_demo_b.yaml` (the same
 second instance, for that graph only) and its allow-list entries. Checks: `check_dataflows` (8 library graphs), run_console
 `--self-check`; project `check_config_duplicates`, `check_dataflows`.
+
+Review: ACCEPT. Taken: the RUNBOOK's reason is scoped (supervisors isolate arms on hardware; the sim `--dual` console is one process, so sim process isolation is no longer exercised). Named: nothing asserts distinct console ports across the real arm configs (run_console's port probe catches a collision at launch only).

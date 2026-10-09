@@ -346,9 +346,11 @@ PYTHONPATH=. python -B tools/check/check_refinement.py
 ```
 
 `--dual` selects the shared-world console above. (The older two-independent-
-worlds graph `dual_arm_sim.yml` was deleted 2026-10-09, operator decision: each
-arm runs on its own supervisor, a separate process, so process isolation is no
-longer a separate graph.)
+worlds graph `dual_arm_sim.yml` was deleted 2026-10-09, operator decision. It
+exercised the retired in-process controller path; on hardware each arm runs on its
+own supervisor, a separate process. The sim `--dual` console runs both arms in one
+process, so sim process isolation is not exercised; a second isolated sim arm needs
+its own instance config.)
 
 ### Hand Grasp / Open
 
