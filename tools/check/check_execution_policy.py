@@ -374,6 +374,14 @@ def check_measured_outside():
     assert policy.command_valid(hold(-1.01), 7, c._where_been())
     assert not policy.command_valid(hold(-1.02), 7, c._where_been())    # a new ARM grants nothing from before it
 
+    # Resting past its LOWER limit widens only that side: a traverse past the upper limit grants nothing there.
+    c, clock, policy = controller()
+    feed(c, clock, -1.02)
+    clock[0] += .01
+    c.on_motor_state(state(1.003))
+    assert not policy.command_valid(hold(1.003), 7, c._where_been())
+    assert policy.command_valid(hold(-1.02), 7, c._where_been())
+
     # Inside at ARM: an overshoot past the limit while armed widens nothing (no ratchet).
     c, clock, policy = controller()
     feed(c, clock, -.99)

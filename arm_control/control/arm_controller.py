@@ -1013,16 +1013,17 @@ class ArmController:
     # -- outputs -------------------------------------------------------------
     def _where_been(self) -> np.ndarray | None:
         """The poses the position envelope widens to (rows), operator 2026-10-09 "never further out": per joint, where it
-        rested at ARM if that was inside the envelope (so nothing widens), else the outermost pose it has been at since
-        ARM (it rests on its stop: holds re-anchoring at the measured pose, and samples a command was built from as it
+        rested at ARM if that was inside the envelope (so nothing widens), else -- on the side it rests past -- the outermost
+        pose it has been at since ARM (it rests on its stop: holds re-anchoring at the measured pose, and samples a command was built from as it
         creeps back in, lie there). None while disarmed or before the first sample: the envelope as configured."""
         policy = self.execution_policy
         if not self.armed or self._arm_pose is None or policy is None or policy.position_lower is None:
             return None
         rest = self._arm_pose
-        outside = (rest < policy.position_lower) | (rest > policy.position_upper)
         been = self._been if self._been is not None else np.vstack([rest, rest])
-        return np.vstack([np.where(outside, been[0], rest), np.where(outside, been[1], rest)])
+        # per SIDE: a joint resting past its lower limit never gains anything past its upper one
+        return np.vstack([np.where(rest < policy.position_lower, been[0], rest),
+                          np.where(rest > policy.position_upper, been[1], rest)])
 
     def envelope_band(self):
         """``(lower, upper)`` every command and setpoint must stay inside, or None without a position envelope."""
@@ -1125,8 +1126,10 @@ class ArmController:
             self._disarm_reset()
         if armed and not self.armed:
             # the pose it rests at as it ARMs (the hold anchors there); none yet: the first sample after
+            fresh = (self._last_state_at is not None and self.execution_policy is not None
+                     and self._clock() - self._last_state_at <= self.execution_policy.state_timeout_sec)
             self._arm_pose = (np.asarray(self.last_state.position, dtype=float).copy()
-                              if self._last_state_at is not None and np.isfinite(self.last_state.position).all() else None)
+                              if fresh and np.isfinite(self.last_state.position).all() else None)
             self._arm_pose_fixed = False
             self._been = None if self._arm_pose is None else np.vstack([self._arm_pose, self._arm_pose])
         self.armed = armed

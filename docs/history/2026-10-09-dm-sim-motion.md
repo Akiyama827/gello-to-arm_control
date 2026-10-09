@@ -38,7 +38,8 @@ served over the hand_bridge wire (A1/A2, merged), with no force grasp yet and sp
     to the episode's first command, because the plant is limp until its first hold and that hold is built from a sample
     taken then.
     - A joint inside the envelope there never widens: an overshoot or sag while armed grants nothing (no ratchet).
-    - A joint outside it (resting on its stop) widens to its outermost measured pose since ARM (`_been`, reset at ARM).
+    - A joint outside it (resting on its stop) widens, on THAT side only, to its outermost measured pose since ARM
+      (`_been`, reset at ARM, seeded only from a fresh sample).
   - `envelope_band()` is that band; its servo commands, its plan admission and the supervisor's setpoint/1 use it.
   - What failed live, in turn:
     - The latest sample alone: the arm creeps in under the hold by ~0.1 mrad per tick, so a hold anchor or a jog step
@@ -64,6 +65,17 @@ Review round 1 (opus): BLOCK, fixed:
   `Gripper`), or the controller packs a 7th slot for a motor hand_bridge owns.
 * NITs: the hold-anchor term is gone (the ARM pose covers it); the sim Hand no longer divides by zero fingers; the
   supervisor's setpoint tolerance is `ENVELOPE_TOL`; the sim profile's policy comment.
+Review round 2 (opus): ACCEPT. Its SHOULD is taken: the widening was per joint, so a joint resting past its lower limit
+gained its upper side too (a traverse plus an overshoot reopened the ratchet there). It is now per side, checked. Its NIT
+is taken too: the ARM pose seeds only from a fresh pre-ARM sample.
+
+Named, not changed (round 2):
+* A joint resting just INSIDE its limit at ARM that sags past it under the DM's weak hold (kp 20) faults on the next
+  relatch, as before this slice: the rule working as decided. Bench: record where the DM's stops sit relative to the URDF
+  limits. If one sits just inside, the options are an ARM classification margin or a per-joint relatch (operator).
+* On the side it rests past, an outside joint follows its measured sag, so operator targets may follow it there too. On a
+  hard stop that is nothing; on a soft stop it can walk out by sag increments. A tighter variant: holds use the outermost
+  pose, operator targets (setpoints, plans) only the ARM pose. That is the operator's choice.
 
 Project (pinned with this): `configs/robots/assembler/execution.yaml` (the policy), `configs/robots/assembler/gripper.yaml`
 (`joint_mimics` moved out of hardware.yaml so the sim shares it), `configs/simulation/assembler.yaml` (the supervised sim
@@ -74,7 +86,7 @@ Checks:
   carries joint 1 to its target, a planned move COMPLETES on observed feedback, DISARM. The supervisor starts as run.py starts it and offers the six
   joints and setpoint/1, but no `cartesian_impedance` (the policy allows no Cartesian legs). The gains match
   supervised_arm's. The sim Hand states the DM envelope; the spawned width is the open 0.0878 m (killed mutant: SimLink
-  without the mimic reads 0.0). A MOVE to mid-stroke lands there, and GRASP is REJECTed `uncalibrated_force`. The FR3
+  without the mimic reads 0.0). A MOVE to quarter stroke lands there, and GRASP is REJECTed `uncalibrated_force`. The FR3
   sim and the bench pass the same Hand checks.
 * `check_dataflows`, `check_sim_hand`, `check_console_grasp`, `check_console_controls`, `check_node_shutdown`,
   `check_hand_grasp`.
