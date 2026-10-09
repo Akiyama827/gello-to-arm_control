@@ -8,8 +8,8 @@
 # against a supervisor running a different configuration.
 #
 # What the console sees differently from the retired in-process path: jog is a supervisor setpoint (setpoint/1; it cancels a
-# staged plan first); gains must be named presets (control mode `gain_presets`); Soft (pose hold) is not offered (the retired
-# MuJoCo plant offered it; open with the real graphs).
+# staged plan first); gains must be named presets (control mode `gain_presets`); Soft (pose hold) is not offered (the sim
+# servo has no pose hold; the retired MuJoCo plant node offered it).
 #
 #   python examples/run_console.py
 nodes:

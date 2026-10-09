@@ -105,6 +105,8 @@ def main():
     assert nodes["arm_console"]["inputs"]["grasp_result"] == "franka_gripper/grasp_result"
     for node in nodes.values():
         for source in node.get("inputs", {}).values():
+            if source.startswith("dora/timer/"):
+                continue
             producer, topic = source.split("/")
             assert topic in nodes[producer]["outputs"], source
     print("console grasp: below-slider markup and real Hand graph contracts OK")

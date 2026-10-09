@@ -95,9 +95,87 @@ def main(cfg: dict | None = None) -> None:
                     f.flush()
 
 
+#: trace/1 field per CSV column (``_COLUMNS`` order): the same measured/commanded split, from the supervisor's controller ticks
+TRACE_FIELDS = dict(pos="q_rt", vel="dq_rt", torque="tau_meas_rt", qdes="q_cmd_pc", pos_cmd="q_cmd_rt", vel_cmd="dq_cmd_rt",
+                    tor_cmd="tau_cmd_rt")
+#: how often the supervisor's trace ring (TRACE_TICKS = 0.64 s at 100 Hz) is read: well inside it
+TRACE_POLL_S = 0.1
+
+
+def trace_row(elapsed_s: float, motor_names: list[str], sample: dict) -> dict[str, float]:
+    """One controller tick of trace/1 as a CSV row with ``_row``'s columns; a field the tick lacks (no RT packet yet, no
+    command sent) is nan, never zero."""
+    row = {"elapsed_s": elapsed_s}
+    for suffix, field in TRACE_FIELDS.items():
+        values = sample.get(field)
+        for i, name in enumerate(motor_names):
+            row[f"{name}_{suffix}"] = float("nan") if values is None else float(values[i])
+    return row
+
+
+def trace_main(cfg: dict | None = None) -> None:
+    """The same CSV from a supervised graph, where no ``motor_command`` topic exists: the supervisor's trace/1 holds every
+    controller tick's PC command and the RT packet it consumed. One row per tick; ticks that fell off the ring before a read are
+    counted and reported (``dropped``), never invented. ``ARM_CONTROL_CONFIG`` names the arm (``rt.instance_id``),
+    ``ARM_CONTROL_SOCKET`` its supervisor."""
+    import os
+
+    from arm_control.sdk import ArmClient
+
+    shutdown = ShutdownFlag()
+    install_signal_handlers(shutdown)
+    cfg = _load_cfg() if cfg is None else cfg
+    arm = ArmClient(str((cfg.get("rt") or {}).get("instance_id", "")), socket_path=os.environ.get("ARM_CONTROL_SOCKET") or None)
+    motor_names = list(arm.identity.joint_names)
+    base = Path(str(cfg.get("motor_log_path") or "/tmp/arm_control_motor_state.csv"))
+    path = base.with_name(f"{base.stem}_{time.strftime('%Y%m%d_%H%M%S')}{base.suffix}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["elapsed_s"] + [f"{name}_{suffix}" for name in motor_names for suffix in _COLUMNS]
+    node = Node()
+    cursor, start, dropped, last_read = 0, None, 0, 0.0
+    print(f"[motor_state_logger] logging the supervisor's trace/1 to {path}", flush=True)
+    try:
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            while not shutdown.stop_requested:
+                event = node.next(timeout=0.05)
+                if shutdown.stop_requested or (event is not None and event["type"] == "STOP"):
+                    break
+                if time.monotonic() - last_read < TRACE_POLL_S:
+                    continue
+                last_read = time.monotonic()
+                batch = arm.trace_samples(cursor)
+                dropped += batch["dropped"]
+                for sample in batch["samples"]:
+                    start = sample["pc_monotonic"] if start is None else start
+                    writer.writerow(trace_row(sample["pc_monotonic"] - start, motor_names, sample))
+                cursor = batch["latest_seq"]
+                f.flush()
+    finally:
+        arm.close()
+        print(f"[motor_state_logger] stopped ({dropped} controller ticks fell off the trace ring between reads)", flush=True)
+
+
 def cli() -> None:
     main()
 
 
+def trace_cli() -> None:
+    trace_main()
+
+
+def _self_check() -> None:
+    """trace_row keeps the Dora logger's columns, maps each to its trace/1 field, and writes nan (never 0) for a missing one."""
+    sample = dict(q_rt=[1., 2.], dq_rt=[.1, .2], tau_meas_rt=[3., 4.], q_cmd_pc=[1.5, 2.5], q_cmd_rt=None,
+                  dq_cmd_rt=[0., 0.], tau_cmd_rt=[5., 6.])
+    row = trace_row(.25, ["a", "b"], sample)
+    assert set(row) == {"elapsed_s"} | {f"{n}_{c}" for n in "ab" for c in _COLUMNS}, row.keys()
+    assert row["a_pos"] == 1. and row["b_qdes"] == 2.5 and row["b_tor_cmd"] == 6. and np.isnan(row["a_pos_cmd"]), row
+    print("motor_state_logger: trace/1 rows keep the CSV columns (qdes = the PC's command, pos_cmd = the RT's), nan when absent")
+
+
 if __name__ == "__main__":
-    cli()
+    import sys
+
+    _self_check() if sys.argv[1:] == ["--self-check"] else cli()
