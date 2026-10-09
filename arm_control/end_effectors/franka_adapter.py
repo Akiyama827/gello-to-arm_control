@@ -46,6 +46,7 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 
+import math
 import socket
 import threading
 import time
@@ -53,7 +54,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from arm_control.end_effectors.franka_hand import (
-    GRASP_TIMEOUT_S, HandGraspFsm, resolve_grasp_parameters,
+    FRANKA_HAND, GRASP_TIMEOUT_S, HandGraspFsm, parse_limits, resolve_grasp_parameters,
 )
 from arm_control.end_effectors.hand_move import HandMove
 from arm_control.config import load_robot_config
@@ -108,7 +109,7 @@ def submit_grasp_request(client, fsm: HandGraspFsm, req: dict, now: float, *,
             raise ValueError('hand busy: position completion is pending')
         if fsm.awaiting_result:
             raise ValueError("hand busy: previous grasp result has not been consumed")
-        p = resolve_grasp_parameters(fsm._config, req)
+        p = resolve_grasp_parameters(fsm._config, req, fsm.limits)
         line = _request_line(p, req.get("mode", "close"))
         gdone_base = client.gdone_count
         wire_req = dict(req, _grasp_operation=True, _requires_active_stop=True) if require_authority else req
@@ -158,6 +159,7 @@ class BridgeClient(threading.Thread):
         self._stop_epoch: int | None = None
         self._stop_sample_seq = 0
         self._active_stop = False
+        self.limits = FRANKA_HAND   # the bridge's stated envelope; a bridge that states none is the Franka Hand
         self.gdone_count = 0        # bumps per GDONE line received
         self.gdone_sample_seq = -1
         self.gdone_ok = False       # verdict behind gdone_count
@@ -168,7 +170,8 @@ class BridgeClient(threading.Thread):
             state = dict(self.state or {})
             state.update(
                 available=self._connected and state.get("available", False),
-                force_grasp=self._epoch is not None,
+                force_grasp=self._epoch is not None and self.limits.force_grasp,
+                limits=self.limits._asdict(),
                 active_stop=self._connected and self._active_stop,
                 busy=bool(self._cancel_waiting or self._inflight or state.get("busy", False)),
                 measured=bool(state.get("measured") and "width" in state and self._connected
@@ -184,11 +187,11 @@ class BridgeClient(threading.Thread):
         parts = line.split()
         try:
             if len(parts) == 3 and parts[0] == "MOVE":
-                resolve_grasp_parameters({}, dict(width_m=float(parts[1]), speed_mps=float(parts[2])))
+                resolve_grasp_parameters({}, dict(width_m=float(parts[1]), speed_mps=float(parts[2])), self.limits)
             elif len(parts) == 6 and parts[0] == "GRASP":
                 resolve_grasp_parameters({}, dict(zip(
                     ("width_m", "speed_mps", "force_n", "epsilon_inner_m", "epsilon_outer_m"),
-                    map(float, parts[1:]))))
+                    map(float, parts[1:]))), self.limits)
             elif parts != ["HOME"]:
                 return False
         except (ValueError, OverflowError):
@@ -241,6 +244,8 @@ class BridgeClient(threading.Thread):
         with self._lock:
             if parts == ['CAPS', 'active_stop']:
                 self._active_stop = True
+            elif parts and parts[0] == 'LIMITS':  # the gripper's stated envelope (absent: the Franka Hand)
+                self.limits = parse_limits(parts)
             elif len(parts) == 2 and parts[0] == 'STOPPING':
                 epoch = int(parts[1])
                 if epoch < 0:
@@ -250,7 +255,8 @@ class BridgeClient(threading.Thread):
                     self._stop_sample_seq = self._sample_seq
             elif len(parts) == 3 and parts[0] == "STATE":
                 width = float(parts[1])
-                resolve_grasp_parameters({}, {"width_m": width})
+                if not (math.isfinite(width) and 0 <= width <= self.limits.width_max_m):
+                    raise ValueError(f"STATE width {width} outside the gripper's stroke")
                 if parts[2] not in ("0", "1"):
                     raise ValueError("invalid grasped bit")
                 self.state = dict(self.state or {}, width=width, is_grasped=parts[2] == "1")
@@ -319,6 +325,7 @@ class BridgeClient(threading.Thread):
                             self._connected = True
                             self._epoch = self._bridge_seq = None
                             self._active_stop = False
+                            self.limits = FRANKA_HAND  # until this bridge states its own
                             self._cancel = self._cancel_waiting = False
                             self._stop_epoch = None
                             self.state = None
@@ -348,7 +355,7 @@ class BridgeClient(threading.Thread):
                         and (sent is None or abs(w - sent) >= DEADBAND_M)
                     ):
                         sent = w
-                        self.send_line(f"MOVE {w:.5f} {MOVE_SPEED:.3f}")
+                        self.send_line(f"MOVE {w:.5f} {min(MOVE_SPEED, self.limits.speed_max_mps):.3f}")
                     if self.want_home:
                         self.want_home = False
                         self.send_line("HOME")
@@ -433,6 +440,7 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
         event = next_event_gil_friendly(node)
         if shutdown.stop_requested:
             break
+        grasp_fsm.limits = move.limits = client.limits  # the connected bridge's stated envelope
         if event is not None:
             if event["type"] == "STOP":
                 break

@@ -11,7 +11,17 @@ struct HandAction {
   uint64_t token = 0, generation = 0;
 };
 
-inline bool parse_hand_command(const std::string& line, HandAction& a) {
+// A gripper's command envelope, stated to clients on the LIMITS line (a bridge
+// that states none is the Franka Hand). force_max_n == 0: no force grasp.
+struct HandLimits {
+  double width_max_m, speed_max_mps, force_min_n, force_max_n;
+};
+// Franka Hand product manual 1.2 section 5.1: 80 mm travel, 0.10 m/s total
+// opening speed, continuous adjustable force 30..70 N.
+constexpr HandLimits franka_hand{.08, .10, 30, 70};
+
+inline bool parse_hand_command(const std::string& line, HandAction& a,
+                               const HandLimits& l = franka_hand) {
   a = {};
   std::istringstream in(line);
   std::string prefix, token, verb, extra;
@@ -28,12 +38,12 @@ inline bool parse_hand_command(const std::string& line, HandAction& a) {
   } else return false;
   if (in >> extra) return false;
   if (a.kind == 2) return true;
-  if (!std::isfinite(a.w) || a.w < 0 || a.w > .08 ||
-      !std::isfinite(a.s) || a.s <= 0 || a.s > .10) return false;
-  // Hand manual 1.2 section 5.1: continuous adjustable force 30..70 N.
-  return a.kind != 3 || (std::isfinite(a.f) && a.f >= 30 && a.f <= 70 &&
-      std::isfinite(a.ei) && a.ei >= 0 && a.ei <= .08 &&
-      std::isfinite(a.eo) && a.eo >= 0 && a.eo <= .08);
+  if (!std::isfinite(a.w) || a.w < 0 || a.w > l.width_max_m ||
+      !std::isfinite(a.s) || a.s <= 0 || a.s > l.speed_max_mps) return false;
+  return a.kind != 3 || (std::isfinite(a.f) && a.f >= l.force_min_n &&
+      a.f <= l.force_max_n && l.force_max_n > 0 &&
+      std::isfinite(a.ei) && a.ei >= 0 && a.ei <= l.width_max_m &&
+      std::isfinite(a.eo) && a.eo >= 0 && a.eo <= l.width_max_m);
 }
 
 // All methods are called under the bridge mutex. One command, never a queue.

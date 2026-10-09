@@ -42,6 +42,9 @@ move, grasp and homing; a separate worker invokes the same session's thread-safe
 It neither joins nor blocks the arm RT servo loop.
 
 - `CAPS active_stop` advertises the updated bridge; legacy META 2 framing stays.
+- `LIMITS <width_max_m> <speed_max_mps> <force_min_n> <force_max_n>` (before STATE, every report) states the
+  gripper's command envelope; the parser admits commands inside it, and a bridge that omits it is the Franka Hand
+  (0.08 / 0.10 / 30 / 70). `force_max_n` 0 = no force grasp: GRASP is refused.
 - `STOPPING <epoch>` acknowledges receipt, not physical completion. Admission
   stays busy while stopping. Canceled actions cannot report successful DONE.
 - Stop is retried while the canceled action is active, then once after its exit
