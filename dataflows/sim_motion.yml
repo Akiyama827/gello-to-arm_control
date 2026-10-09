@@ -1,68 +1,63 @@
-# Sim twin of real_motion.yml: operator console -> planner -> arm_controller
-# -> MuJoCo sim plant. Desk-side end-to-end check of the motion stack with zero
-# hardware: same nodes, same mode config, mujoco_interface instead of the DM
-# bridge.
+# Sim twin of real_motion.yml: the DM arm through its SUPERVISOR over a simulated MuJoCo plant (CTRL-053), as
+# sim_franka_motion.yml does for the FR3.
 #
-# ONE command owner. The console plans and never commands the plant;
-# arm_controller servos and never plans. A plan crosses gated and named, and
-# runs only when an `execute` names that same id -- so a plan superseded by a
-# re-plan can never run.
+# The supervisor is the control authority: a separate process (`--plant sim`) running the arm's controller under its
+# execution_policy, started before this graph by the launcher (python tools/run.py sim motion). Nodes reach it only through
+# the SDK: `supervised_arm` serves the arm_controller contract. The gripper is driven by `franka_gripper` (the hand_bridge
+# client) over the Hand protocol, against the sim Hand the supervisor serves at rt.host:rt.hand_port with the DM gripper's
+# envelope (sim_hand.limits: no force grasp, so GRASP is refused) and finger map (joint_mimics) -- the wire the DM gripper's
+# hand_bridge --backend dm speaks on the bench.
 #
-#   ARM_CONTROL_CONFIG=configs/entries/sim_assembler.yaml dora run dataflows/sim_motion.yml
-#   (or, from the deployment: python tools/run.py sim motion)
+# ONE command owner: the console plans, the supervisor servos; a plan runs only when an `execute` names its id. Jog is a
+# supervisor setpoint (setpoint/1); gains must be named presets (control mode `gain_presets`).
+#
+#   python tools/run.py sim motion
 nodes:
   - id: arm_console
     path: ../nodes/arm_console.py
     env:
       ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
     inputs:
-      motor_state: plant_interface/motor_state
-      controller_arm: arm_controller/arm
-      controller_event: arm_controller/controller_event
-      plant_capabilities: plant_interface/model_revision
+      motor_state: supervised_arm/motor_state
+      controller_event: supervised_arm/controller_event
+      # the console takes its armed state and its fault latch from motor_health alone (it needs exactly ONE authority source)
+      motor_health: supervised_arm/motor_health
+      plant_capabilities: supervised_arm/model_revision
+      gripper_state: franka_gripper/gripper_state
+      grasp_result: franka_gripper/grasp_result
     outputs:
       - plan       # gated, named
       - control    # arm / execute / cancel / gains
       - jog        # live setpoint while a direction is held
       - gripper
+      - grasp_request
 
-  - id: arm_controller
-    path: ../nodes/arm_controller.py
+  - id: franka_gripper
+    path: ../nodes/franka_gripper.py
+    inputs:
+      gripper: arm_console/gripper
+      grasp_request: arm_console/grasp_request
+    outputs:
+      - gripper_state
+      - grasp_result
+
+  - id: supervised_arm
+    path: ../nodes/supervised_arm.py
     env:
       ARM_CONTROL_MODE_CONFIG: examples/profiles/motion.yaml
-      # No sim_bridge in this graph: mujoco_interface is the plant and has no
-      # arm gate, so it publishes no motor_health. Without this the controller
-      # waits forever for an armed edge that cannot come. Opt-out, and only
-      # ever set on a graph with no safety bridge in the path.
-      ARM_CONTROL_PLANT_HEALTH: "0"
     inputs:
-      motor_state: plant_interface/motor_state
-      plan:        arm_console/plan
-      control:     arm_console/control
-      jog:         arm_console/jog
-      plant_capabilities: plant_interface/model_revision
-    outputs:
-      - motor_command     # the ONLY producer of this topic
-      - arm               # and of this one
-      - controller_event  # ready / leg_result / fault
-
-  - id: plant_interface
-    path: ../nodes/mujoco_interface.py
-    inputs:
-      motor_command: arm_controller/motor_command
-      arm: arm_controller/arm
-      # Console gripper slider drives the scene's finger servos directly (the
-      # 6-motor sim config has no gripper motor slot). No-op if the scene has
-      # no gripper.
-      motor_command_gripper: arm_console/gripper
+      plan:     arm_console/plan
+      control:  arm_console/control
+      jog:      arm_console/jog
     outputs:
       - motor_state
-      - sim_qpos       # live twin qpos (unconsumed here)
-      - gripper_state  # finger positions/efforts (unconsumed here)
-      - topology_state # sent once with model_revision (unconsumed here)
+      - arm
+      - controller_event
+      - motor_health
       - model_revision
 
   - id: visualizer
     path: ../nodes/visualizer.py
     inputs:
-      motor_state: plant_interface/motor_state
+      motor_state: supervised_arm/motor_state
+      gripper_state: franka_gripper/gripper_state

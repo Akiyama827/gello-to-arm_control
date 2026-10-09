@@ -50,7 +50,7 @@ from arm_control.contracts.gripper import pack_grasp_request, unpack_grasp_resul
 from arm_control.ui.hand_panel import HandPanel
 from arm_control.ui.jog_panel import JogPanel
 from arm_control.grasp_visual import VisualFK
-from arm_control.joint_motor_map import gripper_motor_to_finger
+from arm_control.joint_motor_map import finger_from_width, gripper_mimic, gripper_motor_to_finger
 from arm_control.messages import (
     pack_control_update,
     pack_motor_command,
@@ -938,10 +938,7 @@ def _run(
         gripper_joints=gj,
     )
     # First mimic entry = the gripper's motor slot, whatever this arm calls it.
-    mimic = next(
-        (dict(m) for m in (cfg.get("joint_mimics") or {}).values() if isinstance(m, dict)),
-        {},
-    )
+    mimic = gripper_mimic(cfg) or {}
     # Finger travel for the slider. An arm with no `joint_mimics` (its gripper is
     # not a motor on this bus — the FR3's Franka Hand) has no mimic to read, and
     # the old fallback silently handed it the DM arm's 0.0439 m. State it in the
@@ -1090,7 +1087,7 @@ def _run(
                 width = float(hand_state["width"])
                 if not np.isfinite(width):
                     continue
-                mgrip_f = width / 2.0
+                mgrip_f = finger_from_width(width, mimic or None)
                 panel.set_measured_grip(mgrip_f)
                 scene.set_finger_state(mgrip_f)
                 if not grip_synced:
@@ -1225,7 +1222,7 @@ def _run(
                 shown_attachment = scene_actions.attachment
             width = scene_context['hand']['measured_width_mm']
             if state['status'] != 'stored' and width is not None:
-                panel.set_gripper(width / 2000, dirty=False)
+                panel.set_gripper(finger_from_width(width / 1000, mimic or None), dirty=False)
             panel.set_scene_state(state)
 
         if panel.clicked("Sync target to robot") and measured is not None:

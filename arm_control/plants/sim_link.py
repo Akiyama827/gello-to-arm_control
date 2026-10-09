@@ -149,7 +149,17 @@ class SimLink:
             spec = dict(cfg.get("sim_hand"))
             if "port" not in spec:
                 raise ValueError("sim_hand needs port (where the Hand's protocol is served): nothing is assumed")
-            hand = SimHandBridge(int(spec["port"]), bind=str(spec.get("bind", "127.0.0.1")))
+            from arm_control.end_effectors.franka_hand import FRANKA_HAND, HandLimits
+            from arm_control.joint_motor_map import gripper_mimic
+
+            # The gripper's envelope (absent: the Franka Hand's) and how its finger joints run (the arm's joint_mimics).
+            limits = HandLimits(**spec["limits"]) if spec.get("limits") is not None else FRANKA_HAND
+            mimic = gripper_mimic(cfg)
+            if mimic is not None:
+                stroke = 2 * abs(float(mimic.get("upper", 0.0)) - float(mimic.get("lower", 0.0)))  # both fingers' travel
+                if abs(stroke - limits.width_max_m) > 1e-9:
+                    raise ValueError(f"sim_hand.limits.width_max_m {limits.width_max_m} is not the mimic's stroke {stroke}")
+            hand = SimHandBridge(int(spec["port"]), bind=str(spec.get("bind", "127.0.0.1")), limits=limits, mimic=mimic)
         return cls(RtConfig.from_config(cfg), joints, plant, servo=servo, observe=cfg.get("sim_observe"), hand=hand)
 
     @property

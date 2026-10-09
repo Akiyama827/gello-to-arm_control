@@ -14,6 +14,7 @@ from arm_control.end_effectors.grasp import GraspGate
 from arm_control.control.gains import validate_torque_limits
 from arm_control.control.safety import SafetyController
 from arm_control.config import load_robot_config
+from arm_control.joint_motor_map import gripper_mimic
 from arm_control.messages import (
     pack_grasp_result,
     unpack_grasp_request,
@@ -39,13 +40,6 @@ from arm_control.node_utils import (
 _DEFAULT_TORQUE_LIMIT_BY_TYPE = {"4310": 3.0, "4310p": 3.0, "4340": 9.0, "4340p": 9.0}
 
 
-def _gripper_mimic_cfg(cfg) -> dict | None:
-    for mimic in (cfg.get("joint_mimics") or {}).values():
-        if isinstance(mimic, dict):
-            return mimic
-    return None
-
-
 def _gripper_motor_index(backend, cfg) -> int | None:
     sources = {
         str(m.get("source"))
@@ -59,7 +53,7 @@ def _gripper_motor_index(backend, cfg) -> int | None:
 
 
 def _make_grasp(cfg, backend) -> GraspController | None:
-    mimic = _gripper_mimic_cfg(cfg)
+    mimic = gripper_mimic(cfg)
     index = _gripper_motor_index(backend, cfg)
     if mimic is None or index is None:
         return None

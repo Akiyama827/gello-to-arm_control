@@ -28,6 +28,7 @@ from arm_control.control.execution_policy import build_execution_policy
 from arm_control.control.trajectory_executor import JointTrajectoryExecutor
 from arm_control.control.gains import validate_integral_vector
 from arm_control.control.integral import IntegralState
+from arm_control.joint_motor_map import gripper_mimic
 from arm_control.model_bundle import execution_gravity, model_token, pose_provenance
 from arm_control.node_utils import planner_speed_limits, resolve_gains
 
@@ -109,11 +110,14 @@ def gripper_command_cfg(cfg) -> dict:
     """Gripper packing parameters for the arm+gripper motor command.
 
     Returns ``None`` for ``mimic`` on arms whose gripper is not a motor slot on
-    the same bus (the FR3's Franka Hand is its own device, driven by grasp
-    requests rather than a packed command word).
+    the same bus: the FR3's Franka Hand (no mimic), and a gripper whose mimic
+    source is not one of this config's motors -- its own device behind a
+    hand_bridge (the DM gripper once the arm runs on its supervisor). The mimic
+    still states how its finger joints run; it no longer implies a slot.
     """
-    mimics = cfg.get("joint_mimics") or {}
-    mimic = next((m for m in mimics.values() if isinstance(m, dict)), None)
+    mimic = gripper_mimic(cfg)
+    if mimic is not None and str(mimic.get("source")) not in list(cfg.get("motor_names") or []):
+        mimic = None
     grasp = cfg.get("grasp") or {}
     return {
         "mimic": mimic,

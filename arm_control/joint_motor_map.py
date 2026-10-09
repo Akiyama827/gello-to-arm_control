@@ -15,6 +15,7 @@ it now lives here so both directions share one source of truth.
 """
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import numpy as np
@@ -38,6 +39,34 @@ def _endpoints(mimic_cfg: dict) -> tuple[float, float, float, float]:
     lower = float(mimic_cfg.get("lower", 0.0))
     upper = float(mimic_cfg.get("upper", 1.0))
     return motor_open, motor_closed, lower, upper
+
+
+def gripper_mimic(cfg) -> dict | None:
+    """The gripper's mimic (the first ``joint_mimics`` entry), or None: a Hand that is no motor slot (the Franka Hand)."""
+    for mimic in (cfg.get("joint_mimics") or {}).values():
+        if isinstance(mimic, dict):
+            return dict(mimic)
+    return None
+
+
+def finger_from_width(width_m: float, mimic_cfg: dict | None) -> float:
+    """One finger joint's value for an opening ``width_m`` between the fingers (both move symmetrically).
+
+    No mimic: the Franka Hand's fingers (0 = closed, each opens by half the width). A mimic: ``lower`` is the finger at
+    the OPEN motor end and ``upper`` at the closed one, whichever way the joint runs (the DM gripper's closes as it rises).
+    """
+    if mimic_cfg is None:
+        return width_m / 2.0
+    _, _, f_open, f_closed = _endpoints(mimic_cfg)
+    return f_closed + math.copysign(width_m / 2.0, f_open - f_closed)
+
+
+def width_from_finger(finger_m: float, mimic_cfg: dict | None) -> float:
+    """The opening between the fingers for one finger joint's value; the inverse of :func:`finger_from_width`."""
+    if mimic_cfg is None:
+        return 2.0 * finger_m
+    _, _, f_open, f_closed = _endpoints(mimic_cfg)
+    return 2.0 * (finger_m - f_closed) * math.copysign(1.0, f_open - f_closed)
 
 
 def gripper_motor_to_finger(motor_rad: float, mimic_cfg: dict) -> float:
@@ -144,6 +173,9 @@ def unpack_motor_state_to_joint(
 
 
 __all__ = [
+    "finger_from_width",
+    "gripper_mimic",
+    "width_from_finger",
     "gripper_motor_to_finger",
     "gripper_finger_to_motor",
     "pack_arm_gripper_command",

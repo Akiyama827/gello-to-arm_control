@@ -180,6 +180,9 @@ class ArmController:
         self._mode_report_at: float | None = None
         self.last_command: JointServoCommand | None = None
         self._hold_anchor: JointServoCommand | None = None
+        # The outermost measured pose per joint since ARM (rows: min, max): the envelope widens to where the arm has BEEN,
+        # never further (operator 2026-10-09). Reset at ARM, so a sag while disarmed grants nothing.
+        self._been: np.ndarray | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
         self.last_law: str | None = None           # the law of the last word sent
         self._pose_hold: dict | None = None
@@ -508,6 +511,10 @@ class ArmController:
                     preserve_rt_hold=self._reference_source is None,
                 )
         self.last_state = arm
+        if np.isfinite(arm.position).all():
+            q = np.asarray(arm.position, dtype=float)
+            self._been = (np.vstack([q, q]) if self._been is None
+                          else np.vstack([np.minimum(self._been[0], q), np.maximum(self._been[1], q)]))
         if finger_m is not None:
             self._finger_m = float(finger_m)
         if self.execution_policy is None:
@@ -996,6 +1003,24 @@ class ArmController:
         )
 
     # -- outputs -------------------------------------------------------------
+    def _where_been(self) -> np.ndarray | None:
+        """The poses the position envelope widens to (rows), operator 2026-10-09 "never further out": where the arm has BEEN
+        since ARM (measured; a command is built from an earlier sample than the latest, so the latest alone races) and the
+        hold anchor (a measured pose, possibly from just before ARM). None before any sample (last_state is zeros until
+        then): the envelope as configured."""
+        if self._last_state_at is None:
+            return None
+        where = [self.last_state.position[None]]
+        if self._been is not None:
+            where.append(self._been)
+        if self._hold_anchor is not None:
+            where.append(np.asarray(self._hold_anchor.q_des, dtype=float)[None])
+        return np.vstack(where)
+
+    def envelope_band(self):
+        """``(lower, upper)`` every command and setpoint must stay inside, or None without a position envelope."""
+        return None if self.execution_policy is None else self.execution_policy.envelope(self._where_been())
+
     def _static_hold(self) -> JointServoCommand:
         """Measured-position gravity hold, reading this cycle's existing bias.
 
@@ -1046,7 +1071,7 @@ class ArmController:
         The spec has no pose: the plant aims the spring at FK(q_des) with its own model."""
         aborted = False
         if self.execution_policy is not None:
-            if not self.execution_policy.command_valid(command, self.n_arm):
+            if not self.execution_policy.command_valid(command, self.n_arm, self._where_been()):
                 self._fault("non-finite or invalid servo command")
                 return False
             if (self._pose_hold is None
@@ -1055,7 +1080,7 @@ class ArmController:
                 self.last_command = None
                 self._hold_anchor = self._static_hold()
                 command = self._hold_anchor
-                if command is None or not self.execution_policy.command_valid(command, self.n_arm):
+                if command is None or not self.execution_policy.command_valid(command, self.n_arm, self._where_been()):
                     self._fault("invalid measured hold command")
                     return False
                 cartesian = False
@@ -1089,6 +1114,8 @@ class ArmController:
         armed = bool(armed)
         if self.armed and not armed:
             self._disarm_reset()
+        if armed and not self.armed:
+            self._been = None  # the band starts from the poses measured while armed
         self.armed = armed
         self.node.send_output("arm", pack_json_message("arm", {"armed": self.armed}))
 

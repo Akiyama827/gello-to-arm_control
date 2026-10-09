@@ -32,7 +32,7 @@ from dora import Node
 
 from arm_control.assets import mesh_package_dirs
 from arm_control.config import load_robot_config_dict
-from arm_control.joint_motor_map import gripper_motor_to_finger
+from arm_control.joint_motor_map import finger_from_width, gripper_mimic, gripper_motor_to_finger
 # Same scene draw as the teleop preview — one implementation, so the two Rerun
 # recordings can never disagree about where the dock stands.
 from arm_control.viz.preview import log_static_scene
@@ -525,6 +525,7 @@ def main(*, cfg=None, static_geoms=None) -> None:
     time_ranges  = _plot_time_ranges(cfg)
     log_rates = bool(cfg.get("viz_log_rates", False))
     joint_mimics = dict(cfg.get("joint_mimics") or {})
+    hand_mimic = gripper_mimic(cfg)  # how the finger joints run for a Hand width (none: the Franka Hand)
 
     joint_names   = _resolve_joint_names(cfg, urdf_path)
 
@@ -613,8 +614,8 @@ def main(*, cfg=None, static_geoms=None) -> None:
                     _gripper_unknown = False
                     print("[viz] Hand width received; fingers are live again",
                           flush=True)
-                half = float(width) / 2.0
-                finger_values = {j: half for j in finger_joints}
+                finger = finger_from_width(float(width), hand_mimic)
+                finger_values = {j: finger for j in finger_joints}
                 _last_fk_q = None  # force a re-render even with a motionless arm
 
         elif eid == "can_bus_status":

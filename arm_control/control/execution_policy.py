@@ -81,6 +81,20 @@ class ExecutionPolicy:
     def period(self):
         return 1.0 / self.command_rate_hz
 
+    def envelope(self, measured=None):
+        """The admissible position band: the description's envelope, widened per joint to the MEASURED pose where that
+        already lies outside it (operator 2026-10-09: never further out). A joint gravity rested past its limit -- the DM
+        arm, disarmed, sits on its stops -- can be held where it is and brought back in, never driven further out: the
+        setpoint/1 escape rule, for every command and plan."""
+        if self.position_lower is None:
+            return None
+        if measured is None:
+            return self.position_lower, self.position_upper
+        q = np.atleast_2d(np.asarray(measured, dtype=float))  # one pose, or several the arm was at (rows)
+        if q.shape[1:] != self.position_lower.shape or not np.isfinite(q).all():
+            return self.position_lower, self.position_upper
+        return np.minimum(self.position_lower, q.min(axis=0)), np.maximum(self.position_upper, q.max(axis=0))
+
     def plan_error(self, plan, measured, n_arm):
         q, v, t = plan["positions"], plan["velocities"], plan["times"]
         if q.ndim != 2 or q.shape[1] != n_arm:
@@ -92,9 +106,10 @@ class ExecutionPolicy:
                 return "trajectory contains non-finite values"
         if np.any(np.diff(t) <= 0):
             return "trajectory times must be strictly increasing"
-        if self.position_lower is not None:
-            if (np.any(q < self.position_lower - ENVELOPE_TOL)
-                    or np.any(q > self.position_upper + ENVELOPE_TOL)):
+        band = self.envelope(measured)
+        if band is not None:
+            if (np.any(q < band[0] - ENVELOPE_TOL)
+                    or np.any(q > band[1] + ENVELOPE_TOL)):
                 return "trajectory outside configured position/velocity safety envelope"
         dt = np.diff(t)[:, None]
         if self.velocity_limits is not None:
@@ -124,9 +139,9 @@ class ExecutionPolicy:
         # a cornered one was already refused -- so it closes the hole without
         # newly refusing anything the retimer produces today.
         curve = JointTrajectory(times=t, positions=q, velocities=v).bounds()
-        if self.position_lower is not None:
-            if (np.any(curve["q_min"] < self.position_lower - ENVELOPE_TOL)
-                    or np.any(curve["q_max"] > self.position_upper + ENVELOPE_TOL)):
+        if band is not None:
+            if (np.any(curve["q_min"] < band[0] - ENVELOPE_TOL)
+                    or np.any(curve["q_max"] > band[1] + ENVELOPE_TOL)):
                 return ("interpolated trajectory leaves the position envelope "
                         "between waypoints")
         if self.velocity_limits is not None:
@@ -168,14 +183,15 @@ class ExecutionPolicy:
     def tracking_error_exceeded(self, command, measured):
         return not float(np.max(np.abs(command.q_des - measured))) <= self.abort_pos_err_rad
 
-    def command_valid(self, command, n_arm):
+    def command_valid(self, command, n_arm, measured=None):
         for key in ("q_des", "qd_des", "tau_ff", "kp", "kd"):
             value = np.asarray(getattr(command, key))
             if value.shape != (n_arm,) or not np.isfinite(value).all():
                 return False
-        if self.position_lower is not None:
-            if (np.any(command.q_des < self.position_lower - ENVELOPE_TOL)
-                    or np.any(command.q_des > self.position_upper + ENVELOPE_TOL)):
+        band = self.envelope(measured)
+        if band is not None:
+            if (np.any(command.q_des < band[0] - ENVELOPE_TOL)
+                    or np.any(command.q_des > band[1] + ENVELOPE_TOL)):
                 return False
         if self.velocity_limits is not None and np.any(np.abs(command.qd_des) > self.velocity_limits + 1e-8):
             return False

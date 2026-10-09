@@ -174,6 +174,7 @@ def main():
     check_deadlines()
     check_interpolated_limits()
     check_goal_on_limit()
+    check_measured_outside()
     check_factory_envelope()
     check_modes_and_validation()
     check_cartesian_lifecycle()
@@ -298,7 +299,65 @@ def check_goal_on_limit():
                                 velocities=np.zeros((2, 1)), kp=[600], kd=[20]))
     assert policy.plan_error(waypoints(np.nextafter(hi, 0)), np.array([hi - 0.01]), 1) is None   # a knot one ulp past: legal
     assert policy.plan_error(waypoints(hi + 1e-6), np.array([hi - 0.01]), 1)                     # a micro-radian past: refused
+    # Never further out (operator 2026-10-09): a joint MEASURED past its limit may be held there and brought back in, never
+    # driven further out; inside the envelope nothing changes.
+    out = hi + 0.02
+    assert policy.command_valid(command(out), 1, np.array([out]))               # hold where gravity rested it
+    assert policy.command_valid(command(hi + 0.01), 1, np.array([out]))         # back toward the envelope
+    assert not policy.command_valid(command(out + 1e-6), 1, np.array([out]))    # further out: refused
+    assert not policy.command_valid(command(hi + 1e-6), 1, np.array([hi - 0.1]))  # measured inside: the envelope as before
+    assert not policy.command_valid(command(out), 1)                            # no measurement: the envelope as before
+    back = unpack_plan(plan(width=1, times=[0, 1], positions=np.array([[out], [hi - 0.05]]),
+                            velocities=np.zeros((2, 1)), kp=[600], kd=[20]))
+    assert policy.plan_error(back, np.array([out]), 1) is None                  # a plan out of the stop
+    further = unpack_plan(plan(width=1, times=[0, 1], positions=np.array([[out], [out + 0.01]]),
+                               velocities=np.zeros((2, 1)), kp=[600], kd=[20]))
+    assert "envelope" in policy.plan_error(further, np.array([out]), 1)        # deeper: refused
     print("goal on a joint limit: held exactly, one rounding allowance for plan, curve and servo OK")
+
+
+def check_measured_outside():
+    """Never further out (operator 2026-10-09): an arm that gravity rested past a limit ARMs and holds where it is -- also as it
+    creeps back in under the hold, past the sample its hold was built from -- and nothing may go further out than it has been
+    since ARM. Re-ARM starts over."""
+    from arm_control.control.execution_policy import ExecutionPolicy
+    from arm_control.motion import JointServoCommand
+
+    clock = [10.0]
+    policy = ExecutionPolicy(
+        command_rate_hz=100, state_timeout_sec=.25, health_timeout_sec=1,
+        start_pos_tol_rad=.1, abort_pos_err_rad=.35, hold_relatch_rad=.3,
+        torque_limits=np.array([87]*4+[12]*3), position_lower=np.full(7, -1.0), position_upper=np.full(7, 1.0))
+    c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), clock=lambda: clock[0],
+                      plant_reports_health=True, execution_policy=policy)
+    c._set_arm(True)
+    c.on_motor_health(pack_json_message("motor_health", dict(
+        armed=True, state_fresh=True, any_fault=False, supports_pose_hold=True)))
+    # ARMed where gravity rested it, 0.02 rad past the lower limit; then the hold pulls it back in, a sample behind
+    for q in (-1.02, -1.0199, -1.0198, -1.0197):
+        clock[0] += .01
+        c.on_motor_state(state(q))
+        c.tick()
+        assert not c.stopped, (q, "a hold where the arm is (or was, since ARM) faulted")
+    assert np.allclose(commands(c)[-1]["position"], -1.02, atol=1e-3)
+    # A jog (no hold anchor) built from a sample older than the latest, as the arm keeps creeping in: still where it has been.
+    assert c.on_jog(pack_jog(q=[-1.0197] * 7)) is None
+    for q in (-1.0196, -1.0195, -1.0194):
+        clock[0] += .01
+        c.on_motor_state(state(q))
+        c.tick()
+        assert not c.stopped and c._hold_anchor is None, (q, "a jog to where the arm has been since ARM faulted")
+
+    def hold(q):
+        return JointServoCommand(np.full(7, q), np.zeros(7), np.zeros(7), np.full(7, 600.), np.full(7, 20.))
+    assert policy.command_valid(hold(-1.02), 7, c._where_been())        # where it has been since ARM
+    assert not policy.command_valid(hold(-1.021), 7, c._where_been())   # further out: never
+    c._set_arm(False)
+    c.on_motor_state(state(-1.0))
+    c._set_arm(True)
+    clock[0] += .01
+    c.on_motor_state(state(-1.0))
+    assert not policy.command_valid(hold(-1.02), 7, c._where_been())    # a new ARM grants nothing from before it
 
 
 def check_factory_envelope():

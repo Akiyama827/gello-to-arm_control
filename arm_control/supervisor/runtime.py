@@ -365,7 +365,8 @@ class RobotRuntime:
     def setpoint(self, session, q):
         """Hold the arm at ``q`` (arm joints, rad) on the joint law until the next setpoint, or until none arrives within the
         controller's jog timeout: then it holds the MEASURED pose (not the last target). Refused while an execution is live,
-        for a target that moves any joint further past its position limit than the measured pose is, and for one further from
+        for a target that moves any joint further past its position limit than the arm has been since ARM (measured: never
+        further out, operator 2026-10-09), and for one further from
         the measured pose than the policy's abort_pos_err_rad (the controller would cancel it on the next tick, after telling
         the caller it was taken). Returns the timeout, which is the rate a caller must keep up. Within that, the step size is the
         caller's envelope (the console's JogLimits); the supervisor checks only what holds for every caller."""
@@ -385,10 +386,9 @@ class RobotRuntime:
         if refusal is not None:
             raise Refused(f'setpoint refused: {refusal}')
         policy, measured = c.execution_policy, np.asarray(c.last_state.position, float)
-        lower, upper = policy.position_lower, policy.position_upper
-        if lower is not None and upper is not None:
-            past = lambda x: np.maximum(np.maximum(lower - x, x - upper), 0.)  # noqa: E731
-            worse = np.flatnonzero(past(q) > past(measured) + 1e-9)
+        band = c.envelope_band()  # the envelope, widened to where the arm has been since ARM: never further out
+        if band is not None:
+            worse = np.flatnonzero((q < band[0] - 1e-9) | (q > band[1] + 1e-9))
             if worse.size:
                 raise Refused(f'setpoint moves {self.joints[worse[0]]} past its position limit')
         step = float(np.max(np.abs(q - measured)))

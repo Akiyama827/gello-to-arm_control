@@ -57,6 +57,7 @@ from arm_control.end_effectors.franka_hand import (
     FRANKA_HAND, GRASP_TIMEOUT_S, HandGraspFsm, parse_limits, require_force_grasp, resolve_grasp_parameters,
 )
 from arm_control.end_effectors.hand_move import HandMove
+from arm_control.joint_motor_map import gripper_mimic, width_from_finger
 from arm_control.config import load_robot_config
 from arm_control.messages import (
     pack_grasp_result,
@@ -426,6 +427,7 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
     grasp_fsm = HandGraspFsm(dict((cfg.get("franka") or {}).get("gripper") or {}),
                              measured_completion=require_authority)
     move = HandMove()
+    mimic = gripper_mimic(cfg)  # how this gripper's finger joints run (none: the Franka Hand)
     permitted = not require_authority
     operator_armed = not require_authority
     health_at = 0.
@@ -450,7 +452,7 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
                 if require_authority:
                     continue  # Gated applications accept only correlated requests.
                 finger_m = float(unpack_motor_command(event["value"], 2)["position"][0])
-                client.target = 2.0 * finger_m  # width = both fingers
+                client.target = width_from_finger(finger_m, mimic)  # the slider is a finger joint's value
             elif event['type'] == 'INPUT' and event['id'] == 'motor_health':
                 health = unpack_json_message(event['value'])
                 health_at = time.monotonic()
