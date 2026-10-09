@@ -152,6 +152,10 @@ def load_pair_config(path) -> PairConfig:
             ):
                 raise ValueError(f"{name}: {label} needs {n} finite numbers")
         actors.append(actor)
+        if cfg.get("joint_mimics"):
+            # The pair's Hand path (multi_arm.hands, the dual console) works in the Franka Hand's finger units (finger =
+            # width / 2); a mimic'd gripper's fingers can run the other way (the DM's close as their joints rise).
+            raise ValueError(f"{name}: the dual console drives Franka Hands only; this arm's gripper has joint_mimics")
         robots[name] = cfg
         digest = hashlib.sha256(
             urdf.read_bytes() + json.dumps((actor.pos, actor.rpy, joints)).encode()

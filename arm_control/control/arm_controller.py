@@ -180,6 +180,15 @@ class ArmController:
         self._mode_report_at: float | None = None
         self.last_command: JointServoCommand | None = None
         self._hold_anchor: JointServoCommand | None = None
+        # Never further out (operator 2026-10-09): a joint RESTING past its limit when the arm is ARMed -- gravity, disarmed,
+        # on a stop -- may be held where it rests and brought back in. `_arm_pose` is where the arm rested: it follows the
+        # measured pose until the episode's first command (the plant is limp until then, and that hold is built from a
+        # sample taken then). Joints outside the envelope there follow their outermost measured pose since ARM (`_been`:
+        # on the stop, a hold re-anchoring at the measured pose must not fault); joints inside it never widen, so an
+        # excursion while armed (overshoot, sag) grants nothing.
+        self._arm_pose: np.ndarray | None = None
+        self._arm_pose_fixed = False
+        self._been: np.ndarray | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
         self.last_law: str | None = None           # the law of the last word sent
         self._pose_hold: dict | None = None
@@ -322,7 +331,7 @@ class ArmController:
             return
         if self.execution_policy is not None:
             reason = self._observation_error() or self.execution_policy.plan_error(
-                plan, self.last_state.position, self.n_arm)
+                plan, self.last_state.position, self.n_arm, been=self._where_been())
             if reason:
                 self._refuse_plan(plan, reason, report=True)
                 return
@@ -508,6 +517,12 @@ class ArmController:
                     preserve_rt_hold=self._reference_source is None,
                 )
         self.last_state = arm
+        if self.armed and np.isfinite(arm.position).all():
+            q = np.asarray(arm.position, dtype=float)
+            if not self._arm_pose_fixed:
+                self._arm_pose = q.copy()  # where it rests, until the first command
+            self._been = (np.vstack([q, q]) if self._been is None
+                          else np.vstack([np.minimum(self._been[0], q), np.maximum(self._been[1], q)]))
         if finger_m is not None:
             self._finger_m = float(finger_m)
         if self.execution_policy is None:
@@ -996,6 +1011,24 @@ class ArmController:
         )
 
     # -- outputs -------------------------------------------------------------
+    def _where_been(self) -> np.ndarray | None:
+        """The poses the position envelope widens to (rows), operator 2026-10-09 "never further out": per joint, where it
+        rested at ARM if that was inside the envelope (so nothing widens), else -- on the side it rests past -- the outermost
+        pose it has been at since ARM (it rests on its stop: holds re-anchoring at the measured pose, and samples a command was built from as it
+        creeps back in, lie there). None while disarmed or before the first sample: the envelope as configured."""
+        policy = self.execution_policy
+        if not self.armed or self._arm_pose is None or policy is None or policy.position_lower is None:
+            return None
+        rest = self._arm_pose
+        been = self._been if self._been is not None else np.vstack([rest, rest])
+        # per SIDE: a joint resting past its lower limit never gains anything past its upper one
+        return np.vstack([np.where(rest < policy.position_lower, been[0], rest),
+                          np.where(rest > policy.position_upper, been[1], rest)])
+
+    def envelope_band(self):
+        """``(lower, upper)`` every command and setpoint must stay inside, or None without a position envelope."""
+        return None if self.execution_policy is None else self.execution_policy.envelope(self._where_been())
+
     def _static_hold(self) -> JointServoCommand:
         """Measured-position gravity hold, reading this cycle's existing bias.
 
@@ -1046,7 +1079,9 @@ class ArmController:
         The spec has no pose: the plant aims the spring at FK(q_des) with its own model."""
         aborted = False
         if self.execution_policy is not None:
-            if not self.execution_policy.command_valid(command, self.n_arm):
+            if self.armed and self._arm_pose is not None:
+                self._arm_pose_fixed = True  # the episode's first command: from here the band is fixed
+            if not self.execution_policy.command_valid(command, self.n_arm, self._where_been()):
                 self._fault("non-finite or invalid servo command")
                 return False
             if (self._pose_hold is None
@@ -1055,7 +1090,7 @@ class ArmController:
                 self.last_command = None
                 self._hold_anchor = self._static_hold()
                 command = self._hold_anchor
-                if command is None or not self.execution_policy.command_valid(command, self.n_arm):
+                if command is None or not self.execution_policy.command_valid(command, self.n_arm, self._where_been()):
                     self._fault("invalid measured hold command")
                     return False
                 cartesian = False
@@ -1089,6 +1124,14 @@ class ArmController:
         armed = bool(armed)
         if self.armed and not armed:
             self._disarm_reset()
+        if armed and not self.armed:
+            # the pose it rests at as it ARMs (the hold anchors there); none yet: the first sample after
+            fresh = (self._last_state_at is not None and self.execution_policy is not None
+                     and self._clock() - self._last_state_at <= self.execution_policy.state_timeout_sec)
+            self._arm_pose = (np.asarray(self.last_state.position, dtype=float).copy()
+                              if fresh and np.isfinite(self.last_state.position).all() else None)
+            self._arm_pose_fixed = False
+            self._been = None if self._arm_pose is None else np.vstack([self._arm_pose, self._arm_pose])
         self.armed = armed
         self.node.send_output("arm", pack_json_message("arm", {"armed": self.armed}))
 

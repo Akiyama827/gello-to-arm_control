@@ -36,6 +36,7 @@ import threading
 import time
 
 from arm_control.end_effectors.franka_hand import FRANKA_HAND, HandLimits
+from arm_control.joint_motor_map import finger_from_width, width_from_finger
 
 CLOSED_TOL_M = 1e-5         # the C++ observe_state's sample envelope: below -1e-5 or above 0.082 the sample is rejected
 OPEN_TOL_M = 2e-3           # (no STATE, not fresh); inside it the width is clamped to [0, width_max_m]
@@ -132,8 +133,9 @@ class _Admission:
 class _Fingers:
     """SimHand's finger physics (plant thread only): per tick, the finger command to apply, and an action's verdict."""
 
-    def __init__(self, width_max_m: float) -> None:
+    def __init__(self, width_max_m: float, mimic: dict | None = None) -> None:
         self.width_max_m = width_max_m
+        self.mimic = mimic  # how the finger joints run (none: the Franka Hand's)
         self.mode = "idle"          # idle | move | grasp | holding
         self.action: dict | None = None
         self.cmd_w: float | None = None
@@ -192,19 +194,22 @@ class _Fingers:
         """``(per-finger targets, force_n)`` for the plant, or None before any action."""
         if self.cmd_w is None:
             return None
-        return [self.cmd_w / 2.0, self.cmd_w / 2.0], self.force_n
+        finger = finger_from_width(self.cmd_w, self.mimic)
+        return [finger, finger], self.force_n
 
 
 class SimHandBridge:
     """The ``hand_bridge`` protocol over a hosted world's fingers. ``on_sample`` runs on the plant thread, once per tick, after
     the step; the server thread only parses, admits and reports. One lock, as the C++ server's ``mx``."""
 
-    def __init__(self, port: int, *, bind: str = "127.0.0.1", limits: HandLimits = FRANKA_HAND) -> None:
+    def __init__(self, port: int, *, bind: str = "127.0.0.1", limits: HandLimits = FRANKA_HAND,
+                 mimic: dict | None = None) -> None:
         self.addr = (bind, int(port))
         self.limits = limits
+        self.mimic = mimic
         self._lock = threading.Lock()
         self._adm = _Admission()
-        self._fingers = _Fingers(limits.width_max_m)
+        self._fingers = _Fingers(limits.width_max_m, mimic)
         self._acting: dict | None = None
         self.have_real, self.real_t, self.real_w, self.real_grasped, self.sample_seq = False, 0.0, 0.0, False, 0
         self.grasp_seq, self.grasp_ok, self.done_seq, self.done_token, self.done_ok = 0, False, 0, 0, False
@@ -240,7 +245,7 @@ class SimHandBridge:
     # -- the plant thread ------------------------------------------------------------------------------------
     def on_sample(self, positions, efforts, now: float):
         """One measured finger sample after a plant step. Returns ``(targets, force_n)`` to apply, or None."""
-        width = float(sum(float(p) for p in positions))
+        width = float(sum(width_from_finger(float(p), self.mimic) for p in positions) / max(len(positions), 1))
         with self._lock:
             adm = self._adm
             if adm.stopping:

@@ -63,7 +63,9 @@ def open_jaws(backend, cfg) -> None:
     gripper_cfg = dict((cfg.get("franka") or {}).get("gripper") or {})
     open_w = float(gripper_cfg.get("open_width_m", 0.0))
     if fingers and open_w > 0:
-        backend.apply_gripper_command([open_w / fingers] * fingers)
+        from arm_control.joint_motor_map import finger_from_width, gripper_mimic
+
+        backend.apply_gripper_command([finger_from_width(open_w, gripper_mimic(cfg))] * fingers)
         print(
             f"[mujoco_interface] jaws spawned OPEN at {open_w * 1000:.0f} mm",
             flush=True,
