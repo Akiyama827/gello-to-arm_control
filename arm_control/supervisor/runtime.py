@@ -21,6 +21,7 @@ from __future__ import annotations
 import collections
 import itertools
 import queue
+import re
 import socket
 import threading
 import time
@@ -52,6 +53,7 @@ from arm_control.messages import (
     unpack_controller_event, unpack_json_message, unpack_motor_command,
 )
 from arm_control.control.inprocess import QueueControllerNode
+from arm_control.multi_arm.diagnostics import SupervisorFaultTrace
 from arm_control.multi_arm.group import GROUP_BUDGET_S, GROUP_MIN_LEAD_MS
 from arm_control.plants.remote_rt import protocol as rtp
 from arm_control.plants.remote_rt.client import ReferenceRefused, RtBackend, RtLinkError, epoch_reached
@@ -192,6 +194,13 @@ class RobotRuntime:
         self._mode_feedback = dict(law='joint', kp=self.controller.executor.kp.copy(),
                                    kd=self.controller.executor.kd.copy())
         self.period = self.controller.execution_policy.period
+        # CTRL-051: this supervisor's own fault record (the ticks 10 s before a fault to 2 s after), written off the loop
+        self.fault_trace = SupervisorFaultTrace(self.instance_id, self.period, context=dict(
+            joints=list(self.joints), rt_host=getattr(self.link.config, 'host', None)),
+            sim=getattr(self.link, 'backend_name', '') == 'sim')  # a simulated plant's traces never prune the hardware's
+        self._latched_kinds = set()   # fault kinds seen while the latch has stayed set: only a kind not yet seen in this
+                                      # episode opens a window (its changing age, e.g. "rt state stream stale (0.42s)", and a
+                                      # degraded link flapping between "stale" and "frozen" do not); cleared with the latch
         self._profile_gains = (self.controller.executor.kp.copy(),
                                self.controller.executor.kd.copy())
         self.identity: RobotIdentity | None = None
@@ -294,6 +303,7 @@ class RobotRuntime:
                           reference_id=getattr(native, 'id', None), reference_revision=getattr(native, 'revision', None))
             self._trace_seq += 1
             self._trace.append(sample)
+            self.fault_trace.record(sample)
         except Exception:  # noqa: BLE001 -- diagnostics must not stop the control loop
             self._trace_errors += 1
 
@@ -888,7 +898,10 @@ class RobotRuntime:
         self._stream_worker.shutdown(wait=False, cancel_futures=True)
         self._tracker.disarm_sent()
         if self._native is not None:
-            self._native.close()
+            try:
+                self._native.close()
+            except Exception as exc:  # noqa: BLE001 -- the DISARM below must still happen
+                print(f"[supervisor] native reference close: {exc!r}", flush=True)
         for fut, _, _ in self._pending:
             fut.cancel()  # queued ARM/DISARM work; link.close() disarms itself
         closing = self._rpc.submit(self.link.close)
@@ -897,6 +910,8 @@ class RobotRuntime:
         except Exception as exc:  # noqa: BLE001 -- reported, shutdown continues
             print(f"[supervisor] link close: {exc}", flush=True)
         self._rpc.shutdown(wait=False, cancel_futures=True)
+        # After the DISARM: an open fault window is written with what it has; it never delays the stop (never raises).
+        self.fault_trace.close(timeout_s, record_errors=self._trace_errors)
 
     def now(self) -> Stamp:
         return Stamp(time.monotonic_ns(), Clock.PC, self.domain)
@@ -1396,6 +1411,8 @@ class RobotRuntime:
         return live[-1].status if live else None
 
     def _receipt(self, ex: _Execution, phase: Phase, reason: str = "", **evidence) -> None:
+        if phase is Phase.FAULTED:
+            self.fault_trace.trigger(f'{ex.status.execution_id} FAULTED: {reason}', time.monotonic())
         if phase is Phase.ADMITTED:
             evidence["payload_revision"] = ex.payload_revision
         r = Receipt(ex.status.execution_id, ex.status.request_id, self.instance_id, phase,
@@ -1848,6 +1865,13 @@ class RobotRuntime:
         rs = c.runtime_state
         self._pump_controller(sent_for=rs["plan_id"] if rs["executing"] else None)
         self._record_trace(health)
+        latched = str(health["latched_fault"] or "")
+        kind = re.sub(r'\s*\([^)]*\)', '', latched)  # the fault without its parenthesised age/detail
+        if not kind:
+            self._latched_kinds.clear()
+        elif kind not in self._latched_kinds:
+            self._latched_kinds.add(kind)
+            self.fault_trace.trigger(f'latched fault: {latched}', time.monotonic())
         for ex in list(self._executions.values()):
             if (ex.first_seq is not None and not ex.status.terminal
                     and self._tracker.fault_seen(ex.epoch)):
@@ -1860,6 +1884,7 @@ class RobotRuntime:
                     self._receipt(ex, Phase.APPLIED, command_seq=confirmed, arm_epoch=ex.epoch)
         self._reconcile()
         if c.stopped:
+            self.fault_trace.trigger(f'controller stopped: {getattr(c, "stop_reason", "")}', time.monotonic())
             # A stopped ArmController is terminal (its Dora node exits). Here a
             # fresh one replaces it: disarmed, nothing staged, new admission.
             print("[supervisor] controller stopped; replaced with a fresh, disarmed one",
@@ -1868,6 +1893,7 @@ class RobotRuntime:
             self._reconcile()
         self._prune()
         self._publish()
+        self.fault_trace.poll(time.monotonic(), record_errors=self._trace_errors)
 
     def _publish(self) -> None:
         """Snapshot state and authority as contract values for readers."""

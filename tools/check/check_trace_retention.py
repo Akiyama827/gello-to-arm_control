@@ -2,6 +2,7 @@
 import errno
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 import subprocess
@@ -39,19 +40,32 @@ def main():
             else:
                 raise AssertionError("a failed write was reported as saved")
         assert digest_tree(root) == before, "a failed write left a file behind"
-        # 3. Capacity: a save never deletes; over the policy it warns; pruning is an explicit, dry-run-by-default action.
-        for i in range(6):
-            small = diagnostics.PairFaultTrace(f"r{i}")
-            small.record(dict(index=i))
-            small.save(f"r{i}", {}, root=root)
-        assert len(list(root.glob("*.json"))) == 7, "a save deleted something"
-        assert diagnostics.capacity_warning(root, keep_files=3) and not diagnostics.capacity_warning(root)
-        assert diagnostics.prune_traces(root, keep_files=3, dry_run=True) and len(list(root.glob("*.json"))) == 7
+        # 3. Capacity: every save keeps the newest RETAIN_FILES (operator 2026-10-10), the new one always among them, sidecars
+        #    with their traces; pruning further is the operator's explicit, dry-run-by-default action.
+        with patch.object(diagnostics, "RETAIN_FILES", 4):
+            for i in range(6):
+                small = diagnostics.PairFaultTrace(f"r{i}")
+                small.record(dict(index=i))
+                last = small.save(f"r{i}", {}, root=root)
+        names = sorted(p.name for p in root.glob("*.json"))
+        assert len(names) == 4 and names[-1] == last.name and first.name not in names, names
+        assert sorted(p.name for p in root.glob("*.sha256")) == [n + ".sha256" for n in names]
+        assert diagnostics.prune_traces(root, keep_files=3, dry_run=True) and len(list(root.glob("*.json"))) == 4
         assert trace_export.main(["--root", str(root), "--prune", "--keep-files", "3"]) == 0  # dry run
-        assert len(list(root.glob("*.json"))) == 7
+        assert len(list(root.glob("*.json"))) == 4
         removed = diagnostics.prune_traces(root, keep_files=3)
         names = sorted(p.name for p in root.glob("*.json"))
-        assert len(names) == 3 and len(removed) == 4 and all(n.endswith(".json") for n in removed), (names, removed)
+        assert len(names) == 3 and len(removed) == 1 and all(n.endswith(".json") for n in removed), (names, removed)
+        # Over MAX_TRACE_BYTES the OLDEST samples go, counted; the trace still verifies.
+        big = diagnostics.PairFaultTrace("big")
+        for i in range(400):
+            big.record(dict(index=i, pad="x" * 1000))
+        with patch.object(diagnostics, "MAX_TRACE_BYTES", 100_000):
+            capped = big.save("capped", {}, root=Path(tmp) / "capped")
+        report = json.loads(capped.read_text())
+        assert capped.stat().st_size <= 100_000 and report["truncated_samples"] > 0, capped.stat().st_size
+        assert report["samples"][-1]["index"] == 399 and report["samples_kept"] + report["truncated_samples"] == 400
+        assert trace_export.verify(capped)["ok"]
         assert sorted(p.name for p in root.glob("*.sha256")) == [n + ".sha256" for n in names]
         assert all(trace_export.verify(root / n)["ok"] for n in names)
         newest = root / names[-1]
@@ -83,6 +97,23 @@ def main():
             else:
                 raise AssertionError(f"export accepted {unsafe}")
         assert trace_export.main(["--root", str(root), "--verify"]) == 1  # one bad trace: non-zero
+        # Simulations never share a fault directory (or its retention) with the hardware, under the same instance id.
+        assert diagnostics.supervisor_fault_root("fr3_1", sim=True) != diagnostics.supervisor_fault_root("fr3_1")
+        assert diagnostics.fault_root(sim=True) != diagnostics.fault_root()
+        with patch.dict(os.environ, {diagnostics.FAULT_ROOT_ENV: "relative/faults"}):
+            try:
+                diagnostics.fault_root()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("a relative fault root was accepted")
+        # CTRL-010: a bare --dest exports under the deployment's export root, never without one.
+        with patch.dict(os.environ, {diagnostics.EXPORT_ROOT_ENV: ""}):
+            assert trace_export.main(["--root", str(root), "--dest"]) == 2
+        with patch.dict(os.environ, {diagnostics.EXPORT_ROOT_ENV: str(Path(tmp) / "exports")}):
+            assert trace_export.main(["--root", str(root), "--dest", "--include-unverified"]) == 0
+        auto = list((Path(tmp) / "exports").glob("*/faults-*/EXPORT_MANIFEST.json"))
+        assert len(auto) == 1 and auto[0].parent.name.startswith(f"faults-{root.parent.name}-"), auto
         # 4b. Round-1 review hardening.
         sub = Path(tmp) / "hard"
         t = diagnostics.PairFaultTrace("h")
@@ -191,7 +222,7 @@ def main():
                                   "--confirm-exported", str(out)]) == 0
         assert not [p for p in sub.glob("2*.json") if (out / p.name).is_file()], "an exported trace survived the prune"
         # 4b. A symlink named like a trace is not a trace: not counted, never pruned, never exported, and what it points to is
-        # untouched. Orphan .partial files count toward capacity (and are named by the warning).
+        # untouched.
         sym_root, outside = Path(tmp) / "symroot", Path(tmp) / "outside.json"
         sym_root.mkdir()
         outside.write_text("{}")
@@ -199,18 +230,6 @@ def main():
         assert diagnostics._traces(sym_root) == []
         assert diagnostics.prune_traces(sym_root, keep_files=0, keep_bytes=0) == [] and outside.read_text() == "{}"
         assert not trace_export.export(sym_root, Path(tmp) / "symexport")["traces"]
-        (sym_root / "20990101T000000000001Z-x.json.partial").write_bytes(b"x" * 2048)
-        assert diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=1024), "a partial file did not count"
-        assert not diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=4096)
-        assert "1 unfinished .partial" in diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=1024)
-        # a dangling .partial link or a vanished file does not hide the warning for the rest
-        (sym_root / "dangling.partial").symlink_to(Path(tmp) / "nowhere")
-        assert diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=1024), "a dangling link hid the warning"
-        assert diagnostics._size(Path(tmp) / "nowhere") == 0  # a vanished file is not countable and not an error
-        big = Path(tmp) / "big.bin"
-        big.write_bytes(b"x" * (2 << 20))
-        (sym_root / "linked.partial").symlink_to(big)  # a link is not a partial file: what it points at is not ours to count
-        assert not diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=4096), "a .partial link was counted"
         # 4c. Durability: the trace and its sidecar are fsynced before the rename and the directory after it, in that order.
         order = []
         real_fsync, real_replace = diagnostics.os.fsync, diagnostics.os.replace

@@ -1,12 +1,15 @@
 """Operator export of persisted fault traces (CTRL-051): verify and copy, read-only.
 
     python -m arm_control.multi_arm.trace_export --verify [--root DIR]
-    python -m arm_control.multi_arm.trace_export --dest DIR [--root DIR] [--include-unverified]
+    python -m arm_control.multi_arm.trace_export --dest [DIR] [--root DIR] [--include-unverified]
     python -m arm_control.multi_arm.trace_export --prune [--keep-files N] [--yes --confirm-exported DIR] [--root DIR]
 
-Reads the fault-trace directory and does not modify it, except for an explicit ``--prune --yes --confirm-exported DIR`` (dry run
-without ``--yes``; only traces with a byte-identical copy in DIR are deleted), the only way traces are ever deleted. A trace is verified when its SHA-256 sidecar matches its bytes,
-it parses as ``arm_control.dual_fault`` JSON and its recorded ``samples_kept`` equals the number of samples it holds.
+Reads a fault-trace directory (the console's by default; a supervisor's is ``.cache/supervisor/<instance>/faults``) and does
+not modify it, except for an explicit ``--prune --yes --confirm-exported DIR`` (dry run without ``--yes``; only traces with a
+byte-identical copy in DIR are deleted). Every save also keeps only the newest ``RETAIN_FILES`` traces of its directory
+(operator 2026-10-10): export what must outlive that. A trace is verified when its SHA-256 sidecar matches its bytes, it
+parses as ``arm_control.dual_fault`` or ``arm_control.supervisor_fault`` JSON and its recorded ``samples_kept`` equals the
+number of samples it holds.
 ``--dest`` copies the verified traces (and their sidecars) plus ``EXPORT_MANIFEST.json`` (name, size, sha256, reason,
 observed time, samples kept, dropped samples) into a directory that must not exist or must be empty; files are created
 exclusively, so nothing is overwritten. This module imports no transport and opens no device, socket or robot address:
@@ -21,7 +24,8 @@ from pathlib import Path
 import shutil
 import sys
 
-from arm_control.multi_arm.diagnostics import RETAIN_FILES, TRACE_GLOB, fault_root, prune_traces
+from arm_control.multi_arm.diagnostics import (EXPORT_ROOT_ENV, RETAIN_FILES, TRACE_GLOB, TRACE_SCHEMAS, export_dir, fault_root,
+                                               prune_traces)
 
 
 def _digest(path: Path) -> str:
@@ -62,7 +66,7 @@ def verify(path: Path) -> dict:
         if not isinstance(report, dict) or not isinstance(report.get("samples", []), list):
             info["problem"] = "not a trace object with a samples list"
             return info
-        if not str(report.get("schema", "")).startswith("arm_control.dual_fault/"):
+        if not str(report.get("schema", "")).startswith(TRACE_SCHEMAS):
             info["problem"] = f"unknown schema {report.get('schema')!r}"
             return info
         held = len(report.get("samples", []))
@@ -112,16 +116,21 @@ def export(root: Path, dest: Path, *, include_unverified: bool = False) -> dict:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--root", type=Path, default=None, help="fault-trace directory (default: the console's)")
+    ap.add_argument("--root", type=Path, default=None, help="fault-trace directory (default: the console's; a supervisor's: .cache/supervisor/<instance>/faults)")
     ap.add_argument("--verify", action="store_true", help="list traces and their verification")
-    ap.add_argument("--dest", type=Path, help="copy verified traces and a manifest here")
+    ap.add_argument("--dest", nargs="?", const="", default=None,
+                    help=f"copy verified traces and a manifest here (no value: ${EXPORT_ROOT_ENV}/<date>/<faults|sim_faults>-<source>-<time>)")
     ap.add_argument("--include-unverified", action="store_true")
     ap.add_argument("--prune", action="store_true", help="remove the oldest traces beyond the capacity policy")
     ap.add_argument("--keep-files", type=int, default=RETAIN_FILES)
     ap.add_argument("--yes", action="store_true", help="actually delete (default is a dry run)")
     ap.add_argument("--confirm-exported", type=Path, help="with --prune --yes: only traces with a byte-identical copy in this directory are deleted")
     args = ap.parse_args(argv)
-    root = fault_root() if args.root is None else args.root
+    try:
+        root = fault_root() if args.root is None else args.root
+    except ValueError as exc:  # a relative ARM_CONTROL_FAULT_ROOT
+        print(exc)
+        return 2
     if args.prune:
         if args.keep_files < 0:
             print("--keep-files must be >= 0")
@@ -140,10 +149,25 @@ def main(argv=None) -> int:
         print(f"not a directory: {root}")
         return 2
     if args.dest is not None:
+        if args.dest == "":
+            try:
+                auto = export_dir(f"{root.name}-{root.parent.name}")  # faults-fr3_1 / sim_faults-fr3_1
+            except ValueError as exc:
+                print(exc)
+                return 2
+            if auto is None:
+                print(f"--dest without a directory needs {EXPORT_ROOT_ENV} (the deployment's export root)")
+                return 2
+            args.dest = auto
+        args.dest = Path(args.dest)
         if args.dest.exists() and not args.dest.is_dir():
             print(f"--dest is not a directory: {args.dest}")
             return 2
-        manifest = export(root, args.dest, include_unverified=args.include_unverified)
+        try:
+            manifest = export(root, args.dest, include_unverified=args.include_unverified)
+        except (ValueError, FileExistsError) as exc:
+            print(f"export refused: {exc}")
+            return 2
         bad = [t for t in manifest["traces"] if not t["ok"]]
         print(f"exported {sum(t['exported'] for t in manifest['traces'])} trace(s) to {args.dest}; "
               f"{len(bad)} failed verification")

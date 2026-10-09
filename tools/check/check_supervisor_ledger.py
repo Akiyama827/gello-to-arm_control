@@ -10,6 +10,7 @@ is check_sdk_supervisor.py; this complements it and opens no socket.
 """
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -35,7 +36,7 @@ class StubLink:
 
     def __init__(self, *, accept: bool, stop_delay_s: float = 0.0) -> None:
         self.accept, self.stop_delay_s = accept, stop_delay_s
-        self.config = SimpleNamespace(state_timeout_s=0.5)
+        self.config = SimpleNamespace(state_timeout_s=0.5, host="stub")
         self.backend_name, self.supports_pose_hold, self.rt_setup = "stub", False, "ok"
         self.hold_ms = None  # the link contract: an RT HELLO without hold_ms (no streamed-gap deadline)
         self.identity, self.session_id = SimpleNamespace(model_id=""), SESSION
@@ -45,6 +46,7 @@ class StubLink:
         self.seq = self.last_cmd = self.state_seq = 0
         self.history: deque = deque(maxlen=32)
         self._lock = threading.Lock()
+        self.fault = ""  # the RT's latched fault text, switchable by a check
 
     def open(self) -> None:
         pass
@@ -70,7 +72,7 @@ class StubLink:
             return self.history[-1] if self.history else (None, 0.0)
 
     def motor_health(self) -> dict:
-        return dict(armed=self.armed, state_fresh=bool(self.history), latched_fault="",
+        return dict(armed=self.armed, state_fresh=bool(self.history), latched_fault=self.fault,
                     any_fault=False, holding=False, arm_epoch=self.epoch,
                     supports_pose_hold=False)
 
@@ -120,6 +122,144 @@ def settle(rt: RobotRuntime, eid: str, timeout_s: float = 6.0):
     return rt.status(eid, wait_s=timeout_s)
 
 
+def check_fault_trace() -> None:
+    """CTRL-051: the supervisor writes its own fault trace off the loop: the ticks pre_s before the first fault to post_s
+    after it (later faults join the window), sha256-verified; a busy writer skips (counted), a failed write is counted, and
+    neither stalls the servo loop; closing with a window open writes it, marked incomplete."""
+    from unittest.mock import patch
+
+    from arm_control.multi_arm import diagnostics, trace_export
+
+    tmp = Path(tempfile.mkdtemp(prefix="supervisor_fault_"))
+    link = StubLink(accept=True)
+    rt = RobotRuntime(load_robot_config(write_config(tmp, 1, 2)), link=link)
+    pre, post = .5, .3
+    rt.fault_trace = diagnostics.SupervisorFaultTrace("sdk_arm", rt.period, root=tmp / "faults", pre_s=pre, post_s=post)
+    rt.start()
+    closed = False
+    try:
+        rt.claim("owner")
+        armed(rt)
+        time.sleep(pre + .3)
+        t0 = time.monotonic()
+        link.fault = "test fault"
+        time.sleep(.05)
+        link.fault = ""
+        time.sleep(.03)
+        link.fault = "a second fault"   # a second rising edge inside the window: the same trace
+        deadline = time.monotonic() + 3
+        while not rt.fault_trace.written and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert rt.fault_trace.written, "no fault trace written"
+        path = rt.fault_trace.written[0]
+        report = json.loads(path.read_text())
+        assert trace_export.verify(path)["ok"], trace_export.verify(path)
+        assert report["schema"] == "arm_control.supervisor_fault/v1" and report["post_window_complete"]
+        assert [f["reason"] for f in report["faults"]] == ["latched fault: test fault", "latched fault: a second fault"], report["faults"]
+        start = report["fault_at_pc_monotonic"]
+        stamps = [x["pc_monotonic"] for x in report["samples"]]
+        assert abs(start - t0) < .05 and stamps[0] >= start - pre - 1e-9 and stamps[0] < start - pre + .05, (stamps[0], start)
+        assert stamps[-1] >= start + post - .02 and np.diff(stamps).max() < .05, (stamps[-1], np.diff(stamps).max())
+        assert len(stamps) >= .8 * (pre + post) / rt.period, len(stamps)
+        # A busy writer: the next trace is SKIPPED (counted), and the loop keeps its cadence while the writer sleeps.
+        real_write = diagnostics.write_trace
+
+        def slow_write(*a, **k):
+            time.sleep(1.)
+            return real_write(*a, **k)
+        link.fault = ""
+        time.sleep(.05)
+        with patch.object(diagnostics, "write_trace", slow_write):
+            link.fault = "third"
+            time.sleep(post + .1)       # window 3 flushed; its writer sleeps
+            seq0 = rt.trace_samples()["latest_seq"]
+            link.fault = ""
+            time.sleep(.03)
+            link.fault = "fourth"
+            time.sleep(post + .1)       # window 4 flushes while the writer is busy
+            assert rt.fault_trace.skipped == 1, rt.fault_trace.skipped
+            ticks = rt.trace_samples()["latest_seq"] - seq0
+            assert ticks >= .8 * (post + .1) / rt.period, f"the loop stalled behind the writer: {ticks} ticks"
+            time.sleep(1.)
+        # A failed write (disk full) is counted, never raised into the loop.
+        link.fault = ""
+        time.sleep(.05)
+        with patch.object(diagnostics, "write_trace", side_effect=OSError(28, "No space left on device")):
+            link.fault = "fifth"
+            time.sleep(post + .2)
+        assert rt.fault_trace.errors == 1 and rt.state().validity.value != "missing", rt.fault_trace.errors
+        # A latched fault whose TEXT changes every tick (RtBackend's "rt state stream stale (0.42s)") is one fault: one window,
+        # one trace, however long it lasts.
+        link.fault = ""
+        time.sleep(.05)
+        before = len(rt.fault_trace.written)
+        stop = time.monotonic() + 1.2
+        while time.monotonic() < stop:
+            link.fault = f"rt state stream stale ({time.monotonic() - stop + 1.2:.2f}s)"
+            time.sleep(.005)
+        time.sleep(post + .2)
+        assert len(rt.fault_trace.written) == before + 1, len(rt.fault_trace.written) - before
+        # A fault of another KIND replacing one still latched (no clear tick between) is a new fault: a new trace.
+        link.fault = ""
+        time.sleep(.05)
+        before = len(rt.fault_trace.written)
+        link.fault = "rt servo frozen (0.10s, link alive)"
+        time.sleep(post + .2)
+        link.fault = "rt fault 3: joint limit"
+        time.sleep(post + .2)
+        assert len(rt.fault_trace.written) == before + 2, len(rt.fault_trace.written) - before
+        assert not rt.fault_trace.sim, "a stub (non-sim) link's traces went to the simulation directory"
+        # A degraded link flapping between "stale" and "frozen" for 1.5 s, the latch never clearing: one episode, one trace.
+        link.fault = ""
+        time.sleep(.05)
+        before = len(rt.fault_trace.written)
+        stop = time.monotonic() + 1.5
+        while time.monotonic() < stop:
+            link.fault = "rt servo frozen (0.30s, link alive)"
+            time.sleep(.15)
+            link.fault = "rt state stream stale (0.45s)"
+            time.sleep(.15)
+        time.sleep(post + .2)
+        assert len(rt.fault_trace.written) == before + 1, len(rt.fault_trace.written) - before
+        # A trace that fails inside the loop is counted, never raised: the arm stays armed.
+        link.fault = ""
+        time.sleep(.05)
+        errors = rt.fault_trace.errors
+        with patch.object(rt.fault_trace, "_flush", side_effect=RuntimeError("cannot schedule new futures")):
+            link.fault = "seventh"
+            time.sleep(post + .2)
+        assert rt.fault_trace.errors == errors + 1 and link.armed, (rt.fault_trace.errors, link.armed)
+        # Closing with a window open writes what it has, AFTER the DISARM: a slow write never delays the stop.
+        link.fault = ""
+        time.sleep(.05)
+        link.fault = "sixth"
+        time.sleep(.05)
+        real_stop, stopped_at = link.safe_stop, []
+
+        def timed_stop():
+            stopped_at.append(time.monotonic())
+            return real_stop()
+        link.safe_stop = timed_stop
+
+        def slow(*a, **k):
+            time.sleep(1.)
+            return real_write(*a, **k)
+        with patch.object(diagnostics, "write_trace", slow):
+            closing = time.monotonic()
+            closed = True
+            rt.close()
+        assert stopped_at and stopped_at[0] - closing < .3, (stopped_at, closing)
+    finally:
+        if not closed:
+            rt.close()
+    last = json.loads(rt.fault_trace.written[-1].read_text())
+    assert last["reason"] == "latched fault: sixth" and last["post_window_complete"] is False, last["reason"]
+    assert len(list((tmp / "faults").glob("*.json"))) == 7, sorted((tmp / "faults").iterdir())
+    print(f"  supervisor fault trace: {len(stamps)} ticks [-{pre}, +{post}] s, faults joined, busy writer skipped, "
+          f"write failure counted, a changing fault text traced once, a failing trace leaves the arm armed, "
+          f"open window written on close after the DISARM")
+
+
 def check_stall_schedule() -> None:
     """The servo loop's schedule (rt_mod.next_tick), modelled as the loop runs it: tick, take the next deadline, sleep to it.
     One late wake or one slow step, swept from just over a period to 40 ms: no two ticks closer than a period, and exactly one
@@ -141,6 +281,7 @@ def check_stall_schedule() -> None:
 
 def main() -> None:
     check_stall_schedule()
+    check_fault_trace()
     # Completion observed on feedback, but the plant never accepted a command.
     rt = runtime(StubLink(accept=False))
     try:

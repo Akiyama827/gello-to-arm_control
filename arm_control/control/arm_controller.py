@@ -197,6 +197,7 @@ class ArmController:
         self.ready_sent = False
         self.frozen = False         # milestone hold / failed settle; cancel clears
         self.stopped = False
+        self.stop_reason = ""
 
         # The one loaded plan, its staged trajectory, and once released the
         # reference being executed (trajectory, start time, sampling).
@@ -1148,7 +1149,7 @@ class ArmController:
     def _stop(self, reason: str) -> None:
         if self.stopped:
             return
-        self.stopped = True
+        self.stopped, self.stop_reason = True, str(reason)
         if self.armed:
             self._set_arm(False)
         self.node.send_output(
