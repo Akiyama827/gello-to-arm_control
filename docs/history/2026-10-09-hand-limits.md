@@ -40,6 +40,9 @@ Review round 1 (opus): BLOCK, one MUST, fixed:
   a new field goes on a new line), stated in the header and README. A release on a no-force gripper commands force 0
   rather than passing the payload's value through.
 
+Review round 2 (opus): ACCEPT. M1 verified per case on both envelopes; both round-1 mutants now fail the check; no Franka
+regression. Its NIT (the panel shows Close enabled on a no-force gripper; a click is refused) is display only, for A2.
+
 Named, not changed:
 * `HandGraspFsm.__init__` and `HandPanel.__init__` resolve the configured defaults against the Franka Hand before any
   LIMITS arrives. A DM config with `open_width_m`/`grasp_width_m` above 0.08 would raise at startup. That belongs to the DM
