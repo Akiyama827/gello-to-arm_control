@@ -26,6 +26,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def main():
+    import arm_control
+    # This process plans with the assets under ITS root and the supervisors simulate the library's: a project root here would
+    # plan against camera-equipped FR3s while simulating camera-less ones (a misleading target collision).
+    assert arm_control.CONTROL_ROOT.resolve() == ROOT, (
+        f"run with ARM_CONTROL_ROOT unset or {ROOT} (got {arm_control.CONTROL_ROOT}): the example is the library's")
     env = dict(os.environ, ARM_CONTROL_ROOT=str(ROOT), PYTHONPATH=os.pathsep.join([str(ROOT), os.environ.get("PYTHONPATH", "")]))
     with running_pair(ROOT / "examples/configs/dual_arm_object.yaml", env, plant="sim", cwd=ROOT) as (staged, env):
         os.environ[SOCKETS_ENV] = env[SOCKETS_ENV]
