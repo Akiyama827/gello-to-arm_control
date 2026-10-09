@@ -197,7 +197,7 @@ async function build(initial) {
   if (initial.shared_object) {
 
     objectMeshes={};
-    for (const [name,color,opacity] of [['measured',0x8ca3bf,initial.shared_object.virtual ? .45 : 1],['target',0xe9ac42,.3],['preview',0x72c48f,.55]]) {
+    for (const [name,color,opacity] of [['measured',0x8ca3bf,.45],['target',0xe9ac42,.3],['preview',0x72c48f,.55]]) {
       const group=await buildStatic(geometry.object);
       group.traverse(o=>{if(o.isMesh){o.material.color.setHex(color);o.material.transparent=opacity<1;o.material.opacity=opacity;o.material.depthWrite=opacity===1;}});
       group.visible=name==='measured';
@@ -234,33 +234,28 @@ function resetMode(s) {
   syncGizmo();
 }
 function renderMode(s, fresh, blocked) {
-  const virtual=!!s.shared_object?.virtual;
+  // coupling is virtual in simulation as on hardware: empty Hands, the plate inferred from both TCPs
   const wanted=$('control-mode').value;
   const transition=wanted!==s.mode && !!s.shared_object;
-  $('active-mode').textContent=sharedMode(s)?(virtual?'Virtual coupling active':'Shared object active'):'Independent arms active';
-  $('control-mode').querySelector('option[value="shared"]').textContent=virtual?'Virtual object':'Shared object';
+  $('active-mode').textContent=sharedMode(s)?'Virtual coupling active':'Independent arms active';
+  $('control-mode').querySelector('option[value="shared"]').textContent='Virtual object';
   $('control-mode').disabled=!fresh||blocked||!s.shared_object;
   $('object-panel').hidden=!sharedMode(s);
   $('mode-transition').hidden=!transition;
   $('plan-grasps').hidden=wanted!=='shared';
   $('plan-grasps').disabled=!fresh||blocked;
-  $('plan-grasps').textContent=virtual?'Plan to virtual grasps':'Plan to grasp poses';
+  $('plan-grasps').textContent='Plan to virtual grasps';
   $('mode-confirmed').disabled=!fresh||blocked;
-  $('apply-mode').textContent=wanted==='shared'?(virtual?'Enable virtual coupling':'Enable shared-object mode'):'Return to independent arms';
+  $('apply-mode').textContent=wanted==='shared'?'Enable virtual coupling':'Return to independent arms';
   $('apply-mode').disabled=!fresh||blocked||!!s.transition_reason||!$('mode-confirmed').checked;
-  $('mode-confirmation').textContent=virtual?(wanted==='shared'?'Both Hands are empty; capture these TCP offsets.':'Return to independent arm targets.'):
-    wanted==='shared'?'I verified both fixed grasps.':'The object is externally supported; release both grasp constraints.';
+  $('mode-confirmation').textContent=wanted==='shared'?'Both Hands are empty; capture these TCP offsets.':'Return to independent arm targets.';
   const entry=s.shared_object?.entry_errors;
-  const residual=virtual&&entry?Object.entries(entry).map(([a,e])=>`${a}: ${e.position_mm.toFixed(2)} mm / ${e.angle_deg.toFixed(2)}°`).join('; '):'';
-  $('transition-reason').textContent=s.transition_reason || (virtual&&wanted==='shared'?
+  const residual=entry?Object.entries(entry).map(([a,e])=>`${a}: ${e.position_mm.toFixed(2)} mm / ${e.angle_deg.toFixed(2)}°`).join('; '):'';
+  $('transition-reason').textContent=s.transition_reason || (wanted==='shared'?
     `Ready to capture stopped TCP offsets (within 10 mm / 2°). ${residual}`:'Stopped and ready for confirmation.');
-  const widths=s.shared_object?Object.entries(s.shared_object.grasp_widths_mm).map(([a,w])=>`${a}: ${w.toFixed(1)} mm`).join(', '):'';
   $('mode-detail').textContent=!s.shared_object?'No shared object is described in this setup.':
-    virtual?(sharedMode(s)?'Both real arms follow the virtual plate using the captured TCP offsets. No physical object or added payload.':
-      'Keep both Hands empty and open. Plan to virtual grasps, review / stage / execute, then capture the stopped TCP offsets. These offsets stay fixed during coupling; no Hand closure is required.'):
-    sharedMode(s)?'Both TCPs follow the object. To return to independent control, stop and support the object first.':
-    wanted==='shared'?`Object supported in simulation. Open both Hands, Plan to grasp poses, review / stage / execute, then close the Hands (${widths}) and confirm. Selecting this mode does not move the arms.`:
-    'Individual TCP targets. The object remains supported in simulation; select Shared object to prepare both grasps.';
+    sharedMode(s)?'Both arms follow the virtual plate using the captured TCP offsets. No physical object or added payload.':
+      'Keep both Hands empty and open. Plan to virtual grasps, review / stage / execute, then capture the stopped TCP offsets. These offsets stay fixed during coupling; no Hand closure is required.';
 }
 $('control-mode').onchange=()=>{ $('mode-confirmed').checked=false; if(state)render(state); };
 $('refine').onchange=async()=>{
@@ -271,10 +266,8 @@ $('mode-confirmed').onchange=()=>state&&render(state);
 $('apply-mode').onclick=async()=>{
   const wanted=$('control-mode').value;
   const reply=await action('set_mode',{mode:wanted,
-    empty_hands_confirmed:!!state.shared_object?.virtual&&wanted==='shared'&&$('mode-confirmed').checked,
-    virtual_release_confirmed:!!state.shared_object?.virtual&&wanted==='independent'&&$('mode-confirmed').checked,
-    grasps_confirmed:wanted==='shared'&&$('mode-confirmed').checked,
-    support_confirmed:wanted==='independent'&&$('mode-confirmed').checked});
+    empty_hands_confirmed:wanted==='shared'&&$('mode-confirmed').checked,
+    virtual_release_confirmed:wanted==='independent'&&$('mode-confirmed').checked});
   if(reply)changed();
 };
 $('plan-grasps').onclick=async()=>{
@@ -310,9 +303,9 @@ function render(s) {
   if (s.shared_object) {
     const o=s.shared_object;
     setObject(objectMeshes.measured,o.pose);
-    $('object-heading').textContent=o.virtual?'Virtual plate · empty Hands':'Shared object · fixed grasps';
-    $('object-sync').textContent=o.virtual?'Use current virtual pose':'Use measured object pose';
-    const poseNote=o.virtual?(sharedMode(s)?'Virtual pose inferred from time-aligned TCPs; real arms move.':'Virtual plate at preparation pose; real arms move.'):(o.paused?'Physics paused until both arms are armed.':'Simulated rigid grasps active.');
+    $('object-heading').textContent='Virtual plate · empty Hands';
+    $('object-sync').textContent='Use current virtual pose';
+    const poseNote=sharedMode(s)?'Virtual pose inferred from time-aligned TCPs; real arms move.':'Virtual plate at preparation pose; real arms move.';
     $('object-detail').textContent=`${poseNote} TCP agreement error: ${o.closure_mm.toFixed(3)} mm / ${o.closure_deg.toFixed(3)}°. Object target is in shared world coordinates.`;
     if (!sharedMode(s)) { objectMeshes.target.visible=false; objectMeshes.preview.visible=false; }
   }
@@ -330,7 +323,7 @@ function render(s) {
   $('timing').textContent=s.timing;
   const skew=s.pair.pair_id===s.preview_id?s.pair.release_skew_sec:null;
   $('pair-detail').textContent=s.pair.cancellation_pending.length?`Waiting for cancellation: ${s.pair.cancellation_pending.join(', ')}`:
-    skew!==null?`Release send gap: ${(skew*1000).toFixed(3)} ms. Both member results are required.`:
+    skew!==null?`Release request gap: ${(skew*1000).toFixed(3)} ms (both start at one scheduled stamp). Both member results are required.`:
     sharedMode(s)?'Arm both controllers before staging. Both grasps remain fixed throughout the move.':
     'Arm both controllers before staging. Unselected arms hold their measured position.';
   $('instruction').textContent = s.planning ? 'Planning both arms in the shared scene…'

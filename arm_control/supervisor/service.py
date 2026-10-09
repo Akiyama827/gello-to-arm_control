@@ -125,7 +125,10 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
     if op == "submit":
         return enc(runtime.submit(session, codec.request_from(args["request"])))
     if op == "release":
-        return enc(runtime.release(session, str(args["execution_id"])))
+        start_at = args.get("start_at")
+        if start_at is not None and runtime.extensions.get("scheduled_release") != 1:
+            raise Refused("scheduled_release/1 is unavailable")
+        return enc(runtime.release(session, str(args["execution_id"]), codec.stamp_from(start_at)))
     if op == "cancel":
         return enc(runtime.cancel(session, str(args["execution_id"]),
                                   str(args.get("reason") or "cancelled")))

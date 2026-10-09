@@ -18,7 +18,8 @@ life; a restart shows up as a closed channel, 'supervisor unreachable' and a fau
 
 What stays out: the Hand/gripper and collision world (project composition, per the card), Soft (the SDK path needs a
 Soft-capable plant: ``set_mode('soft')`` is refused), arbitrary gains (only named presets, through the console adapter),
-and timing across arms (a pair's start skew belongs to the CTRL-040 group execution, not to this handle). The handle's `clock` must be the
+and timing across arms (the pair runtime defers a release through ``deferred`` and sends both with one start stamp;
+RT-side starts are CTRL-040 group/1). The handle's `clock` must be the
 coordinator's clock. The calls
 that talk to the supervisor block up to the SDK timeouts (``set_armed`` up to ``arm_timeout_s``).
 """
@@ -93,6 +94,9 @@ class SdkArmHandle:
         self._fault_reported = False
         self._fault_reason = None
         self.dropped: dict[str, list] = {}
+        # While a pair's release is in progress (SupervisedHardware.release_context): the list a release is deferred to (the
+        # pair runtime sends both together with one start stamp and confirms both before it, or cancels).
+        self.deferred = None
         # The coordinator clock vs the supervisor's PC clock, estimated from a read taken BEFORE the supervisor's stamp
         # (so the offset errs toward older samples): observed_at is the sample's reception time on the coordinator's
         # clock, never a fresh read, which could be later than the coordinator's own `now`.
@@ -237,9 +241,12 @@ class SdkArmHandle:
         if record is None:
             raise ValueError(f'{plan_id}: no such staged plan')
         # Ownership/unknown-id/start-mode problems raise Refused (the coordinator aborts the pair). A selection refusal
-        # (not armed, expired) comes back as a REJECTED/EXPIRED execution and surfaces as a failed leg_result, which the
-        # coordinator's _poll after execute() sees before it releases the partner.
-        self._arm.release(record['execution'])
+        # (not armed, expired) comes back as a REJECTED/EXPIRED execution: alone, it surfaces as a failed leg_result; in a
+        # pair's release it fails the release and the accepted partner is cancelled (SupervisedHardware._release_together).
+        if self.deferred is not None:
+            self.deferred.append((self._arm, record['execution']))
+        else:
+            self._arm.release(record['execution'])
         record['released'] = True
 
     def cancel(self, reason: str = '', *, plan_id: str | None = None) -> None:

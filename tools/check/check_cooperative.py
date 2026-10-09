@@ -1,4 +1,5 @@
-"""Device-free rigid-grasp planning, collision, HTTP and execution checks."""
+"""Device-free virtual-grasp planning, collision, HTTP and execution checks: the console over the simulated pair's two
+supervisors (one hosts the world, one co-hosts; the plate is virtual, inferred from both TCPs)."""
 
 from dataclasses import replace
 from pathlib import Path
@@ -12,15 +13,27 @@ import urllib.request
 import numpy as np
 
 from arm_control import frames
+from arm_control.config import gripper_joints
 from arm_control.multi_arm.cooperative import pose_error
-from arm_control.multi_arm.simulation import SharedSimulation
+from arm_control.multi_arm.launch import SOCKETS_ENV, running_pair
+from arm_control.multi_arm.world import refuse_colliding_start
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.scene import ObstacleSpec
 from arm_control.ui.dual_arm_console import DualArmConsole, _pose_matrix, plan_request
 
 
+ROOT = Path(__file__).resolve().parents[2]
+
+
 def main():
-    app = DualArmConsole(Path("examples/configs/dual_arm_object.yaml"), port=0)
+    env = dict(os.environ, ARM_CONTROL_ROOT=str(ROOT), PYTHONPATH=os.pathsep.join([str(ROOT), os.environ.get("PYTHONPATH", "")]))
+    with running_pair(ROOT / "examples/configs/dual_arm_object.yaml", env, plant="sim", cwd=ROOT) as (staged, env):
+        os.environ[SOCKETS_ENV] = env[SOCKETS_ENV]
+        check(staged)
+
+
+def check(pair):
+    app = DualArmConsole(pair, port=0)
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     base = f"http://127.0.0.1:{app.server.port}"
 
@@ -66,7 +79,7 @@ def main():
         for inferred in obj.grasps.infer(obj.grasps.targets(T)).values():
             np.testing.assert_allclose(inferred, T, atol=1e-12)
         first = fetch()["shared_object"]
-        assert not first["paused"] and fetch()["mode"] == "independent"
+        assert fetch()["mode"] == "independent"
         time.sleep(0.12)
         assert (
             pose_error(
@@ -94,10 +107,9 @@ def main():
         wait(lambda s: s["pair"]["lifecycle"] == "ready")
         action("execute", pair_id=pid)
         wait(lambda s: s["pair"]["lifecycle"] == "complete")
-        for a, width in obj.fingers.items():
-            action("gripper", arm_id=a, width_mm=width * 2000)
         wait(lambda s: not s["transition_reason"])
-        action("set_mode", mode="shared", grasps_confirmed=True)
+        action("set_mode", expected=400, mode="shared", grasps_confirmed=True)  # the physical confirmation is gone
+        action("set_mode", mode="shared", empty_hands_confirmed=True)
         wait(lambda s: s["mode_settled"])
         action("gripper", expected=400, arm_id="left", width_mm=50)
         initial = fetch()["shared_object"]["values"]
@@ -134,7 +146,7 @@ def main():
             "object_only", "box", (0.02, 0.02, 0.004), (0.45, 0, 0.4), (0, 0, 0)
         )
         scene = replace(scene, obstacles=(obstacle,))
-        held = {name: 0.006 for name in app.runtime.finger_names}
+        held = {f"{a}__{j}": 0.006 for a, cfg in app.config.robots.items() for j in gripper_joints(cfg)}
         world = MuJoCoCollisionWorld.from_scene(
             scene, scene.state(), scene.actor_names, held_positions=held
         )
@@ -148,19 +160,17 @@ def main():
         print(
             "Object-only collision, exact grasp permissions, transform round-trip: PASS"
         )
-
         try:
-            bad_sim = SharedSimulation(replace(app.config, scene=scene))
+            refuse_colliding_start(replace(app.config, scene=scene))  # the plate in the obstacle: the pair world refuses it
         except ValueError as exc:
             assert "initial scene collides" in str(exc), str(exc)
         else:
-            bad_sim.close()
-            raise AssertionError("colliding already-held initial scene admitted")
+            raise AssertionError("colliding initial scene admitted")
 
         # Endpoint IK is not enough: a broken initial rigid relation is refused.
         with app._lock:
             starts = {
-                a: c.last_state.position.copy() for a, c in app.runtime.controllers.items()
+                a: np.asarray(h.state().position, float).copy() for a, h in app.runtime.handles.items()
             }
             object_start = app.runtime.object_pose()
             fingers = app.runtime.finger_positions()
@@ -177,6 +187,7 @@ def main():
                 object_start,
                 goal,
                 mode="shared",
+                virtual_grasps=app._virtual_grasps(),
             )
         except ValueError as exc:
             assert "closure" in str(exc), str(exc)
@@ -193,13 +204,12 @@ def main():
         action("stage", expected=400, pair_id=s["preview_id"], reviewed=True)
         action("cancel")
         action("disarm", arm_id="left")
-        assert fetch()["shared_object"]["paused"]
         action("disarm", arm_id="right")
         worker_pid = app._pool.submit(os.getpid).result(timeout=5)
         os.kill(worker_pid, signal.SIGINT)
         assert app._pool.submit(pow, 2, 3).result(timeout=5) == 8
         print(
-            "HTTP fixed-grasp lock, invalid input, stale object admission, disarm pause, worker Ctrl-C ownership: PASS"
+            "HTTP virtual-grasp lock, invalid input, stale object admission, disarm, worker Ctrl-C ownership: PASS"
         )
     finally:
         app.close()

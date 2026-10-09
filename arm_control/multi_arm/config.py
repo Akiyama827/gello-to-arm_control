@@ -11,12 +11,11 @@ import math
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from arm_control.config import RobotConfig, arm_joints, ee_frame, load_config_tree
-from arm_control import frames
+from arm_control.config import RobotConfig, arm_joints, load_config_tree
 from arm_control.model_bundle import execution_gravity, model_token
 from arm_control.control.factory import arm_urdf
 from arm_control.dynamics import PinocchioDynamics
-from arm_control.scene import ActorSpec, ObjectSpec, SceneSpec, WeldSpec, load_scene
+from arm_control.scene import ActorSpec, ObjectSpec, SceneSpec, load_scene
 from arm_control.multi_arm.cooperative import (
     RigidGrasps,
     rigid_transform,
@@ -29,16 +28,7 @@ class SharedObject:
     body: str
     world_T_object: np.ndarray
     grasps: RigidGrasps
-    fingers: dict[str, float]
-    virtual: bool = False
-
-    @property
-    def support(self):
-        return f"{self.name}__support"
-
-    @property
-    def grasp_welds(self):
-        return tuple(f"grasp_{a}" for a in self.fingers)
+    fingers: dict[str, float]  # each Hand's width at the nominal grasp (display and grasp preparation; never commanded)
 
 
 @dataclass
@@ -65,19 +55,12 @@ class PairConfig:
 
 
 def scene_for_mode(config, mode):
-    """Select constraints for planning; changing mode never changes joint poses."""
+    """The planning scene for a mode: the same in both (coupling is virtual, nothing is welded)."""
     if mode not in {"independent", "shared"}:
         raise ValueError("mode must be independent or shared")
-    obj = config.shared_object
-    if obj is None:
-        if mode == "shared":
-            raise ValueError("this setup has no shared object")
-        return config.scene
-    removed = {obj.support} if mode == "shared" else set(obj.grasp_welds)
-    return replace(
-        config.scene,
-        welds=tuple(w for w in config.scene.welds if w.name not in removed),
-    )
+    if mode == "shared" and config.shared_object is None:
+        raise ValueError("this setup has no shared object")
+    return config.scene
 
 
 def load_pair_config(path) -> PairConfig:
@@ -216,13 +199,10 @@ def load_pair_config(path) -> PairConfig:
             or set(obj["grasps"]) != set(robots)
         ):
             raise ValueError("shared_object.grasps must name both arms")
-        virtual = obj.get("virtual", False)
-        if not isinstance(virtual, bool):
-            raise ValueError("shared_object.virtual must be a boolean")
-        if raw["backend"] == "remote_rt" and not virtual:
-            raise ValueError("physical hardware shared-object grasps are not qualified")
-        if virtual and raw["backend"] != "remote_rt":
-            raise ValueError("virtual shared objects require the remote_rt backend")
+        if obj.get("virtual") is not True:
+            # Coupling is virtual in simulation as on the bench (operator 2026-10-09): empty Hands, the object inferred from
+            # both TCPs. Physical welded carrying left with the in-process shared simulation; it is not qualified anywhere.
+            raise ValueError("shared_object.virtual must be true: shared-object coupling is virtual (empty Hands)")
         name, body = obj.get("name"), obj.get("body")
         if (
             not all(isinstance(v, str) and v and "/" not in v for v in (name, body))
@@ -239,21 +219,12 @@ def load_pair_config(path) -> PairConfig:
             raise ValueError(
                 "shared grasp finger positions must be finite and nonnegative"
             )
-        shared = SharedObject(name, f"{name}__{body}", pose, grasps, fingers, virtual)
+        shared = SharedObject(name, f"{name}__{body}", pose, grasps, fingers)
         object_spec = ObjectSpec(
             name,
             path,
             tuple(pose[:3, 3]),
             tuple(Rotation.from_matrix(pose[:3, :3]).as_euler("xyz")),
-        )
-        welds = tuple(
-            WeldSpec(
-                f"grasp_{a}",
-                f"{a}__{ee_frame(robots[a])}",
-                shared.body,
-                tuple(frames.T_to_pose_xyzquat(np.linalg.inv(T))),
-            )
-            for a, T in grasps.object_T_tcp.items()
         )
         exclusions = []
         for a, g in obj["grasps"].items():
@@ -266,14 +237,7 @@ def load_pair_config(path) -> PairConfig:
         scene = replace(
             scene,
             objects=(object_spec,),
-            welds=scene.welds + (() if virtual else welds + (
-                WeldSpec(
-                    shared.support,
-                    "world",
-                    shared.body,
-                    tuple(frames.T_to_pose_xyzquat(pose)),
-                ),
-            )),
+            welds=scene.welds,  # virtual: no grasp or support weld
             contact_exclusions=scene.contact_exclusions + tuple(exclusions),
         )
     for item in (*scene.actors, *scene.objects, *scene.fixtures, *scene.obstacles):

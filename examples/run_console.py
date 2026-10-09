@@ -7,7 +7,7 @@ it is. All this does is the three things a bare `dora run` cannot do for you:
 check the assets are staged, export the two roots, and pick the graph.
 
     python examples/run_console.py                 # one arm, console on :7500
-    python examples/run_console.py --dual          # shared-world console, :7520
+    python examples/run_console.py --dual          # the simulated pair (two supervisors, one world), :7520
     python examples/run_console.py --config <path> # your own entry config
 
 Meshes are not vendored here (this repo owns the code; a project owns its CAD),
@@ -113,7 +113,7 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                         help=f"entry config (default: {DEFAULT_CONFIG.name})")
     parser.add_argument("--dual", action="store_true",
-                        help="one shared-world dual-arm simulation console on :7520")
+                        help="the simulated pair's console on :7520 (two supervisors, one world)")
     parser.add_argument("--pair-config", type=Path, default=PAIR_CONFIG,
                         help="dual-arm composition (used with --dual)")
     parser.add_argument("--port", type=int, default=7520, help="dual console loopback port")
@@ -133,8 +133,16 @@ def main() -> int:
             pair = load_pair_config(config_path)
             print(f"{pair.backend} configuration: {config_path}, arms={pair.scene.actor_names}; no transports opened")
             return 0
+        if load_pair_config(config_path).backend != "shared_sim":
+            parser.error("--dual runs the simulated pair; a hardware pair is the project's launcher (two RT supervisors)")
+        from arm_control.multi_arm.launch import SOCKETS_ENV, running_pair
         from arm_control.ui.dual_arm_console import main as dual_main
-        dual_main(config_path, port=args.port)
+        env = dict(os.environ, ARM_CONTROL_ROOT=str(REPO_ROOT),
+                   PYTHONPATH=os.pathsep.join([str(REPO_ROOT), os.environ.get("PYTHONPATH", "")]).strip(os.pathsep))
+        # every arm on its supervisor (CTRL-053): the first hosts the pair's world, the second co-hosts it
+        with running_pair(config_path, env, plant="sim", cwd=REPO_ROOT) as (staged, env):
+            os.environ[SOCKETS_ENV] = env[SOCKETS_ENV]
+            dual_main(staged, port=args.port)
         return 0
 
     ready, hint = assets_ready()

@@ -117,4 +117,6 @@ def align_feedback(links, histories, *, now, max_age_s=.05, max_interval_s=.02):
                       else ":".join(domains[next(iter(domains))])),
         t_mono_ns=target, latest_skew_s=(max(stamps) - target) * 1e-9,
         brackets=brackets,
+        # the oldest arm's newest packet, on the caller's clock: what an idle hold's recovery budget is measured from
+        received_at=min(history[-1][1] for history in histories.values()),
     )

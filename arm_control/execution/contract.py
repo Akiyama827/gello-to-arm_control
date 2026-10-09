@@ -383,8 +383,9 @@ class TrajectoryRequest:
 
     ``request_id`` is the caller's idempotency key: submitting the same id
     again returns the existing execution, never a second one. ``times`` are
-    execution time: the trajectory's first sample plays at selection, never at
-    request time (review/gate time is not charged against the motion).
+    execution time: the trajectory's first sample plays at selection (or at a
+    scheduled release's ``start_at``), never at request time (review/gate time
+    is not charged against the motion).
 
     ``admit_by`` is the latest SELECTION time, on the admitting layer's own
     monotonic clock (``Clock.PC``, attested domain): an admitted, unselected

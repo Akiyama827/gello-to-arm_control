@@ -8,8 +8,8 @@ ledger that turns controller events and RT evidence into contract receipts
 Threading: every controller call and ledger change happens on the loop thread
 while it holds ``_cv``. Client threads enqueue operations and read snapshots
 under the same lock, so a stalled or slow client never delays a tick.
-Authority RPCs (ARM/DISARM round trips) run on their own worker, as in
-``multi_arm.hardware.RemoteHardware``, whose single-arm pump this mirrors.
+Authority RPCs (ARM/DISARM round trips) run on their own worker (the pump of
+the retired direct dual runtime, which this replaced).
 
 Ownership: at most one client session owns the robot (``claim``). Losing the
 owner cancels its live executions and holds, still armed; nobody reacquires
@@ -52,6 +52,7 @@ from arm_control.messages import (
     unpack_controller_event, unpack_json_message, unpack_motor_command,
 )
 from arm_control.control.inprocess import QueueControllerNode
+from arm_control.multi_arm.group import GROUP_BUDGET_S, GROUP_MIN_LEAD_MS
 from arm_control.plants.remote_rt import protocol as rtp
 from arm_control.plants.remote_rt.client import ReferenceRefused, RtBackend, RtLinkError, epoch_reached
 from arm_control.plants.remote_rt.reference import ReferenceHorizon, SelectionUnresolved
@@ -224,6 +225,7 @@ class RobotRuntime:
             result['scene_action'] = 1
         if self._native is None:  # setpoints are words on the streamed path; a native reference plays only its own curve
             result['setpoint'] = 1
+            result['scheduled_release'] = 1  # this supervisor's controller owns the trajectory clock (a native one: the RT)
         return result
 
     def observe(self, after: int = 0, limit: int = 64) -> dict:
@@ -266,11 +268,12 @@ class RobotRuntime:
         return dict(samples=ring, latest_seq=latest, dropped=dropped, errors=errors, capacity=TRACE_TICKS)
 
     def _record_trace(self, health) -> None:
-        """One per-arm controller diagnostic per tick (the same record the direct hardware runtime keeps), stamped with a
+        """One per-arm controller diagnostic per tick (`control.diagnostic`), stamped with a
         sequence, the PC time, the authority lifecycle and the native reference. Never raises into the loop."""
         try:
             packet, received = self._last_packet
-            sample = controller_diagnostic(self.link, self.controller, packet, received, health)
+            sample = controller_diagnostic(self.link, self.controller, packet, received, health,
+                                            reference_time=self.controller.exec_time)
             native = self._native
             # The controller runs an EXECUTION; the identity a client requested (and a pair joins its lineage on) is the
             # request id: ``plan_id`` carries that, ``execution_id`` the controller's own.
@@ -921,8 +924,11 @@ class RobotRuntime:
     def submit(self, session: str, request: TrajectoryRequest) -> ExecutionStatus:
         return self._call(self._submit, session, request)
 
-    def release(self, session: str, execution_id: str) -> ExecutionStatus:
-        return self._call(self._release, session, execution_id)
+    def release(self, session: str, execution_id: str, start_at: Stamp | None = None) -> ExecutionStatus:
+        """``start_at`` (scheduled_release/1): anchor the trajectory at this PC-monotonic stamp, not at the release (a pair
+        released through two supervisors starts both members at one stamp). It must lie between the CTRL-040 minimum lead
+        and budget ahead of this supervisor's clock."""
+        return self._call(self._release, session, execution_id, start_at)
 
     def cancel(self, session: str, execution_id: str, reason: str = "cancelled"
                ) -> ExecutionStatus:
@@ -1235,9 +1241,18 @@ class RobotRuntime:
             self._select(ex)
         return ex.status
 
-    def _release(self, session: str, execution_id: str) -> ExecutionStatus:
+    def _release(self, session: str, execution_id: str, start_at: Stamp | None = None) -> ExecutionStatus:
         self._owns(session)
         ex = self._get(execution_id)
+        if start_at is not None:
+            if self._native is not None or ex.stream is not None:
+                raise Refused('a scheduled release needs the supervisor\'s own trajectory clock (a planned leg, not native)')
+            if start_at.clock is not Clock.PC or not self.domain or start_at.domain != self.domain:
+                raise Refused(f'start_at is not on this supervisor\'s clock ({self.domain or "unattested"})')
+            lead = (start_at.ns - time.monotonic_ns()) / 1e9
+            if not GROUP_MIN_LEAD_MS / 1e3 <= lead <= GROUP_BUDGET_S:
+                raise Refused(f'start_at is {lead * 1e3:.1f} ms ahead: it must be {GROUP_MIN_LEAD_MS} to '
+                              f'{GROUP_BUDGET_S * 1e3:.0f} ms ahead')
         if ex.stream is not None:
             if ex.status.phase is not Phase.ADMITTED:
                 raise Refused('stream release requires ADMITTED')
@@ -1249,10 +1264,10 @@ class RobotRuntime:
             return ex.status  # already selected or ended: release is idempotent
         if ex.request.start is not Start.ON_RELEASE:
             raise Refused(f"{execution_id} starts on admission, not on release")
-        self._select(ex)
+        self._select(ex, start_at)
         return ex.status
 
-    def _select(self, ex: _Execution) -> None:
+    def _select(self, ex: _Execution, start_at: Stamp | None = None) -> None:
         """Expiry, then ARM, then the controller's own release checks."""
         if self._expire(ex):
             return
@@ -1271,7 +1286,11 @@ class RobotRuntime:
                 return
             self._native_pending = ex.status.execution_id
             return  # upload and selection are observed asynchronously on ticks
-        self.controller.on_control(pack_control_update(execute=ex.status.execution_id))
+        if start_at is None:
+            self.controller.on_control(pack_control_update(execute=ex.status.execution_id))
+        else:  # the stamp on the controller's own clock (a sim world's runs paused with the world)
+            c = self.controller
+            c._release(ex.status.execution_id, start=c.exec_time + (start_at.ns - time.monotonic_ns()) / 1e9)
         self._pump_controller()
 
     def _cancel(self, session: str, execution_id: str, reason: str) -> ExecutionStatus:
@@ -1725,7 +1744,7 @@ class RobotRuntime:
     # -- authority RPCs ------------------------------------------------------------
     def _request_authority(self, armed: bool) -> None:
         """From the controller's ``arm`` output. One worker, bounded by the
-        link's ACK timeouts; a DISARM drops queued ARMs (RemoteHardware's rule)."""
+        link's ACK timeouts; a DISARM drops queued ARMs."""
         if not armed:
             self._native_pending = None
             if self._native is not None:
@@ -1808,7 +1827,7 @@ class RobotRuntime:
                 self._seen_seq = state.state_seq
                 self._last_packet = (state, rx)
                 c.on_motor_state(pack_motor_state_dict(link.motor_state(state=state)))
-                # Arrival freshness survives a delayed tick (RemoteHardware's seam).
+                # Arrival freshness survives a delayed tick.
                 if c._last_state_at is not None:
                     # rx is wall time; the controller may run on a sim world's clock (paused with the world): carry the
                     # sample's AGE across, never the wall stamp itself, or every pause would shorten every later age

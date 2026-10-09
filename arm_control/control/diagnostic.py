@@ -8,7 +8,7 @@ def controller_diagnostic(link, c, packet, received, health, reference_time=None
     measurement that command's cycle consumed; `*_rt` come from the same RT state packet (the servo's post-clamp post-slew
     output and measured torque). Vendor-acknowledged torque (franka tau_J_d) is not on the wire and stays explicitly absent,
     never zero-filled; the authoritative limiter activity is the RT-side loop-gap diagnostic, never a PC-side cross-tick
-    comparison. Shared by the direct hardware runtime and the supervisor's trace ring."""
+    comparison. Recorded per tick by the supervisor's trace ring (trace/1)."""
     motor = link.motor_state(state=packet) if packet is not None else None
     command = c.last_command
     return dict(

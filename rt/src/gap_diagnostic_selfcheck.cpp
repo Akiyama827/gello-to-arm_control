@@ -5,6 +5,7 @@
 // stalled consumer, correct sequence association reconstructed from a
 // fixture, and instrumentation that does not change behavior (the law's
 // optional raw export must leave the limited output byte-identical).
+#include <vector>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -145,7 +146,7 @@ class ScriptedBackend final : public Backend {
 }  // namespace
 
 uint64_t mono_ns() { return 10'000'000'000ull + uint64_t(tick) * 1'000'000 + skew; }
-std::unique_ptr<Backend> make_fake_backend(int) {
+std::unique_ptr<Backend> make_fake_backend(int, const std::vector<double>&) {
   return std::make_unique<ScriptedBackend>();
 }
 // Hardware constructors deliberately unavailable in this executable.

@@ -174,22 +174,23 @@ Concrete deployments should use their own launcher and asset-root composition.
 The older manuals are retained in [history](history/README.md) for engineering
 context, not as instructions to run retired commands.
 
-### Dual-arm shared simulation
+### Dual-arm simulation
 
 ```bash
 PYTHONPATH=. python -B examples/run_console.py --dual --check
 PYTHONPATH=. python -B examples/run_console.py --dual          # http://127.0.0.1:7520
 ```
 
-This launches one scene, two stock controllers and one browser console; it
-opens no hardware connection. `examples/configs/dual_arm.yaml` references the
+This starts the pair's two arm supervisors (the first hosts one MuJoCo world, the
+second co-hosts it; each serves its own simulated Hand) and one browser console;
+it opens no hardware connection. `examples/configs/dual_arm.yaml` references the
 existing `sim_arm.yaml` twice and supplies only layout and pair motion limits.
 For another composition use `--dual --pair-config /absolute/path/pair.yaml`;
 set `ARM_CONTROL_ROOT` before launch if its profiles use deployment-relative
 asset paths. An optional `scene:` loads existing `SceneSpec` static scenery.
 Both actors must be configured, with matching controller joint order. The
-optional `shared_object` composition below describes a supported object and
-fixed grasps. Startup always preserves the configured arm joints and opens in
+optional `shared_object` composition below describes a virtual object and its
+nominal grasps. Startup always preserves the configured arm joints and opens in
 independent mode. Hand closure alone never establishes object ownership.
 
 Arm both controllers. Select one or both moving arms, enter joint angles or
@@ -215,21 +216,24 @@ Its configured object is available through the runtime **Control mode** selector
 No deployed bench values are copied into this library's example configs.
 
 For hardware, the consumer supplies `backend: remote_rt`, two real robot
-profiles with model bindings, 100 Hz execution policies and real-mode gains.
-The console loads collision/display models and exports meshes before
-`RemoteHardware.connect()` opens both identity-bound RT links. Fresh arm and
-Hand measurements are required before the console appears; staged model poses
-are replaced with those measurements. It starts disarmed. Hand moves
-require the bridge's active-stop capability. Pending authority acknowledgements
-block re-ARM; disarm, faults and shutdown supersede queued enables. Physical
-shared-object hardware configurations are refused. A `shared_object` explicitly
-marked `virtual: true` supports empty-Hand coordination without welds or payload.
+profiles with model bindings, 100 Hz execution policies and real-mode gains;
+its launcher starts one supervisor per arm over its RT server
+(`multi_arm.launch.running_pair(..., plant="rt")`). The console loads
+collision/display models and exports meshes before `SupervisedHardware.connect()`
+claims both arms. Fresh arm and Hand measurements are required before the
+console appears; staged model poses are replaced with those measurements. It
+starts disarmed. Hand moves require the bridge's active-stop capability; a Hand
+is unmeasured while it moves or while a stop is unconfirmed, and the console
+refuses actions until it settles. Pending authority acknowledgements block
+re-ARM; disarm, faults and shutdown supersede queued enables. A `shared_object`
+must be marked `virtual: true`: empty-Hand coordination without welds or payload.
 The consuming Control command is
 `python tools/run.py real dual` (port 7521), after its experimental RT deployment.
-`--check` validates configuration without connecting. Paired hardware uses a
-common PC trajectory epoch and sample time, computing both commands before
-dispatch. Release/send times remain distinct; physical start skew and concurrent
-FCI timing remain unqualified.
+`--check` validates configuration without connecting. Both members of a pair leg
+start at one scheduled PC stamp (scheduled_release/1). Both releases are sent
+together and must be accepted before the stamp less 10 ms; otherwise the accepted
+member is cancelled before it moves and the pair faults. Physical start skew and
+concurrent FCI timing remain unqualified.
 
 For a virtual object, choose **Virtual object**, ARM both controllers, then
 **Plan to virtual grasps** → review → Stage → Execute. Keep both Hands empty
@@ -262,7 +266,7 @@ hold. Active-motion cancellation, timeout and task-specific completion hold at
 the measured pose.
 
 A shared-object runtime fault prints the measured disagreement and requests
-both arms to stop. Hardware runtime faults save the last 500 PC ticks under
+both arms to stop. Runtime faults save the last 500 PC ticks under
 `$ARM_CONTROL_ROOT/.cache/dual_arm/faults/` and print the JSON path. The report
 includes measured joints, PC/RT references, packet timestamps, common reference
 times, interpolation brackets, captured grasps and the planned trajectories.
@@ -285,21 +289,10 @@ PYTHONPATH=. python -B examples/run_console.py --dual \
 ```
 
 This preset includes `dual_arm.yaml` and overrides only the facing layout and
-fixed grasps. It uses one 200 × 300 × 12 mm, 1 kg plate; robot descriptions,
-gains and limits remain in the existing arm profiles.
-Choose **Shared object** in the console and arm both controllers. With open
-Hands and external support, **Plan to grasp poses** plans from the current joints
-with both arms, the object and scenery in collision checking. Review → Stage →
-Execute, then close each Hand to its displayed grasp width. Explicitly verify
-both grasps and enable shared-object mode. Already-aligned arms can skip the
-approach. Entry requires 1 mm / 0.5° alignment, matching measured and commanded
-Hand widths, no active operation, and 0.25 s stationary feedback.
-
-The mode switch preserves the plant, controller instances, joints and object
-pose; it transfers support and payload accounting to the two grasps. After
-settling, use the object's translate/rotate controls and ordinary plan workflow.
-Independent targets and Hand commands are locked while both fixed grasps are
-active. Physics pauses if either controller is disarmed.
+the virtual plate's nominal grasps; robot descriptions, gains and limits remain
+in the existing arm profiles. The workflow is the virtual one above, in
+simulation as on hardware (operator 2026-10-09): nothing is welded, no Hand
+closes and no payload is added.
 
 The same **Refine trajectory with TrajOpt** checkbox applies to independent
 moves, grasp preparation and shared-object moves. Independent refinement optimizes
@@ -311,26 +304,18 @@ collisions are checked again on the returned Hermite curve. It does not search
 for object detours or control internal grasp force. Refinement is off initially;
 changing it clears the preview and is refused during active pair operations.
 
-To leave, stop and externally support the object. Choose **Independent arms**
-and confirm support before disabling the two simulated grasp constraints.
-Support anchors the object's current pose; then open the Hands before moving
-away. Every mode change invalidates old previews and staging identities.
-
 Object moves follow a straight translation and shortest rotation, with a
 500 mm / 90° request limit. Unreachable, discontinuous, colliding or
 closure-breaking paths fail instead of detouring in joint space. The preview
 checks grasp and object-path errors against 1 mm / 0.5° on the retimed curve.
-The running simulator faults at measured grasp error above 3 mm / 2°.
-Equal payload gravity sharing uses the existing executors and torque limits;
-world gravity is transformed into each model's base frame, including tilted
-mounts. It is not an internal-force controller or evidence of a secure physical grasp.
+The running console faults (and disarms both arms) when the two TCP-inferred
+plate poses disagree by more than 3 mm / 2°.
 
-Supported here: joint/TCP and fixed-grasp object targets, translate/rotate
+Supported here: joint/TCP and virtual-object targets, translate/rotate
 gizmos, common retiming, shared collision checking, preview, pair staging and
-release, guided grasp approach, explicit mode confirmation, per-arm ARM/DISARM
-and independent-mode Hand position. Continuous jog, Soft mode, automatic
-pickup and physical coupled carrying are not exposed. Hardware transport and
-empty-Hand virtual coordination use the experimental adapter described above.
+scheduled release, guided grasp approach, explicit mode confirmation, per-arm
+ARM/DISARM and independent-mode Hand position. Continuous jog, Soft mode,
+automatic pickup and physical coupled carrying are not exposed.
 
 Device-free regression commands (planning/simulation checks need staged assets):
 
@@ -340,17 +325,17 @@ PYTHONPATH=. python -B tools/check/check_bimanual_sync.py
 PYTHONPATH=. python -B tools/check/check_pair_planning.py
 PYTHONPATH=. python -B tools/check/check_dual_console.py
 PYTHONPATH=. python -B tools/check/check_cooperative.py
-PYTHONPATH=. python -B tools/check/check_dual_modes.py [path/to/pair.yaml]
-PYTHONPATH=. python -B tools/check/check_dual_modes.py [path/to/pair.yaml] --refine
 PYTHONPATH=. python -B tools/check/check_refinement.py
+# the console over two supervisors and two fake RT servers (a staged remote_rt pair; the project suite stages its bench)
+PYTHONPATH=. python -B tools/check/check_dual_hardware.py <pair.yaml> <rt build>/arm_rt_server [--refine]
 ```
 
-`--dual` selects the shared-world console above. (The older two-independent-
+`--dual` selects the simulated pair above. (The older two-independent-
 worlds graph `dual_arm_sim.yml` was deleted 2026-10-09, operator decision. It
 exercised the retired in-process controller path; on hardware each arm runs on its
-own supervisor, a separate process. The sim `--dual` console runs both arms in one
-process, so sim process isolation is not exercised; a second isolated sim arm needs
-its own instance config.)
+own supervisor, a separate process. In simulation both arms' supervisors share
+one process (host and co-host of one world), so sim process isolation is not
+exercised.)
 
 ### Hand Grasp / Open
 

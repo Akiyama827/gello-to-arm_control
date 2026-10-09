@@ -6,8 +6,8 @@ The runtime surface the console uses, driven through the real stack (fake RT -> 
 SdkArmHandle): construction claims nothing; connect() claims and waits for fresh measured feedback and fresh Hands;
 ARM/DISARM do not block the caller, a pending request holds readiness back, a refused one is the arm's fault until the next
 succeeds; a pair plan runs through ``BimanualCoordinator`` over ``runtime.handles``; stop() and close() leave both arms
-disarmed; shared-object coupling is refused. Hands are a local double and the scene a stub: the console-level checks stay in
-check_dual_hardware (direct links) until a supervisor deployment exists for the real pair. Nothing here is a hardware claim.
+disarmed; coupling without a shared object is refused. Hands are a local double and the scene a stub: the console over two
+supervisors is check_dual_hardware (FR3 pair, fake RT) and check_cooperative (simulated pair). Nothing here is a hardware claim.
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def main():
     try:
         socks, tokens = {}, {}
         for name in ARMS:
-            rt, sup, sock, token = start_arm(args.server, tmp, name)
+            rt, sup, sock, token = start_arm(args.server, tmp, name, native=False)  # streamed, as deployed
             procs += [sup, rt]
             socks[name], tokens[name] = sock, token
         robots = {a: dict(arm=dict(joints=list(JOINTS), gripper_joints=[]), rt=dict(instance_id=a, host='x', hand_port=1))
@@ -109,6 +109,17 @@ def main():
             return rt
 
         probe = {a: ArmClient(a, socket_path=socks[a]) for a in ARMS}  # a second, independent view of each supervisor
+        # A supervisor that cannot take a scheduled start (native: its RT plays the reference) is refused before any claim.
+        native = make()
+        native.clients['arm_b'].extensions = {k: v for k, v in native.clients['arm_b'].extensions.items()
+                                              if k != 'scheduled_release'}
+        try:
+            native.connect()
+        except ValueError as exc:
+            assert 'scheduled_release' in str(exc) and "'arm_b'" in str(exc), exc
+        else:
+            raise AssertionError('a pair without scheduled_release/1 connected')
+        assert native._closed and all(p.authority().lifecycle is Lifecycle.CONNECTED for p in probe.values())
         runtime = make()
         # Construction claims nothing (the lifecycle stays CONNECTED, not CLAIMED).
         assert all(p.authority().lifecycle is Lifecycle.CONNECTED for p in probe.values()), \
@@ -132,9 +143,9 @@ def main():
         try:
             runtime.set_shared_grasps(True)
         except ValueError as exc:
-            assert 'direct hardware runtime' in str(exc), exc
+            assert 'no virtual shared object' in str(exc), exc
         else:
-            raise AssertionError('shared coupling admitted')
+            raise AssertionError('shared coupling admitted without a shared object')
         assert set(runtime.telemetry()) == set(ARMS) and runtime.diagnostic_sample()['arms']['arm_a']['measurement_valid']
 
         # ARM does not block the caller; a pending request holds readiness back; arming again while pending is refused.
@@ -396,7 +407,7 @@ def main():
         for p in procs:
             p.terminate()
     print('PASS: SupervisedHardware over two supervisors: claim on connect only, non-blocking ARM with pending/fault state, '
-          'a pair plan through the coordinator, stop/close disarm, shared coupling refused')
+          'a pair plan through the coordinator, stop/close disarm, coupling without an object refused')
 
 
 if __name__ == '__main__':

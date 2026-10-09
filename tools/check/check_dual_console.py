@@ -1,7 +1,8 @@
-"""Device-free HTTP -> planner process -> two stock controllers regression."""
+"""Device-free HTTP -> planner process -> the simulated pair's two supervisors regression."""
 
 from pathlib import Path
 import json
+import os
 import selectors
 import signal
 import subprocess
@@ -12,11 +13,22 @@ import urllib.request
 
 import numpy as np
 
+from arm_control.multi_arm.launch import SOCKETS_ENV, running_pair
 from arm_control.ui.dual_arm_console import DualArmConsole, plan_request
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def main():
-    app = DualArmConsole(Path("examples/configs/dual_arm.yaml"), port=0)
+    env = dict(os.environ, ARM_CONTROL_ROOT=str(ROOT), PYTHONPATH=os.pathsep.join([str(ROOT), os.environ.get("PYTHONPATH", "")]))
+    with running_pair(ROOT / "examples/configs/dual_arm.yaml", env, plant="sim", cwd=ROOT) as (staged, env):
+        os.environ[SOCKETS_ENV] = env[SOCKETS_ENV]
+        check(staged)
+    os.environ.pop(SOCKETS_ENV)
+
+
+def check(pair):
+    app = DualArmConsole(pair, port=0)
     local = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     base = f"http://127.0.0.1:{app.server.port}"
 
@@ -50,11 +62,11 @@ def main():
             expected=expected,
         )
 
-    def wait(predicate, *, timeout=25):
+    def wait(predicate, *, timeout=25, connected=True):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             state = fetch()
-            assert state["connected"], state
+            assert state["connected"] or not connected, state
             if predicate(state):
                 return state
             time.sleep(0.04)
@@ -73,21 +85,11 @@ def main():
         return state, targets
 
     try:
-        # A cancel holds the measured fingers even when soft MuJoCo limits let
-        # them read past the model range (seen: 1.7 mm over the 40 mm limit).
-        with app._lock:
-            limits = app.runtime.finger_limits
-            app.runtime.finger_positions = lambda: {a: hi + 0.002 for a, (_, hi) in limits.items()}
-            try:
-                app.runtime.cancel_hands()
-            finally:
-                del app.runtime.finger_positions
-            assert app.runtime.fingers == {a: hi for a, (_, hi) in limits.items()}
         # The console reads limits from the model and poses through the handles, never a controller: the displayed limits are
         # the controller's own, a rejected sample keeps the last good pose, and before any measurement a plan is refused.
         state = fetch()
         for a_, arm_ in state["arms"].items():
-            lo, hi = app.runtime.controllers[a_].executor.joint_limits
+            lo, hi = app._limits[a_]
             np.testing.assert_allclose(arm_["limits_deg"], np.rad2deg(np.vstack([lo, hi])).T.tolist(), atol=1e-6)
         with app._lock:
             from dataclasses import replace
@@ -156,12 +158,14 @@ def main():
         action("gripper", arm_id="left", width_mm=40)
         assert fetch()["preview_id"] is None
         action("stage", pair_id=old_id, reviewed=True, expected=400)
-        time.sleep(0.3)
+        end = time.monotonic() + 10
+        while not fetch()["connected"] and time.monotonic() < end:  # a moving Hand is unmeasured (as the bridge reports)
+            time.sleep(0.04)
 
         # Cancelling a pending worker cannot resurrect its preview.
         action("plan", targets=targets, active_arms=["left"])
-        action("cancel")
-        state = wait(lambda s: not s["planning"])
+        action("cancel")  # also stops both Hands: unmeasured until each bridge confirms its stop, as on hardware
+        state = wait(lambda s: not s["planning"] and s["connected"], connected=False)
         assert state["preview_id"] is None
 
         state, _ = plan()
@@ -186,7 +190,7 @@ def main():
         )
         for arm in ("left", "right"):
             action("disarm", arm_id=arm)
-        wait(lambda s: all(not a["armed"] for a in s["arms"].values()))
+        wait(lambda s: all(not a["armed"] for a in s["arms"].values()), connected=False)  # DISARM stops the Hand too
     finally:
         app.close()
 
@@ -202,11 +206,14 @@ def check_launcher_shutdown():
     try:
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
-            assert selector.select(timeout=15), "launcher did not become ready"
+            assert selector.select(timeout=90), "launcher did not become ready"
             line = process.stdout.readline()
+            while not line.startswith("[dual_console]"):  # the supervisors' start-up lines come first
+                assert line, "launcher exited"
+                line = process.stdout.readline()
         assert "[dual_console] shared_sim, DISARMED: http://127.0.0.1:" in line, line
         process.send_signal(signal.SIGTERM)
-        output, _ = process.communicate(timeout=15)
+        output, _ = process.communicate(timeout=60)
         assert process.returncode == 0, output
         print("dual launcher: PASS (SIGTERM exits through resource cleanup)")
     finally:

@@ -11,9 +11,9 @@ Defaults are the values the operator approved on 2026-10-01 (``Control/docs/ctrl
 flags (``--group-peer-max-age-ms``, ``--group-min-lead-ms``) that the servers of a group must be started with.
 No unit file may pass ``--group-*`` until the FR3-host measurement and the CTRL-042 decision.
 
-NOT wired into ``RemoteHardware``, the supervisor or the console: those run the streamed or per-arm
-supervisor paths. Wiring (and any change to the execution contract or SDK) is a separate, unapproved step
-(CTRL-053). What this module refuses to do: start a group whose members are on different or half-attested RT clock
+Through supervisors this is ``supervised_group.SdkGroupCoordinator`` (group/1, native references only). NOT wired into
+the dual console: its pair legs run each arm's streamed path, started at one PC stamp (scheduled_release/1, bounded by
+``MIN_LEAD``..``BUDGET``); an RT-side group start for the console is a separate, unapproved step. What this module refuses to do: start a group whose members are on different or half-attested RT clock
 domains (a group whose members are ALL unattested, i.e. older servers, is accepted and labelled 'unattested';
 the shared record already confines a group to one host), whose references are shorter than ``H`` or exceed the wire
 limits, or that has fewer than two members.

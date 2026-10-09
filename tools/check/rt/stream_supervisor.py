@@ -80,7 +80,7 @@ def main(binary):
             serving = threading.Thread(target=service.serve, args=(stop,), daemon=True)
             serving.start()
             with ArmClient('fake', socket_path=service.path) as arm:
-                assert arm.extensions == {'stream': 1, 'controller': 1, 'state_history': 1, 'trace': 1}
+                assert arm.extensions == {'stream': 1, 'controller': 1, 'load_model': 1, 'state_history': 1, 'trace': 1}
                 arm.claim()
                 arm.arm()
                 def opened(seq, rid, start=Start.ON_ADMIT):

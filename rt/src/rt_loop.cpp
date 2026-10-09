@@ -33,7 +33,7 @@
 
 namespace arm_rt {
 
-std::unique_ptr<Backend> make_fake_backend(int n);
+std::unique_ptr<Backend> make_fake_backend(int n, const std::vector<double>& q0);
 std::unique_ptr<Backend> make_franka_backend(const std::string& ip, double ee_mass,
                                              const double ee_com[3]);
 std::unique_ptr<Backend> make_dm_backend(const std::string& can_if,
@@ -42,7 +42,7 @@ std::unique_ptr<Backend> make_dm_backend(const std::string& can_if,
 void rt_loop(ServerCtx& ctx) {
   std::unique_ptr<Backend> backend;
   if (ctx.cfg.backend == "fake") {
-    backend = make_fake_backend(ctx.cfg.n);
+    backend = make_fake_backend(ctx.cfg.n, ctx.cfg.fake_q0);
   } else if (ctx.cfg.backend == "franka") {
     backend = make_franka_backend(ctx.cfg.franka_ip, ctx.cfg.ee_mass, ctx.cfg.ee_com);
     if (!backend)
