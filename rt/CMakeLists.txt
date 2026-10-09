@@ -42,11 +42,6 @@ if(WITH_FRANKA)
   target_compile_definitions(arm_rt_server PRIVATE ARM_RT_WITH_FRANKA)
   target_link_libraries(arm_rt_server PRIVATE Franka::Franka)
 
-  # Franka Hand daemon for the box: the Hand's state stream is server-push
-  # UDP, which cannot cross the PC-side NAT — the Hand must be owned from
-  # the robot LAN, like the torque loop. See src/hand_bridge.cpp.
-  # Read-only kinematics probe: no control path, so nothing to deploy to the
-  # box -- it runs wherever libfranka can reach the FCI.
   add_executable(flange_probe src/flange_probe.cpp)
   target_link_libraries(flange_probe PRIVATE Franka::Franka Eigen3::Eigen)
   # Same deployed layout as arm_rt_server: the box has no toolchain and no
@@ -56,16 +51,29 @@ if(WITH_FRANKA)
     INSTALL_RPATH "\$ORIGIN/lib")
   target_link_options(flange_probe PRIVATE -Wl,--disable-new-dtags)
 
-  add_executable(hand_bridge src/hand_bridge.cpp)
-  add_executable(hand_bridge_selfcheck src/hand_bridge_selfcheck.cpp)
-  target_link_libraries(hand_bridge_selfcheck PRIVATE Franka::Franka Threads::Threads)
-  target_compile_options(hand_bridge_selfcheck PRIVATE -UNDEBUG)
-  target_link_libraries(hand_bridge PRIVATE Franka::Franka Threads::Threads)
+endif()
+
+# hand_bridge: gripper ownership on the box (src/hand_bridge.cpp). Always the
+# DM gripper backend; the Franka Hand only WITH_FRANKA -- its state stream is
+# server-push UDP, which cannot cross the PC-side NAT, so the Hand is owned
+# from the robot LAN, like the torque loop. The self-checks need neither
+# libfranka nor CAN.
+add_executable(hand_bridge src/hand_bridge.cpp)
+target_link_libraries(hand_bridge PRIVATE Threads::Threads)
+if(WITH_FRANKA)
+  target_compile_definitions(hand_bridge PRIVATE HAND_WITH_FRANKA)
+  target_link_libraries(hand_bridge PRIVATE Franka::Franka)
   set_target_properties(hand_bridge PROPERTIES
     BUILD_RPATH "\$ORIGIN/lib"
     INSTALL_RPATH "\$ORIGIN/lib")
   target_link_options(hand_bridge PRIVATE -Wl,--disable-new-dtags)
 endif()
+add_executable(hand_bridge_selfcheck src/hand_bridge_selfcheck.cpp)
+target_link_libraries(hand_bridge_selfcheck PRIVATE Threads::Threads)
+target_compile_options(hand_bridge_selfcheck PRIVATE -UNDEBUG)
+add_executable(hand_dm_selfcheck src/hand_dm_selfcheck.cpp)
+target_link_libraries(hand_dm_selfcheck PRIVATE Threads::Threads)
+target_compile_options(hand_dm_selfcheck PRIVATE -UNDEBUG)
 
 add_executable(protocol_selfcheck src/selfcheck.cpp)
 add_executable(hand_admission_selfcheck src/hand_admission_selfcheck.cpp)
@@ -210,7 +218,6 @@ if(BUILD_TESTING)
     $<TARGET_FILE:reference_runtime_selfcheck>)
   set_tests_properties(reference_session_selfcheck reference_runtime_selfcheck
     PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/..")
-  if(TARGET hand_bridge_selfcheck)
-    add_test(NAME hand_bridge_selfcheck COMMAND $<TARGET_FILE:hand_bridge_selfcheck>)
-  endif()
+  add_test(NAME hand_bridge_selfcheck COMMAND $<TARGET_FILE:hand_bridge_selfcheck>)
+  add_test(NAME hand_dm_selfcheck COMMAND $<TARGET_FILE:hand_dm_selfcheck>)
 endif()

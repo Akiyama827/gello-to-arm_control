@@ -1,4 +1,14 @@
-// hand_bridge — Franka Hand ownership ON the robot LAN (the RT box).
+// hand_bridge — gripper ownership ON the robot LAN (the RT box).
+//
+// Backends (one protocol, admission and stop path for both):
+//   hand_bridge [robot_ip [port [bind_ip]]]            the Franka Hand (libfranka)
+//   hand_bridge --backend dm --can-if IF --motor ID:TYPE:MST
+//       --mimic OPEN,CLOSED,STROKE --kp KP --kd KD --tau-cap N.M --speed-max M/S
+//       [--port P] [--bind IP]                         a DM motor gripper (hand_dm.hpp)
+// Every DM value is a flag (nothing assumed). The bridge states its gripper's
+// envelope on LIMITS; the DM gripper has no force grasp yet, so its GRASP is
+// REJECTed `uncalibrated_force`. SIGTERM/SIGINT: the DM gripper gets zero torque,
+// then disable, before exit.
 //
 // The Hand mirrors the robot's protocol split: commands over TCP, cyclic
 // state PUSHED over UDP. Through the PC-side NAT those pushed datagrams die
@@ -64,9 +74,17 @@
 #include <mutex>
 #include <thread>
 
+#include <csignal>
+#include <cstdlib>
+#include <functional>
+#include <string>
+
+#include "hand_device.hpp"
+#include "hand_dm.hpp"
+#ifdef HAND_WITH_FRANKA
 #include <franka/exception.h>
 #include <franka/gripper.h>
-#include "hand_admission.hpp"
+#endif
 
 namespace {
 
@@ -80,7 +98,8 @@ double mono_s() {
 std::mutex mx;
 std::condition_variable cv;
 HandAdmission admission;
-std::shared_ptr<franka::Gripper> hand_session; // protected by mx
+std::shared_ptr<HandDevice> hand_session; // protected by mx
+HandLimits bridge_limits = franka_hand;   // the served gripper's envelope (set once, before serving)
 uint64_t grasp_seq = 0;  // bumped per completed GRASP; serve() sends GDONE on change
 uint64_t done_seq = 0, done_token = 0, sample_seq = 0;
 bool done_ok = false;
@@ -106,12 +125,12 @@ constexpr double width_measurement_tolerance_m = 1e-5;
 constexpr double width_open_tolerance_m = 2e-3;
 
 // Called under mx. Only a new device timestamp can refresh measured freshness.
-void observe_state(const franka::GripperState& st) {
+void observe_state(const HandSample& st) {
   if (admission.stopping) return; // Never attest freshness during stop dispatch.
-  const auto stamp = st.time.toMSec();
+  const auto stamp = st.stamp;
   if (seen_robot_sample && stamp <= robot_sample_time) return;
   if (!std::isfinite(st.width) || st.width < -width_measurement_tolerance_m ||
-      st.width > franka_hand.width_max_m + width_open_tolerance_m) {
+      st.width > bridge_limits.width_max_m + width_open_tolerance_m) {
     // Throttled, NOT gated on have_real: the first bad sample clears the
     // very flag such a gate would test, so a Hand that never once reports a
     // usable width stays completely silent -- which is the failure that is
@@ -132,8 +151,8 @@ void observe_state(const franka::GripperState& st) {
   real_t = mono_s();
   ++sample_seq;
   admission.sampled();
-  real_w = std::clamp(st.width, 0.0, franka_hand.width_max_m);
-  real_grasped = st.is_grasped;
+  real_w = std::clamp(st.width, 0.0, bridge_limits.width_max_m);
+  real_grasped = st.grasped;
 }
 
 // GSTOP is STICKY: clearing the mailbox alone loses the race where the
@@ -185,8 +204,9 @@ void stopper() {
   }
 }
 
-void actor(const char* robot_ip) {
-  std::shared_ptr<franka::Gripper> hand;
+void actor(std::function<std::shared_ptr<HandDevice>()> open_device, std::string label) {
+  const char* robot_ip = label.c_str();
+  std::shared_ptr<HandDevice> hand;
   double next_connect = 0.0;
   bool warned = false;
   for (;;) {
@@ -203,7 +223,7 @@ void actor(const char* robot_ip) {
         continue;
       }
       try {
-        hand = std::make_shared<franka::Gripper>(robot_ip);
+        hand = open_device();
         std::printf("[hand] connected to %s\n", robot_ip);
         std::lock_guard<std::mutex> lk(mx);
         hand_session = hand;
@@ -215,7 +235,7 @@ void actor(const char* robot_ip) {
                       "sample follows\n");
         admission.session_opened();
         cv.notify_all();
-      } catch (const franka::Exception& e) {
+      } catch (const std::exception& e) {
         if (!warned) {
           warned = true;
           std::printf("[hand] no Hand at %s (%s) — retrying\n", robot_ip,
@@ -261,12 +281,12 @@ void actor(const char* robot_ip) {
           ok = hand->grasp(a.w, a.s, a.f, a.ei, a.eo);
           std::printf("[hand] grasp verdict: %s\n", ok ? "HELD" : "not held");
         }
-      } catch (const franka::NetworkException& e) {
+      } catch (const DeviceLost& e) {
         std::printf("[hand] session lost (%s) — reconnecting\n", e.what());
         hand.reset();
         next_connect = mono_s() + 2.0;
-      } catch (const franka::Exception& e) {
-        // CommandException — e.g. jaws met an obstacle. Session is fine.
+      } catch (const ActionEnded& e) {
+        // e.g. jaws met an obstacle. Session is fine.
         std::printf("[hand] action ended: %s\n", e.what());
       } catch (const std::exception& e) {
         // Anything else escaping a detached thread is std::terminate.
@@ -306,11 +326,11 @@ void actor(const char* robot_ip) {
       read_during_stop = admission.stopping;
     }
     try {
-      const franka::GripperState st = hand->readOnce();
+      const HandSample st = hand->read();
       std::lock_guard<std::mutex> lk(mx);
       if (!read_during_stop && read_stop_serial == admission.stop_serial)
         observe_state(st);
-    } catch (const franka::Exception& e) {
+    } catch (const std::exception& e) {
       std::printf("[hand] read failed (%s) — reconnecting\n", e.what());
       {
         std::lock_guard<std::mutex> lk(mx);
@@ -377,9 +397,11 @@ void serve(int fd) {
           if (send(fd, out, size_t(n), MSG_NOSIGNAL) != n) return;
         } else {
           const char* error = "invalid_command";
-          if (parse_hand_command(line, action)) {
+          if (parse_hand_command(line, action, bridge_limits)) {
             std::lock_guard<std::mutex> lk(mx);
             error = admission.admit(action, have_real && mono_s() - real_t < .6);
+          } else if (action.kind == 3 && !(bridge_limits.force_max_n > 0)) {
+            error = "uncalibrated_force";  // no force grasp on this gripper (yet)
           }
           if (!error) cv.notify_all();
           char out[128];
@@ -461,8 +483,8 @@ void serve(int fd) {
       // has not seen it assumes the Franka Hand's.
       char limits[96];
       const int nl = std::snprintf(limits, sizeof(limits), "LIMITS %.5f %.5f %.3f %.3f\n",
-          franka_hand.width_max_m, franka_hand.speed_max_mps, franka_hand.force_min_n,
-          franka_hand.force_max_n);
+          bridge_limits.width_max_m, bridge_limits.speed_max_mps, bridge_limits.force_min_n,
+          bridge_limits.force_max_n);
       if (send(fd, limits, size_t(nl), MSG_NOSIGNAL) != nl) return;
       if (valid) {
         char out[64];
@@ -481,10 +503,158 @@ void serve(int fd) {
 
 } // namespace
 
+#ifdef HAND_WITH_FRANKA
+// The Franka Hand: libfranka's Gripper, its exceptions mapped onto the seam.
+class FrankaHand final : public HandDevice {
+public:
+  explicit FrankaHand(const char* ip) : g_(open(ip)) {}
+  HandSample read() override {
+    try {
+      const franka::GripperState st = g_.readOnce();
+      return {st.width, st.is_grasped, uint64_t(st.time.toMSec())};
+    } catch (const franka::Exception& e) {
+      throw DeviceLost(e.what());
+    }
+  }
+  bool move(double w, double s) override { return act([&] { return g_.move(w, s); }); }
+  bool homing() override { return act([&] { return g_.homing(); }); }
+  bool grasp(double w, double s, double f, double ei, double eo) override {
+    return act([&] { return g_.grasp(w, s, f, ei, eo); });
+  }
+  bool stop() override { return g_.stop(); }  // thread-safe; interrupts move/grasp
+
+private:
+  static franka::Gripper open(const char* ip) {
+    try {
+      return franka::Gripper(ip);
+    } catch (const franka::Exception& e) {
+      throw DeviceLost(e.what());
+    }
+  }
+  template <class F> static bool act(F f) {
+    try {
+      return f();
+    } catch (const franka::NetworkException& e) {
+      throw DeviceLost(e.what());
+    } catch (const franka::Exception& e) {
+      throw ActionEnded(e.what());  // CommandException: the session is fine
+    }
+  }
+  franka::Gripper g_;
+};
+#endif
+
+// One served device, so SIGTERM/SIGINT can release it (DM: zero torque, then disable).
+std::function<void()> release_device = [] {};
+
+const char* const kFlags[] = {"--backend", "--port", "--bind", "--robot-ip", "--can-if", "--motor", "--mimic",
+                              "--kp", "--kd", "--tau-cap", "--speed-max"};
+
+// Flag mode: every argument is a known flag followed by its value, each flag at most once; a typo must not fall back
+// to a default (a misspelt --bind would expose the jaws on every interface).
+void check_flags(int argc, char** argv) {
+  std::vector<std::string> seen;
+  for (int i = 1; i < argc; i += 2) {
+    const bool known = std::any_of(std::begin(kFlags), std::end(kFlags),
+                                   [&](const char* f) { return !std::strcmp(argv[i], f); });
+    if (!known || i + 1 >= argc || !std::strncmp(argv[i + 1], "--", 2) ||
+        std::find(seen.begin(), seen.end(), argv[i]) != seen.end()) {
+      std::fprintf(stderr, "[hand] bad argument '%s': flags are --name value, each known flag once\n", argv[i]);
+      std::exit(2);
+    }
+    seen.push_back(argv[i]);
+  }
+}
+
+bool flag(int argc, char** argv, const char* name, std::string& out) {
+  for (int i = 1; i + 1 < argc; i += 2)
+    if (!std::strcmp(argv[i], name)) {
+      out = argv[i + 1];
+      return true;
+    }
+  return false;
+}
+
+std::vector<std::string> split(const std::string& text, char sep) {
+  std::vector<std::string> out;
+  for (size_t at = 0;;) {
+    const size_t end = text.find(sep, at);
+    out.push_back(text.substr(at, end - at));
+    if (end == std::string::npos) return out;
+    at = end + 1;
+  }
+}
+
+double number(const std::string& text, const char* what) {
+  char* end = nullptr;
+  const double v = std::strtod(text.c_str(), &end);
+  if (text.empty() || *end || !std::isfinite(v)) {
+    std::fprintf(stderr, "[hand] %s must be a number, got '%s'\n", what, text.c_str());
+    std::exit(2);
+  }
+  return v;
+}
+
+// "--motor ID:TYPE:MST" and "--mimic OPEN,CLOSED,STROKE" into a DM gripper config; exits on error.
+DmGripperConfig dm_config(int argc, char** argv, std::string& iface, uint32_t& reply_id) {
+  std::string motor, mimic, kp, kd, cap, speed;
+  for (auto [name, out] : {std::pair{"--can-if", &iface}, {"--motor", &motor}, {"--mimic", &mimic},
+                           {"--kp", &kp}, {"--kd", &kd}, {"--tau-cap", &cap}, {"--speed-max", &speed}})
+    if (!flag(argc, argv, name, *out)) {
+      std::fprintf(stderr, "[hand] --backend dm needs %s (nothing is assumed)\n", name);
+      std::exit(2);
+    }
+  DmGripperConfig c;
+  const std::vector<std::string> m = split(motor, ':');
+  if (m.size() != 3 || !arm_rt::limits_for(m[1], c.lim)) {
+    std::fprintf(stderr, "[hand] --motor ID:TYPE:MST (TYPE 4310|4310p|4340|4340p; MST = the reply CAN id)\n");
+    std::exit(2);
+  }
+  const double id = number(m[0], "motor id"), mst = number(m[2], "Master ID");
+  if (id != std::floor(id) || id < 1 || id > 15 || mst != std::floor(mst) || mst < 0 || mst > 0x7FF) {
+    std::fprintf(stderr, "[hand] motor id must be an integer 1..15 and Master ID 0..0x7FF\n");
+    std::exit(2);
+  }
+  c.id = int(id);
+  reply_id = uint32_t(mst);
+  const std::vector<std::string> v = split(mimic, ',');
+  if (v.size() != 3) {
+    std::fprintf(stderr, "[hand] --mimic OPEN_RAD,CLOSED_RAD,FINGER_STROKE_M\n");
+    std::exit(2);
+  }
+  c.motor_open = number(v[0], "--mimic OPEN_RAD");
+  c.motor_closed = number(v[1], "--mimic CLOSED_RAD");
+  c.finger_stroke_m = number(v[2], "--mimic FINGER_STROKE_M");
+  c.kp = number(kp, "--kp");
+  c.kd = number(kd, "--kd");
+  c.tau_cap = number(cap, "--tau-cap");
+  c.speed_max_mps = number(speed, "--speed-max");
+  if (const char* why = c.invalid()) {
+    std::fprintf(stderr, "[hand] %s\n", why);
+    std::exit(2);
+  }
+  return c;
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);  // journald/file logs must not sit in a 4K buffer
-  const char* robot_ip = argc > 1 ? argv[1] : "172.16.0.3";
-  const long port_arg = argc > 2 ? std::atol(argv[2]) : 47802;
+  std::string backend = "franka", port_text = "47802", bind_text, robot_text = "172.16.0.3";
+  const bool flags = argc > 1 && !std::strncmp(argv[1], "--", 2);
+  if (flags) {
+    check_flags(argc, argv);
+    if (!flag(argc, argv, "--backend", backend)) {
+      std::fprintf(stderr, "[hand] flag mode needs --backend franka|dm\n");
+      return 2;
+    }
+    flag(argc, argv, "--port", port_text);
+    flag(argc, argv, "--bind", bind_text);
+    flag(argc, argv, "--robot-ip", robot_text);
+  } else {  // the deployed unit's positional form: robot_ip [port [bind_ip]]
+    if (argc > 1) robot_text = argv[1];
+    if (argc > 2) port_text = argv[2];
+    if (argc > 3) bind_text = argv[3];
+  }
+  const long port_arg = std::atol(port_text.c_str());
   if (port_arg < 1 || port_arg > 65535) {
     std::fprintf(stderr, "[hand] port must be 1..65535\n");
     return 2;
@@ -494,10 +664,49 @@ int main(int argc, char** argv) {
   // the robot LAN too — anything routable there could drive the jaws.
   in_addr bind_ip{};
   bind_ip.s_addr = INADDR_ANY;
-  if (argc > 3 && inet_pton(AF_INET, argv[3], &bind_ip) != 1) {
+  if (!bind_text.empty() && inet_pton(AF_INET, bind_text.c_str(), &bind_ip) != 1) {
     std::fprintf(stderr, "[hand] bind arg must be a dotted IPv4 address\n");
     return 2;
   }
+
+  std::function<std::shared_ptr<HandDevice>()> open_device;
+  std::string label;
+  if (backend == "dm") {
+    std::string iface;
+    uint32_t reply_id = 0;
+    const DmGripperConfig cfg = dm_config(argc, argv, iface, reply_id);
+    bridge_limits = cfg.limits();
+    label = iface + " motor " + std::to_string(cfg.id);
+    open_device = [cfg, iface, reply_id] {
+      return std::make_shared<DmGripper>(cfg, std::make_unique<SocketCanPort>(iface, reply_id));
+    };
+    release_device = [] {
+      std::shared_ptr<HandDevice> hand;
+      {
+        std::lock_guard<std::mutex> lk(mx);
+        hand = hand_session;
+      }
+      if (auto dm = std::dynamic_pointer_cast<DmGripper>(hand)) dm->shutdown();
+    };
+  } else if (backend == "franka") {
+#ifdef HAND_WITH_FRANKA
+    label = robot_text;
+    open_device = [robot_text] { return std::make_shared<FrankaHand>(robot_text.c_str()); };
+#else
+    std::fprintf(stderr, "[hand] built without libfranka: only --backend dm\n");
+    return 2;
+#endif
+  } else {
+    std::fprintf(stderr, "[hand] --backend franka|dm\n");
+    return 2;
+  }
+
+  // Signals go to one waiting thread (blocked everywhere else), which releases the device and exits.
+  sigset_t stop_signals;
+  sigemptyset(&stop_signals);
+  sigaddset(&stop_signals, SIGTERM);
+  sigaddset(&stop_signals, SIGINT);
+  pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
 
   const int lfd = socket(AF_INET, SOCK_STREAM, 0);
   const int one = 1;
@@ -511,9 +720,18 @@ int main(int argc, char** argv) {
     std::perror("[hand] bind/listen");
     return 1;
   }
-  std::printf("[hand] hand_bridge up: robot %s, port %u\n", robot_ip, port);
+  std::printf("[hand] hand_bridge up: %s %s, port %u, limits %.5f m %.5f m/s %.1f-%.1f N\n",
+              backend.c_str(), label.c_str(), port, bridge_limits.width_max_m,
+              bridge_limits.speed_max_mps, bridge_limits.force_min_n, bridge_limits.force_max_n);
+  std::thread([stop_signals] {
+    int sig = 0;
+    sigwait(&stop_signals, &sig);
+    std::printf("[hand] signal %d: releasing the gripper\n", sig);
+    release_device();
+    std::_Exit(0);
+  }).detach();
   std::thread(stopper).detach();
-  std::thread(actor, robot_ip).detach();
+  std::thread(actor, open_device, label).detach();
   for (;;) {
     const int client = accept(lfd, nullptr, nullptr);
     if (client < 0) continue;

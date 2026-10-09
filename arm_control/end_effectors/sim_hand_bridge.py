@@ -7,7 +7,7 @@ finger actuators, so the Hand path (``franka_adapter`` + ``HandGraspFsm``) is on
 
 * admission (``HandAdmission``): one command, never a queue; the client must echo the current epoch; the epoch bumps on every
   admission, cancellation and client change; REJECT reasons ``offline``, ``stopping``, ``stale_epoch``, ``busy``,
-  ``stale_state``, ``invalid_command``;
+  ``stale_state``, ``invalid_command``, and ``uncalibrated_force`` for a GRASP on a gripper without force grasp;
 * a new action needs a measured sample under 0.6 s old, taken after the previous action ended;
 * every 0.1 s ``LIMITS <width_max_m> <speed_max_mps> <force_min_n> <force_max_n>`` (the envelope it admits; the Franka
   Hand's unless constructed with another), ``STATE <width> <grasped>``, ``CAPS active_stop`` and
@@ -354,8 +354,10 @@ class SimHandBridge:
         if action is None:
             # as the C++: the token is reported only once `CMD <token> <verb>` read and the token parsed
             parts = line.split(" ")
-            token = parts[1] if (len(parts) >= 3 and parts[0] == "CMD" and parts[1].isascii()
-                                 and parts[1].isdigit()) else "0"
+            framed = len(parts) >= 3 and parts[0] == "CMD" and parts[1].isascii() and parts[1].isdigit()
+            token = parts[1] if framed else "0"
+            if framed and parts[2] == "GRASP" and not self.limits.force_grasp:
+                return f"REJECT {token} uncalibrated_force\n"  # no force grasp on this gripper (yet)
             return f"REJECT {token} invalid_command\n"
         with self._lock:
             error = self._adm.admit(action, self.have_real and time.monotonic() - self.real_t < FRESH_S)

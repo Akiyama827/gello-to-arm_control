@@ -357,6 +357,10 @@ def reconnect_cases():
     client.start()
     try:
         wait(lambda: client.limits.width_max_m == .0878, 3, 'the stated envelope')
+        # the reject reason, as the C++ serve(): GRASP on a no-force gripper, malformed or not
+        assert wide._handle('CMD 5 GRASP 0.04 0.05 40 0.02 0.02') == 'REJECT 5 uncalibrated_force\n'
+        assert wide._handle('CMD 5 GRASP 0.04') == 'REJECT 5 uncalibrated_force\n'
+        assert SimHandBridge(0)._handle('CMD 5 GRASP 0.04') == 'REJECT 5 invalid_command\n'
         wide.close()
         wait(lambda: not client.snapshot()['available'], 3, 'the client sees the bridge gone')
         old = socket.socket()  # an old bridge: META and CAPS, no LIMITS
