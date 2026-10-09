@@ -36,6 +36,8 @@ def main() -> int:
                                              cwd=ROOT, timeout_s=300.0)
     arm = None
     try:
+        # the supervisor writes its log FILE (a stalled reader can never block its loop's prints); the launcher tails it
+        assert supervisor.stdout is None and "serving" in (supervisor._workdir / "supervisor.log").read_text()
         cfg = load_robot_config(graph_env["ARM_CONTROL_CONFIG"])
         rt = cfg.get("rt")
         assert rt["host"] == "127.0.0.1" and rt["hand_port"] == cfg.get("sim_hand")["port"], rt

@@ -14,9 +14,8 @@ Differences from the in-process node (stated, not hidden):
   * an untargeted ``cancel`` (the console's Stop) also clears the supervisor controller's ``frozen`` hold after a failed settle
     (``ArmClient.hold``), as in-process; ``hold`` (the planner's milestone) cancels the live leg and leaves the arm held by the
     supervisor, without the in-process freeze; ``stop`` cancels and DISARMs;
-  * Soft (pose hold) is not offered: ``plant_capabilities`` says ``supports_pose_hold: False`` (the in-process MuJoCo plant offered
-    it; a supervisor offers Soft through its presets once the bridge advertises the plant's capability: open, with the real
-    graphs);
+  * Soft (pose hold) is offered exactly when the supervisor's plant runs it (``capabilities.pose_hold``: an RT server with pose
+    hold; the sim servo has none, so the FR3 sim console has no Soft, where the retired MuJoCo plant node offered it);
   * ``motor_state`` reports the supervisor's measured joints and its selected reference; gains and measured torque are zeros where the
     supervisor does not publish them;
   * a plan the supervisor refuses (e.g. a Cartesian-impedance leg on a plant without the law, or on the native reference path)
@@ -74,6 +73,9 @@ class DoraArmBridge:
         self.arm, self.handle, self.emit, self.arm_id, self._clock = arm, handle, emit, arm_id, clock
         self.adapter = ConsoleControlAdapter(arm, presets, live=live)
         self.joints = tuple(arm.identity.joint_names)
+        # Soft is offered when the plant runs it (an RT server with pose hold; not the sim servo): the console's Soft becomes the
+        # supervisor's pose_hold preset through the control adapter
+        self.pose_hold = bool(getattr(arm.capabilities, 'pose_hold', False))
         self._release_on_stage: set[str] = set()   # ungated plans: released as soon as the supervisor admits them
         self._staged: list[str] = []               # staged, not yet released: a new plan REPLACES these (as on the in-process controller)
         self._replaced: set[str] = set()           # plans cancelled by that replacement: their plan_cleared is not forwarded
@@ -102,7 +104,7 @@ class DoraArmBridge:
     def start(self) -> None:
         """Claim (never ARM) and announce the plant capabilities the console reads."""
         self.arm.claim()
-        self.emit('model_revision', pack_json_message('plant_capabilities', {'supports_pose_hold': False}))
+        self.emit('model_revision', pack_json_message('plant_capabilities', {'supports_pose_hold': self.pose_hold}))
         self.emit('arm', pack_json_message('arm', {'armed': False}))
         self._armed_sent = False
 
@@ -253,7 +255,7 @@ class DoraArmBridge:
             self.emit('controller_event', pack_controller_event(kind='fault', ok=False, reason=f'supervisor lost: {reason}'))
             self.emit('motor_health', pack_json_message('motor_health', dict(
                 armed=False, state_fresh=False, latched_fault=f'supervisor lost: {reason}', any_fault=True,
-                supports_pose_hold=False, unknown_authority=True)))
+                supports_pose_hold=self.pose_hold, unknown_authority=True)))
 
     def _publish_health(self, state, armed: bool) -> None:
         """The console reads armed and its fault latch from ``motor_health`` (authoritative, and the only thing that CLEARS a latch)."""
@@ -263,7 +265,7 @@ class DoraArmBridge:
             self._health_sent, self._health_at = key, self._clock()
             self.emit('motor_health', pack_json_message('motor_health', dict(
                 armed=armed, state_fresh=state.position is not None, latched_fault=fault, any_fault=bool(fault),
-                supports_pose_hold=False)))
+                supports_pose_hold=self.pose_hold)))
 
     def _forward(self, event: dict) -> None:
         plan_id = str(event.get('plan_id') or '')
