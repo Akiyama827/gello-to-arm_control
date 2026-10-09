@@ -21,7 +21,7 @@ from arm_control.motion import JointServoCommand
 
 
 class _FakeNode:
-    """Collects outputs; iterating it ends the run loop immediately."""
+    """Collects outputs."""
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, object]] = []
