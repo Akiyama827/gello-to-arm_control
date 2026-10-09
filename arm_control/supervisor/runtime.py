@@ -173,6 +173,7 @@ class RobotRuntime:
         self._group_hold_grace = 0.0  # monotonic: after it, the RT's group retire may have retired this arm's standing hold
         self.controller = self._build_controller()
         self._payload = PayloadState(0, PayloadValue(0.))
+        self._load_model_revision = -1  # controller_load_model: none installed (the construction model's RNEA)
         self._presets = resolve_presets(cfg.get('control_mode') or {}, self.joints,
                                        self.controller.executor.kp, self.controller.executor.kd)
         self._soft_ids = itertools.count(1)
@@ -207,7 +208,7 @@ class RobotRuntime:
 
     @property
     def extensions(self):
-        result = {'controller': 1}
+        result = {'controller': 1, 'load_model': 1}
         if self._native is not None and self._stream_admission is not None:
             result['stream'] = 1
         if self._native is not None and getattr(self.link, 'group_capable', False):
@@ -358,9 +359,47 @@ class RobotRuntime:
             raise Refused('cancel and retire the arm execution before replacing payload')
         # Install the validated complete value once; the executor applies its
         # compensation, while this revision owns admission identity.
-        self.controller.executor.set_payload(payload.mass_kg, com_offset=payload.com_ee)
+        try:
+            self.controller.executor.set_payload(payload.mass_kg, com_offset=payload.com_ee)
+        except ValueError as exc:
+            raise Refused(str(exc)) from None
         self._payload = PayloadState(self._payload.revision + 1, payload)
         return self._payload
+
+    def set_load_model(self, session, revision, model):
+        return self._call(self._set_load_model, session, revision, model)
+
+    def _set_load_model(self, session, revision, model):
+        """Install a revisioned rigid-body load model (operator 2026-10-09, B1): this arm's RNEA from a body list, e.g. the base
+        with the modules grafted onto it. Refused while an execution is live, for a revision not above the installed one, for
+        another joint order, on a native-reference supervisor (the RT plays the reference), and when gravity at the measured
+        pose is non-finite or above the policy's torque limits. Returns the installed revision."""
+        from arm_control.dynamics import BodyListDynamics
+
+        self._owns(session)
+        if type(revision) is not int or revision <= self._load_model_revision:
+            raise Refused(f'load model revision must be an integer above {self._load_model_revision}')
+        if self._current() is not None:
+            raise Refused('cancel and retire the arm execution before replacing the load model')
+        if self._native is not None:
+            raise Refused('a native-reference supervisor plays the reference on the RT box: no PC load model')
+        if not isinstance(model, dict) or list(model.get('joints') or []) != list(self.joints):
+            raise Refused(f'load model joints must be this arm\'s, in order: {list(self.joints)}')
+        c = self.controller
+        try:
+            dynamics = BodyListDynamics(model)
+            tau = dynamics.gravity(np.asarray(c.last_state.position, float))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise Refused(f'load model refused: {exc}') from None
+        limits = c.execution_policy.torque_limits if c.execution_policy is not None else None
+        if not np.isfinite(tau).all() or (limits is not None and np.any(np.abs(tau) > limits)):
+            raise Refused(f'load model gravity {np.round(tau, 3).tolist()} N.m at the measured pose exceeds the torque limits')
+        try:
+            c.executor.set_dynamics(dynamics)
+        except ValueError as exc:
+            raise Refused(str(exc)) from None
+        self._load_model_revision = revision
+        return revision
 
     # -- setpoint/1: a live joint target with a deadman (console jog, policy actions) -------
     def setpoint(self, session, q):

@@ -146,3 +146,111 @@ class PinocchioDynamics:
             J_lin = J_lin - pin.skew(r) @ J[3:]
         tau_full = J_lin.T @ (-np.asarray(self._model.gravity.linear) * float(mass_kg))
         return np.asarray(tau_full[self._v_indices], dtype=float)
+
+
+_HINGE, _SLIDE = 3, 2  # mujoco.mjtJoint.mjJNT_HINGE / mjJNT_SLIDE (no MuJoCo import for a number)
+
+
+class BodyListDynamics:
+    """RNEA over a revisioned rigid-body list: a model shipped as numbers (no URDF, no meshes, no pickle).
+
+    ``description``: ``joints`` (the commanded order), ``bodies`` (parent index, pose, mass, CoM, inertia, an optional scalar
+    ``joint`` {name, kind, axis, pos}), ``gravity``, ``inactive_joints`` (command slots the tree does not contain: held at
+    model zero) and optional ``unmeasured_joints`` (tree joints no motor reports: model zero). Joint ``kind`` is MuJoCo's
+    ``mjtJoint`` value (hinge 3, slide 2), the composer the model comes from. A load model's body list (the base, with the
+    modules grafted onto it) is one of these; the supervisor installs it with ``controller_load_model``.
+    """
+
+    def __init__(self, description):
+        bodies = description['bodies']
+        self.joints = list(description['joints'])
+        unmeasured = description.get('unmeasured_joints', [])
+        if (not isinstance(unmeasured, list) or not all(isinstance(n, str) for n in unmeasured)
+                or len(set(unmeasured)) != len(unmeasured) or set(unmeasured) & set(self.joints)):
+            raise ValueError('invalid unmeasured joint declarations')
+        if not 0 < len(self.joints) <= 64 or len(set(self.joints)) != len(self.joints):
+            raise ValueError('invalid dynamics joint order')
+        if not 0 < len(bodies) <= 256:
+            raise ValueError('invalid dynamics tree size')
+        self.model = pin.Model()
+        self.model.gravity.linear = self._array(description['gravity'], (3,))
+        links = [(0, pin.SE3.Identity())]
+        for bid, body in enumerate(bodies, 1):
+            parent = body['parent']
+            if not isinstance(parent, int) or not 0 <= parent < bid:
+                raise ValueError('invalid dynamics parent order')
+            parent_joint, parent_pose = links[parent]
+            pose = parent_pose * pin.SE3(self._rot(body['quat']), self._array(body['pos'], (3,)))
+            joint = body['joint']
+            if joint is not None:
+                axis = self._array(joint['axis'], (3,))
+                if abs(np.linalg.norm(axis) - 1.0) > 1e-6:
+                    raise ValueError('invalid joint axis')
+                offset = self._array(joint['pos'], (3,))
+                if joint['kind'] == _HINGE:
+                    jm = pin.JointModelRevoluteUnaligned(axis)
+                elif joint['kind'] == _SLIDE:
+                    jm = pin.JointModelPrismaticUnaligned(axis)
+                else:
+                    raise ValueError('non-scalar dynamics joint')
+                if (joint['name'] not in self.joints and joint['name'] not in description.get('unmeasured_joints', [])) or self.model.existJointName(joint['name']):
+                    raise ValueError('unexpected or duplicate dynamics joint')
+                parent_joint = self.model.addJoint(parent_joint, jm,
+                    pose * pin.SE3(np.eye(3), offset), joint['name'])
+                pose = pin.SE3(np.eye(3), -offset)
+            mass = float(body['mass'])
+            inertia = self._array(body['inertia'], (3,))
+            if not np.isfinite(mass) or mass < 0 or np.any(inertia < 0):
+                raise ValueError('invalid body inertia')
+            rotation = self._rot(body['inertia_quat'])
+            self.model.appendBodyToJoint(parent_joint,
+                pin.Inertia(mass, self._array(body['com'], (3,)),
+                            rotation @ np.diag(inertia) @ rotation.T), pose)
+            links.append((parent_joint, pose))
+        self.data = self.model.createData()
+        inactive = description['inactive_joints']
+        if (not isinstance(inactive, list) or len(set(inactive)) != len(inactive)
+                or not set(inactive) <= set(self.joints)):
+            raise ValueError('invalid inactive inventory slots')
+        represented = set(self.model.names[1:])
+        if represented != (set(self.joints) - set(inactive)) | set(description.get('unmeasured_joints', [])):
+            raise ValueError('model does not represent every required base and attached joint')
+        self.slots, self.indices = [], []
+        for slot, name in enumerate(self.joints):
+            if self.model.existJointName(name):
+                self.slots.append(slot)
+                self.indices.append(self.model.joints[self.model.getJointId(name)].idx_v)
+
+    @staticmethod
+    def _array(value, shape):
+        array = np.asarray(value, dtype=float)
+        if array.shape != shape or not np.isfinite(array).all():
+            raise ValueError('nonfinite or malformed numeric dynamics')
+        return array
+
+    @classmethod
+    def _rot(cls, value):
+        quat = cls._array(value, (4,))
+        if abs(np.linalg.norm(quat) - 1.0) > 1e-6:
+            raise ValueError('invalid dynamics quaternion')
+        w, x, y, z = quat  # MuJoCo and the scene contract store w,x,y,z
+        return pin.Quaternion(w, x, y, z).matrix()
+
+    def rnea(self, q, qd, qdd):
+        vectors = [self._array(v, (len(self.joints),)) for v in (q, qd, qdd)]
+        # The two-axis hardware stream contains no module-motor feedback.
+        # Unmeasured internal joints use declared model zero, never fabricated
+        # measured slots or motor authority. Hardware release remains blocked.
+        full = []
+        for vector in vectors:
+            embedded = np.zeros(self.model.nv)
+            embedded[self.indices] = vector[self.slots]
+            full.append(embedded)
+        output = np.zeros(len(self.joints))
+        output[self.slots] = pin.rnea(self.model, self.data, *full)[self.indices]
+        if not np.isfinite(output).all():
+            raise ValueError('nonfinite RNEA output')
+        return output
+
+    def gravity(self, q):
+        return self.rnea(q, np.zeros(len(q)), np.zeros(len(q)))

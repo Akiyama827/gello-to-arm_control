@@ -80,6 +80,9 @@ class JointTrajectoryExecutor:
         self.arm_id = str(arm_id)
         self._joints = list(joint_names)
         self._dyn = dynamics
+        # RNEA/gravity source: the construction model, or a load model installed later (set_dynamics). Joint limits and the
+        # payload frame stay the construction model's.
+        self._rigid = dynamics
         self._kp = np.asarray(kp_default, dtype=float).copy()
         self._kd = np.asarray(kd_default, dtype=float).copy()
         self._max_tau = np.array(max_torque, dtype=float)
@@ -136,9 +139,9 @@ class JointTrajectoryExecutor:
         """
         q = np.asarray(state.position, dtype=float).copy()
         anchor = q if q_des is None else np.asarray(q_des, dtype=float).copy()
-        tau = self._dyn.gravity(q) + self._payload_tau(q) + integral_bias
+        tau = self._rigid.gravity(q) + self._payload_tau(q) + integral_bias
         if self._gravity_comp:
-            tau = tau - self._dyn.gravity(q)  # plant adds gravity itself
+            tau = tau - self._rigid.gravity(q)  # plant adds gravity itself
         tau = np.clip(tau, -self._max_tau, self._max_tau)
         return JointServoCommand(
             q_des=anchor,
@@ -164,6 +167,8 @@ class JointTrajectoryExecutor:
         if not np.isfinite(mass):
             raise ValueError("payload mass must be finite")
         mass = max(0.0, mass)
+        if mass > 0.0 and self._rigid is not self._dyn:
+            raise ValueError("a load model is installed: its bodies carry the load, not a payload")
         com = None
         if mass > 0.0:
             if not self._payload_frame:
@@ -173,6 +178,16 @@ class JointTrajectoryExecutor:
                 if com.shape != (3,) or not np.all(np.isfinite(com)):
                     raise ValueError("payload CoM must have shape (3,) and be finite")
         self._payload = (mass, com)
+
+    def set_dynamics(self, dynamics) -> None:
+        """Install a load model's RNEA (``arm_control.dynamics.BodyListDynamics``, over this executor's joint order) in place
+        of the construction model's: the base with the modules grafted onto it. Joint limits stay the construction model's.
+        Refused while a payload is declared (the payload's frame belongs to the construction model)."""
+        if list(getattr(dynamics, "joints", [])) != self._joints:
+            raise ValueError(f"load model joints {getattr(dynamics, 'joints', None)} != executor joints {self._joints}")
+        if self._payload[0] > 0.0:
+            raise ValueError("clear the payload before installing a load model")
+        self._rigid = dynamics
 
     def _payload_tau(self, q: np.ndarray) -> np.ndarray:
         mass, com = self._payload
@@ -211,11 +226,11 @@ class JointTrajectoryExecutor:
         # cubic Hermite). It used to be a 1 ms forward difference of qd, which
         # both lagged half a step and straddled knots -- and differenced a qd
         # that was not the derivative of the q being commanded anyway.
-        tau_ff = self._dyn.rnea(state.position, pt.velocity, pt.acceleration)
+        tau_ff = self._rigid.rnea(state.position, pt.velocity, pt.acceleration)
         tau_ff = tau_ff + self._payload_tau(np.asarray(state.position, dtype=float))
         tau_ff = tau_ff + integral_bias
         if self._gravity_comp:
-            tau_ff = tau_ff - self._dyn.gravity(state.position)
+            tau_ff = tau_ff - self._rigid.gravity(state.position)
         tau_ff = np.clip(tau_ff, -self._max_tau, self._max_tau)
         return JointServoCommand(
             q_des=pt.position.copy(),
