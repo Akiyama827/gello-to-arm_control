@@ -399,6 +399,17 @@ class ArmController:
             self._jog.set(unpack_jog(value)["q"], self._clock())
         return refusal
 
+    @property
+    def jog_timeout_s(self) -> float:
+        """How long a jog/setpoint stays live without renewal."""
+        return self._jog.timeout_s
+
+    def clear_jog(self) -> None:
+        """Drop a live jog and hold the MEASURED pose (as its expiry does): its sender is gone."""
+        if self._jog.active:
+            self._jog.clear()
+            self._hold_anchor = self._static_hold()
+
     def _jog_target(self) -> tuple[np.ndarray | None, bool]:
         """Select the live jog target and report expiry; do not update bias."""
         q_des = self._jog.target(self._clock())
@@ -702,6 +713,7 @@ class ArmController:
                 self._finish_leg(ok=False, reason=reason)
                 self._pending_traj = None
                 return
+        self._jog.clear()  # a released plan owns the arm: a jog set before it must not resume after the leg
         start = self.exec_time
         source = self._reference_source
         self._reference = TrajectoryReference(

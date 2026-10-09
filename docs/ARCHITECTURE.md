@@ -744,8 +744,7 @@ This remains unintegrated: console migration is stopped on native-to-Soft mode
 arbitration. RT retains the reference identity after CANCEL and rejects all v5/v6
 commands for the rest of that ARM epoch. The SDK refuses Soft in that state rather
 than confirming a law RT cannot apply. No implicit DISARM/re-ARM or RT ownership
-change is implemented. Existing console preset resolution and raw jog remain until
-one-owner migration and its silence/cancel/expiry checks are complete.
+change is implemented. (Raw jog through the supervisor: setpoint/1, below.)
 
 ### setpoint/1: a live joint target with a deadman
 
@@ -755,11 +754,15 @@ setpoint; if none arrives within the controller's jog timeout (the mode config's
 MEASURED pose, never the last target. It is the in-process controller's own jog
 path (`JogHold`), reached through the supervisor: the owner session only, ARMed,
 no live execution (a staged plan counts; cancel it first), finite and full width,
-and never moving a joint further past its position limit than it already is.
+never moving a joint further past its position limit than it already is, and no
+further from the measured pose than the policy's `abort_pos_err_rad` (the
+controller would cancel a farther one on its next tick). An owner that leaves
+(disconnect, unclaim) takes its setpoint with it: the arm holds its measured pose.
 Refusals carry the controller's reason and change nothing. Offered on the
 streamed path only: a native-reference supervisor plays only its curve (use
 stream/1 there). It is the command path for the console jog (`DoraArmBridge`
-forwards `jog`, and cancels its staged plans first) and for policy clients that
-emit joint targets. The step size is the CALLER's envelope (the console's
+forwards `jog`, and cancels its staged plans first; an execute naming one fails
+its leg) and for policy clients that emit joint targets. Within
+`abort_pos_err_rad` the step size is the CALLER's envelope (the console's
 `JogLimits`: stroke, workspace, singularity, collision); the supervisor checks
 only what holds for every caller.
