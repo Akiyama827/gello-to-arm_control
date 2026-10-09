@@ -350,29 +350,40 @@ class RobotRuntime:
     def setpoint(self, session, q):
         """Hold the arm at ``q`` (arm joints, rad) on the joint law until the next setpoint, or until none arrives within the
         controller's jog timeout: then it holds the MEASURED pose (not the last target). Refused while an execution is live,
-        and for a target that moves any joint further past its position limit than the measured pose is. Returns the timeout,
-        which is the rate a caller must keep up. The step size is the caller's envelope (the console's JogLimits); the
-        supervisor checks only what holds for every caller."""
+        for a target that moves any joint further past its position limit than the measured pose is, and for one further from
+        the measured pose than the policy's abort_pos_err_rad (the controller would cancel it on the next tick, after telling
+        the caller it was taken). Returns the timeout, which is the rate a caller must keep up. Within that, the step size is the
+        caller's envelope (the console's JogLimits); the supervisor checks only what holds for every caller."""
         return self._call(self._setpoint, session, q)
 
     def _setpoint(self, session, q):
         self._owns(session)
+        if self._native is not None:
+            raise Refused('setpoints are on the streamed path; this supervisor plays the native reference (use stream/1)')
         q = np.asarray(q, dtype=float).ravel()
         if q.shape != (len(self.joints),) or not np.isfinite(q).all():
             raise Refused(f'a setpoint is {len(self.joints)} finite joint positions')
         if self._current() is not None:
             raise Refused('an execution is live: cancel it before streaming setpoints')
         c = self.controller
-        lower, upper = c.execution_policy.position_lower, c.execution_policy.position_upper
+        refusal = c.jog_refusal()  # the controller's own state first: its reason is the real one
+        if refusal is not None:
+            raise Refused(f'setpoint refused: {refusal}')
+        policy, measured = c.execution_policy, np.asarray(c.last_state.position, float)
+        lower, upper = policy.position_lower, policy.position_upper
         if lower is not None and upper is not None:
             past = lambda x: np.maximum(np.maximum(lower - x, x - upper), 0.)  # noqa: E731
-            worse = np.flatnonzero(past(q) > past(np.asarray(c.last_state.position, float)) + 1e-9)
+            worse = np.flatnonzero(past(q) > past(measured) + 1e-9)
             if worse.size:
                 raise Refused(f'setpoint moves {self.joints[worse[0]]} past its position limit')
+        step = float(np.max(np.abs(q - measured)))
+        if step > policy.abort_pos_err_rad:
+            raise Refused(f'setpoint is {step:.3f} rad from the measured pose; the controller aborts beyond '
+                          f'{policy.abort_pos_err_rad:g} rad (abort_pos_err_rad): send nearer targets')
         refusal = c.on_jog(pack_json_message('jog', {'q': q.tolist(), 'reason': 'setpoint'}))
         if refusal is not None:
             raise Refused(f'setpoint refused: {refusal}')
-        return {'timeout_s': c._jog.timeout_s}
+        return {'timeout_s': c.jog_timeout_s}
 
     # -- stream/1: same execution ledger, reference owner and control loop -------
     def open_stream(self, session, request):
@@ -1046,10 +1057,11 @@ class RobotRuntime:
         self._stream_marks.pop(session, None)
 
     def _abandon(self, reason: str) -> None:
-        """Cancel the owner's live executions and hold; stay armed."""
+        """Cancel the owner's live executions and its live setpoint, and hold; stay armed."""
         for ex in list(self._executions.values()):
             if not ex.status.terminal and ex.completed_at is None:
                 self._cancel_execution(ex, reason)
+        self.controller.clear_jog()
         self._owner = None
         self._publish()
 

@@ -391,13 +391,28 @@ class ArmController:
         trajectory for the same joints. The Dora node drops the reason (the
         console re-sends while a button is held); the supervisor returns it.
         """
-        refusal = ("stopped" if self.stopped else "frozen (cancel to clear)" if self.frozen
-                   else "not armed" if not self.armed else "no fresh measured pose since ARM" if not self.ready_sent
-                   else "Soft (pose hold) is selected" if self._pose_hold is not None
-                   else "a plan is running" if self._running else None)
+        refusal = self.jog_refusal()
         if refusal is None:
             self._jog.set(unpack_jog(value)["q"], self._clock())
         return refusal
+
+    def jog_refusal(self) -> str | None:
+        """Why a jog would be dropped now (None = it would be taken). Pure."""
+        return ("stopped" if self.stopped else "frozen (cancel to clear)" if self.frozen
+                else "not armed" if not self.armed else "no fresh measured pose since ARM" if not self.ready_sent
+                else "Soft (pose hold) is selected" if self._pose_hold is not None
+                else "a plan is running" if self._running else None)
+
+    @property
+    def jog_timeout_s(self) -> float:
+        """How long a jog/setpoint stays live without renewal."""
+        return self._jog.timeout_s
+
+    def clear_jog(self) -> None:
+        """Drop a live jog and hold the MEASURED pose (as its expiry does): its sender is gone."""
+        if self._jog.active:
+            self._jog.clear()
+            self._hold_anchor = self._static_hold()
 
     def _jog_target(self) -> tuple[np.ndarray | None, bool]:
         """Select the live jog target and report expiry; do not update bias."""
@@ -702,6 +717,7 @@ class ArmController:
                 self._finish_leg(ok=False, reason=reason)
                 self._pending_traj = None
                 return
+        self._jog.clear()  # a released plan owns the arm: a jog set before it must not resume after the leg
         start = self.exec_time
         source = self._reference_source
         self._reference = TrajectoryReference(

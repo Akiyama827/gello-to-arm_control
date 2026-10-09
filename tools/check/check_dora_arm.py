@@ -7,7 +7,8 @@
 ``ready`` event with the first measured pose, ``motor_state`` shape and values, a gated plan (staged, executed, ``leg_result``), an
 UNGATED plan (released when admitted), a targeted cancel (``plan_cleared``), named-preset gains (accepted, ``mode`` event) and
 non-preset gains (refused), ``jog`` as a supervisor setpoint (the arm follows while re-sent, holds when it stops; refused with the
-reason past a joint limit, malformed, from a non-owner, while a plan runs, DISARMed), the unsupported ``gripper`` (refused with a
+reason past a joint limit, beyond abort_pos_err_rad, malformed, from a non-owner, while a plan is staged or runs, DISARMed; an
+execute of a plan a jog superseded fails its leg; an owner that leaves takes its setpoint with it), the unsupported ``gripper`` (refused with a
 notice, rate limited), ``stop`` (cancel + DISARM),
 malformed input (never raises), and configuration drift (the bridge refuses to start against a supervisor running other gains).
 """
@@ -243,6 +244,7 @@ def main():
         qs = np.asarray(arm.state().q)
         bridge.on_plan(plan_message('s1', qs, qs + [.1, 0, 0], 1.0, gated=True))
         pump(lambda: [e for e in cap.events('plan_staged') if e['plan_id'] == 's1'], 'plan_staged s1')
+        refused(qs, 'execution is live')  # a staged plan is a live execution: a direct setpoint is refused (the bridge cancels first)
         before = len(cap.events('mode'))
         end = time.monotonic() + 1.5
         while time.monotonic() < end:
@@ -253,6 +255,12 @@ def main():
         assert abs(arm.state().q[0] - (qs[0] - .05)) < .02, (arm.state().q, qs)
         assert not [m for m in cap.events('mode')[before:] if not m['ok']], 'the supersede showed a refusal'
         time.sleep(.6)
+        # the console kept s1 as pending: its execute answers a failed leg_result, never silence
+        bridge.on_control(pack_control_update(execute='s1'))
+        failed = [e for e in cap.events('leg_result') if e['plan_id'] == 's1']
+        assert failed and failed[0]['ok'] is False and 'superseded by a jog' in failed[0]['reason'], failed
+        # a target beyond the policy's abort_pos_err_rad (0.35 here) is refused, not taken and then dropped by the controller
+        refused(np.asarray(arm.state().q) + [.5, 0, 0], 'abort_pos_err_rad')
         # the gripper is not served by an arm supervisor: refused with a notice, a burst makes one notice
         before = len(cap.events('mode'))
         for _ in range(5):
@@ -272,6 +280,22 @@ def main():
         assert not arm.authority().arm_epoch
         assert [unpack_json_message(v)['armed'] for t, v in cap.out if t == 'arm'] == [False, True, False]
         refused(reached, 'not armed')
+        # an owner that leaves takes its setpoint with it: the arm holds where it is, not at the departed owner's target
+        arm.arm()
+        end = time.monotonic() + 5.
+        while True:
+            try:
+                arm.setpoint(np.asarray(arm.state().q) + [.3, 0, 0])
+                break
+            except Refused as exc:
+                assert 'fresh measured pose' in str(exc) and time.monotonic() < end, exc
+                time.sleep(.02)
+        arm.unclaim()
+        left = np.asarray(arm.state().q)
+        time.sleep(.25)  # inside the 0.3 s deadman: without the clear the arm would still be travelling to the target
+        assert abs(arm.state().q[0] - left[0]) < .03, (arm.state().q, left)
+        arm.claim()
+        arm.disarm()
         for t, v in cap.out:
             if t == 'arm':
                 pass
