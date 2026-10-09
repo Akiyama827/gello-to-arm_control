@@ -87,7 +87,7 @@ public:
     // over" and pace the servo by bus traffic instead of the clock.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     for (;;) {
-      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+      const auto left = std::chrono::ceil<std::chrono::milliseconds>(
           deadline - std::chrono::steady_clock::now()).count();
       pollfd p{fd_, POLLIN, 0};
       const int ready = ::poll(&p, 1, int(std::max<int64_t>(left, 0)));
@@ -149,7 +149,7 @@ public:
     // (an arm server whose spec includes it, the PC-side DM driver) is commanding it. Never take over a live motor.
     // (A motor left ENABLED by a crashed bridge is silent and cannot be detected this way: see the record.)
     for (auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenMs);;) {
-      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now());
+      const auto left = std::chrono::ceil<std::chrono::milliseconds>(end - std::chrono::steady_clock::now());
       if (left.count() <= 0) break;
       uint8_t data[8];
       const int got = port_->recv(data, int(left.count()));
@@ -281,7 +281,7 @@ private:
       }
       next += std::chrono::microseconds(int64_t(kPeriodS * 1e6));
       for (;;) {
-        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        const auto left = std::chrono::ceil<std::chrono::milliseconds>(
             next - std::chrono::steady_clock::now()).count();
         uint8_t data[8];
         const int got = port_->recv(data, int(std::max<int64_t>(left, 0)));
