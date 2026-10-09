@@ -27,8 +27,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_sdk_supervisor import write_config  # noqa: E402
 
-from arm_control.contracts import pack_json_message
-from arm_control.contracts import unpack_json_message  # noqa: E402
+from arm_control.contracts import pack_json_message, unpack_json_message  # noqa: E402
 from arm_control.contracts.motion import pack_control_update, pack_jog, pack_plan, unpack_controller_event  # noqa: E402
 from arm_control.contracts.motor import unpack_motor_state  # noqa: E402
 from arm_control.multi_arm.supervised import AsyncAuthorityHandle, SdkArmHandle  # noqa: E402

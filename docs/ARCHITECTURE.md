@@ -292,8 +292,8 @@ project registry. Nominal installation assumptions are not measurements.
 
 `examples/configs/` contains minimal reusable examples, not measured deployment
 facts. `examples/profiles/` contains reusable command and motion styles;
-Float is a gain preset in the motion console. The retired `plant.mode: float`
-bridge shortcut is rejected before opening hardware.
+Float is a gain preset in the motion console (mode configs carry no `plant`
+block).
 The consumer composes final entries from hardware identity, calibration, sensor
 roles, workcell facts, task policy, and simulation overrides. Existing
 `config.load_config_tree` include/deep-merge behavior remains unchanged.

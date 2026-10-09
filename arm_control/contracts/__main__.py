@@ -122,6 +122,13 @@ def _self_check() -> None:
             pass
         else:
             raise AssertionError(f"malformed runtime heartbeat admitted: {bad}")
+    # The light contracts stay light: the numpy-only SDK builds Cartesian requests through contracts.impedance.
+    import subprocess
+    import sys
+
+    probe = ("import sys, arm_control.contracts.impedance, arm_control.contracts; "
+             "assert 'pyarrow' not in sys.modules, 'contracts.impedance loaded pyarrow'")
+    subprocess.run([sys.executable, "-c", probe], check=True)
     print("contracts self-check ok")
 
 

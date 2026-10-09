@@ -81,3 +81,16 @@ every dataflow/factory string resolve; each of 154 rewritten names is the same o
   "update rate"); blank-line runs; `unpack_object_poses` documents `stamp`; the history no longer calls
   `control_mode.plant.listen_mode` live: `control_mode.plant` had no reader at all and is removed from the three mode
   configs and run.py's base staging (check_add_contracts asserts no mode states one).
+
+Review round 2 (Opus xhigh, PASS-WITH-FIXES; the run.py PYTHONPATH fix verified correct, no other launcher with the gap;
+`control_mode.plant` confirmed unread in Python, C++ and deployment rendering):
+* MUST (introduced by round 1's re-export): `contracts/__init__` imported `_arrow` eagerly, so every
+  `arm_control.contracts.*` import loaded pyarrow and numpy, including `contracts.impedance`, which the numpy-only SDK
+  imports to build a Cartesian request (a pyarrow-free interpreter raised ImportError) -> the two codecs are a lazy
+  module `__getattr__`; `python -m arm_control.contracts` asserts in a fresh interpreter that importing
+  `contracts.impedance` and `arm_control.contracts` loads no pyarrow.
+* SHOULD: a newer negative observation cleared the pose time, so an older positive arriving after it was accepted ->
+  `_frame_at` keeps the newest frame's capture time (positive or negative) and guards both; the check adds that case.
+* NITs taken: a declared time uncertainty above `perception.stale_s` is refused (such a capture cannot be judged fresh);
+  the project RUNBOOK and library ARCHITECTURE no longer claim `plant.mode: float` is "rejected before the DM bridge opens";
+  check_dora_arm's split import.
