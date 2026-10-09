@@ -141,7 +141,9 @@ def link_unit(tmp):
             raise AssertionError(f'accepted a bad sim_servo {bad}')
     link = SimLink(cfg, JOINTS, plant(tmp / 'three.urdf'), servo=SERVO)
     link.open()
-    # a plant without the Cartesian law refuses a spec rather than running the joint word alone (the Dora plant path)
+    # a plant without the Cartesian law refuses a spec rather than running the joint word alone (the Dora plant path), and
+    # atomically: the word it was running stays installed
+    before = link._plant._last_command
     try:
         link._plant.apply_motor_command(dict(command([0, 0, 0]), cartesian=dict(frame='base', task_R=np.eye(3), kc=np.zeros(6),
                                                                                  dc=np.zeros(6))))
@@ -149,6 +151,7 @@ def link_unit(tmp):
         pass
     else:
         raise AssertionError('a plant without the Cartesian law accepted a spec')
+    assert link._plant._last_command is before, 'a refused Cartesian word was partly installed'
     try:
         state, _ = link.latest_state()
         assert state.session_id == link.session_id and not state.armed and state.arm_epoch == 0, state

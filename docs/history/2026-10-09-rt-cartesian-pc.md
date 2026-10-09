@@ -95,7 +95,15 @@ Review round 1: BLOCK. Taken:
 * A phase's Cartesian block outside the envelope now fails when the coordinator is built, not when the dock leg is packed.
 * `MuJoCoBackend.apply_motor_command` refuses a Cartesian spec on a plant that cannot run the law (it ran the joint word alone,
   silently); `check_sim_supervisor` checks it on a plant with no EE. `_stream` passes `False`, not `None`.
-Not taken, recorded: the DM backend ignores a Cartesian spec (no DM config admits Cartesian legs: its policy has no
-`cartesian_kp_min`; changing a hardware backend's command path is its own stop); the Dora multi-slice `SceneCore.set_slice` is
+Not taken, recorded: the DM backend ignores a Cartesian spec (no DM task config emits Cartesian legs, and `real_assembler.yaml`
+has no execution policy, so no admission at all; changing a hardware backend's command path is its own stop); the Dora multi-slice `SceneCore.set_slice` is
 last-writer-wins for the EE-level spec with no actor gate (`sim_bench` has one writer; the supervisor path is gated by
 ScenePlant).
+
+Review round 2: ACCEPT (probes: holds after a float preset, DISARM->ARM and a kp-5 preset carry no spec, with and without a policy;
+malformed wire plans refused; coordinator `.T`/no-conversion mutants fail `check_bench_twin`; 6 of 8 mutants caught, one
+equivalent). Settle confirmed as the only post-execution window: completion and the 5 s timeout end it (without a policy the
+completing word itself still carries the spec, as `_check_completion` runs after the send there; every later word is clean).
+Taken: a jog while a gated Cartesian plan is staged is checked to be the joint law (mutant caught); the plant's refusal is atomic
+(the guard runs before anything is installed; mutant caught); the DM wording above. Remaining, accepted: a plan whose JSON
+cannot name itself still raises out of `on_plan` (garbage input).

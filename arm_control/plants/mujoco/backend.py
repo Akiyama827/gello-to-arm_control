@@ -1546,6 +1546,10 @@ class MuJoCoBackend:
     # -- motor I/O --------------------------------------------------------
     def apply_motor_command(self, command: dict[str, np.ndarray]) -> None:
         self.load()
+        # A plant that cannot run the Cartesian law REFUSES the whole word (as the RT link and SimLink do), before installing
+        # any of it, rather than running the joint word alone as if it were the leg that was planned.
+        if command.get("cartesian") is not None and not self.supports_cartesian:
+            raise ValueError("this plant cannot run the Cartesian law (no EE on a commanded jointed chain, or no compiled law)")
         soft = command.get("pose_hold")
         if soft is not None:
             pose_hold_values(soft)
@@ -1563,10 +1567,7 @@ class MuJoCoBackend:
             for key in ("position", "velocity", "torque", "kp", "kd")
         }
         # Optional Cartesian-impedance block (messages.unpack_motor_command). None = every graph that does not send one
-        # behaves exactly as before. A plant that cannot run the law REFUSES it (as the RT link and SimLink do) rather than
-        # running the joint word alone as if it were the leg that was planned.
-        if command.get("cartesian") is not None and not self.supports_cartesian:
-            raise ValueError("this plant cannot run the Cartesian law (no EE on a commanded jointed chain, or no compiled law)")
+        # behaves exactly as before; a refused one was refused above, before anything was installed.
         self._last_command["cartesian"] = command.get("cartesian")
         self._last_command["pose_hold"] = soft
 

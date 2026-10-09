@@ -522,6 +522,14 @@ def check_cartesian_lifecycle():
             later = commands(c)[sent:]
             assert later and all(m["cartesian"] is None for m in later), (strict, after, [m["cartesian"] for m in later])
 
+    # A jog while a gated Cartesian plan is staged (loaded, not released) is the joint law: the spec belongs to the leg.
+    c, clock = setup()
+    c.on_plan(cartesian_plan())
+    assert c._plan is not None and not c._running
+    c.on_jog(pack_jog(q=[.02] * 7))
+    c.tick()
+    assert np.allclose(commands(c)[-1]["position"], .02) and commands(c)[-1]["cartesian"] is None
+
     # A plan that names itself but does not decode is refused with its reason; the controller lives on.
     import json
     body = json.loads(json.dumps(unpack_json_message(cartesian_plan(), expected_schema="plan")))
