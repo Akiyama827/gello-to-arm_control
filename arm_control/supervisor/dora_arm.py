@@ -85,6 +85,7 @@ class DoraArmBridge:
         self._health_sent: tuple | None = None
         self._fault_text = ''                      # a recoverable supervisor fault, shown through motor_health like a server latch
         self.lost: str | None = None               # why the supervisor is unreachable (terminal for this node)
+        self._disarming = False                    # the control message being applied also DISARMs
         self._superseded: dict[str, None] = {}     # staged plans a jog cancelled (oldest first): an execute naming one fails its leg
 
     # -- startup ---------------------------------------------------------------------------------------------------
@@ -138,7 +139,12 @@ class DoraArmBridge:
         except (ValueError, KeyError, TypeError) as exc:
             self._event('mode', '', False, f'unreadable control update: {exc}')
             return
-        result = self.adapter.apply(update, send=self._send_group)
+        # a cancel riding with a DISARM (the console's DISARM button) must not wait on an unfreeze RPC: the DISARM cancels all
+        self._disarming = update.get('arm') is False
+        try:
+            result = self.adapter.apply(update, send=self._send_group)
+        finally:
+            self._disarming = False
         for line in result.refusals:
             self._mode_event(ok=False, reason=line)
         if result.applied:
@@ -207,7 +213,7 @@ class DoraArmBridge:
         # The console's Stop is an untargeted cancel: as in-process it also clears the hold a failed settle froze in. Not for
         # `hold` (the planner's milestone hold: in-process it FREEZES at the anchor, it never re-latches) nor for `stop` (the
         # DISARM that follows cancels everything).
-        if unfreeze and plan_id is None:
+        if unfreeze and plan_id is None and not self._disarming:
             try:
                 self.arm.hold(reason)
             except (SupervisorError, TimeoutError, OSError) as exc:

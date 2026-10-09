@@ -64,3 +64,7 @@ Review round 1: BLOCK. Taken:
 * `configs/entries/sim_console_demo.yaml` (and `_b`, through it) inherited the real Hand address and was safe only through
   run_console's overlay replacing the whole `rt` block; it now includes `sim_supervised.yaml` last.
 * NITs: check_sim_hand's docstring; check_supervised_sims' labels.
+
+Review round 2: ACCEPT (pinned-state configs re-resolved: every sim entry 127.0.0.1:47812, real entries unchanged). Residual NIT
+taken: the console's DISARM button sends `cancel` with `arm=False`; a cancel riding with a DISARM no longer makes the unfreeze RPC
+first (a hung supervisor would have delayed the DISARM by the SDK timeout). Checked (mutant caught).
