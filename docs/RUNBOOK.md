@@ -345,10 +345,12 @@ PYTHONPATH=. python -B tools/check/check_dual_modes.py [path/to/pair.yaml] --ref
 PYTHONPATH=. python -B tools/check/check_refinement.py
 ```
 
-The older `dataflows/dual_arm_sim.yml` deliberately runs two **independent**
-worlds and consoles on 7500/7510. Retain it for process-isolation diagnostics;
-it provides neither cross-arm collision checking nor coordinated execution.
-`--dual` now selects the shared-world console above.
+`--dual` selects the shared-world console above. (The older two-independent-
+worlds graph `dual_arm_sim.yml` was deleted 2026-10-09, operator decision. It
+exercised the retired in-process controller path; on hardware each arm runs on its
+own supervisor, a separate process. The sim `--dual` console runs both arms in one
+process, so sim process isolation is not exercised; a second isolated sim arm needs
+its own instance config.)
 
 ### Hand Grasp / Open
 
