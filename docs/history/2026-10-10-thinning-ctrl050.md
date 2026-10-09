@@ -94,3 +94,7 @@ Review round 2 (Opus xhigh, PASS-WITH-FIXES; the run.py PYTHONPATH fix verified 
 * NITs taken: a declared time uncertainty above `perception.stale_s` is refused (such a capture cannot be judged fresh);
   the project RUNBOOK and library ARCHITECTURE no longer claim `plant.mode: float` is "rejected before the DM bridge opens";
   check_dora_arm's split import.
+
+Review round 3 (Opus xhigh, PASS): the pyarrow probe fails on a reintroduced eager import (mutant verified); the
+reordered-frame and uncertainty-cap cases hold; all first-party imports resolve. Left: `dir(arm_control.contracts)` does
+not list the two lazy names (introspection only).
