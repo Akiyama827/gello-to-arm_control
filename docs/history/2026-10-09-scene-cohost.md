@@ -121,6 +121,15 @@ Review round 2 (opus): BLOCK, fixed:
     no q to SDK readers (base_client's base_health) for its length. Harmless at today's 0.35 s.
   - `_plant_failed` dates its failure sample with the pre-step time (cosmetic).
 
+Review round 3 (opus): ACCEPT.
+* SHOULD taken: `SharedWorld.clock()` read the pause state twice, so a pause ending between the reads stepped it back a whole
+  pause. It now reads it once, under its own lock, and clamps to its last value. The time read and the state read stay two
+  operations, so a check racing 100 pauses against a reader at a 1 µs switch interval still saw a 5 µs step without the clamp.
+  The check keeps that race (no step back).
+* NIT taken: a co-host counts host silence from start-up too, so a host whose first step fails still faults it.
+* NIT not taken: a host period above the world's idle timeout (under 10 Hz) would fault its co-host between normal steps.
+  No config does that.
+
 OPEN:
 * `BaseDriver`'s in-process executor and `base_command` path have no node any more. They stay as the self-checked decision core
   of `SupervisedBaseDriver`, and are retired once those checks move onto the client.

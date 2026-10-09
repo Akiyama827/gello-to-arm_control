@@ -174,6 +174,29 @@ def in_process(host_path, peer_path) -> None:
             time.sleep(.1)
         assert not peer.latest_state()[0].faulted and not host.latest_state()[0].faulted, (
             peer.motor_health()["latched_fault"], host.motor_health()["latched_fault"])
+        # The clock is monotonic under a reader racing pauses that end (review 3: two reads of the pause state stepped it back
+        # a whole pause); a tiny switch interval makes the race likely.
+        backwards, reading = [], threading.Event()
+
+        def reader():
+            last = shared.clock()
+            while not reading.is_set():
+                now_c = shared.clock()
+                if now_c < last:
+                    backwards.append(now_c - last)
+                last = now_c
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        racer = threading.Thread(target=reader)
+        racer.start()
+        try:
+            for _ in range(100):
+                pause(shared, .01)
+        finally:
+            reading.set()
+            racer.join()
+            sys.setswitchinterval(interval)
+        assert not backwards, min(backwards)
         # A pause past the excuse cap stalls the plant but never turns the world clock back when it ends.
         from arm_control.plants.mujoco import scene_core
         cap, scene_core.PAUSE_EXCUSE_MAX_S = scene_core.PAUSE_EXCUSE_MAX_S, .1

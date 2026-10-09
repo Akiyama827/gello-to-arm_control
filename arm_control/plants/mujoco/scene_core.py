@@ -302,6 +302,7 @@ class SharedWorld:
         # (seconds the world has been paused for scene changes, start of the change in progress or None): ONE attribute, so a
         # reader on another thread never sees a finished pause counted twice
         self._pause = (0.0, None)
+        self._clock_lock, self._clock_last = threading.Lock(), float("-inf")
 
     def apply_scene(self, request: dict) -> dict:
         """scene_action/1: an optimistic scene change, between steps (``SceneCore.apply_scene``). The world is paused while
@@ -325,9 +326,14 @@ class SharedWorld:
         """The world's time on the wall clock's scale: monotonic time less every pause for a scene change, so it stands still
         while the world does. A supervisor's controller deadlines run on it (a 0.35 s recompile is no stale state in a world
         that did not move), as SceneCore's slice deadmen are credited the same stall."""
-        now = time.monotonic()
-        paused, _ = self._pause
-        return now - paused - self.stalled(now)
+        with self._clock_lock:
+            now = time.monotonic()
+            paused, started = self._pause  # ONE read: a pause ending between two reads would count twice, then not at all
+            value = now - paused - (0.0 if started is None else min(max(0.0, now - started), PAUSE_EXCUSE_MAX_S))
+            # the time read and the pause read are two operations: a pause starting or ending between them is off by the
+            # microseconds between the two, either way; never let that show as the clock running back
+            self._clock_last = max(self._clock_last, value)
+            return self._clock_last
 
 
 class ScenePlant:
@@ -414,8 +420,6 @@ class ScenePlant:
                 self.shared.last = self._core.tick(now)
                 self.shared.host_steps += 1
                 return self._mine(self.shared.last)
-            if self.shared.host_steps == 0:  # the host has not stepped yet (start-up): nothing to fail, nothing to write
-                return self._mine(self.backend.motor_state())
             if command.get("cartesian") is not None:
                 raise ValueError("a co-hosted actor takes joint commands only (the world's Cartesian law is the host's)")
             # A co-host whose world has stopped stepping (the host failed or is gone) is a failed plant, not a fresh one. Counted
@@ -433,7 +437,8 @@ class ScenePlant:
             if not (released and not self._driven):
                 self._driven = True
                 self._core.set_slice(self.actor, dict(command, cartesian=None), now)
-            return self._mine(self.shared.last)
+            # before the host's first step (start-up) there is no stepped state yet: the world as loaded
+            return self._mine(self.shared.last if self.shared.last is not None else self.backend.motor_state())
 
     def motor_state(self) -> dict:
         with self.shared.lock:
