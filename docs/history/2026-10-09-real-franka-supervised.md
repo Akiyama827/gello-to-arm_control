@@ -60,8 +60,11 @@ Base coupling in real-add (read, not run): the base now ARMs only once the FR3's
 operator's request before), and DISARMs once the FR3 reports DISARMED. OPEN, OPERATOR DECISION: when the FR3's supervisor is
 LOST the base stays ARMED (as on the retired path: rt_interface ignored a closed input) -- publishing DISARM to it would leave a
 tilted base limp under the FR3; keeping it armed leaves it powered with no FR3 authority. Unchanged here (the adapter rule
-"unknown is never published as DISARMED" stands).
+"unknown is never published as DISARMED" stands). Operator 2026-10-09: KEEP (hold; the operator's stop); revisit with graph 4,
+where the base's own supervisor can hold explicitly on the FR3's loss.
 Named: no per-instance lock across calibrate/real-add/real franka motion (as before); ARM over the RT link untested offline (a
 `--q0` for the fake backend would allow it: a C++ change, not taken here). FAIL (not this slice; owner: the machine's load):
 check_sim_supervisor's observe-rate assertion (0.84-0.88x real time) while 30+ external `run_expert.py` jobs held load ~94 on
 32 cores; the check starts its supervisor directly (not through the changed launcher); re-run when the load drops.
+
+Review round 2: ACCEPT (the tail version tested with a launcher stdout blocked forever: 1,500 loop-thread prints, 135 kB of log, worst RPC 12 ms, the loop at 100 ticks/s; the pipe version would have stalled the loop). NITs taken: the echo prints whole lines only and survives a non-UTF-8 byte.

@@ -47,11 +47,13 @@ def start_supervisor(config: Path, env: dict, *, overlays=(), control_mode: Path
     proc._echo_stop = threading.Event()
 
     def _echo():
-        with open(workdir / "supervisor.log") as tail:
+        partial = ""
+        with open(workdir / "supervisor.log", errors="replace") as tail:  # one stray byte must not end the echo
             while True:
-                line = tail.readline()
-                if line:
-                    print(line if line.startswith("[") else f"[supervisor] {line}", end="", flush=True)
+                partial += tail.readline()
+                if partial.endswith("\n") or (partial and proc._echo_stop.is_set()):  # whole lines only (a write may split one)
+                    print(partial if partial.startswith("[") else f"[supervisor] {partial}", end="", flush=True)
+                    partial = ""
                 elif proc._echo_stop.is_set():
                     return
                 else:
