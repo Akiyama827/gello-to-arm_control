@@ -5,7 +5,7 @@ import numpy as np
 from dataclasses import replace
 
 from arm_control.control.arm_controller import ArmController
-from arm_control.control.doubles import _FakeExecutor, _FakeNode, _GRIPPER
+from arm_control.control.doubles import _FakeExecutor, _FakeNode
 from arm_control.messages import (
     pack_control_update, pack_json_message, pack_motor_state, pack_plan,
     pack_jog, unpack_json_message, unpack_motor_command,
@@ -33,8 +33,7 @@ def setup(*, strict=True, health=True, **kw):
         start_pos_tol_rad=.1, abort_pos_err_rad=.35, hold_relatch_rad=.3,
         torque_limits=np.array([87]*4+[12]*3), cartesian_kp_min=20.,
     ) if strict else None
-    c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
-                      clock=lambda: clock[0], plant_reports_health=health,
+    c = ArmController(_FakeNode(), _FakeExecutor(), clock=lambda: clock[0], plant_reports_health=health,
                       execution_policy=policy, **kw)
     c._set_arm(True)
     if health:
@@ -216,8 +215,7 @@ def check_deadlines():
     # Idle inputs still wake on the deadline; invalid clock configuration
     # cannot silently select a second, incompatible trajectory timebase.
     try:
-        ArmController(_FakeNode(), _FakeExecutor(), gripper=_GRIPPER,
-                      execution_policy=c.execution_policy, state_period_s=.01)
+        ArmController(_FakeNode(), _FakeExecutor(), execution_policy=c.execution_policy, state_period_s=.01)
     except ValueError:
         pass
     else:
@@ -330,7 +328,7 @@ def check_measured_outside():
             command_rate_hz=100, state_timeout_sec=.25, health_timeout_sec=1,
             start_pos_tol_rad=.1, abort_pos_err_rad=.35, hold_relatch_rad=.3,
             torque_limits=np.array([87]*4+[12]*3), position_lower=np.full(7, -1.0), position_upper=np.full(7, 1.0))
-        c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), clock=lambda: clock[0],
+        c = ArmController(_FakeNode(), _FakeExecutor(), clock=lambda: clock[0],
                           plant_reports_health=True, execution_policy=policy)
         c._set_arm(True)
         c.on_motor_health(pack_json_message("motor_health", dict(

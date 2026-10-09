@@ -1,14 +1,12 @@
 """Grasp request/result state machine for self-sensing hands (Franka Hand).
 
-The DM path senses grasps bridge-side (``GraspGate`` thresholds the gripper
-motor torque). A Franka Hand states its own verdict: ``grasp()`` returns the
+A Franka Hand states its own grasp verdict: ``grasp()`` returns the
 width-band-under-force check, and ``is_grasped`` tracks it afterwards. This
 FSM turns that verdict stream into the orchestrator's grasp contract:
 
 - ``close``  -> caller sends the hand a grasp action; the eventual verdict
   (``gdone``) becomes the GRASPED/MISSED ``grasp_result``.
-- ``release`` -> caller opens the jaws; acked immediately (unsensed, same as
-  the DM release path).
+- ``release`` -> caller opens the jaws; acked immediately (unsensed).
 - after a held grasp, ``is_grasped`` falling is the drop event: a second,
   failed result under the close request_id — the LOST semantics the
   orchestrator already freezes on.
@@ -147,7 +145,7 @@ class HandGraspFsm:
             return None, _result(rid, tid, False, str(exc))
         self.parameters = parameters
         if str(payload.get("mode", "close")) == "release" and not self.measured_completion:
-            # Unsensed, like the DM release: ack now, jaws travel after.
+            # Unsensed: ack now, jaws travel after.
             self._pending = None
             self._held = None
             return "open", _result(rid, tid, True, "released")

@@ -981,8 +981,8 @@ class MuJoCoBackend:
             gripper_present.append(name)
         if len(gripper_present) == 2:
             # Both jaws run off ONE actuator on the real hardware -- the FR3's
-            # URDF says so (`<mimic joint="fr3_finger_joint1"/>` on finger 2),
-            # and the DM pair has its joint_mimics block. MuJoCo's URDF
+            # URDF says so (`<mimic joint="fr3_finger_joint1"/>` on finger 2).
+            # MuJoCo's URDF
             # importer silently DROPS mimic tags, so without this the sim has
             # two free jaws: each closes until it personally finds contact, and
             # an off-centre part is simply held where it sits (measured: pads
@@ -1311,9 +1311,8 @@ class MuJoCoBackend:
             self.model.actuator(f"{n}_servo").id for n in gripper_present
         ]
         # The joints that ACTUALLY exist in this model, not the ones configured:
-        # ``gripper_joints`` is a superset covering every arm (the DM assembler's
-        # Gripper_1/2 and the FR3's fr3_finger_joint1/2), and only one pair is
-        # present in any given model.
+        # ``gripper_joints`` may name more than one arm's fingers, and only the
+        # pair present in this model is used.
         self._gripper_names = list(gripper_present)
         # Finger travel from the MODEL, not a constant: the clamp in
         # _set_gripper_targets must match whatever gripper this scene has.
@@ -1332,8 +1331,7 @@ class MuJoCoBackend:
         for act, name in zip(self._gripper_act, gripper_present):
             self.data.ctrl[act] = self.data.qpos[self.model.joint(name).qposadr[0]]
         # The spawn rest IS this gripper's OPEN: the release trigger compares
-        # commanded ctrl against it (a literal `<= 0.004` assumed the DM's
-        # open-at-zero and never fired for the FR3's open-at-0.04). Latched
+        # commanded ctrl against it (the FR3 opens at 0.04, not at zero). Latched
         # ONCE, at spawn — re-deriving it after a dock would record whatever
         # the fingers happen to be doing (mid-grip!) as "open".
         self._gripper_open_ctrl = [float(self.data.ctrl[a]) for a in self._gripper_act]
@@ -1499,8 +1497,8 @@ class MuJoCoBackend:
         one-sided shove the module slid out of. Under force both fingers load
         equally (-10/-10 N, both in contact).
 
-        The plant takes every command verbatim: gripper OWNERSHIP (grasp gate
-        vs orchestrator open/hold) is bridge policy, not plant policy."""
+        The plant takes every command verbatim: gripper OWNERSHIP (grasp
+        vs orchestrator open/hold) is policy above the plant, not plant policy."""
         self._gripper_force_mode = force_n > 0.0
         self._set_gripper_force(force_n if force_n > 0.0 else self.gripper_force_n)
         self._set_gripper_targets(positions)
@@ -1533,9 +1531,8 @@ class MuJoCoBackend:
         )
 
     def gripper_efforts(self) -> np.ndarray:
-        """Per-finger servo forces in N (plant SENSING, the sim's analog of the
-        DM gripper motor's torque estimate). The bridge's GraspGate thresholds
-        these — grasp success is policy and does not live in the plant."""
+        """Per-finger servo forces in N (plant SENSING). Grasp success is
+        policy above the plant and does not live here."""
         if not getattr(self, "_gripper_act", None):
             return np.empty(0)
         self.load()
@@ -1737,7 +1734,7 @@ class MuJoCoBackend:
         if self.scene is not None and getattr(self, "_gripper_act", None):
             # SENSOR-LOCAL topology physics — the plant senses and reacts to
             # its own world; the grasp PROTOCOL (close sequencing, success,
-            # drop events) lives in the bridge's GraspGate:
+            # drop events) lives above the plant:
             # - a nest fixture YIELDS once the gripper truly squeezes that
             #   module (a fixture's magnets give way to the hand's pull);
             # - the keyed mate COMMITS when the hand lets go with the

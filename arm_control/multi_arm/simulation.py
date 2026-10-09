@@ -12,7 +12,7 @@ import mujoco
 from arm_control.config import gripper_joints
 from arm_control import frames
 from arm_control.control.arm_controller import ArmController
-from arm_control.control.factory import build_executor, gripper_command_cfg
+from arm_control.control.factory import build_executor
 from arm_control.messages import pack_motor_state, unpack_motor_command
 from arm_control.control.inprocess import QueueControllerNode
 from arm_control.multi_arm.interface import LocalArmHandle
@@ -108,7 +108,6 @@ class SharedSimulation:
                     @ self.backend.model.opt.gravity,
                 ),
                 arm_id=a,
-                gripper=gripper_command_cfg(cfg),
                 state_period_s=period,
                 plant_reports_health=False,
                 clock=lambda: self.t,

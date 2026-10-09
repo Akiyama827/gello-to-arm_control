@@ -22,7 +22,6 @@ from arm_control.control.factory import (
     arm_urdf,
     arm_speed_limits,
     gain_vector,
-    gripper_command_cfg,
 )
 from arm_control.planning.planner import ArmPlanner, build_collision_stack, ompl_settings
 # Scene-derived obstacles, from the rerun-free module: a controller host must
@@ -37,7 +36,6 @@ __all__ = [
     "build_planner",
     "build_preview",
     "gain_vector",
-    "gripper_command_cfg",
     "arm_joints",
     "gripper_joints",
     "ee_frame",

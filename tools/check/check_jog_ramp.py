@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 
 from arm_control.control.arm_controller import ArmController
-from arm_control.control.doubles import _FakeExecutor, _FakeNode, _GRIPPER
+from arm_control.control.doubles import _FakeExecutor, _FakeNode
 from arm_control.control.execution_policy import ExecutionPolicy
 from arm_control.control.jog_hold import _self_check as jog_hold_self_check
 from arm_control.messages import (pack_control_update, pack_jog, pack_json_message, pack_motor_state, pack_plan,
@@ -33,7 +33,7 @@ def controller():
     policy = ExecutionPolicy(command_rate_hz=100, state_timeout_sec=.25, health_timeout_sec=1, start_pos_tol_rad=.1,
                              abort_pos_err_rad=.35, hold_relatch_rad=.3, torque_limits=np.array([87.] * 4 + [12.] * 3),
                              velocity_limits=np.full(7, 1.), acceleration_limits=np.full(7, 2.))
-    c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), clock=lambda: clock[0], execution_policy=policy)
+    c = ArmController(_FakeNode(), _FakeExecutor(), clock=lambda: clock[0], execution_policy=policy)
     c._set_arm(True)
     c.on_motor_health(HEALTH)
     c.on_motor_state(state(0.))
@@ -91,7 +91,7 @@ def main() -> int:
                                  abort_pos_err_rad=.35, hold_relatch_rad=.3, torque_limits=np.array([87.] * 4 + [12.] * 3),
                                  velocity_limits=np.full(7, .4), acceleration_limits=np.full(7, .8),
                                  position_lower=np.full(7, -2.), position_upper=np.full(7, 1.))
-        c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), clock=lambda: clock[0],
+        c = ArmController(_FakeNode(), _FakeExecutor(), clock=lambda: clock[0],
                           execution_policy=policy)
         c._set_arm(True)
         c.on_motor_health(HEALTH)

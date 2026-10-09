@@ -77,9 +77,6 @@ class _FakeExecutor:
         return True  # completion is the reference playing out
 
 
-_GRIPPER = {"n_motors": 7, "mimic": None, "open_finger_m": 0.04, "gains": (100.0, 1.0)}
-
-
 def _controller(**kw) -> "ArmController":
     node = _FakeNode()
     # PLANT clock by default: these checks fast-forward by assigning _plant_t,
@@ -87,7 +84,7 @@ def _controller(**kw) -> "ArmController":
     # config without motor_state_period_s gets -- has its own check below.
     kw.setdefault("state_period_s", 0.01)
     kw.setdefault('settle_dwell_s', 0.)  # Legacy lifecycle checks; dwell has its own replay.
-    c = ArmController(node, _FakeExecutor(), gripper=dict(_GRIPPER), **kw)
+    c = ArmController(node, _FakeExecutor(), **kw)
     c._set_arm(True)
     c.bridge_armed = True
     c.on_motor_state(_state())   # the post-arm state that earns `ready`
@@ -119,7 +116,6 @@ def _plan_msg(plan_id: str, *, gated: bool, completion=None):
 
 FakeNode = _FakeNode
 FakeExecutor = _FakeExecutor
-GRIPPER = _GRIPPER
 controller = _controller
 state = _state
 plan_msg = _plan_msg

@@ -160,9 +160,8 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | N
 
     Without the arm-table fallback a mode config keyed by ANOTHER arm's joint
     names expands to all-zeros -- a limp arm on the bench, silently. The arm
-    table (``arm.<key>``) is arm-length and says nothing about non-arm motor
-    slots such as the DM gripper, so it is zero-padded up to the full motor
-    list; those trailing slots are only ever set by an explicit mode entry.
+    table (``arm.<key>``) is arm-length, so it is zero-padded up to the full
+    motor list; any trailing slots are only ever set by an explicit mode entry.
 
     Gain CEILINGS are per-arm hardware facts, not policy: 500/5 are the DM MIT
     wire-format limits (``pack_mit_control_frame`` clips above them), while the

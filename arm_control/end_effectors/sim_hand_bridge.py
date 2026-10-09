@@ -7,7 +7,7 @@ finger actuators, so the Hand path (``franka_adapter`` + ``HandGraspFsm``) is on
 
 * admission (``HandAdmission``): one command, never a queue; the client must echo the current epoch; the epoch bumps on every
   admission, cancellation and client change; REJECT reasons ``offline``, ``stopping``, ``stale_epoch``, ``busy``,
-  ``stale_state``, ``invalid_command``, and ``uncalibrated_force`` for a GRASP on a gripper without force grasp;
+  ``stale_state``, ``invalid_command``;
 * a new action needs a measured sample under 0.6 s old, taken after the previous action ended;
 * every 0.1 s ``LIMITS <width_max_m> <speed_max_mps> <force_min_n> <force_max_n>`` (the envelope it admits; the Franka
   Hand's unless constructed with another), ``STATE <width> <grasped>``, ``CAPS active_stop`` and
@@ -133,9 +133,8 @@ class _Admission:
 class _Fingers:
     """SimHand's finger physics (plant thread only): per tick, the finger command to apply, and an action's verdict."""
 
-    def __init__(self, width_max_m: float, mimic: dict | None = None) -> None:
+    def __init__(self, width_max_m: float) -> None:
         self.width_max_m = width_max_m
-        self.mimic = mimic  # how the finger joints run (none: the Franka Hand's)
         self.mode = "idle"          # idle | move | grasp | holding
         self.action: dict | None = None
         self.cmd_w: float | None = None
@@ -194,7 +193,7 @@ class _Fingers:
         """``(per-finger targets, force_n)`` for the plant, or None before any action."""
         if self.cmd_w is None:
             return None
-        finger = finger_from_width(self.cmd_w, self.mimic)
+        finger = finger_from_width(self.cmd_w)
         return [finger, finger], self.force_n
 
 
@@ -202,14 +201,12 @@ class SimHandBridge:
     """The ``hand_bridge`` protocol over a hosted world's fingers. ``on_sample`` runs on the plant thread, once per tick, after
     the step; the server thread only parses, admits and reports. One lock, as the C++ server's ``mx``."""
 
-    def __init__(self, port: int, *, bind: str = "127.0.0.1", limits: HandLimits = FRANKA_HAND,
-                 mimic: dict | None = None) -> None:
+    def __init__(self, port: int, *, bind: str = "127.0.0.1", limits: HandLimits = FRANKA_HAND) -> None:
         self.addr = (bind, int(port))
         self.limits = limits
-        self.mimic = mimic
         self._lock = threading.Lock()
         self._adm = _Admission()
-        self._fingers = _Fingers(limits.width_max_m, mimic)
+        self._fingers = _Fingers(limits.width_max_m)
         self._acting: dict | None = None
         self.have_real, self.real_t, self.real_w, self.real_grasped, self.sample_seq = False, 0.0, 0.0, False, 0
         self.grasp_seq, self.grasp_ok, self.done_seq, self.done_token, self.done_ok = 0, False, 0, 0, False
@@ -245,7 +242,7 @@ class SimHandBridge:
     # -- the plant thread ------------------------------------------------------------------------------------
     def on_sample(self, positions, efforts, now: float):
         """One measured finger sample after a plant step. Returns ``(targets, force_n)`` to apply, or None."""
-        width = float(sum(width_from_finger(float(p), self.mimic) for p in positions) / max(len(positions), 1))
+        width = float(sum(width_from_finger(float(p)) for p in positions) / max(len(positions), 1))
         with self._lock:
             adm = self._adm
             if adm.stopping:
@@ -359,10 +356,8 @@ class SimHandBridge:
         if action is None:
             # as the C++: the token is reported only once `CMD <token> <verb>` read and the token parsed
             parts = line.split(" ")
-            framed = len(parts) >= 3 and parts[0] == "CMD" and parts[1].isascii() and parts[1].isdigit()
-            token = parts[1] if framed else "0"
-            if framed and parts[2] == "GRASP" and not self.limits.force_grasp:
-                return f"REJECT {token} uncalibrated_force\n"  # no force grasp on this gripper (yet)
+            token = parts[1] if (len(parts) >= 3 and parts[0] == "CMD" and parts[1].isascii()
+                                 and parts[1].isdigit()) else "0"
             return f"REJECT {token} invalid_command\n"
         with self._lock:
             error = self._adm.admit(action, self.have_real and time.monotonic() - self.real_t < FRESH_S)

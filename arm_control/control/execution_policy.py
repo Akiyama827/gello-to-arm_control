@@ -84,7 +84,7 @@ class ExecutionPolicy:
     def envelope(self, measured=None):
         """The admissible position band: the description's envelope, widened per joint to ``measured`` (a pose, or rows
         of poses) where that already lies outside it (operator 2026-10-09: never further out). A joint gravity rested past
-        its limit -- the DM arm, disarmed, sits on its stops -- can be held where it is and brought back in, never driven
+        its limit -- an arm resting on its stops while disarmed -- can be held where it is and brought back in, never driven
         further out: the setpoint/1 escape rule, for every command and plan. The controller passes the pose it ARMed at."""
         if self.position_lower is None:
             return None

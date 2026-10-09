@@ -72,9 +72,9 @@ void check_stop_dispatch() {
   assert(!admission.stopping && admission.stop_fault && !have_real);
   {
     std::lock_guard<std::mutex> lock(mx);
-    HandSample fresh{};
+    franka::GripperState fresh{};
     fresh.width = .03;
-    fresh.stamp = 1;
+    fresh.time = franka::Duration(1);
     seen_robot_sample = false;
     observe_state(fresh);
     assert(have_real && !admission.stop_fault);
@@ -85,15 +85,15 @@ void check_stop_dispatch() {
 
 int main() {
   check_stop_dispatch();
-  HandSample sample{};
+  franka::GripperState sample{};
   sample.width = .04;
-  sample.stamp = 10;
+  sample.time = franka::Duration(10);
   observe_state(sample);
   const auto first_seq = sample_seq;
   const auto first_time = real_t;
   observe_state(sample);
   assert(sample_seq == first_seq && real_t == first_time);
-  sample.stamp = 11;
+  sample.time = franka::Duration(11);
   observe_state(sample);
   assert(sample_seq == first_seq + 1);
   // Actual closed-Hand observation: -1.97 um is endpoint noise, not stale data.
@@ -102,7 +102,7 @@ int main() {
   for (double width : {-1.97000008484e-6, -1e-5, .080002, .08001,
                        .0807588398457, .082}) {
     sample.width = width;
-    sample.stamp = stamp++;
+    sample.time = franka::Duration(stamp++);
     const auto seq = sample_seq;
     observe_state(sample);
     assert(have_real && sample_seq == seq + 1);
@@ -114,7 +114,7 @@ int main() {
                        std::numeric_limits<double>::quiet_NaN(),
                        std::numeric_limits<double>::infinity()}) {
     sample.width = width;
-    sample.stamp = stamp++;
+    sample.time = franka::Duration(stamp++);
     const auto seq = sample_seq;
     const auto observed_at = real_t;
     observe_state(sample);
@@ -188,7 +188,7 @@ int main() {
     perform_hand_stop(lock, [] { return true; });
     assert(!have_real);
     sample.width = .06;
-    sample.stamp = stamp++;
+    sample.time = franka::Duration(stamp++);
     observe_state(sample);
     assert(have_real);
     epoch = admission.epoch;
@@ -231,28 +231,5 @@ int main() {
     assert(!admission.stopping && real_grasped);
     if (carried) assert(!admission.begin_action(active));
   }
-  // A gripper without force grasp (the DM gripper): its envelope on the wire,
-  // a wider stroke admitted, GRASP refused `uncalibrated_force`.
-  bridge_limits = {.0878, .2, 0, 0};
-  admission = {};
-  admission.connected = true;
-  real_grasped = false;
-  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
-  have_real = true;
-  real_t = mono_s();
-  real_w = .085;
-  {
-    std::thread dm_server([&] { serve(pair[1]); close(pair[1]); });
-    assert(until("META 2").rfind("LIMITS 0.08780 0.20000 0.000 0.000\nSTATE 0.08500 ", 0) == 0);
-    { std::lock_guard<std::mutex> lock(mx); epoch = admission.epoch; real_t = mono_s(); }
-    send_line("CMD " + std::to_string(epoch) + " GRASP 0.04 0.05 40 0.02 0.02\n");
-    assert(until("REJECT").find("REJECT " + std::to_string(epoch) + " uncalibrated_force") != std::string::npos);
-    send_line("CMD " + std::to_string(epoch) + " MOVE 0.085 0.15\n");
-    until("ACCEPT");
-    close(pair[0]);
-    dm_server.join();
-  }
-  bridge_limits = franka_hand;
-  std::puts("PASS production Hand socket STOP, active disconnect, completed grasp preservation, "
-            "no-force envelope (LIMITS, uncalibrated_force)");
+  std::puts("PASS production Hand socket STOP, active disconnect, completed grasp preservation");
 }

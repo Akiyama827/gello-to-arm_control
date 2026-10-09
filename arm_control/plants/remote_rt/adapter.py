@@ -1,20 +1,14 @@
 """Dora node: plant bridge to an arm behind the RT machine (arm_rt_server).
 
-The naming peer of ``hardware_interface`` (direct DM CAN): same inputs
-(``motor_command`` / ``arm``), same outputs (``motor_state`` /
-``motor_state_viz`` / ``motor_health`` / ``model_revision``), so a dataflow
-moves an arm onto the RT machine by pointing ``plant_interface`` at this file
-— the orchestrator, executor, and teleop never learn the difference.
+Inputs ``motor_command`` / ``arm``; outputs ``motor_state`` / ``motor_state_viz`` / ``motor_health`` /
+``model_revision`` -- the plant contract every arm node speaks.
 
 Deliberately NOT here:
 - A deadman. The SERVER owns staleness->hold and fault latching; a dead PC
   leaves the arm holding. This node only mirrors server flags into
   ``motor_health`` so the operator and orchestrator see them.
 - Grasp handling. The FR3's Hand is its own TCP device, owned by
-  ``hand_bridge`` on the RT box (see ``end_effectors/franka_adapter``); a DM
-  gripper is a bus motor slot that rides
-  ``motor_command`` through the server like any other joint, with the grasp
-  GATE staying PC-side policy.
+  ``hand_bridge`` on the RT box (see ``end_effectors/franka_adapter``).
 """
 from __future__ import annotations
 

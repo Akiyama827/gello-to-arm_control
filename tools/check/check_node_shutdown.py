@@ -117,12 +117,12 @@ def child(kind: str, stop: str, directory: Path) -> None:
     else:
         from arm_control.control import adapter
         from arm_control.control.arm_controller import ArmController
-        from arm_control.control.doubles import _FakeExecutor, _GRIPPER
+        from arm_control.control.doubles import _FakeExecutor
 
         adapter.load_robot_config = lambda: SimpleNamespace(get=lambda key: None)
         adapter._load_mode_config = lambda: {}
         adapter.build_arm_controller = lambda cfg, node, *, arm_id, mode_cfg, **kw: (
-            ArmController(node, _FakeExecutor(), arm_id=arm_id, gripper=dict(_GRIPPER), **kw))
+            ArmController(node, _FakeExecutor(), arm_id=arm_id, **kw))
     adapter.Node = Node
     try:
         adapter.main()
