@@ -756,7 +756,11 @@ path (`JogHold`), reached through the supervisor: the owner session only, ARMed,
 no live execution (a staged plan counts; cancel it first), finite and full width,
 never moving a joint further past its position limit than it already is, and no
 further from the measured pose than the policy's `abort_pos_err_rad` (the
-controller would cancel a farther one on its next tick). An owner that leaves
+controller would cancel a farther one on its next tick). The commanded target is
+SATURATED per control tick (`JogRamp`, the joint-limits saturation of ros2_control
+and libfranka): it approaches the requested one no faster than the policy's
+velocity limit, changes speed within its acceleration limit and brakes to stop on
+it, so a streamed target moves no faster than planned motion may. An owner that leaves
 (disconnect, unclaim) takes its setpoint with it: the arm holds its measured pose.
 Refusals carry the controller's reason and change nothing. Offered on the
 streamed path only: a native-reference supervisor plays only its curve (use

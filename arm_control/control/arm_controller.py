@@ -40,7 +40,7 @@ import uuid
 import numpy as np
 from arm_control.contracts.impedance import pose_hold_values, unpack_pose_hold_values
 
-from arm_control.control.jog_hold import JogHold
+from arm_control.control.jog_hold import JogHold, JogRamp
 from arm_control.control.leg_settling import SETTLED, TIMED_OUT, LegSettling
 from arm_control.control.integral import IntegralState
 from arm_control.control.reference import TrajectoryReference
@@ -167,6 +167,13 @@ class ArmController:
         # stop arriving and the arm stops. Nothing has to notice and send a
         # stop; not sending IS the stop.
         self._jog = JogHold(timeout_s=jog_timeout_s, n_joints=self.n_arm)
+        # A streamed target (console jog, setpoint/1) moves no faster than planned motion may: saturated per tick at the
+        # policy's velocity/acceleration limits (operator 2026-10-09). No policy limits (the legacy DM path): unsaturated.
+        policy = execution_policy
+        self._jog_ramp = (JogRamp(policy.velocity_limits, policy.acceleration_limits,
+                                  lower=policy.position_lower, upper=policy.position_upper)
+                          if policy is not None and policy.velocity_limits is not None
+                          and policy.acceleration_limits is not None else None)
 
         self.last_state = JointState(np.zeros(self.n_arm), np.zeros(self.n_arm))
         self._last_state_at: float | None = None
@@ -393,6 +400,10 @@ class ArmController:
         """
         refusal = self.jog_refusal()
         if refusal is None:
+            if self._jog_ramp is not None and not self._jog.active:
+                # a NEW jog (none live: never, expired, cleared, a leg released or cancelled) starts at the measured pose, at
+                # rest -- never from a ramp a cleared jog left behind, even within the tick it was cleared in
+                self._jog_ramp.reset()
             self._jog.set(unpack_jog(value)["q"], self._clock())
         return refusal
 
@@ -618,6 +629,11 @@ class ArmController:
                 self._check_completion(arm)
             return
         jog, expired = self._jog_target()
+        if self._jog_ramp is not None:
+            if jog is None:
+                self._jog_ramp.reset()  # no jog (none yet, expired, cleared, a leg released): the next starts at rest
+            elif np.isfinite(jog).all():
+                jog = self._jog_ramp.step(jog, self.last_state.position, self.execution_policy.period)
         if jog is not None:
             # Invalid streamed targets used to reach _send's fault path.
             # Refuse before the atomic integral boundary without changing

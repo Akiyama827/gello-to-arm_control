@@ -71,6 +71,107 @@ class JogHold:
         return expired
 
 
+class JogRamp:
+    """Saturate a streamed joint target per control tick (the standard joint-limits saturation: ros2_control's
+    JointSaturationLimiter, libfranka's rate limiter): the commanded target moves toward the requested one at no more than the
+    policy's velocity limit, changes speed by no more than its acceleration limit, and brakes so it stops at the target (speed
+    capped by the remaining distance, as braking at the acceleration limit requires). A big step from a slow client becomes a ramp; a console jog (0.15 rad/s) is followed at its speed, behind by about v^2/2a
+    (13 mrad at the FR3's 0.4/0.8), braking to a stop after release. The bounds are per control tick. No jerk
+    term (no jerk limit is stated anywhere; the RT server slews torque). Velocity is not fed forward: the command stays the
+    joint law's hold word, as the in-process jog was."""
+
+    def __init__(self, v_max, a_max, *, lower=None, upper=None) -> None:
+        self.v_max = np.asarray(v_max, dtype=float).ravel()
+        self.a_max = np.asarray(a_max, dtype=float).ravel()
+        # the joint position envelope (the policy's): the ramp's braking may carry it past a target, never further past a limit
+        # than the target or the current command is (an arm already beyond a stop may still be jogged off it, smoothly)
+        self.lower = None if lower is None else np.asarray(lower, dtype=float).ravel()
+        self.upper = None if upper is None else np.asarray(upper, dtype=float).ravel()
+        if (self.lower is None) != (self.upper is None) or (self.lower is not None and not (
+                self.lower.shape == self.upper.shape == self.v_max.shape and np.isfinite(self.lower).all()
+                and np.isfinite(self.upper).all() and (self.lower <= self.upper).all())):
+            raise ValueError("jog ramp envelope: both bounds or neither, finite, lower <= upper, one per joint")
+        if self.v_max.shape != self.a_max.shape or not (np.isfinite(self.v_max).all() and np.isfinite(self.a_max).all()
+                                                         and (self.v_max > 0).all() and (self.a_max > 0).all()):
+            raise ValueError("jog ramp limits must be finite, positive and one per joint")
+        self.q: np.ndarray | None = None
+        self.v = np.zeros_like(self.v_max)
+
+    def reset(self) -> None:
+        """No jog: the next one starts from the measured pose, at rest."""
+        self.q = None
+
+    def step(self, target, measured, dt: float) -> np.ndarray:
+        """The commanded target for this tick (``dt`` = the control period)."""
+        target = np.asarray(target, dtype=float)
+        if self.q is None:
+            self.q, self.v = np.asarray(measured, dtype=float).copy(), np.zeros_like(self.v_max)
+        error = target - self.q
+        # the fastest speed from which braking at a_max, one tick at a time, still stops on the target (the discrete form of
+        # sqrt(2 a d), which overshoots at tick resolution)
+        step = self.a_max * dt
+        cap = np.minimum(self.v_max, step * (np.sqrt(.25 + 2.0 * np.abs(error) / (step * dt)) - .5))
+        v = np.clip(np.clip(error / dt, -cap, cap), self.v - self.a_max * dt, self.v + self.a_max * dt)
+        # the acceleration bound would carry it past the target: stop there when that is itself within the acceleration limit
+        # (a fixed target's last tick); else brake through and come back (a target that jumped to just ahead of the ramp)
+        over = ((error - v * dt) * error < 0) & (np.abs(error / dt - self.v) <= self.a_max * dt)
+        v[over] = error[over] / dt
+        q = self.q + v * dt
+        if self.lower is not None and self.upper is not None:
+            # never further past a limit than the target is, or than the command already was (a jog off a stop moves smoothly)
+            low = np.minimum(self.lower, np.minimum(target, self.q))
+            high = np.maximum(self.upper, np.maximum(target, self.q))
+            stopped = (q < low) | (q > high)
+            # at the limit it stops, as a position saturation does: the stop (the clipped tick and the next) is the one place the
+            # acceleration exceeds its limit, by up to 2x
+            q, v[stopped] = np.clip(q, low, high), 0.
+        self.q, self.v = q, v
+        return self.q.copy()
+
+
+def _ramp_check() -> None:
+    dt, rng = .01, np.random.default_rng(0)
+    v_max, a_max = np.array([1., .4]), np.array([2., .8])  # per-joint limits (the FR3 policy is 0.4/0.8)
+    for target in rng.uniform(-1., 1., (100, 2)):  # a step, held: speed and acceleration within the limits, lands on target
+        ramp, q, last_v = JogRamp(v_max, a_max), np.zeros(2), np.zeros(2)
+        for _ in range(600):
+            q_next = ramp.step(target, q if ramp.q is None else ramp.q, dt)
+            v = (q_next - q) / dt
+            assert (np.abs(v) <= v_max + 1e-9).all() and (np.abs(v - last_v) / dt <= a_max + 1e-9).all(), (target, v, last_v)
+            q, last_v = q_next, v
+        assert np.allclose(q, target), (q, target)
+    for sigma in (.001, .01, .05):  # a jittery stream (a policy client): the target random-walks every tick
+        ramp, q, last_v, target = JogRamp(v_max, a_max), np.zeros(2), np.zeros(2), np.zeros(2)
+        for _ in range(2000):
+            target = target + rng.normal(0., sigma, 2)
+            q_next = ramp.step(target, q if ramp.q is None else ramp.q, dt)
+            v = (q_next - q) / dt
+            assert (np.abs(v) <= v_max + 1e-9).all() and (np.abs(v - last_v) / dt <= a_max + 1e-9).all(), (sigma, v, last_v)
+            q, last_v = q_next, v
+    for start in (.0123, .05, .1337, .21, .3):  # a target ON a limit (or a jump to just ahead of the ramp): never commanded past it
+        ramp = JogRamp([.4], [.8], lower=[-2.], upper=[1.])
+        q = np.array([1. - start])
+        for k in range(400):
+            q = ramp.step([1.] if k < 30 or start > .2 else [1. - start / 2 if k < 31 else 1.], q, dt)
+            assert q[0] <= 1., (start, k, q)
+        assert q[0] == 1., (start, q)
+    escape = JogRamp([.4], [.8], lower=[-2.], upper=[1.])  # already past the stop: jogged further OFF it, never snapped to it
+    first = escape.step([1.04], [1.05], dt)[0]
+    assert 1.05 > first > 1.0499, first
+    small = JogRamp([1.], [2.])
+    for k in range(1, 101):  # a console joint jog: its target moves 0.15 rad/s; followed at that speed, a few mrad behind
+        q = small.step([.0015 * k], [0.], dt)
+    assert abs(small.v[0] - .15) < 1e-6 and 0 <= .15 - q[0] < .01, (small.v, q)
+    small.reset()
+    assert abs(small.step([.0], [.3], dt)[0] - .3) <= 2. * dt * dt, "a new jog starts at the measured pose, at rest"
+    for bad in (([0.], [1.]), ([1., 1.], [1.]), ([np.inf], [1.])):
+        try:
+            JogRamp(*bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+
+
 def _self_check() -> None:
     """Renewal keeps a jog alive; silence kills it, exactly once."""
     j = JogHold(timeout_s=0.2, n_joints=7)
@@ -116,7 +217,8 @@ def _self_check() -> None:
         except ValueError:
             continue
         raise AssertionError(f"accepted timeout {bad}")
-    print("jog_hold: renewal keeps it alive, silence expires it once")
+    _ramp_check()
+    print("jog_hold: renewal keeps it alive, silence expires it once; the ramp saturates velocity/acceleration and stops on target")
 
 
 if __name__ == "__main__":
