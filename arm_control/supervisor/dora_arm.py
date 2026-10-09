@@ -30,7 +30,7 @@ import time
 
 import numpy as np
 
-from arm_control.contracts._arrow import pack_json_message
+from arm_control.contracts import pack_json_message
 from arm_control.contracts.motion import pack_controller_event, unpack_control_update, unpack_jog, unpack_plan
 from arm_control.contracts.motor import pack_motor_state_dict
 from arm_control.multi_arm.supervised import AsyncAuthorityHandle

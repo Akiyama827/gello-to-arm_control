@@ -31,7 +31,7 @@ from dora import Node
 
 from arm_control.config import arm_joints, load_robot_config
 from arm_control.model_bundle import model_token
-from arm_control.contracts._arrow import unpack_json_message
+from arm_control.contracts import unpack_json_message
 from arm_control.contracts.motion import pack_control_update, pack_plan
 from arm_control.contracts.motor import unpack_motor_state
 from arm_control.node_utils import (

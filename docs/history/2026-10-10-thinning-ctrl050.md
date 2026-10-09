@@ -53,3 +53,31 @@ supervised_hardware, sdk_supervisor, dual_supervisor, state_history; project ass
 bench_twin, dual_bench, supervised_sims, add_contracts, completion, manual_carry, dataflows, franka_ownership,
 calibration_contract, workcell_scene, model_binding, stream_admission, base_supervisor, supervised_real; perceptions
 check_sensor_contracts; `run.py` dry-runs (sim bench, sim-add, real franka motion, real-add); sim-add e2e passed (70.9 s).
+
+Review round 1 (Opus xhigh, PASS-WITH-FIXES, no MUST; no live reference to anything removed, 1,370 first-party imports and
+every dataflow/factory string resolve; each of 154 rewritten names is the same object as before):
+* SHOULD: CTRL-050 could stall the planner with weak diagnostics -> a capture ahead by at most the header's
+  `uncertainty_ns` is clock noise (age 0), beyond it is refused with the reason; an older capture never replaces a newer one
+  (reordered frames, a second producer; a future-stamped negative observation can no longer leave a stale positive);
+  a pose that arrives older than `perception.stale_s` prints its capture age. The check covers older-after-newer, future
+  over a cached pose, a newer negative observation, a late old capture and the tolerance. `perception.stale_s` (2.0 s on
+  the hardware camera config) was set under the arrival rule and now also covers registration time: unchanged here,
+  recorded for the bench (no hardware graph wires module_poses yet).
+* SHOULD: CTRL-050 was not run end to end -> `tools/run.py sim bench` was run once: the planner took a fresh pose one second
+  after the operator arm (perception targets set). It exposed a launcher defect: `run.py` put `Control/` and
+  `libs/arm_control` on the graph's PYTHONPATH but not `libs/perceptions`, so from a worktree the nodes imported the
+  perceptions of the conda env's editable install (another checkout) beside this tree's arm_control (here: the old
+  perceptions imported the retired `arm_control.messages` and sim_perception crashed) -> `_add_import_roots` adds
+  `libs/perceptions`. The run then stopped at `planning_failed:move_to_pregrasp`: the bench's sideways-grasp pregrasp has no
+  self-collision-free IK branch (link5 into link1/link2, up to 34 mm). Reproduced offline at the pre-bundle commits
+  (library bf05c6e, project 95d9c024, old and new franka_bench alike): pre-existing, not this bundle; the bench pick ladder
+  is task geometry, reported to the operator (owner: operator decision; blocks only the legacy perception rehearsal
+  `sim bench`, not the add pipeline).
+* SHOULD: the malformed-heartbeat refusal (`runtime_state`) lost its only check with the topic adapter -> in
+  `python -m arm_control.contracts` (well-formed round-trip, four malformed refusals).
+* SHOULD: `contracts._arrow` (private) had become the import path of 31 files -> `arm_control.contracts` re-exports
+  `pack_json_message`/`unpack_json_message` and every importer outside `contracts/` uses it (34 files).
+* NITs taken: `unpack_controller_settings` (orphan) deleted; stale docstrings (multi_arm adapter, trace_row, franka_bench
+  "update rate"); blank-line runs; `unpack_object_poses` documents `stamp`; the history no longer calls
+  `control_mode.plant.listen_mode` live: `control_mode.plant` had no reader at all and is removed from the three mode
+  configs and run.py's base staging (check_add_contracts asserts no mode states one).

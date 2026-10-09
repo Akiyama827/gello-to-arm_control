@@ -36,4 +36,6 @@ def unpack_points(arrow: pa.Array) -> np.ndarray:
 
 
 def unpack_object_poses(payload: pa.Array) -> dict:
+    """``frame`` (world), ``objects`` and ``stamp``: the capture time, Unix seconds on this PC, which a live consumer's
+    freshness rests on (the planner falls back to arrival time without it)."""
     return unpack_json_message(payload, expected_schema="object_poses")

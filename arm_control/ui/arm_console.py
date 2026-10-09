@@ -51,7 +51,7 @@ from arm_control.ui.hand_panel import HandPanel
 from arm_control.ui.jog_panel import JogPanel
 from arm_control.grasp_visual import VisualFK
 from arm_control.joint_motor_map import finger_from_width
-from arm_control.contracts._arrow import unpack_json_message
+from arm_control.contracts import unpack_json_message
 from arm_control.contracts.motion import pack_control_update, pack_jog, pack_plan, unpack_controller_event
 from arm_control.contracts.motor import pack_motor_command, unpack_motor_state
 from arm_control.planning.planner import build_collision_stack

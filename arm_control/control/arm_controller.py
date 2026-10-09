@@ -46,7 +46,7 @@ from arm_control.control.integral import IntegralState
 from arm_control.control.reference import TrajectoryReference
 from arm_control.control.trajectory_executor import gain_error
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
-from arm_control.contracts._arrow import pack_json_message, unpack_json_message
+from arm_control.contracts import pack_json_message, unpack_json_message
 from arm_control.contracts.motion import pack_controller_event, unpack_jog, unpack_control_update, unpack_plan
 from arm_control.contracts.motor import pack_cartesian_block, pack_motor_command, unpack_motor_state
 

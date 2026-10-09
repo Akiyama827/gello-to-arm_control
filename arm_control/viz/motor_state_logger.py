@@ -40,7 +40,7 @@ TRACE_POLL_S = 0.1
 
 
 def trace_row(elapsed_s: float, motor_names: list[str], sample: dict) -> dict[str, float]:
-    """One controller tick of trace/1 as a CSV row with ``_row``'s columns; a field the tick lacks (no RT packet yet, no
+    """One controller tick of trace/1 as a CSV row (``_COLUMNS`` per motor); a field the tick lacks (no RT packet yet, no
     command sent, a stale RT stream) is nan, never zero or a repeat. ``qdes`` is the command computed on THIS tick (the Dora
     logger paired a state with the previous tick's command: ``qdes - pos`` now differs by about v*dt)."""
     row = {"elapsed_s": elapsed_s}
@@ -111,7 +111,7 @@ def trace_cli() -> None:
 
 
 def _self_check() -> None:
-    """trace_row keeps the Dora logger's columns, maps each to its trace/1 field, and writes nan (never 0) for a missing one."""
+    """trace_row keeps the CSV columns, maps each to its trace/1 field, and writes nan (never 0) for a missing one."""
     sample = dict(q_rt=[1., 2.], dq_rt=[.1, .2], tau_meas_rt=[3., 4.], q_cmd_pc=[1.5, 2.5], q_cmd_rt=None,
                   dq_cmd_rt=[0., 0.], tau_cmd_rt=[5., 6.])
     row = trace_row(.25, ["a", "b"], sample)

@@ -111,6 +111,17 @@ def _self_check() -> None:
         pass
     else:
         raise AssertionError("pack_controller_event accepted an unknown kind")
+    # The controller heartbeat a supervisor's Dora bridge publishes: well-formed round-trips, malformed is refused.
+    beat = dict(session_id="s1", n_arm=n, armed=True, ready=True, executing=False, stopped=False, frozen=False,
+                model_token=None, plan_id=None)
+    assert unpack_controller_event(pack_controller_event(kind="mode", reason="joint", runtime_state=beat))["runtime_state"]
+    for bad in (dict(beat, armed="false"), dict(beat, session_id=""), dict(beat, n_arm=0), dict(beat, plan_id=3)):
+        try:
+            pack_controller_event(kind="mode", runtime_state=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"malformed runtime heartbeat admitted: {bad}")
     print("contracts self-check ok")
 
 

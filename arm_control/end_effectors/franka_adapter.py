@@ -58,7 +58,7 @@ from arm_control.end_effectors.franka_hand import (
 from arm_control.end_effectors.hand_move import HandMove
 from arm_control.joint_motor_map import width_from_finger
 from arm_control.config import load_robot_config
-from arm_control.contracts._arrow import pack_json_message, unpack_json_message
+from arm_control.contracts import pack_json_message, unpack_json_message
 from arm_control.contracts.gripper import pack_grasp_result, unpack_grasp_request
 from arm_control.contracts.motor import unpack_motor_command
 from arm_control.node_utils import (

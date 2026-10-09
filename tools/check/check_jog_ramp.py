@@ -17,7 +17,7 @@ from arm_control.control.arm_controller import ArmController
 from arm_control.control.doubles import _FakeExecutor, _FakeNode
 from arm_control.control.execution_policy import ExecutionPolicy
 from arm_control.control.jog_hold import _self_check as jog_hold_self_check
-from arm_control.contracts._arrow import pack_json_message
+from arm_control.contracts import pack_json_message
 from arm_control.contracts.motion import pack_control_update, pack_jog, pack_plan
 from arm_control.contracts.motor import pack_motor_state, unpack_motor_command
 
