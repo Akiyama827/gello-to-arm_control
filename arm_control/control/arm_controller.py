@@ -174,7 +174,6 @@ class ArmController:
         self.last_command: JointServoCommand | None = None
         self._hold_anchor: JointServoCommand | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
-        self._cartesian_live = False  # the Cartesian law is on: holds keep it, aimed at FK(hold q_des)
         self._pose_hold: dict | None = None
         self.supports_pose_hold = False
 
@@ -276,7 +275,15 @@ class ArmController:
 
     def on_plan(self, value) -> None:
         """Load one leg. Refused if another is mid-flight (never swapped)."""
-        plan = unpack_plan(value)
+        try:
+            plan = unpack_plan(value)
+        except (KeyError, TypeError, ValueError) as exc:
+            # A plan that names itself but does not decode (a Cartesian spec outside the envelope, mismatched rows) is
+            # refused like any other, never allowed to take the controller down. One that cannot name itself still raises.
+            body = unpack_json_message(value, expected_schema="plan")
+            self._refuse_plan(dict(plan_id=str(body["plan_id"]), phase=str(body.get("phase"))),
+                              f"malformed plan: {exc}", report=True)
+            return
         if self._pose_hold is not None:
             self._refuse_plan(
                 plan, "Soft pose hold active; select Track before planning",
@@ -562,7 +569,7 @@ class ArmController:
                 arm, q_des=target, integral_bias=self.integral.bias)
             self._stream_sent_at = None
             self._stream_sent_target = None
-            self._send(self._hold_anchor, None)
+            self._send(self._hold_anchor, False)
             return
         self._cycle_id += 1
         cycle = (self._cycle_id, self._clock())
@@ -580,7 +587,7 @@ class ArmController:
                         self.executor.hold_command(arm, q_des=goal, integral_bias=self.integral.bias)
                         if goal is not None else None
                     )
-                self._cartesian_now, self._cartesian_live = None, False
+                self._cartesian_now = None
         if self._running and self._reference is not None:
             point = self._reference.sample(self.exec_time)
             bias = self.integral.update(*cycle, point.position, arm.position, self.executor.kp)
@@ -602,14 +609,14 @@ class ArmController:
             bias = self.integral.update(*cycle, jog, arm.position, self.executor.kp)
             command = self.executor.hold_command(arm, q_des=jog, integral_bias=bias)
             self._hold_anchor = None   # a jog moves: the next hold re-anchors
-            self._send(command, self._cartesian_live)
+            self._send(command, False)
             return
         # No trajectory released: hold the anchor. This is the keepalive the
         # plant's deadman needs while the planner searches, while an operator
         # reviews a gated plan, and while a gripper/tilt/graft request is out.
         command = self._anchored_hold(cycle, refresh=expired)
         if command is not None:
-            self._send(command, self._cartesian_live)
+            self._send(command, False)
 
     # -- leg lifecycle -------------------------------------------------------
     @property
@@ -741,7 +748,6 @@ class ArmController:
         self.executor.set_gains(kp=self._track_kp.copy(), kd=self._track_kd.copy())
         self.last_command = None
         self._cartesian_now = None
-        self._cartesian_live = False
         self._pose_hold = spec
         self._reset_integral()  # the pose-hold law ignores tau_ff
         self._report_mode()
@@ -827,7 +833,7 @@ class ArmController:
             and np.max(np.abs(self.last_state.velocity)) < .01
         )
         if self.execution_policy is not None:
-            self._cartesian_now, self._cartesian_live = None, False
+            self._cartesian_now = None
         if self._pose_hold is not None:
             self._pose_hold = None
             self.last_command = None
@@ -922,7 +928,7 @@ class ArmController:
             # A failed settle must not turn into another motion or release an
             # attached object. Freeze at the measured pose with zero velocity.
             self.last_command = self._hold_anchor = self._static_hold()
-            self._cartesian_now, self._cartesian_live = None, False
+            self._cartesian_now = None
             self._pending_traj = None
             self.frozen = True
             self._finish_leg(ok=False, reason=reason, completion=progress)
@@ -998,8 +1004,10 @@ class ArmController:
         return self._hold_anchor
 
     def _send(self, command: JointServoCommand, cartesian: bool) -> bool:
-        """``cartesian``: this word may carry the loaded leg's Cartesian spec. The spec has no pose: the plant aims the
-        spring at FK(q_des) with its own model, so a hold keeps it on the hold's own q_des."""
+        """``cartesian``: this word belongs to the running leg and carries its Cartesian spec (if it has one). The law lives
+        with its leg (execution and settling) and nowhere else: every hold, jog and keepalive is the joint law only, as the RT
+        box's own hold is, so a gain change, a disarm or a finished leg can never leave a spring on under other joint gains.
+        The spec has no pose: the plant aims the spring at FK(q_des) with its own model."""
         aborted = False
         if self.execution_policy is not None:
             if not self.execution_policy.command_valid(command, self.n_arm):
@@ -1019,7 +1027,6 @@ class ArmController:
         self.last_command = command
         spec = None
         if self._cartesian_now is not None and cartesian:
-            self._cartesian_live = True
             spec = self._cartesian_now
         self.node.send_output(
             "motor_command",
@@ -1062,6 +1069,7 @@ class ArmController:
         if self._running:
             self._finish_leg(ok=False, reason="disarmed mid-leg")
         self._plan = None
+        self._cartesian_now = None
         self._pending_traj = None
         self._running = False
         self._reference = None

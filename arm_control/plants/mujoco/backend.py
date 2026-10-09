@@ -1562,8 +1562,11 @@ class MuJoCoBackend:
             .copy()
             for key in ("position", "velocity", "torque", "kp", "kd")
         }
-        # Optional Cartesian-impedance block (messages.unpack_motor_command).
-        # None = every graph that does not send one behaves exactly as before.
+        # Optional Cartesian-impedance block (messages.unpack_motor_command). None = every graph that does not send one
+        # behaves exactly as before. A plant that cannot run the law REFUSES it (as the RT link and SimLink do) rather than
+        # running the joint word alone as if it were the leg that was planned.
+        if command.get("cartesian") is not None and not self.supports_cartesian:
+            raise ValueError("this plant cannot run the Cartesian law (no EE on a commanded jointed chain, or no compiled law)")
         self._last_command["cartesian"] = command.get("cartesian")
         self._last_command["pose_hold"] = soft
 
@@ -1597,8 +1600,6 @@ class MuJoCoBackend:
         task frame is rotated by the base body's measured orientation. A sim that took a PC-computed target or Jacobian would
         not be testing the thing the robot runs.
         """
-        if self._ee_bid < 0 or self._base_bid < 0 or _servo is None:
-            return tau_ff  # no EE configured, or no compiled law to call
         if cart.get("frame") != "base":
             raise ValueError("the Cartesian spec is in the robot BASE frame")
         target = self._ee_pose_at(q_des)

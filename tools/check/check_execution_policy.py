@@ -495,7 +495,44 @@ def check_cartesian_lifecycle():
         c.tick()
         assert commands(c)[-1]["cartesian"] is None, (stop, commands(c)[-1])
         assert c._cartesian_now is None and c.reference is None
-        assert not c._cartesian_live
+
+    # The law lives with its leg and nowhere else: every hold is the joint law only (the RT box's own hold), so no later event
+    # can leave a spring on under joint gains the floor never admitted. With and without a policy.
+    for strict in (True, False):
+        for after in ("complete", "disarm_rearm", "gains"):
+            c, clock = setup(strict=strict, health=False, settle_dwell_s=0.)
+            c.on_plan(cartesian_plan())
+            c.on_control(pack_control_update(execute="p"))
+            advance(c, clock, .1)
+            assert commands(c)[-1]["cartesian"] is not None, (strict, after)
+            if after == "complete":
+                c.executor.at_goal = lambda *args, **kwargs: True
+                advance(c, clock, 1.2)
+                assert not c._running, (strict, after)
+            elif after == "disarm_rearm":
+                c._set_arm(False)
+                c._set_arm(True)
+            else:
+                c.on_control(pack_control_update(gains=dict(kp=[5.] * 7, kd=[1.] * 7)))
+            sent = len(commands(c))
+            for _ in range(3):
+                clock[0] += .01
+                c.on_motor_state(state())
+                c.tick()
+            later = commands(c)[sent:]
+            assert later and all(m["cartesian"] is None for m in later), (strict, after, [m["cartesian"] for m in later])
+
+    # A plan that names itself but does not decode is refused with its reason; the controller lives on.
+    import json
+    body = json.loads(json.dumps(unpack_json_message(cartesian_plan(), expected_schema="plan")))
+    body["cartesian"]["kc"] = [2000.] * 6
+    c, clock = setup()
+    c.on_plan(pack_json_message("plan", body))
+    assert c._plan is None and not c.stopped
+    events = [unpack_json_message(v) for t, v in c.node.sent if t == "controller_event"]
+    assert any(e.get("kind") == "leg_result" and not e["ok"] and "malformed plan" in e["reason"] for e in events), events
+    c.on_plan(cartesian_plan())
+    assert c._plan is not None, "a good plan after a malformed one must load"
 
 
 def check_completion_order():

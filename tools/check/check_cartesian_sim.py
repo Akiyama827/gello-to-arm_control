@@ -2,8 +2,9 @@
 
 The spec carries the task frame in the robot BASE frame and K_c/D_c, no pose: the plant targets FK(q_des) with its own model and
 rotates the task frame by its own base orientation. Checked on the robot's description (plants/mujoco/single):
-* with the mount yawed 90 deg, a stiffness along base x pushes along the BASE's x in the world (a law applying the task frame in
-  world coordinates fails), at K_c times the FK(q_des) displacement, with no moment when the rotational K_c is zero;
+* with the mount turned 30 deg in yaw and tilted 10 deg (NOT a multiple of 90: at 90 deg a transposed rotation maps x to the
+  same line and the sign-blind stiffness k a a^T passes), a stiffness along base x pushes along the BASE's x in the world (a law
+  applying the task frame in world coordinates, or the transposed rotation, fails), at K_c times the FK(q_des) displacement, with no moment when the rotational K_c is zero;
 * at q_des = q and at rest the law adds nothing;
 * closed loop with the bench's gains (joint kp at the 20 N.m/rad floor, K_c [1000, 200, 200, 20, 5, 5]) the EE settles on
   FK(q_des) and stays finite;
@@ -44,10 +45,11 @@ def main():
     base, ee = plant._base_bid, plant._ee_bid
     assert plant.ee_chain_joints and set(plant.ee_chain_joints) <= set(plant.joint_names), plant.ee_chain_joints
 
-    # 1. Mount yawed 90 deg about world z.
-    yaw = np.array([np.cos(np.pi / 4), 0, 0, np.sin(np.pi / 4)])
-    turned = np.empty(4)
-    mujoco.mju_mulQuat(turned, yaw, model.body_quat[base].copy())
+    # 1. Mount turned 30 deg about world z and tilted 10 deg about x.
+    yaw, tilt, mount, turned = (np.array([np.cos(np.pi / 12), 0, 0, np.sin(np.pi / 12)]),
+                                np.array([np.cos(np.pi / 36), np.sin(np.pi / 36), 0, 0]), np.empty(4), np.empty(4))
+    mujoco.mju_mulQuat(mount, yaw, tilt)
+    mujoco.mju_mulQuat(turned, mount, model.body_quat[base].copy())
     model.body_quat[base] = turned
     data.qvel[:] = 0
     mujoco.mj_forward(model, data)
@@ -64,8 +66,8 @@ def main():
     expected = k * base_x * (base_x @ disp)
     assert np.allclose(w[:3], expected, atol=1e-6 * k), (w[:3], expected)
     assert np.allclose(w[3:], 0, atol=1e-9), w[3:]
-    world_x = np.array([1., 0, 0])
-    assert np.linalg.norm(w[:3] - k * world_x * (world_x @ disp)) > .5, "base and world frames are indistinguishable here"
+    for wrong in (np.array([1., 0, 0]), R_wb.T[:, 0]):  # the world's x; the transposed rotation's x
+        assert np.linalg.norm(w[:3] - k * wrong * (wrong @ disp)) > .5, "a wrong frame is indistinguishable here"
     # The spec's own task frame is honoured too: a task frame whose X is base y pushes along the base's y.
     swapped = dict(spec, task_R=np.array([[0., -1, 0], [1, 0, 0], [0, 0, 1]]))
     w = wrench(plant, plant._cartesian_tau_ff(np.zeros(n), swapped, q_des))
@@ -89,7 +91,7 @@ def main():
     assert np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all()
     error = np.linalg.norm(data.xpos[ee] - plant._ee_pose_at(q_des)[:3])
     assert error < 2e-3, f"EE {error * 1e3:.2f} mm from FK(q_des) after 2 s"
-    print(f"cartesian twin: base-frame task axis under a 90 deg mount, zero at the target, closed loop {error * 1e3:.2f} mm "
+    print(f"cartesian twin: base-frame task axis under a 30 deg + 10 deg mount, zero at the target, closed loop {error * 1e3:.2f} mm "
           "from FK(q_des)", flush=True)
 
     # 4. SimLink: the v8 rules and the hold.

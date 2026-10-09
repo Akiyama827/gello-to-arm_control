@@ -11,9 +11,9 @@ The spec, everywhere: `{frame: "base", task_R (3x3, task axes as columns in the 
 * Plan (`contracts/motion.pack_plan`): the spec is validated at pack time and unpacked with its frame; a world-frame or
   out-of-envelope spec never ships. `cartesian_poses` stays, for previews only.
 * `motor_command` (`contracts/motor`): the tail is the RT v8 tail, 21 values (was 28 with a world pose); unpacked as the spec.
-* Controller: sends the loaded leg's spec as is. A hold after a Cartesian sample keeps the law (now aimed at FK of the hold's
-  own q_des; it used to keep the last knot pose); completion, cancel, abort, disarm and outage drop it, as before. The pose lookup
-  in `TrajectoryReference` is deleted (the target was the knot pose of the segment, piecewise constant; FK(q_des) follows the
+* Controller: the law lives with its leg (execution and settling) and nowhere else. Only the running leg's words carry its spec;
+  every hold, jog and keepalive is the joint law only, as the RT box's own hold is (review round 1). The pose lookup in
+  `TrajectoryReference` is deleted (the target was the knot pose of the segment, piecewise constant; FK(q_des) follows the
   interpolated reference, as the RT box does).
 * Admission (`ExecutionPolicy`): a Cartesian leg is refused unless the spec passes `cartesian_values` and every joint kp >=
   `cartesian_kp_min`; a policy without `cartesian_kp_min` admits no Cartesian leg. `robots/fr3/execution.yaml` sets 20. Joint
@@ -75,3 +75,27 @@ bench task (project), decisions marked. Blocking: the sim dock re-measure and st
    behind wall clock). Unverified cause; consistent with the open item "no armature on the composed bench arm" (the
    single-model FR3 showed the same joint-7 instability before `sim_armature`). The roll also changes the in-hand pose the dock
    ladder was swept for. Decision: armature on the composed arm (own item), then whether to roll.
+
+Review round 1: BLOCK. Taken:
+* (BLOCK) The law outlived its leg: `_cartesian_now`/`_cartesian_live` survived DISARM->ARM, and a gains preset after a hold or a
+  re-arm streamed Cartesian words at joint kp 0-5, under the floor the leg was admitted with (the base revision had the same
+  re-arm gap; the record's "disarm drops it" was false). Fixed at the root: `_cartesian_live` is deleted and only the running
+  leg's words carry the spec, so no event outside the leg can leave a spring on; disarm also clears the loaded spec. Same fix
+  closes the policy-less divergence (a Dora graph with no policy kept the law after completion and cancel). Checked with and
+  without a policy: after completion, after DISARM->ARM and after a gains preset, every later word is the joint law; mutant
+  "holds carry the law" caught.
+* A plan that names itself but does not decode (e.g. kc 2000 on the wire) crashed `on_plan`; it is now refused with the reason
+  (`leg_result` failed, "malformed plan: ..."), and the next good plan loads. Mutant "no guard" caught.
+* `check_cartesian_sim`'s 90 deg mount could not see a transposed base rotation (x maps to the same line; k a a^T is
+  sign-blind): the mount is now 30 deg yaw + 10 deg tilt and the transposed rotation's axis is asserted different; mutant caught.
+  The project's `check_bench_twin` asserts on the real composed bench that the twin's base rotation times the coordinator's
+  base-frame task frame equals the coordinator's world task frame (matrices, so the -90 deg mount cannot hide a transposition;
+  mutant caught), and that ScenePlant runs the law only for the actor owning the EE chain and passes its spec to the plant
+  (mutants "slice drops the spec" and "any actor" caught). Its planner preview is off (a check never streams to a viewer).
+* A phase's Cartesian block outside the envelope now fails when the coordinator is built, not when the dock leg is packed.
+* `MuJoCoBackend.apply_motor_command` refuses a Cartesian spec on a plant that cannot run the law (it ran the joint word alone,
+  silently); `check_sim_supervisor` checks it on a plant with no EE. `_stream` passes `False`, not `None`.
+Not taken, recorded: the DM backend ignores a Cartesian spec (no DM config admits Cartesian legs: its policy has no
+`cartesian_kp_min`; changing a hardware backend's command path is its own stop); the Dora multi-slice `SceneCore.set_slice` is
+last-writer-wins for the EE-level spec with no actor gate (`sim_bench` has one writer; the supervisor path is gated by
+ScenePlant).
