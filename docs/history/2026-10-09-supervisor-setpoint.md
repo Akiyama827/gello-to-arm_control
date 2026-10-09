@@ -50,3 +50,12 @@ supersede, timeout not from the mode config, no live-execution refusal. Related:
 `check_execution_policy`, `check_pose_hold`, `check_node_shutdown`, `check_sim_supervisor`, `check_stream`,
 `check_sdk_supervisor`, `check_dual_supervisor`, `check_state_history` (offline server rebuilt from current rt/src),
 `run_console --self-check`, ruff.
+
+Review round 2: ACCEPT (every round-1 fix verified by probe). NITs taken: only `Refused` reads "jog refused", any other SDK error
+"outcome unknown" (the SDK maps lost/garbled replies to SupervisorError); the superseded-plan ids are bounded (64, oldest out) and
+an id staged again is forgotten; the controller's own refusal (`ArmController.jog_refusal`, pure) is checked first, so a far
+target while frozen or DISARMed reports that, not the distance.
+OPEN (pre-existing, found in review; owner: CTRL-053, the next slice; blocking effect: a migrated console cannot recover a failed
+settle with Stop, only with DISARM then ARM): after a completion timeout the supervisor's controller stays `frozen`; the bridge's
+Stop cancels only executions the handle holds, so with none nothing reaches the controller, and the SDK has no op that clears
+`frozen` (the in-process controller cleared it on Stop). The "cancel to clear" text is wrong for setpoint/1 callers until then.

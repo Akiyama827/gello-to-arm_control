@@ -391,13 +391,17 @@ class ArmController:
         trajectory for the same joints. The Dora node drops the reason (the
         console re-sends while a button is held); the supervisor returns it.
         """
-        refusal = ("stopped" if self.stopped else "frozen (cancel to clear)" if self.frozen
-                   else "not armed" if not self.armed else "no fresh measured pose since ARM" if not self.ready_sent
-                   else "Soft (pose hold) is selected" if self._pose_hold is not None
-                   else "a plan is running" if self._running else None)
+        refusal = self.jog_refusal()
         if refusal is None:
             self._jog.set(unpack_jog(value)["q"], self._clock())
         return refusal
+
+    def jog_refusal(self) -> str | None:
+        """Why a jog would be dropped now (None = it would be taken). Pure."""
+        return ("stopped" if self.stopped else "frozen (cancel to clear)" if self.frozen
+                else "not armed" if not self.armed else "no fresh measured pose since ARM" if not self.ready_sent
+                else "Soft (pose hold) is selected" if self._pose_hold is not None
+                else "a plan is running" if self._running else None)
 
     @property
     def jog_timeout_s(self) -> float:

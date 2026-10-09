@@ -366,6 +366,9 @@ class RobotRuntime:
         if self._current() is not None:
             raise Refused('an execution is live: cancel it before streaming setpoints')
         c = self.controller
+        refusal = c.jog_refusal()  # the controller's own state first: its reason is the real one
+        if refusal is not None:
+            raise Refused(f'setpoint refused: {refusal}')
         policy, measured = c.execution_policy, np.asarray(c.last_state.position, float)
         lower, upper = policy.position_lower, policy.position_upper
         if lower is not None and upper is not None:
