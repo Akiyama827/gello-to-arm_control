@@ -165,6 +165,12 @@ class SimLink:
         """The MuJoCo backend under the plant (a scene's world, or the one model itself): the Hand's fingers live there."""
         return getattr(self._plant, "backend", self._plant)
 
+    def clock(self) -> float:
+        """This plant's clock for its supervisor's controller: a hosted world's (``SharedWorld.clock``: paused with the world),
+        else the wall clock."""
+        shared = getattr(self._plant, "shared", None)
+        return time.monotonic() if shared is None else shared.clock()
+
     @property
     def scene_world(self):
         """The ``SharedWorld`` this link HOSTS (steps), for co-hosted actors and scene_action/1; None otherwise."""
@@ -307,7 +313,9 @@ class SimLink:
     def motor_health(self) -> dict:
         state, rx_t = self.latest_state()
         now = time.monotonic()
-        age = now - rx_t if rx_t > 0 else float("inf")
+        shared = getattr(self._plant, "shared", None)
+        # a world paused for a scene change publishes nothing, and nothing in it moved: the pause is not staleness
+        age = max(0.0, now - rx_t - (0.0 if shared is None else shared.stalled(now))) if rx_t > 0 else float("inf")
         stale = age > self.config.state_timeout_s
         fault = self._latched_fault or (f"sim state stream stale ({age:.2f}s)" if stale and rx_t > 0 else "")
         return {"armed": bool(state and state.armed), "state_fresh": not stale, "latched_fault": fault,
@@ -419,7 +427,8 @@ class SimLink:
                           model_revision=world["model_revision"], scene_revision=world.get("scene_revision"),
                           actor_q=actor_q, actor_dq=actor_dq,
                           gripper=world.get("gripper"), attachments=world.get("attachments"),
-                          constraints=world.get("constraints"), object_poses=world.get("object_poses"),
+                          constraints=world.get("constraints"), scene_state=world.get("scene_state"),
+                          object_poses=world.get("object_poses"),
                           inhand_pose=world.get("inhand_pose"),
                           constraint_force=world.get("constraint_force"), ee_wrench=world.get("ee_wrench"),
                           topology=world.get("topology"), qpos=world.get("qpos"))

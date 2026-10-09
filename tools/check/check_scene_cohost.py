@@ -5,8 +5,8 @@
 
 The toy two-actor world of check_sim_supervisor. In process: the ``arm`` link hosts the world (``scene_world``), the ``peer``
 link is a co-host (``SimLink.from_config(cfg, cohost_of=...)``) built from a body-list arm (``arm.body_list``, no URDF); both
-ARM and track their own targets in the one world, the co-host never steps it (its close leaves the host stepping), and a
-co-host config without ``sim_actor`` is refused. Over the service (``--cohost``, via ``launch.start_supervisor(cohosts=...)``):
+ARM and track their own targets in the one world, a scene change pauses the world's clock (and is not staleness), the co-host
+never steps it (its close leaves the host stepping), and a co-host config without ``sim_actor`` is refused. Over the service (``--cohost``, via ``launch.start_supervisor(cohosts=...)``):
 two sockets, two claims, two ARMs, a move COMPLETED on each, and the env names the co-host's config and socket. scene_action/1
 on the host only: one lease (another session refused until the holder's connection ends), a stale revision refused, a newer
 one applied and returned.
@@ -112,6 +112,24 @@ def in_process(host_path, peer_path) -> None:
         assert ps.armed and not ps.faulted and np.allclose(ps.q, b, atol=.03), ps.q
         world = host.observations(0)["samples"][-1]["actor_q"]
         assert abs(list(world["peer"].values())[0] - .6) < .03, world
+        # A scene change pauses the world: its clock stands still and its links are not stale meanwhile (a 0.6 s pause, past
+        # the links' 0.5 s state timeout), and afterwards the clock has lost exactly the pause against the wall.
+        import threading
+        inner = shared.core.apply_scene
+        shared.core.apply_scene = lambda request: (time.sleep(.6), {"revision": request["revision"]})[1]
+        wall0, clock0 = time.monotonic(), shared.clock()
+        change = threading.Thread(target=shared.apply_scene, args=(dict(revision=1, state={}),))
+        change.start()
+        time.sleep(.3)
+        frozen = shared.clock()
+        time.sleep(.2)
+        assert abs(shared.clock() - frozen) < 1e-9 and peer.clock() == shared.clock(), "the world clock ran during a pause"
+        time.sleep(.2)
+        assert host.motor_health()["state_fresh"] and peer.motor_health()["state_fresh"], "a paused world reported stale"
+        change.join()
+        shared.core.apply_scene = inner
+        lost = (time.monotonic() - wall0) - (shared.clock() - clock0)
+        assert abs(lost - .6) < .05, lost
         sim_t = shared.backend.data.time
         peer.close()
         peer = None
@@ -120,7 +138,8 @@ def in_process(host_path, peer_path) -> None:
         if peer is not None:
             peer.close()
         host.close()
-    print("co-host in process: two links, one world, each tracks its own slice; the co-host never steps or closes it: PASS",
+    print("co-host in process: two links, one world, each tracks its own slice; a scene change pauses the world clock; the "
+          "co-host never steps or closes it: PASS",
           flush=True)
 
 

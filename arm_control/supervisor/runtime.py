@@ -837,7 +837,9 @@ class RobotRuntime:
     def _build_controller(self) -> ArmController:
         return build_arm_controller(
             self.cfg, _Node(self), arm_id=self.instance_id, require_policy=True,
-            clock=time.monotonic, plant_reports_health=True,
+            # the plant's clock: wall time for a real arm; a sim world's own (it stands still while the world is paused for a
+            # scene change, as plant time did for the plant-clocked controller this supervisor replaced)
+            clock=getattr(self.link, 'clock', time.monotonic), plant_reports_health=True,
             reference_source=(None if self._native is None else lambda: self._native.point))
 
     # -- lifecycle ---------------------------------------------------------------
@@ -1407,7 +1409,7 @@ class RobotRuntime:
                 if seq is not None:
                     sent.append(seq)
                     if sent_for is not None and self._native is None:
-                        c.streamed_command_sent(sent_for, command['position'], time.monotonic())
+                        c.streamed_command_sent(sent_for, command['position'], c._clock())
             elif topic == "controller_event":
                 events.append(unpack_controller_event(value))
         c.node.sent = []

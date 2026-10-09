@@ -292,11 +292,34 @@ class SharedWorld:
         self.core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
         self.lock = threading.Lock()
         self.last: dict | None = None  # the backend state after the last step
+        # (seconds the world has been paused for scene changes, start of the change in progress or None): ONE attribute, so a
+        # reader on another thread never sees a finished pause counted twice
+        self._pause = (0.0, None)
 
     def apply_scene(self, request: dict) -> dict:
-        """scene_action/1: an optimistic scene change, between steps (``SceneCore.apply_scene``)."""
+        """scene_action/1: an optimistic scene change, between steps (``SceneCore.apply_scene``). The world is paused while
+        it is rebuilt (every actor's servo waits on the lock): that time is not plant time (``clock``)."""
         with self.lock:
-            return self.core.apply_scene(request)
+            paused, _ = self._pause
+            started = time.monotonic()
+            self._pause = (paused, started)
+            try:
+                return self.core.apply_scene(request)
+            finally:
+                self._pause = (paused + time.monotonic() - started, None)
+
+    def stalled(self, now: float) -> float:
+        """Seconds the world has been paused by the scene change in progress (0 when none is)."""
+        _, started = self._pause
+        return 0.0 if started is None else max(0.0, now - started)
+
+    def clock(self) -> float:
+        """The world's time on the wall clock's scale: monotonic time less every pause for a scene change, so it stands still
+        while the world does. A supervisor's controller deadlines run on it (a 0.35 s recompile is no stale state in a world
+        that did not move), as SceneCore's slice deadmen are credited the same stall."""
+        now = time.monotonic()
+        paused, started = self._pause
+        return now - paused - (0.0 if started is None else now - started)
 
 
 class ScenePlant:
