@@ -216,6 +216,8 @@ class RobotRuntime:
             result['trace'] = 1
         if getattr(self.link, 'observing', False):
             result['observe'] = 1
+        if self._native is None:  # setpoints are words on the streamed path; a native reference plays only its own curve
+            result['setpoint'] = 1
         return result
 
     def observe(self, after: int = 0, limit: int = 64) -> dict:
@@ -343,6 +345,34 @@ class RobotRuntime:
         self.controller.executor.set_payload(payload.mass_kg, com_offset=payload.com_ee)
         self._payload = PayloadState(self._payload.revision + 1, payload)
         return self._payload
+
+    # -- setpoint/1: a live joint target with a deadman (console jog, policy actions) -------
+    def setpoint(self, session, q):
+        """Hold the arm at ``q`` (arm joints, rad) on the joint law until the next setpoint, or until none arrives within the
+        controller's jog timeout: then it holds the MEASURED pose (not the last target). Refused while an execution is live,
+        and for a target that moves any joint further past its position limit than the measured pose is. Returns the timeout,
+        which is the rate a caller must keep up. The step size is the caller's envelope (the console's JogLimits); the
+        supervisor checks only what holds for every caller."""
+        return self._call(self._setpoint, session, q)
+
+    def _setpoint(self, session, q):
+        self._owns(session)
+        q = np.asarray(q, dtype=float).ravel()
+        if q.shape != (len(self.joints),) or not np.isfinite(q).all():
+            raise Refused(f'a setpoint is {len(self.joints)} finite joint positions')
+        if self._current() is not None:
+            raise Refused('an execution is live: cancel it before streaming setpoints')
+        c = self.controller
+        lower, upper = c.execution_policy.position_lower, c.execution_policy.position_upper
+        if lower is not None and upper is not None:
+            past = lambda x: np.maximum(np.maximum(lower - x, x - upper), 0.)  # noqa: E731
+            worse = np.flatnonzero(past(q) > past(np.asarray(c.last_state.position, float)) + 1e-9)
+            if worse.size:
+                raise Refused(f'setpoint moves {self.joints[worse[0]]} past its position limit')
+        refusal = c.on_jog(pack_json_message('jog', {'q': q.tolist(), 'reason': 'setpoint'}))
+        if refusal is not None:
+            raise Refused(f'setpoint refused: {refusal}')
+        return {'timeout_s': c._jog.timeout_s}
 
     # -- stream/1: same execution ledger, reference owner and control loop -------
     def open_stream(self, session, request):

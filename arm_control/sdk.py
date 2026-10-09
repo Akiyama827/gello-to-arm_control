@@ -319,6 +319,15 @@ class ArmClient:
         return _dec(lambda rs: _items(codec.receipt_from, rs),
                     self._channel.call("receipts", execution_id=execution_id))
 
+    # -- negotiated setpoint/1 ------------------------------------------------
+    def setpoint(self, q) -> float:
+        """Hold the arm at joint target ``q`` (owner, ARMed, no live execution). Re-send within the returned timeout (s) or the
+        arm holds its measured pose: not sending is the stop. Refused (nothing changed) with the supervisor's reason."""
+        if self.extensions.get('setpoint') != 1:
+            raise Refused('supervisor does not advertise setpoint/1')
+        return _dec(lambda r: float(_need(_mapping(r), 'timeout_s')['timeout_s']),
+                    self._channel.call('setpoint', q=[float(v) for v in q]))
+
     # -- negotiated controller/1 -----------------------------------------------
     def _controller_call(self, op, **args):
         if self.extensions.get('controller') != 1:
@@ -342,7 +351,7 @@ class ArmClient:
     # -- negotiated stream/1 ----------------------------------------------------
     def _stream_call(self, op, **args):
         if self.extensions.get('stream') != 1:
-            raise Refused('supervisor does not advertise stream/1; no raw-jog fallback')
+            raise Refused('supervisor does not advertise stream/1 (joint targets on the streamed path: setpoint/1)')
         return self._channel.call(op, **args)
 
     def open_stream(self, request):

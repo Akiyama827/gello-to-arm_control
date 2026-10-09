@@ -383,18 +383,21 @@ class ArmController:
         if "stop" in fields:
             self._stop(str(fields.get("reason") or fields["stop"]))
 
-    def on_jog(self, value) -> None:
-        """Take a live setpoint, if this is a moment a jog may move at all.
+    def on_jog(self, value) -> str | None:
+        """Take a live setpoint, if this is a moment a jog may move at all; else return why not (None = taken).
 
         Refused while a plan runs: a reviewed plan owns the arm until it ends
         or is cancelled, and a jog arriving underneath it would fight the
-        trajectory for the same joints.
+        trajectory for the same joints. The Dora node drops the reason (the
+        console re-sends while a button is held); the supervisor returns it.
         """
-        if self.stopped or self.frozen or not self.armed or not self.ready_sent or self._pose_hold is not None:
-            return
-        if self._running:
-            return
-        self._jog.set(unpack_jog(value)["q"], self._clock())
+        refusal = ("stopped" if self.stopped else "frozen (cancel to clear)" if self.frozen
+                   else "not armed" if not self.armed else "no fresh measured pose since ARM" if not self.ready_sent
+                   else "Soft (pose hold) is selected" if self._pose_hold is not None
+                   else "a plan is running" if self._running else None)
+        if refusal is None:
+            self._jog.set(unpack_jog(value)["q"], self._clock())
+        return refusal
 
     def _jog_target(self) -> tuple[np.ndarray | None, bool]:
         """Select the live jog target and report expiry; do not update bias."""

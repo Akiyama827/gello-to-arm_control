@@ -6,7 +6,9 @@
 (``pack_plan``, ``pack_control_update``). Checked: the startup claim and capability/authority announcements, the ARM edge, the
 ``ready`` event with the first measured pose, ``motor_state`` shape and values, a gated plan (staged, executed, ``leg_result``), an
 UNGATED plan (released when admitted), a targeted cancel (``plan_cleared``), named-preset gains (accepted, ``mode`` event) and
-non-preset gains (refused), the unsupported ``jog`` and ``gripper`` (refused with a notice, rate limited), ``stop`` (cancel + DISARM),
+non-preset gains (refused), ``jog`` as a supervisor setpoint (the arm follows while re-sent, holds when it stops; refused with the
+reason past a joint limit, malformed, from a non-owner, while a plan runs, DISARMed), the unsupported ``gripper`` (refused with a
+notice, rate limited), ``stop`` (cancel + DISARM),
 malformed input (never raises), and configuration drift (the bridge refuses to start against a supervisor running other gains).
 """
 from __future__ import annotations
@@ -28,7 +30,7 @@ from arm_control.contracts._arrow import pack_json_message, unpack_json_message 
 from arm_control.contracts.motion import pack_control_update, pack_jog, pack_plan, unpack_controller_event  # noqa: E402
 from arm_control.contracts.motor import unpack_motor_state  # noqa: E402
 from arm_control.multi_arm.supervised import AsyncAuthorityHandle, SdkArmHandle  # noqa: E402
-from arm_control.sdk import ArmClient  # noqa: E402
+from arm_control.sdk import ArmClient, Refused  # noqa: E402
 from arm_control.supervisor.dora_arm import DoraArmBridge, default_gains_and_presets, release_after_loss  # noqa: E402
 from arm_control.config import load_robot_config  # noqa: E402
 
@@ -74,7 +76,7 @@ def main():
     text = cfg_path.read_text().replace("  ee_frame: l3\n", "  ee_frame: l3\n  gripper_joints: []\n").replace("  native_reference: true\n", "")
     text += (f"sim_model_path: {tmp / 'three.urdf'}\nsim_gravcomp: true\nsim_timestep: 0.001\n"
              "sim_servo: {state_hz: 250, hold_ms: 100, fault_ms: 600, hold_kp: 50, hold_kd: 5}\n"
-             "control_mode:\n  gain_presets:\n    firm: {kp: [150, 150, 150], kd: [25, 25, 25]}\n")
+             "control_mode:\n  jog: {timeout_s: 0.3}\n  gain_presets:\n    firm: {kp: [150, 150, 150], kd: [25, 25, 25]}\n")
     cfg_path.write_text(text)
     sock = tmp / 'sdk_arm.sock'
     log = open(tmp / 'supervisor.log', 'w')
@@ -193,16 +195,73 @@ def main():
         bridge.on_control(pack_control_update(gains=dict(kp=[7., 7., 7.], kd=[1., 1., 1.])))
         refused = [m for m in cap.events('mode')[before:] if not m['ok']]
         assert refused and 'not a named controller preset' in refused[0]['reason'], cap.events('mode')[before:]
-        # unsupported inputs are refused with a notice, and a burst makes one notice
+        # jog = a supervisor setpoint (setpoint/1): the arm follows while it is re-sent, and holds where it is once it stops
+        assert arm.extensions.get('setpoint') == 1, arm.extensions
+        assert arm.setpoint(arm.state().q) == .3, 'the jog deadman is not the mode config\'s jog.timeout_s'
+        before = len(cap.events('mode'))
+        target = np.asarray(arm.state().q) + [.08, 0, 0]
+        end = time.monotonic() + 1.5
+        while time.monotonic() < end:
+            bridge.on_jog(pack_jog(q=target))
+            bridge.pump()
+            time.sleep(.05)
+        reached = np.asarray(arm.state().q)
+        assert abs(reached[0] - target[0]) < .02, (reached, target)
+        assert not [m for m in cap.events('mode')[before:] if not m['ok']], 'an accepted jog raised a notice'
+        time.sleep(.7)  # past the jog timeout (0.3 s): the hold anchors at the MEASURED pose, not at the last jog target (no coasting on)
+        held = arm.state()
+        assert abs(held.selected_q[0] - reached[0]) < .005 and abs(held.selected_q[0] - target[0]) > .005, (held.selected_q, reached, target)
+        assert held.q[0] < target[0] - .005, (held.q, target)
+
+        def refused(q, why, client=arm):
+            try:
+                client.setpoint(q)
+            except Refused as exc:
+                assert why in str(exc), (why, exc)
+            else:
+                raise AssertionError(f'a setpoint was accepted; expected {why!r}')
+        refused(reached + [10., 0, 0], 'position limit')
+        refused(reached[:2], 'finite joint positions')
+        refused([np.nan, 0., 0.], 'finite joint positions')
+        other = ArmClient('sdk_arm', socket_path=sock)
+        try:
+            refused(reached, 'owned by another client', client=other)
+        finally:
+            other.close()
+        bridge.on_plan(plan_message('j1', reached, reached + [.1, 0, 0], 3.0, gated=True))
+        bridge.on_control(pack_control_update(execute='j1'))
+        pump(lambda: handle.state().executing, 'j1 running')
+        refused(reached, 'execution is live')
+        before = len(cap.events('mode'))
+        for _ in range(5):  # through the bridge: a refused burst is one notice, with the reason
+            bridge.on_jog(pack_jog(q=reached))
+        notices = [m for m in cap.events('mode')[before:] if not m['ok']]
+        assert len(notices) == 1 and 'execution is live' in notices[0]['reason'], notices
+        bridge.on_control(pack_control_update(cancel=True, reason='operator'))
+        pump(lambda: [e for e in cap.events('leg_result') if e['plan_id'] == 'j1'], 'leg_result j1')
+        # a jog supersedes a staged, unreleased plan (planned from the pose the jog leaves): plan_cleared, then the jog moves the arm
+        qs = np.asarray(arm.state().q)
+        bridge.on_plan(plan_message('s1', qs, qs + [.1, 0, 0], 1.0, gated=True))
+        pump(lambda: [e for e in cap.events('plan_staged') if e['plan_id'] == 's1'], 'plan_staged s1')
+        before = len(cap.events('mode'))
+        end = time.monotonic() + 1.5
+        while time.monotonic() < end:
+            bridge.on_jog(pack_jog(q=qs - [.05, 0, 0]))
+            bridge.pump()
+            time.sleep(.05)
+        assert [e for e in cap.events('plan_cleared') if e['plan_id'] == 's1'], 'the superseded plan was not cleared'
+        assert abs(arm.state().q[0] - (qs[0] - .05)) < .02, (arm.state().q, qs)
+        assert not [m for m in cap.events('mode')[before:] if not m['ok']], 'the supersede showed a refusal'
+        time.sleep(.6)
+        # the gripper is not served by an arm supervisor: refused with a notice, a burst makes one notice
         before = len(cap.events('mode'))
         for _ in range(5):
-            bridge.on_jog(pack_jog(q=q2))
-        bridge.on_gripper(pack_json_message('gripper', {}))
+            bridge.on_gripper(pack_json_message('gripper', {}))
         notices = [m for m in cap.events('mode')[before:] if not m['ok']]
-        assert len(notices) == 2 and 'jog' in notices[0]['reason'] and 'gripper' in notices[1]['reason'], notices
+        assert len(notices) == 1 and 'gripper' in notices[0]['reason'], notices
         time.sleep(1.1)  # past the notice period: the next refusal is told again
-        bridge.on_jog(pack_jog(q=q2))
-        assert len([m for m in cap.events('mode')[before:] if not m['ok'] and 'jog' in m['reason']]) == 2
+        bridge.on_gripper(pack_json_message('gripper', {}))
+        assert len([m for m in cap.events('mode')[before:] if not m['ok'] and 'gripper' in m['reason']]) == 2
         # malformed input never raises
         bridge.on_plan(pack_json_message('plan', {'plan_id': 'broken'}))
         bridge.on_control(pack_json_message('not_control', {}))
@@ -212,6 +271,7 @@ def main():
         pump(lambda: not handle.state().armed and bridge._armed_sent is False, 'the DISARM edge')
         assert not arm.authority().arm_epoch
         assert [unpack_json_message(v)['armed'] for t, v in cap.out if t == 'arm'] == [False, True, False]
+        refused(reached, 'not armed')
         for t, v in cap.out:
             if t == 'arm':
                 pass

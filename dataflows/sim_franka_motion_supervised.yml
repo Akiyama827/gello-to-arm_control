@@ -6,8 +6,8 @@
 # separate process; `python examples/run_console.py --supervised` starts it and this graph together. The node refuses to start
 # against a supervisor running a different configuration.
 #
-# Differences the console shows: no raw jog and no gripper through the supervisor (refused with a notice); gains must be named
-# presets (control mode `gain_presets`).
+# Differences the console shows: jog is a supervisor setpoint (setpoint/1; it cancels a staged plan first); no gripper through the
+# supervisor (refused with a notice); gains must be named presets (control mode `gain_presets`).
 #
 #   python examples/run_console.py --supervised
 nodes:

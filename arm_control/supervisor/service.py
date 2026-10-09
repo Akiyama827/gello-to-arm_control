@@ -76,6 +76,10 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
             return runtime.group_report(str(args['execution_id']))
         if op == 'group_events':
             return runtime.group_events(session)
+    if op == 'setpoint':
+        if runtime.extensions.get('setpoint') != 1:
+            raise Refused('setpoint/1 is unavailable (this supervisor plays the native reference: use stream/1)')
+        return runtime.setpoint(session, args['q'])
     if op == 'trace_samples':
         if runtime.extensions.get('trace') != 1:
             raise Refused('trace/1 is unavailable')

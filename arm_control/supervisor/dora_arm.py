@@ -7,8 +7,9 @@ the supervisor only through the SDK: one ``ArmClient``, one non-blocking ``Async
 (gains/Soft/payload become preset and payload calls). It owns no authority of its own and no control law.
 
 Differences from the in-process node (stated, not hidden):
-  * ``jog`` and ``gripper`` are refused: the supervisor has no raw-jog (CTRL-033/052 open) and no gripper; the console is told once a
-    second, never silently ignored;
+  * ``jog`` is a supervisor setpoint (setpoint/1; refused with the reason, at most once a second, e.g. while a plan runs or on a
+    native-reference supervisor); ``gripper`` is refused (an arm supervisor serves no gripper: the graph runs its own Hand
+    node); neither is silently ignored;
   * gains must be a named preset (``gain_presets`` in the control mode config); anything else is refused with a ``mode`` event;
   * ``hold`` cancels the live leg and leaves the arm held by the supervisor (there is no latched "frozen" controller state);
     ``stop`` cancels and DISARMs;
@@ -25,7 +26,7 @@ import time
 import numpy as np
 
 from arm_control.contracts._arrow import pack_json_message
-from arm_control.contracts.motion import pack_controller_event, unpack_control_update, unpack_plan
+from arm_control.contracts.motion import pack_controller_event, unpack_control_update, unpack_jog, unpack_plan
 from arm_control.contracts.motor import pack_motor_state_dict
 from arm_control.multi_arm.supervised import AsyncAuthorityHandle
 from arm_control.multi_arm.types import ArmPlan
@@ -36,6 +37,8 @@ from arm_control.supervisor.console_adapter import ConsoleControlAdapter
 NOTICE_PERIOD_S = 1.0
 #: the bridge publishes state and drains events at the controller's 100 Hz
 PUMP_PERIOD_S = 0.01
+#: after a jog cancels a staged plan, its refusals stay quiet this long (the cancel landing; the console re-sends every tick)
+JOG_SUPERSEDE_S = 0.5
 #: motor_health is published on change and at least this often (the console treats silence as stale)
 HEALTH_PERIOD_S = 0.5
 
@@ -78,6 +81,7 @@ class DoraArmBridge:
         self._health_sent: tuple | None = None
         self._fault_text = ''                      # a recoverable supervisor fault, shown through motor_health like a server latch
         self.lost: str | None = None               # why the supervisor is unreachable (terminal for this node)
+        self._jog_quiet_until = -1e9               # a jog's own plan cancel is landing until then
 
     # -- startup ---------------------------------------------------------------------------------------------------
     def check_config(self, kp, kd) -> None:
@@ -136,7 +140,28 @@ class DoraArmBridge:
             self._mode_event(ok=True)
 
     def on_jog(self, value) -> None:
-        self._notice('jog', 'jog is not available through the supervisor (no raw-jog)')
+        """A console jog is a supervisor setpoint (setpoint/1): the same deadman, the same hold at the measured pose on expiry.
+
+        A staged, unreleased plan was planned from the pose this jog leaves: it is cancelled (``plan_cleared``), where the
+        in-process controller kept it and refused it at execute (start tolerance). The supervisor refuses setpoints while any
+        execution is live, so for a moment the jog is refused while that cancel lands; the console re-sends, so those refusals
+        are not shown."""
+        try:
+            q = unpack_jog(value)['q']
+        except (ValueError, KeyError, TypeError) as exc:
+            self._notice('jog', f'unreadable jog: {exc}')
+            return
+        if self._staged:
+            for old in self._staged:
+                self._release_on_stage.discard(old)
+                self.handle.cancel('superseded by a jog', plan_id=old)
+            self._staged.clear()
+            self._jog_quiet_until = self._clock() + JOG_SUPERSEDE_S
+        try:
+            self.arm.setpoint(q)
+        except (SupervisorError, TimeoutError, OSError) as exc:  # Refused included: nothing changed; the console re-sends
+            if self._clock() >= self._jog_quiet_until:
+                self._notice('jog', f'jog refused: {exc}')
 
     def on_gripper(self, value) -> None:
         self._notice('gripper', 'the gripper is not served by an arm supervisor')
