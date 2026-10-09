@@ -66,6 +66,12 @@ namespace {
 constexpr double TICK_S = 0.002;  // 500 Hz
 constexpr int64_t TICK_NS = 2'000'000;
 constexpr int64_t SILENCE_NS = 50'000'000;  // per-motor feedback deadman
+// A shared bus (operator 2026-10-09: the base and the DM arm on ONE can0, their motor ids colliding, ONE robot powered at a
+// time) is checked on an unfiltered probe socket: a passive listen before the first frame, then the first moments of
+// operation. DM motors speak only when spoken to, so a command to one of our ids before we sent anything is another
+// driver, and our id answering on a Master ID that is not ours is another robot's motor, powered.
+constexpr int64_t LISTEN_NS = 100'000'000;
+constexpr int64_t PROBE_NS = 100'000'000;
 
 struct Motor {
   int id = 0;
@@ -327,12 +333,32 @@ public:
       fail("bind(%s): %s", iface_.c_str(), std::strerror(errno));
       return;
     }
+    probe_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (probe_ < 0 ||
+        setsockopt(probe_, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &on, sizeof on) != 0 ||
+        ::bind(probe_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      fail("probe socket on %s: %s", iface_.c_str(), std::strerror(errno));
+      return;
+    }
+    timespec now, end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ts_add(end, LISTEN_NS);
+    for (;;) {  // before our first frame: nobody may be commanding our ids
+      if (!probe_drain(false)) return;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (ts_ns(now) >= ts_ns(end)) break;
+      const uint64_t left_ns = ts_ns(end) - ts_ns(now);
+      timespec left{time_t(left_ns / 1'000'000'000ull), long(left_ns % 1'000'000'000ull)};
+      pollfd pf{probe_, POLLIN, 0};
+      ppoll(&pf, 1, &left, nullptr);
+    }
     clock_gettime(CLOCK_MONOTONIC, &next_);
     ok_ = true;
   }
 
   ~DmBackend() override {
     if (fd_ >= 0) ::close(fd_);
+    if (probe_ >= 0) ::close(probe_);
   }
 
   bool ok() const { return ok_; }
@@ -392,6 +418,14 @@ public:
       started_ = true;
       const uint64_t t0 = ts_ns(now);
       for (Motor& m : motors_) m.last_rx_ns = t0;  // silence grace from here
+      probe_until_ns_ = t0 + uint64_t(PROBE_NS);
+    }
+    if (probe_ >= 0) {  // the first moments: another robot's motor with one of our ids must not be powered
+      if (!probe_drain(true)) return false;
+      if (ts_ns(now) >= probe_until_ns_) {
+        ::close(probe_);
+        probe_ = -1;
+      }
     }
     if (!wrote_ && !elicit_all()) return false;  // keepalive: solicit replies
     wrote_ = false;
@@ -598,6 +632,45 @@ private:
     }
   }
 
+  bool ours(uint32_t id) const {
+    for (const Motor& m : motors_)
+      if (uint32_t(m.id) == id) return true;
+    return false;
+  }
+
+  // Every frame on the bus since the last call (the probe sees them all, our own included). False (latched fault) on a
+  // command to one of our ids before we sent anything, or on one of our ids answering on a Master ID that is not ours.
+  bool probe_drain(bool sent) {
+    for (;;) {
+      canfd_frame f;
+      const ssize_t got = ::recv(probe_, &f, sizeof f, MSG_DONTWAIT);
+      if (got < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+        if (errno == EINTR) continue;
+        fail("probe recv on %s: %s", iface_.c_str(), std::strerror(errno));
+        return false;
+      }
+      if (got != ssize_t(CAN_MTU) && got != ssize_t(CANFD_MTU)) continue;
+      if (f.can_id & (CAN_ERR_FLAG | CAN_EFF_FLAG | CAN_RTR_FLAG)) continue;
+      const uint32_t id = f.can_id & CAN_SFF_MASK;
+      if (ours(id)) {
+        if (sent) continue;  // our own frames, looped back to this socket
+        fail("another driver commands motor %u on %s before this server sent anything (one robot powered, one server "
+             "running, per bus)", id, iface_.c_str());
+        return false;
+      }
+      if (f.len < 8) continue;
+      bool master = false;
+      for (const Motor& m : motors_) master |= uint32_t(m.mst) == id;
+      const uint32_t nib = f.data[0] & 0x0F;
+      if (!master && ours(nib)) {
+        fail("motor id %u answers on Master ID 0x%03X, not this arm's: another robot is powered on %s (operator: one "
+             "robot powered at a time on a shared bus)", nib, id, iface_.c_str());
+        return false;
+      }
+    }
+  }
+
   void fail(const char* fmt, ...) __attribute__((format(printf, 2, 3))) {
     char buf[224];
     va_list ap;
@@ -617,6 +690,8 @@ private:
   uint32_t enabled_mask_ = 0;  // motors enabled since the last stop()
   bool wrote_ = false;     // a write() happened since the last read()
   bool all_seen_ = false;  // every motor has replied at least once
+  int probe_ = -1;         // unfiltered: the shared-bus checks (closed once they are over)
+  uint64_t probe_until_ns_ = 0;
   uint32_t active_mask_ = 0;
   timespec next_ = {};
   std::string fault_;
