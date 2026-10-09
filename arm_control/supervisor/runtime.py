@@ -67,11 +67,12 @@ TRACE_TICKS = 64
 
 
 def next_tick(previous: float, now: float, period: float) -> float:
-    """The servo loop's next deadline, taken after a tick at ``now``: one period after the previous deadline; when the loop
-    is more than a period behind (a late wake or a slow step), a full period after ``now`` -- the late tick was the one
-    tick, never a catch-up burst nor a second tick right behind it."""
+    """The servo loop's next deadline, taken after a tick at ``now``: one period after the previous deadline, or, when that
+    has already passed (a late wake or a slow step), a full period after ``now`` -- the late tick was the one tick, never a
+    catch-up burst nor a second tick right behind it (the retired Dora loop's rule). Steps persistently longer than a
+    period therefore run at 1/(step + period), not back to back."""
     due = previous + period
-    return now + period if now - due > period else due
+    return now + period if now > due else due
 
 
 def offered_profiles(link, *, native: bool, cartesian_kp_min: float | None) -> tuple[str, ...]:
