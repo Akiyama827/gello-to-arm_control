@@ -60,6 +60,9 @@ CHECKS = (
 )
 # Wall-clock assertions (check_refinement: parent heartbeat gap < 0.25 s, teardown < 2 s): run alone, not in the pool.
 TIMED = {"check_refinement"}
+# Simulated supervisors serve their sim Hand on the profile's FIXED loopback port (examples/profiles/sim_supervised.yaml:
+# 47812, +10 per pair member): two at once collide ("Address already in use"), so these also run one at a time.
+TIMED |= {"check_cooperative", "check_dual_console", "check_load_model", "check_pair_planning", "check_scene_cohost"}
 # These simulate the staged FR3 (franka/, gitignored, staged by tools/assets/setup_fr3.py). Unstaged, they do not run and one
 # fr3_assets FAIL names them: a fresh checkout is red until the assets are staged, never silently smaller.
 FR3_ASSET = ROOT / "franka/urdf/fr3.urdf"

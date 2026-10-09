@@ -136,6 +136,8 @@ def check_rejection():
                 target,
                 mode="shared",
                 refinement="trajopt",
+                # coupling is virtual (2026-10-09): shared planning starts from captured grasps; capture the nominal ones
+                virtual_grasps={a: T.tolist() for a, T in config.shared_object.grasps.object_T_tcp.items()},
             )
         except ValueError as exc:
             assert "grasp closure" in str(exc), str(exc)
