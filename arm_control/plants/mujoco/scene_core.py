@@ -16,6 +16,7 @@ What to publish, and when, stays with the front end.
 """
 from __future__ import annotations
 
+from functools import cached_property
 import os
 import threading
 import time
@@ -279,6 +280,11 @@ class SceneCore:
         return pos_cmd
 
 
+#: the longest a scene change may pause a hosted world and still be excused (staleness, the controller clock); measured 0.35 s
+#: for a storage-release recompile. ponytail: one bound for every world; per-world if a heavier scene ever needs more.
+PAUSE_EXCUSE_MAX_S = 5.0
+
+
 class SharedWorld:
     """One composed world and its ``SceneCore``, shared by every supervised actor this process hosts (scene-hosting D1(a)/D2(a),
     operator 2026-10-09: the FR3 and the base in one sim world, each on its own supervisor). The HOST actor's servo thread steps
@@ -292,6 +298,7 @@ class SharedWorld:
         self.core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
         self.lock = threading.Lock()
         self.last: dict | None = None  # the backend state after the last step
+        self.last_step_t: float | None = None  # when the host last stepped the world, on the world clock (pauses excluded)
         # (seconds the world has been paused for scene changes, start of the change in progress or None): ONE attribute, so a
         # reader on another thread never sees a finished pause counted twice
         self._pause = (0.0, None)
@@ -309,17 +316,22 @@ class SharedWorld:
                 self._pause = (paused + time.monotonic() - started, None)
 
     def stalled(self, now: float) -> float:
-        """Seconds the world has been paused by the scene change in progress (0 when none is)."""
+        """Seconds the world has been paused by the scene change in progress (0 when none is), at most PAUSE_EXCUSE_MAX_S:
+        a recompile that hangs longer is a stalled plant, and staleness and the controller clock resume."""
         _, started = self._pause
-        return 0.0 if started is None else max(0.0, now - started)
+        return 0.0 if started is None else min(max(0.0, now - started), PAUSE_EXCUSE_MAX_S)
 
     def clock(self) -> float:
         """The world's time on the wall clock's scale: monotonic time less every pause for a scene change, so it stands still
         while the world does. A supervisor's controller deadlines run on it (a 0.35 s recompile is no stale state in a world
         that did not move), as SceneCore's slice deadmen are credited the same stall."""
         now = time.monotonic()
-        paused, started = self._pause
-        return now - paused - (0.0 if started is None else now - started)
+        paused, _ = self._pause
+        return now - paused - self.stalled(now)
+
+    def stepped_within(self, seconds: float) -> bool:
+        """Whether the host stepped the world in the last ``seconds`` of world time (every pause for a scene change excused)."""
+        return self.last_step_t is not None and self.clock() - self.last_step_t <= seconds
 
 
 class ScenePlant:
@@ -353,6 +365,7 @@ class ScenePlant:
         self._span = slice(start, start + width)
         self.shared, self.host = shared, bool(host)
         self._core = shared.core
+        self._driven = False  # a co-host: its supervisor has written a non-release command
 
     @classmethod
     def from_config(cls, cfg, joints: list, *, period: float) -> "ScenePlant":
@@ -372,7 +385,7 @@ class ScenePlant:
             raise ValueError("a co-hosted actor needs sim_actor (the world's actor its supervisor drives): nothing is assumed")
         return cls(shared, str(actor), list(joints), period=period, idle_timeout=shared.core.idle_timeout, host=False)
 
-    @property
+    @cached_property  # first read at SimLink.open, the world loaded: the EE chain never changes, and a recompile must not race it
     def supports_cartesian(self) -> bool:
         """The world's EE chain is this actor's: a Cartesian spec from it drives its own arm, never another actor's."""
         mine = set(list(self.backend.joint_names)[self._span])
@@ -384,19 +397,34 @@ class ScenePlant:
 
     def close(self) -> None:
         if self.host:
-            self.backend.close()
+            with self.shared.lock:  # never under a scene change still running at shutdown
+                self.backend.close()
 
     def _mine(self, state: dict) -> dict:
         return {"position": np.asarray(state["position"], float)[self._span].copy(),
                 "velocity": np.asarray(state["velocity"], float)[self._span].copy()}
 
     def step(self, command: dict) -> dict:
-        now = time.monotonic()
         with self.shared.lock:
-            self._core.set_slice(self.actor, dict(command, cartesian=command.get("cartesian")), now)
+            now = time.monotonic()  # inside the lock: a step that waited out a pause must not write a pre-pause time
             if self.host:
-                self.shared.last = self._core.tick(now)
-            return self._mine(self.shared.last if self.shared.last is not None else self.backend.motor_state())
+                self._core.set_slice(self.actor, dict(command, cartesian=command.get("cartesian")), now)
+                self.shared.last, self.shared.last_step_t = self._core.tick(now), self.shared.clock()
+                return self._mine(self.shared.last)
+            if self.shared.last_step_t is None:  # the host has not stepped yet (start-up): nothing to fail, nothing to write
+                return self._mine(self.backend.motor_state())
+            if command.get("cartesian") is not None:
+                raise ValueError("a co-hosted actor takes joint commands only (the world's Cartesian law is the host's)")
+            # A co-host whose world has stopped stepping (the host failed or is gone) is a failed plant, not a fresh one.
+            if not self.shared.stepped_within(self._core.idle_timeout):
+                raise RuntimeError("the hosting actor has not stepped the world")
+            # Until its supervisor first drives it, a co-hosted actor keeps the world's spawn hold: SimLink's disarmed release
+            # word would otherwise drop it limp from start-up to the first ARM (the base has no gravity compensation).
+            released = not any(np.any(command[k]) for k in ("kp", "kd", "torque"))
+            if not (released and not self._driven):
+                self._driven = True
+                self._core.set_slice(self.actor, dict(command, cartesian=None), now)
+            return self._mine(self.shared.last)
 
     def motor_state(self) -> dict:
         with self.shared.lock:

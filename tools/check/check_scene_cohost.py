@@ -80,7 +80,27 @@ execution_policy:
     return host, peer
 
 
+def pause(shared, seconds: float) -> None:
+    """A scene change that holds the world for ``seconds`` (the recompile, without a scene), crediting the stall to the slice
+    deadmen as SceneCore.apply_scene does."""
+    shared.core.apply_scene = lambda request: (time.sleep(seconds), shared.core.credit_stall(seconds),
+                                               {"revision": request["revision"]})[2]
+    try:
+        shared.apply_scene(dict(revision=1, state={}))
+    finally:
+        del shared.core.apply_scene  # back to the class's
+
+
+def peer_command(q):
+    return dict(position=np.asarray(q, float), velocity=np.zeros(1), torque=np.zeros(1), kp=np.full(1, 100.),
+                kd=np.full(1, 20.))
+
+
 def in_process(host_path, peer_path) -> None:
+    import threading
+
+    from arm_control.plants.remote_rt import protocol as rtp
+
     host = SimLink.from_config(load_robot_config(host_path))
     host.open()
     peer = None
@@ -95,18 +115,29 @@ def in_process(host_path, peer_path) -> None:
             assert "sim_actor" in str(exc), exc
         else:
             raise AssertionError("a co-host without sim_actor")
+        core = shared.core
+        span = slice(core.arm_slices["peer"]["start"], core.arm_slices["peer"]["start"] + 1)
+        spawn_kp = core.command["kp"][span].copy()
         peer = SimLink.from_config(load_robot_config(peer_path), cohost_of=shared)
         assert peer.scene_world is None, "a co-host must not expose the world it does not host"
         peer.open()
+        # disarmed and never driven, a co-hosted actor keeps the world's spawn hold (its release word is not written)
+        time.sleep(.3)
+        assert np.all(spawn_kp > 0) and np.array_equal(core.command["kp"][span], spawn_kp), core.command["kp"][span]
         host.enable_all()
         peer.enable_all()
         a, b = np.array([.3, -.2, .1]), np.array([.6])
-        end = time.monotonic() + 2.0
-        while time.monotonic() < end:
-            host.apply_command(command(a))
-            peer.apply_command(dict(position=b, velocity=np.zeros(1), torque=np.zeros(1), kp=np.full(1, 100.),
-                                    kd=np.full(1, 20.)))
-            time.sleep(.01)
+        # the supervisors' command streams, kept up through every step below (a pause must not starve the deadman)
+        driven, stop_driving = {host: command(a), peer: peer_command(b)}, threading.Event()
+
+        def drive():
+            while not stop_driving.is_set():
+                for link, word in list(driven.items()):
+                    link.apply_command(word)
+                time.sleep(.01)
+        driver = threading.Thread(target=drive, daemon=True)
+        driver.start()
+        time.sleep(2.0)
         hs, ps = host.latest_state()[0], peer.latest_state()[0]
         assert hs.armed and not hs.faulted and np.allclose(hs.q, a, atol=.03), hs.q
         assert ps.armed and not ps.faulted and np.allclose(ps.q, b, atol=.03), ps.q
@@ -114,11 +145,8 @@ def in_process(host_path, peer_path) -> None:
         assert abs(list(world["peer"].values())[0] - .6) < .03, world
         # A scene change pauses the world: its clock stands still and its links are not stale meanwhile (a 0.6 s pause, past
         # the links' 0.5 s state timeout), and afterwards the clock has lost exactly the pause against the wall.
-        import threading
-        inner = shared.core.apply_scene
-        shared.core.apply_scene = lambda request: (time.sleep(.6), {"revision": request["revision"]})[1]
         wall0, clock0 = time.monotonic(), shared.clock()
-        change = threading.Thread(target=shared.apply_scene, args=(dict(revision=1, state={}),))
+        change = threading.Thread(target=pause, args=(shared, .6))
         change.start()
         time.sleep(.3)
         frozen = shared.clock()
@@ -127,20 +155,69 @@ def in_process(host_path, peer_path) -> None:
         time.sleep(.2)
         assert host.motor_health()["state_fresh"] and peer.motor_health()["state_fresh"], "a paused world reported stale"
         change.join()
-        shared.core.apply_scene = inner
         lost = (time.monotonic() - wall0) - (shared.clock() - clock0)
         assert abs(lost - .6) < .05, lost
+        # ... and no actor's slice deadman fires across pauses while its supervisor keeps commanding (review: a co-host
+        # that waited out the pause wrote a pre-pause time and was zeroed in 5 of 10 pauses)
+        zeroed = []
+        core._log = lambda text, **kw: zeroed.append(text)
+        changes = threading.Thread(target=lambda: [pause(shared, .4) for _ in range(6)])
+        changes.start()
+        changes.join()
+        core._log = print
+        assert not zeroed, zeroed
+        assert not peer.latest_state()[0].faulted and not host.latest_state()[0].faulted, (peer.motor_health()["latched_fault"], host.motor_health()["latched_fault"])
         sim_t = shared.backend.data.time
+        driven.pop(peer)
         peer.close()
         peer = None
         wait(lambda: shared.backend.data.time > sim_t + .1, 2., "the host stepping after the co-host closed")
+        # a world the host no longer steps is a failed plant for its co-host too (review: it stayed fresh and ARMed)
+        peer = SimLink.from_config(load_robot_config(peer_path), cohost_of=shared)
+        peer.open()
+        peer.enable_all()
+        driven[peer] = peer_command(b)
+        time.sleep(.3)
+        core.tick = lambda now: (_ for _ in ()).throw(RuntimeError("world step failed"))
+        wait(lambda: host.latest_state()[0].fault_code == rtp.FAULT_PLANT, 2., "the host's FAULT_PLANT")
+        wait(lambda: peer.latest_state()[0].fault_code == rtp.FAULT_PLANT, 2., "the co-host's FAULT_PLANT")
+        del core.tick
     finally:
+        if "stop_driving" in locals():
+            stop_driving.set()
+            driver.join()
         if peer is not None:
             peer.close()
         host.close()
-    print("co-host in process: two links, one world, each tracks its own slice; a scene change pauses the world clock; the "
-          "co-host never steps or closes it: PASS",
-          flush=True)
+    print("co-host in process: two links, one world, each tracks its own slice; a co-host keeps its spawn hold until driven; a "
+          "scene change pauses the world clock and no slice deadman; a stopped world faults its co-host; the co-host never "
+          "steps or closes it: PASS", flush=True)
+
+
+def stale_after_pause(host_path) -> None:
+    """The supervisor's controller on a world clock: after a pause a fresh sample is fresh, and a plant that then dies is
+    caught within the policy's state timeout (review MUST: wall-time arrival stamps on a paused clock hid it)."""
+    from arm_control.supervisor.runtime import RobotRuntime
+
+    cfg = load_robot_config(host_path)
+    host = SimLink.from_config(cfg)
+    runtime = RobotRuntime(cfg, link=host)
+    runtime.start()
+    try:
+        c = runtime.controller
+        wait(lambda: c._last_state_at is not None, 5., "a fed state")
+        pause(host.scene_world, .6)
+        time.sleep(.1)
+        assert c._observation_error() is None, c._observation_error()
+        timeout = c.execution_policy.state_timeout_sec
+        host._stop.set()  # the servo dies: no sample after this
+        host._thread.join(timeout=2.)
+        died = time.monotonic()
+        wait(lambda: c._observation_error() is not None, timeout + .5, "the stale-state error")
+        assert time.monotonic() - died <= timeout + .1, (time.monotonic() - died, timeout)
+    finally:
+        runtime.close()
+    print("world clock: fresh after a pause, a dead plant caught within the state timeout: PASS", flush=True)
 
 
 def supervised(host_path, peer_path) -> None:
@@ -217,6 +294,7 @@ def main() -> int:
     os.environ["WORKCELL_SCENE"] = str(write_scene(tmp))
     host_path, peer_path = configs(tmp)
     in_process(host_path, peer_path)
+    stale_after_pause(host_path)
     supervised(host_path, peer_path)
     return 0
 

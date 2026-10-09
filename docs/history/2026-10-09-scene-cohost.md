@@ -33,7 +33,9 @@ Library:
   - A scene change pauses the world while it recompiles: about 0.35 s for a storage-release toggle in isolation, measured. Every
     actor's servo waits on the lock meanwhile.
   - The supervisor's controller now runs on the link's clock when the link has one. For a hosted world, that clock is wall time
-    minus every pause, so it stands still with the world. SimLink's state freshness also excuses a pause in progress.
+    minus every pause, so it stands still with the world. A sample's arrival AGE (wall) is carried onto that clock, never the
+    wall stamp, and SimLink stamps a sample when it publishes it (after the step). SimLink's state freshness excuses a pause
+    in progress, for at most `PAUSE_EXCUSE_MAX_S` (5 s): a longer recompile is a stalled plant.
   - Without this, the FR3 policy's 0.25 s state timeout faulted the lift leg ("motor state stale") at the storage release, the
     first supervised e2e run. The plant-clocked Dora controller never saw that pause.
   - The RT link has no clock, so the hardware path keeps wall time and is unchanged.
@@ -76,6 +78,31 @@ Checks:
 * Project: `check_pipeline_sim sim-add` PASSED, all 12 gates in 75.9 s, against 76.8 s for the Dora baseline the same day.
 * Project, also passing: `check_add_contracts`, `check_franka_ownership` (config duplicates), `check_base_supervisor`,
   `check_supervised_real`, `check_base_profile`, the base_driver self-check, `ruff`.
+
+Review round 1 (opus): BLOCK, fixed:
+* MUST: the controller's state age mixed clocks. Wall-time arrival stamps were written into a controller on the paused
+  clock, so every age ran short by the total of all past pauses, and a dead plant hid behind it (the 0.25 s policy timeout
+  fell back to the link's 0.5 s). Also, the first sample after a pause carried a pre-pause stamp. The runtime now carries
+  the age across (`c._clock() - (monotonic - rx)`), and SimLink stamps on publish. The check pauses the world, kills the servo
+  and asserts the stale error within the policy timeout.
+* SHOULDs:
+  - A co-host took `now` before the world lock, wrote a pre-pause time after the host had used the stall credit, and its slice
+    was zeroed. `now` is now taken inside the lock; the check runs six pauses with no slice zeroed.
+  - A co-host could not see a stopped world. It now faults (FAULT_PLANT) when the host has not stepped within the world's
+    idle timeout of world time; the check makes the host's step fail.
+  - A malformed scene request (KeyError/TypeError) reached the SDK as an internal error and killed scene_observer. It is now
+    `Refused`, and the observer answers `ok=False` for any non-timeout supervisor error, as the plant node did.
+  - The co-hosted base hung limp from supervisor start until its first ARM (the disarmed release word overrode the world's
+    spawn hold). A co-host now writes its slice only once its supervisor first drives it; the check asserts the spawn hold.
+* NITs taken:
+  - the pause excuse is capped;
+  - `supports_cartesian` is cached at open, so a recompile cannot race it;
+  - a co-host refuses Cartesian commands;
+  - the host closes the world under its lock;
+  - a co-host whose start fails is closed before the world;
+  - the stale sim_bridge pointer is fixed;
+  - the sim base states MuJoCo's joint ranges (`prepare_model(joint_limits=True)`);
+  - records corrected (below, the migrations doc, the track list).
 
 OPEN:
 * `BaseDriver`'s in-process executor and `base_command` path have no node any more. They stay as the self-checked decision core

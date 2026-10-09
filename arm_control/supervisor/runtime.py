@@ -250,8 +250,8 @@ class RobotRuntime:
                 raise Refused('scene_apply needs the scene lease (scene_claim)')
         try:
             scene = self.link.scene_world.apply_scene(dict(revision=int(revision), state=state))
-        except ValueError as exc:
-            raise Refused(str(exc)) from None
+        except (KeyError, TypeError, ValueError) as exc:  # stale, or a malformed state (the plant node answered ok=False)
+            raise Refused(f'scene change refused: {exc!r}') from None
         return dict(request_id=str(request_id), scene_state=scene)
 
     def trace_samples(self, after: int = 0) -> dict:
@@ -1810,7 +1810,9 @@ class RobotRuntime:
                 c.on_motor_state(pack_motor_state_dict(link.motor_state(state=state)))
                 # Arrival freshness survives a delayed tick (RemoteHardware's seam).
                 if c._last_state_at is not None:
-                    c._last_state_at = rx
+                    # rx is wall time; the controller may run on a sim world's clock (paused with the world): carry the
+                    # sample's AGE across, never the wall stamp itself, or every pause would shorten every later age
+                    c._last_state_at = c._clock() - (time.monotonic() - rx)
         self._publish()
         for ex in list(self._executions.values()):
             self._expire(ex)

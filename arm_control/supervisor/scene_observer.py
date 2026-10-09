@@ -46,8 +46,9 @@ class SceneObserver:
                 self._sent[topic] = now
                 out.append((topic, {key: value if isinstance(value, dict) else list(value)}))
         scene = latest.get("scene_state")
-        if scene is not None and (scene["revision"] != self.scene_revision
-                                  or now - self._sent["scene_state"] >= PERIODS_S["scene_state"]):
+        # never backwards: a sample recorded before a change this node just applied (and published) is older news
+        if scene is not None and (self.scene_revision is None or scene["revision"] >= self.scene_revision) and (
+                scene["revision"] != self.scene_revision or now - self._sent["scene_state"] >= PERIODS_S["scene_state"]):
             out.append(("scene_state", self.scene_sent(scene, now)))
         return out
 
@@ -75,7 +76,7 @@ def main() -> None:
             if not leased:
                 leased.append(arm.scene_claim())
             reply = arm.scene_apply(request["request_id"], request["revision"], request["state"])
-        except Refused as exc:
+        except (Refused, SupervisorError) as exc:  # refused, or rejected as malformed: answered, as the plant node did
             node.send_output("scene_result", pack_scene_result(request_id=request["request_id"], revision=request["revision"],
                                                                ok=False, reason=str(exc)))
             return
@@ -132,6 +133,9 @@ def _self_check() -> None:
     newer = dict(scene, revision=5)
     assert ("scene_state", newer) in observer.messages(dict(latest_seq=9, samples=[dict(sample, seq=9, scene_state=newer)]),
                                                        now=12.6)                                    # a new revision: at once
+    older = dict(scene, revision=4)
+    assert [t for t, _ in observer.messages(dict(latest_seq=10, samples=[dict(sample, seq=10, scene_state=older)]), now=20.0)
+            if t == "scene_state"] == []                                                            # never backwards
     print("scene_observer self-check: PASS (latest sample, per-topic periods, no inhand_pose reported -> none sent, cursor, "
           "scene_state on a new revision or every 2 s, constraint_force)")
 

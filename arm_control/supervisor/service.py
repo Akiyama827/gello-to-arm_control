@@ -264,10 +264,15 @@ def main(argv=None, *, stream_admission=None) -> None:
             if link.scene_world is None:
                 raise SystemExit("--cohost needs a --config that hosts a scene world")
             co_cfg = load_robot_config(path)
-            co = RobotRuntime(co_cfg, link=SimLink.from_config(co_cfg, cohost_of=link.scene_world))
+            co_link = SimLink.from_config(co_cfg, cohost_of=link.scene_world)
+            co = RobotRuntime(co_cfg, link=co_link)
             if not co.instance_id:
                 raise SystemExit(f"{path}: config has no rt.instance_id")
-            co.start()
+            try:
+                co.start()
+            except BaseException:
+                co_link.close()  # before the host closes the world under it (finally below)
+                raise
             served.append((co, Service(co, sock)))
             threads.append(threading.Thread(target=served[-1][1].serve, args=(stop,), name=f"service-{co.instance_id}",
                                              daemon=True))

@@ -407,7 +407,8 @@ class SimLink:
                 finger = self._hand.on_sample(backend.gripper_positions(), backend.gripper_efforts(), now)
                 if finger is not None:
                     backend.apply_gripper_command(finger[0], force_n=float(finger[1]))
-        self._publish(now, motor=motor, command=command, snapshot=snapshot)
+        # stamped AFTER the step: a step that waited out a paused world must not publish a sample dated before the pause
+        self._publish(time.monotonic(), motor=motor, command=command, snapshot=snapshot)
         if self.observing:
             self._observe()
 
