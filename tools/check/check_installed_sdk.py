@@ -26,19 +26,22 @@ def main() -> None:
     ap.add_argument("--server", required=True, help="the fake arm_rt_server binary")
     args = ap.parse_args()
     server = str(Path(args.server).resolve())
+    # Every step runs without this checkout on its path: an inherited PYTHONPATH (the suite sets one) would let pip see an
+    # in-tree egg-info as "already installed" and skip the wheel.
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "ARM_CONTROL_ROOT")}
     with tempfile.TemporaryDirectory(prefix="installed_sdk_") as tmp:
         tmp = Path(tmp)
         # Build from a copy: setuptools writes build/ and *.egg-info next to the sources.
         src = tmp / "src"
         shutil.copytree(ROOT / "arm_control", src / "arm_control", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copy2(ROOT / "pyproject.toml", src / "pyproject.toml")
-        subprocess.run([sys.executable, "-m", "pip", "wheel", "--quiet", "--no-deps", "--no-build-isolation",
-                        "--wheel-dir", str(tmp / "dist"), str(src)], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "wheel", "--quiet", "--no-deps", "--no-build-isolation", "--no-index",
+                        "--disable-pip-version-check", "--wheel-dir", str(tmp / "dist"), str(src)], check=True, env=env, cwd=tmp)
         wheel = next((tmp / "dist").glob("arm_control-*.whl"))
-        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", str(tmp / "venv")], check=True)
+        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", str(tmp / "venv")], check=True, env=env, cwd=tmp)
         py = str(tmp / "venv" / "bin" / "python")
-        subprocess.run([py, "-m", "pip", "install", "--quiet", "--no-deps", "--no-index", str(wheel)], check=True)
-        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "ARM_CONTROL_ROOT")}
+        subprocess.run([py, "-m", "pip", "install", "--quiet", "--no-deps", "--no-index", "--force-reinstall",
+                        "--disable-pip-version-check", str(wheel)], check=True, env=env, cwd=tmp)
         where = subprocess.run([py, "-c", "import arm_control; print(arm_control.__file__)"], cwd=tmp, env=env,
                                check=True, capture_output=True, text=True).stdout.strip()
         assert str(tmp / "venv") in where and str(ROOT) not in where, f"arm_control came from {where}"
