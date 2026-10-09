@@ -30,6 +30,8 @@ def controller_diagnostic(link, c, packet, received, health, reference_time=None
         q_cmd_pc=None if command is None else command.q_des.tolist(),
         dq_cmd_pc=None if command is None else command.qd_des.tolist(),
         tau_ff_pc=None if command is None else command.tau_ff.tolist(),
+        # the law the PC's last word asked for: joint, cartesian_impedance (its spec rode with the word) or pose_hold
+        law_pc=getattr(c, "last_law", None),
         integral_bias_pc=c.integral.bias.tolist(),
         raw_pc=(None if command is None else
                 (command.kp * (command.q_des - c.last_state.position)

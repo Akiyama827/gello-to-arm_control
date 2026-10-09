@@ -14,7 +14,8 @@ Differences from the in-process node (stated, not hidden):
     ``stop`` cancels and DISARMs;
   * ``motor_state`` reports the supervisor's measured joints and its selected reference; gains and measured torque are zeros where the
     supervisor does not publish them;
-  * a plan the supervisor cannot carry (Cartesian impedance) is refused through ``plan_staged`` with the reason.
+  * a plan the supervisor refuses (e.g. a Cartesian-impedance leg on a plant without the law, or on the native reference path)
+    is refused through ``plan_staged`` with the supervisor's reason.
 """
 from __future__ import annotations
 

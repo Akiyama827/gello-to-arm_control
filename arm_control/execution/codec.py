@@ -13,7 +13,7 @@ from enum import Enum
 import numpy as np
 
 from arm_control.execution.contract import (
-    Authority, Capabilities, Clock, Completion, ExecutionStatus, Fault, JointGains,
+    Authority, Capabilities, CartesianImpedance, Clock, Completion, ExecutionStatus, Fault, JointGains,
     Lifecycle, Phase, Receipt, RobotIdentity, RobotState, Stamp, Start,
     TrajectoryRequest, Validity,
 )
@@ -70,7 +70,9 @@ def request_from(d) -> TrajectoryRequest:
         d["request_id"], d["instance_id"], tuple(d["joint_names"]),
         JointTrajectory(t["times"], t["positions"], t["velocities"]),
         d["profile"], gains, d["model_token"], Start(d["start"]),
-        stamp_from(d["admit_by"]), completion, d["supersedes"])
+        stamp_from(d["admit_by"]), completion, d["supersedes"],
+        # absent from a pre-Cartesian client: such a request names the joint profile, which the field must match
+        None if d.get("cartesian") is None else CartesianImpedance(**d["cartesian"]))
 
 
 def status_from(d) -> ExecutionStatus:
@@ -144,6 +146,20 @@ def _self_check() -> None:
             back.supersedes) == ([3, 4], 0.003, at, Start.ON_RELEASE, "e0")
     s2 = state_from(wire(state))
     assert s2.q.tolist() == [1, 2] and s2.dq.tolist() == [0, 0] and s2.tau is None
+    law = CartesianImpedance(np.eye(3), [1000, 200, 200, 20, 5, 5], [130, 40, 40, 1, .5, .5])
+    cart = request_from(wire(dataclasses.replace(req, profile="cartesian_impedance", cartesian=law)))
+    assert cart.profile == "cartesian_impedance" and np.array_equal(cart.cartesian.kc, law.kc)
+    assert request_from(wire(req)).cartesian is None
+    old = wire(req)
+    del old["cartesian"]  # a client from before the field: still a joint request
+    assert request_from(old).cartesian is None
+    over = wire(dataclasses.replace(req, profile="cartesian_impedance", cartesian=law))
+    over["cartesian"]["kc"][0] = 2000.
+    try:
+        request_from(over)
+        raise AssertionError("an out-of-envelope Cartesian request decoded")
+    except ValueError:
+        pass
     bad = wire(req)
     bad["trajectory"]["times"] = [0.0, float("nan")]
     try:
@@ -152,7 +168,7 @@ def _self_check() -> None:
     except ValueError:
         pass
     print("execution codec self-check: PASS (identity, capabilities, state, authority, "
-          "request, status, receipt round-trip through JSON; decoding validates)")
+          "request (incl. Cartesian), status, receipt round-trip through JSON; decoding validates)")
 
 
 if __name__ == "__main__":

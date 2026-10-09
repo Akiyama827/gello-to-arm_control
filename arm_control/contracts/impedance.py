@@ -52,8 +52,11 @@ def cartesian_values(spec: dict) -> list[float]:
         raise ValueError(f"cartesian requires exactly {sorted(keys)}")
     if spec["frame"] != "base":
         raise ValueError("the cartesian tail is in the robot BASE frame (convert world-frame specs before sending)")
-    rows = [list(map(float, row)) for row in spec["task_R"]]
-    kc, dc = [float(x) for x in spec["kc"]], [float(x) for x in spec["dc"]]
+    try:
+        rows = [list(map(float, row)) for row in spec["task_R"]]
+        kc, dc = [float(x) for x in spec["kc"]], [float(x) for x in spec["dc"]]
+    except TypeError as exc:  # a flat or scalar matrix, a scalar gain vector
+        raise ValueError(f"cartesian requires a 3x3 task_R and six-axis kc/dc ({exc})") from exc
     if len(rows) != 3 or any(len(row) != 3 for row in rows) or len(kc) != 6 or len(dc) != 6:
         raise ValueError("cartesian requires a 3x3 task_R and six-axis kc/dc")
     flat = [v for row in rows for v in row]
@@ -90,7 +93,8 @@ if __name__ == "__main__":
         except ValueError:
             continue
         raise AssertionError(f"accepted a bad value at {index}")
-    for wrong in (dict(good, frame="world"), {k: v for k, v in good.items() if k != "dc"}, dict(good, extra=1)):
+    for wrong in (dict(good, frame="world"), {k: v for k, v in good.items() if k != "dc"}, dict(good, extra=1),
+                  dict(good, task_R=[1, 0, 0, 0, 1, 0, 0, 0, 1]), dict(good, kc=5.0)):
         try:
             cartesian_values(wrong)
         except ValueError:

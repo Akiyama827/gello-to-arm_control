@@ -4,9 +4,9 @@ The dual-arm migration (CTRL-053 step 2): the same pair coordinator that drives 
 supervisors, one per arm, through the SDK. ``SdkArmHandle`` is the seam:
 
 * ``stage(ArmPlan)`` converts the plan body into a gated ``TrajectoryRequest`` (``Start.ON_RELEASE``) and submits it;
-  the admission result becomes the ``plan_staged`` event. Plan fields the SDK request cannot carry (``cartesian``, the
-  Cartesian-impedance law) REFUSE the plan with a reason, never silently dropped; ``cartesian_poses`` (visualisation
-  FK) is dropped and recorded in ``dropped``.
+  the admission result becomes the ``plan_staged`` event. A plan's ``cartesian`` spec (robot BASE frame) becomes the
+  ``cartesian_impedance`` profile, which the supervisor admits only when its plant runs the law on a streamed leg;
+  ``cartesian_poses`` (visualisation FK) is dropped and recorded in ``dropped``.
 * ``execute(plan_id)`` releases it; ``cancel`` cancels the execution and answers with ``plan_cleared`` only when the
   supervisor confirmed it; a terminal execution becomes the ``leg_result`` event; a robot fault becomes ``fault``.
 * ``state()`` is built from measured SDK state only (unknown stays ``None``, never zero). ``model_token`` is the
@@ -30,7 +30,10 @@ import time
 
 import numpy as np
 
-from arm_control.execution.contract import Completion, JointGains, Lifecycle, Phase, Start, TrajectoryRequest, Validity
+from arm_control.contracts.impedance import cartesian_values
+from arm_control.execution.contract import (
+    CartesianImpedance, Completion, JointGains, Lifecycle, Phase, Start, TrajectoryRequest, Validity,
+)
 from arm_control.motion import JointTrajectory
 from arm_control.multi_arm.types import ArmControlState
 from arm_control.sdk import Refused, SupervisorError
@@ -55,8 +58,13 @@ def plan_request(body: dict, instance_id: str, joint_names, *, start=Start.ON_RE
     unknown = set(body) - _PLAN_KEYS
     if unknown:
         raise ValueError(f'plan carries fields this handle does not understand: {sorted(unknown)}')
-    if body.get('cartesian') is not None:
-        raise ValueError('Cartesian-impedance plans are not supported through the supervisor SDK')
+    law = body.get('cartesian')
+    if law is not None:
+        if not isinstance(law, dict):
+            raise ValueError('a plan\'s cartesian spec is a mapping {frame: base, task_R, kc, dc}')
+        # exactly the RT tail's keys (an extra world-frame pose is refused, not dropped); frame must be base
+        cartesian_values({k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in law.items()})
+        law = CartesianImpedance(law['task_R'], law['kc'], law['dc'])
     if body.get('gated') is not True:
         raise ValueError('a pair member plan must be gated')
     spec = body.get('completion')
@@ -69,7 +77,7 @@ def plan_request(body: dict, instance_id: str, joint_names, *, start=Start.ON_RE
         str(body['plan_id']), instance_id, tuple(joint_names),
         JointTrajectory(body['times'], body['positions'], body['velocities']),
         gains=JointGains(kp, kd), model_token=body.get('model_token'), start=start,
-        completion=completion)
+        completion=completion, profile='joint_impedance' if law is None else 'cartesian_impedance', cartesian=law)
     return request, (['cartesian_poses'] if body.get('cartesian_poses') is not None else [])
 
 
