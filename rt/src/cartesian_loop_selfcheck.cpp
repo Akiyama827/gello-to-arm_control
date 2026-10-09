@@ -2,6 +2,7 @@
 // sensing writes exactly servo_torque of the commanded joint word whose tau_ff carries cartesian_impedance at the target
 // FK(q_des); when the backend cannot evaluate FK(q_des) the loop latches FAULT_PLANT and holds. (Decode, capability and
 // envelope are protocol_selfcheck's; the controller's arithmetic is controller_selfcheck's.)
+#include <vector>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -112,7 +113,7 @@ class CartesianBackend final : public Backend {
 }  // namespace
 
 uint64_t mono_ns() { return 10'000'000'000ull + uint64_t(tick) * 1'000'000; }
-std::unique_ptr<Backend> make_fake_backend(int) { return std::make_unique<CartesianBackend>(); }
+std::unique_ptr<Backend> make_fake_backend(int, const std::vector<double>&) { return std::make_unique<CartesianBackend>(); }
 std::unique_ptr<Backend> make_franka_backend(const std::string&, double, const double[3]) { std::abort(); }
 std::unique_ptr<Backend> make_dm_backend(const std::string&, uint32_t, double) { std::abort(); }
 }  // namespace arm_rt

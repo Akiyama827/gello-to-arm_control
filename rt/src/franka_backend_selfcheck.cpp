@@ -1,6 +1,7 @@
 // FR3 backend + the real RT loop against a SCRIPTED franka:: surface: no
 // libfranka, no network, no robot. Every device call consults a hook that may
 // throw, so libfranka and non-libfranka (Poco-like) failures are injectable.
+#include <vector>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -105,7 +106,7 @@ struct Robot {
 #include "server.hpp"
 
 namespace arm_rt {  // mono_ns, state_tx_thread, finish_fault_journal: udp_link.cpp
-std::unique_ptr<Backend> make_fake_backend(int) { std::abort(); }
+std::unique_ptr<Backend> make_fake_backend(int, const std::vector<double>&) { std::abort(); }
 std::unique_ptr<Backend> make_dm_backend(const std::string&, uint32_t, double) {
   std::abort();
 }

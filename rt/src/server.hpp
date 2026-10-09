@@ -75,6 +75,7 @@ struct ServerConfig {
   // interface name has no motors and is refused by make_dm_backend.
   std::string can_if = "can0";
   int n = 7;                // joints (fake); franka fixes 7 itself
+  std::vector<double> fake_q0;  // the fake plant's start pose (rad); empty = zeros
   uint16_t udp_port = 47800;
   uint16_t tcp_port = 47801;
   double state_hz = 250.0;

@@ -1,24 +1,20 @@
 """Send skew and timeout checks. These do not measure physical motion timing."""
 
-from contextlib import nullcontext
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
-from check_bimanual_contract import Harness, measured
-from check_execution_policy import setup, commands
-from arm_control.multi_arm.synchronization import SharedReferenceClock, StartRecord
+from check_bimanual_contract import Harness
+from arm_control.multi_arm.synchronization import StartRecord
 from arm_control.multi_arm.types import PairLifecycle
 from arm_control.multi_arm.feedback import FeedbackGap, align_feedback
-from arm_control.multi_arm.hardware import RemoteHardware
+from arm_control.multi_arm import supervised_hardware
+from arm_control.multi_arm.supervised_hardware import SupervisedHardware
 from arm_control.plants.remote_rt.protocol import State, FLAG_ARMED, FLAG_FAULTED
 
 
 def main():
-    check_reference_phase()
-    check_reference_safety()
     check_feedback_alignment()
     check_idle_feedback_wait()
     h = Harness()
@@ -43,84 +39,6 @@ def main():
     h.coord.cancel_pair()
     h.coord.pump()
     print("bimanual timing: PASS (distinct send stamps; no physical-start claim)")
-
-
-def check_reference_phase():
-    """Reproduce sequential release/tick skew, then remove it on a moving path."""
-    errors = []
-    for shared in (False, True):
-        reference = SharedReferenceClock(lambda: h.t)
-        h = Harness(controller_kwargs=dict(
-            state_period_s=None, reference_clock=reference if shared else None,
-        ))
-        if shared:
-            h.coord._release_context = reference.batch
-        h.coord.stage_pair(h.pair(distance=.1))
-        h.coord.pump()
-        right = h.handles["other_arm"]
-        execute = right.execute
-
-        def delayed(plan_id):
-            h.t += .02
-            execute(plan_id)
-
-        right.execute = delayed
-        h.coord.execute_pair("pair")
-        assert h.coord.lifecycle is PairLifecycle.EXECUTING
-        assert abs(h.coord.pair_state().release_skew_sec - .02) < 1e-10
-        starts = [c.reference.t_start for c in h.controllers.values()]
-        assert (abs(starts[0] - starts[1]) < 1e-12) == shared
-        # Make the fake executor command the sampled cubic so assertions cover
-        # commands produced by ArmController, not just clock accessor values.
-        for c in h.controllers.values():
-            executor = c.executor
-            original = executor.step
-
-            def sample(point, state, original=original, *, integral_bias=0.0):
-                command = original(point, state, integral_bias=integral_bias)
-                return replace(command, q_des=point.position, qd_des=point.velocity)
-
-            executor.step = sample
-        h.t += .4
-        with reference.batch() if shared else nullcontext():
-            for c in h.controllers.values():
-                c.on_motor_state(measured(c.n_arm))
-                h.t += .01  # deliberate computation delay between arm ticks
-        sent = [c.last_command.q_des[0] for c in h.controllers.values()]
-        error = abs(sent[0] - sent[1])
-        errors.append(error)
-        if shared:
-            np.testing.assert_allclose(sent[0], sent[1], atol=1e-12)
-        else:
-            assert error > .001
-    print(f"Delayed release/tick reference mismatch: {errors[0]:.6f} -> {errors[1]:.6f} rad: PASS")
-
-
-def check_reference_safety():
-    reference = SharedReferenceClock(lambda: wall[0])
-    c, wall = setup(reference_clock=reference, health=False)
-    with reference.batch() as t:
-        wall[0] += .3
-        assert c.exec_time == t
-        c.tick()
-        assert c._observation_paused and not commands(c)
-        with reference.batch():
-            assert reference() == t
-    assert reference() == wall[0]
-    try:
-        with reference.batch():
-            wall[0] += .1
-            raise RuntimeError("batch aborted")
-    except RuntimeError:
-        pass
-    assert reference() == wall[0], "failed batch left reference time frozen"
-    try:
-        setup(reference_clock=reference, state_period_s=.01)
-    except ValueError as exc:
-        assert "cannot be combined" in str(exc)
-    else:
-        raise AssertionError("ambiguous plant/reference clock accepted")
-    print("Shared reference clock retains wall-time freshness and resets on failure: PASS")
 
 
 def check_feedback_alignment():
@@ -237,13 +155,17 @@ def check_feedback_alignment():
 
 
 def check_idle_feedback_wait():
-    """An idle hold may wait; invalid data, moving and prolonged gaps must fail."""
-    runtime = RemoteHardware.__new__(RemoteHardware)
+    """An idle hold may wait; invalid data, moving and prolonged gaps must fail (SupervisedHardware, the pair's runtime)."""
+    runtime = SupervisedHardware.__new__(SupervisedHardware)
     runtime.mode = "shared"
-    runtime.controllers = {a: setup()[0] for a in "ab"}
     runtime._holding_since = runtime._aligned_at = None
     runtime._closure_positions = runtime._feedback_alignment = None
-    runtime.links = {a: SimpleNamespace(
+    runtime.clients = {a: None for a in "ab"}
+    held = dict(armed=True, ready=True, executing=False, stopped=False, frozen=False, mode_law="joint",
+                velocity=np.zeros(7))
+    states = {a: dict(held) for a in "ab"}
+    runtime.handles = {a: SimpleNamespace(state=lambda a=a: SimpleNamespace(**states[a])) for a in "ab"}
+    links = {a: SimpleNamespace(
         config=SimpleNamespace(host="same-host"),
         motor_health=lambda: dict(session_id="7", arm_epoch=0),
         motor_state=lambda *, state: dict(position=state.q, velocity=state.dq),
@@ -257,21 +179,21 @@ def check_idle_feedback_wait():
     gap = {"a": [sample(1), sample(25)], "b": [sample(5), sample(15)]}
     assert not runtime._update_holding(19.74)
     assert runtime._update_holding(20.)
-    with patch("arm_control.multi_arm.hardware.time", SimpleNamespace(monotonic=lambda: 20.)):
-        runtime._align_feedback(good)
-    held = runtime._closure_positions
 
     def apply(raw, now, allowed, expected_error=None):
-        with patch("arm_control.multi_arm.hardware.time", SimpleNamespace(monotonic=lambda: now)):
+        with patch.object(supervised_hardware, "time", SimpleNamespace(monotonic=lambda: now)), patch.object(
+                supervised_hardware, "align_arms", lambda clients: align_feedback(links, raw, now=now)):
             try:
-                runtime._align_feedback(raw, allow_wait=allowed)
+                runtime._align_feedback(allow_wait=allowed)
             except ValueError as exc:
                 assert expected_error and expected_error in str(exc), exc
             else:
                 assert expected_error is None, "unsafe feedback wait was accepted"
 
+    apply(good, 20., False)
+    held_positions = runtime._closure_positions
     apply(gap, 20.01, True)
-    assert not runtime.feedback_ready and runtime._closure_positions is held
+    assert not runtime.feedback_ready and runtime._closure_positions is held_positions
     assert runtime._aligned_at == 20., "a gap must not reset its own deadline"
     apply(gap, 20.04, True)
     apply(gap, 20.051, True, "stale")
@@ -281,24 +203,18 @@ def check_idle_feedback_wait():
     apply(good, 20.02, True)
     assert runtime.feedback_ready
     apply(good, 20.04, True)
-    assert runtime._aligned_at == 20.
+    assert runtime._aligned_at == 20., "re-aligning unchanged packets renewed the recovery budget"
     apply(fresh_gap, 20.051, True, "interpolation gap")
-    for flag, bad in (("_running", True), ("frozen", True), ("stopped", True),
-                      ("bridge_armed", False), ("_health_ok", False), ("_pose_hold", {})):
-        c = runtime.controllers["a"]
-        saved = getattr(c, flag)
-        setattr(c, flag, bad)
+    for flag, bad in (("executing", True), ("frozen", True), ("stopped", True), ("armed", False), ("ready", False),
+                      ("mode_law", "cartesian"), ("velocity", np.full(7, .011))):
+        saved = states["a"][flag]
+        states["a"][flag] = bad
         allowed = runtime._update_holding(20.03)
         assert not allowed, flag
         apply(gap, 20.03, allowed, "interpolation gap")
-        setattr(c, flag, saved)
+        states["a"][flag] = saved
         assert not runtime._update_holding(20.03)
         assert runtime._update_holding(20.30)
-    c._jog.set(np.zeros(7), 10.)
-    assert not runtime._update_holding(20.03)
-    c._jog.clear()
-    c.last_state.velocity[0] = .011
-    assert not runtime._update_holding(20.03)
     good["a"][-1][0].dq[0] = np.nan
     apply(good, 20.03, True, "invalid joints")
     good["a"][-1][0].dq[0] = 0.

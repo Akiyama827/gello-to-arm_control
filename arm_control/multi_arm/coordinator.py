@@ -1,7 +1,8 @@
 """Two-controller staging barrier with fresh-state admission and observed cancels.
 
-The coordinator never produces motor commands. Release timestamps describe send
-ordering, not measured physical start times. Every member retains its controller.
+The coordinator never produces motor commands. Release timestamps describe when
+each member's release was requested (a ``release_context`` may send them together
+afterwards), not measured physical start times. Every member retains its controller.
 """
 
 from __future__ import annotations
@@ -114,8 +115,8 @@ class BimanualCoordinator:
         self.staging_timeout_s = float(staging_timeout_s)
         self.state_timeout_s = float(state_timeout_s)
         self.admission = admission
-        # In-process controllers can share a reference epoch. Transport-backed
-        # handles retain their existing barrier semantics without this hook.
+        # The pair runtime's hook: SupervisedHardware.release_context collects both
+        # releases and sends them with one start stamp. Without it, a PC barrier.
         self._release_context = release_context or nullcontext
         self._run: _PairRun | None = None
         self._last: dict[str, PairState] = {}
@@ -234,7 +235,7 @@ class BimanualCoordinator:
                 for a, p in run.plan.members().items():
                     self.arms[a].execute(p.plan_id)
                     run.releases[a] = self._clock()
-                    # In-process refusals must stop the release of the partner.
+                    # A refusal seen here stops the release of the partner.
                     self._poll(a)
                     if run.lifecycle is not PairLifecycle.EXECUTING:
                         break

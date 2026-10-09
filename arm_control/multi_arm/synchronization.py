@@ -14,10 +14,6 @@ claims nothing more:
   atomic, and no ordinary Python test may claim real-time simultaneity --
   the record is evidence of ordering, not of a timing guarantee.
 
-In-process hardware pairs additionally use SharedReferenceClock for a common
-trajectory epoch and per-tick sample time. This removes PC reference phase skew;
-the actual release/send timestamps above remain unfrozen and observable.
-
 SCHEDULED START (future, designed for but not implemented here): the record
 carries ``requested_start_ns``. A future controller contract accepts a
 common monotonic deadline (``execute_at_mono_ns``), each controller waits
@@ -30,36 +26,7 @@ or that it is filled, which is what keeps the extension compatible.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
-import time
-
-
-class SharedReferenceClock:
-    """One reference time for an in-process release or command batch.
-
-    Batching removes software phase skew between local controllers. It does not
-    synchronize transport delivery or robot cycles. Safety/freshness checks must
-    keep using the unfrozen monotonic clock. Nested batches retain the outer
-    sample; other threads keep their own context.
-    """
-
-    def __init__(self, clock=None):
-        self._clock = clock or time.monotonic
-        self._sample = ContextVar("pair_reference_time", default=None)
-
-    def __call__(self):
-        sampled = self._sample.get()
-        return self._clock() if sampled is None else sampled
-
-    @contextmanager
-    def batch(self):
-        token = self._sample.set(self())
-        try:
-            yield self()
-        finally:
-            self._sample.reset(token)
 
 
 def _spread(times: Mapping[str, float]) -> float | None:

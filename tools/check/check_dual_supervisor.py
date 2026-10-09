@@ -60,7 +60,8 @@ def _tail(proc, lines=40):
 KEY_LINES = ('expired', 'sender gap', 'reference diagnostics', 'fault', 'FAULT')
 
 
-def start_arm(server, tmp: Path, name: str, extra_args=()):
+def start_arm(server, tmp: Path, name: str, extra_args=(), *, native=True):
+    """``native=False``: the supervisor keeps the streamed path (as every deployment instance does today)."""
     udp, tcp = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
     rt = subprocess.Popen([server, '--backend', 'fake', '--n', '3', '--instance-id', name, '--joint-names',
                            ','.join(JOINTS), '--udp-port', str(udp), '--tcp-port', str(tcp), '--hold-ms', '100',
@@ -75,7 +76,8 @@ def start_arm(server, tmp: Path, name: str, extra_args=()):
     workdir = tmp / name
     workdir.mkdir()
     cfg = write_config(workdir, udp, tcp)
-    cfg.write_text(cfg.read_text().replace('sdk_arm', name))
+    cfg.write_text(cfg.read_text().replace('sdk_arm', name).replace('native_reference: true',
+                                                                   f'native_reference: {str(native).lower()}'))
     gravity = dict(instance_id=name, revision=1, vector=[0., 0., -9.81], units='m/s^2', frame='base',
                    source=dict(type='nominal_assumption', evidence='analytical fixture'),
                    reviewed_against=dict(bundle_id='fixture', revision=1, installation_epoch='fixture',

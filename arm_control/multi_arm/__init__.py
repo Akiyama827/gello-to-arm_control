@@ -13,7 +13,9 @@ those endpoints:
 - ``adapter``        the Dora transport seam
 - ``planning``       shared-world joint planning and common retiming
 - ``cooperative``    fixed-grasp object kinematics and checked object-path planning
-- ``simulation``     one MuJoCo plant driven by two stock controllers
+- ``supervised``     an ArmHandle over one arm's supervisor (the SDK)
+- ``supervised_hardware`` the dual console's runtime: two supervisors, virtual shared object
+- ``world``/``launch`` the simulated pair's world and its supervisors (one hosts, one co-hosts)
 - ``config``         composition from existing arm profiles and scene descriptions
 
 The coordinator owns the pair lifecycle. Reusable fixed-grasp math lives beside

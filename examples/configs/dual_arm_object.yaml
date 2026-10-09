@@ -12,6 +12,7 @@ shared_object:
   name: payload
   path: ../assets/shared_plate.xml
   body: plate
+  virtual: true   # empty Hands, the plate inferred from both TCPs (as on the bench)
   pose: {pos: [0.45, 0, 0.4], rpy: [0, 0, 0]}
   grasps:
     left:

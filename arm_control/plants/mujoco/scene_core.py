@@ -365,6 +365,11 @@ class ScenePlant:
             raise ValueError(f"sim_actor {actor!r} joints {world_joints} are not the arm config's {list(joints)} in order")
         self.actor, self.backend, self._slices = actor, backend, dict(slices)
         self._span = slice(start, start + width)
+        # This actor's fingers in a world that may hold several Hands: the world's finger joints under the actor's own joint
+        # prefix (``franka_fr3_2__``; '' for an unprefixed world, every finger). The Hand served for this actor drives these.
+        prefix = world_joints[0][: len(world_joints[0]) - len(joints[0])] if joints else ""
+        self.finger_indices = [i for i, name in enumerate(getattr(backend, "_gripper_names", None) or [])
+                               if name.startswith(prefix)]
         self.shared, self.host = shared, bool(host)
         self._core = shared.core
         self._driven = False  # a co-host: its supervisor has written a non-release command

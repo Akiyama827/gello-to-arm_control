@@ -92,9 +92,9 @@ confused with RT's zero-feedforward transport/underflow hold. Ordinary completio
 keeps the planned endpoint throughout. No automatic hold admission heals UNDERFLOW.
 
 v5 streaming remains for old/non-negotiated peers and unbound configurations.
-Dora, RemoteHardware and SharedSimulation retain their existing construction and
-execution paths; application/group migration is CTRL-040/052/053. They do not run
-a second sampler for a negotiated supervisor execution. Native software checks
+The dual console's pair runs each arm's supervisor on its streamed path; an RT-side
+group start for it is CTRL-040. Nothing runs a second sampler for a negotiated
+supervisor execution. Native software checks
 are not matched deployment or physical/RT timing qualification (CTRL-060/013).
 Neutral values live in `motion/types.py`; retiming algorithms remain under
 `planning/retiming.py`. Execution does not depend on a planning-owned value type.
@@ -116,7 +116,8 @@ the same staging, release, cancellation and per-arm control operations.
 | `contracts/multi_arm.py`, `multi_arm/adapter.py` | Arrow envelope and Dora transport; `nodes/multi_arm_coordinator.py` is only an entry point |
 | `multi_arm/planning.py` | Combined joint-space search with both moving geometries and one retimed trajectory, split back into arm-keyed plans |
 | `multi_arm/cooperative.py` | Fixed object-to-TCP transforms, continuation IK along one object path, grasp/path checks on the retimed Hermite curve |
-| `multi_arm/simulation.py` | Two stock controllers driving one MuJoCo world on one simulation clock |
+| `multi_arm/supervised.py`, `multi_arm/supervised_hardware.py` | An `ArmHandle` over one arm's supervisor (SDK); the dual console's runtime over two of them, virtual coupling from common-time feedback (`supervised_feedback.align_arms`) |
+| `multi_arm/world.py`, `multi_arm/launch.py` | The simulated pair's world (one supervisor hosts it, the other co-hosts); staging and starting a pair's supervisors (`start_pair`, `running_pair`) for sim or RT |
 | `multi_arm/config.py`, `ui/dual_arm_console.py` | Compose existing profiles/scenery; run the generic console with planning in a child process |
 
 Pair release requires explicit positive staging ACKs from both controllers,
@@ -161,56 +162,47 @@ Joint endpoints remain exact; collision/grasp checks are sampled, not continuous
 certification, and jerk is not bounded. Native failure never admits an unchecked
 seed. The simulation/real controller code does not import an optimizer.
 
-`SceneSpec.welds` and exact body-pair `contact_exclusions` describe simulated
-rigid grasps once for both physics and planning. The object starts as an
-externally supported real-mass free body; grasp constraints are inactive.
-`scene_for_mode` selects the same relations for planning. The console plans a
-free-arm approach from measured joints, checks pose/Hand agreement and stopped
-feedback, and requires explicit grasp confirmation before transferring support.
-Mode changes preserve the existing plant and controllers, mutate constraints
-and payload accounting, and invalidate preview/staging identities. Returning
-to independent control requires support confirmation and anchors the object
-at its current pose. Active shared control assigns half the payload mass at its
-center of mass declared to each existing executor. This is equal static load
-sharing, with world gravity expressed in each arm's base frame; it does not
-regulate internal grasp force.
-Shared-mode physics pauses while either controller is disarmed. Measured TCP-to-object
-error above 3 mm / 2° faults the simulated console and disarms both controllers.
-The console locks individual arm targets and Hands in this mode and binds
-admission to the measured object pose as well as the ordinary pair guards.
-Grasp declaration, real attachment sensing and task sequencing remain consumer
-policy. This console's explicit confirmation applies to simulated fixed grasps.
+Shared-object coupling is virtual, in simulation as on hardware (operator 2026-10-09;
+`shared_object.virtual: true` is required): the plate is in the console's planning
+and display world only, never in the physics, and no weld is composed.
+`scene_for_mode` returns the same scene for both modes.
 
-The console selects either `SharedSimulation` or `RemoteHardware` from its
-pair configuration. Both expose measured joints, Hands, controller handles and
-scene geometry through the same small runtime surface. The hardware adapter
-composes the existing session-bound `RtBackend`, `BridgeClient` and stock
-controllers; MuJoCo supplies collision geometry only. Hardware uses each
-profile's real-mode gains and execution policy. Construction prepares models
-without opening transports; the console calls `connect()` after loading its
-visuals and exporting meshes. Native loading can block Python heartbeats past
-the RT session deadline. Admission then applies measured arm/Hand positions to
-the collision world before the UI starts. Authority RPCs stay off the
-100 Hz loop, superseded ARM requests are cancelled, and fault/shutdown paths
-revoke authority without requiring another tick. No simulated joint feedback
-enters the hardware runtime.
+Every pair runs on two arm supervisors (CTRL-053); the console's runtime is
+`SupervisedHardware` in both cases. In simulation one supervisor hosts the pair's
+world (`multi_arm.world.build_pair_world`: both arms, gravity compensated, arm-arm
+contact on, each arm's two fingers) and the other co-hosts it; each serves its own
+sim Hand. On hardware there is one supervisor per arm over its RT server.
+`multi_arm.launch` stages and starts them; the console reaches them through
+`ARM_CONTROL_PAIR_SOCKETS`. The runtime exposes measured joints, Hands, arm handles
+and the collision world; it holds no controller and no RT link. Construction opens
+no claim; `connect()` claims both arms after the console loaded its visuals, then
+applies measured arm/Hand positions to the collision world before the UI starts.
+ARM/DISARM run off the console loop and fault/shutdown paths disarm without
+another tick. A Hand is unmeasured while it moves or while a stop is unconfirmed,
+so the console refuses actions until it settles (as the hand_bridge reports).
 
-Hardware independent/paired motion remains experimental; physical shared-object
-mode is refused. Explicitly virtual objects allow guided preparation and fixed
-TCP relationships with empty Hands: no weld, Hand command or payload is added.
+Hardware independent/paired motion remains experimental. Virtual objects allow
+guided preparation and fixed TCP relationships with empty Hands: no weld, Hand
+command or payload is added.
 Their pose follows the first time-aligned TCP; both inferred poses must agree within
 3 mm / 2° or both arms are disarmed. Entry requires stationary TCPs within
 10 mm / 2° of the nominal edge poses and a separate empty-Hand confirmation.
 After collision admission it captures both measured object-to-TCP transforms;
 no joint/object pose changes. These frames are fixed for the session, hashed
 into preview identity and passed to the planning worker. Exit restores nominal
-grasp frames for the next approach. Physical grasp confirmation cannot authorize
-virtual coupling. Local hardware controllers share a PC reference epoch and
-one sampled trajectory time per tick; both commands are computed before dispatch.
-Freshness checks keep the unfrozen wall clock. Actual PC releases remain
-sequential and observable; physical start skew is not measured. Scheduled RT
-start remains separate work. The historical independent-world graph is an
-isolation diagnostic.
+grasp frames for the next approach. Both members of a pair leg start at one
+PC-monotonic stamp (scheduled_release/1, `SupervisedHardware.release_context`):
+each supervisor's controller anchors its trajectory there, so the two references
+run on one phase. The two releases are sent in parallel and both must be accepted
+(neither refused nor late) before the stamp less `GROUP_MIN_LEAD_MS`; otherwise
+the accepted member is cancelled before it can move and the pair faults. A late
+acceptance can still let one arm start about one supervisor tick before its
+cancel lands. A residual of up to one controller tick (10 ms) remains because the
+supervisors tick independently.
+The stamp lies `GROUP_MIN_LEAD_MS`..`GROUP_BUDGET_S` ahead (the approved CTRL-040
+bounds); a supervisor refuses a stamp outside them or on another clock. A native
+reference (the RT plays it) refuses a scheduled release: an RT-side start is
+group/1. Physical start skew is not measured.
 
 The relative-pose monitor uses fresh packets bracketing a common publication
 timestamp on one RT host. It refuses extrapolation, invalid/reordered packets,
@@ -299,8 +291,7 @@ binds a registry declaration to the approved bundle/model, root frame and
 installation epoch with `bind_gravity`; a canonical digest extends the existing
 opaque model token. `build_executor` consumes that staged value through
 `execution_gravity` and the existing `PinocchioDynamics(gravity=...)`. Bound
-hardware refuses missing/stale facts. Neither RemoteHardware nor a supervisor
-rotates gravity through the fitted workcell mount. Simulation explicitly uses
+hardware refuses missing/stale facts. No supervisor rotates gravity through the fitted workcell mount. Simulation explicitly uses
 its own physics gravity/actor placement via `simulation_gravity`; unbound
 analytical examples retain the dynamics default. No generic module reads the
 project registry. Nominal installation assumptions are not measurements.
@@ -609,9 +600,8 @@ server.
   - Every controller call and ledger change happens on that loop while it
     holds one lock. Client threads only enqueue operations and read
     snapshots.
-  - ARM/DISARM round trips run on their own worker, with
-    `RemoteHardware`'s rules: a DISARM drops queued ARMs, and ARM is refused
-    while a DISARM is unconfirmed.
+  - ARM/DISARM round trips run on their own worker: a DISARM drops queued
+    ARMs, and ARM is refused while a DISARM is unconfirmed.
   - A stalled client (half-sent frame, GIL-bound thread, silence) does not
     delay a tick.
 - **Operations.** These names and arguments are the transport-neutral
@@ -620,6 +610,10 @@ server.
   - `claim`, `unclaim`, `arm`, `disarm`
   - `submit`, `release`, `cancel`, `status` (optionally a bounded wait),
     `receipts`
+  - `release` with `start_at` (scheduled_release/1, offered when the
+    supervisor's controller owns the trajectory clock, i.e. not native): the
+    planned leg starts at that stamp of the supervisor's own clock, 10 to
+    150 ms ahead; the reference holds its first point until then
 
   The transport today is newline-delimited JSON over a Unix socket in an
   owner-only directory, one connection per client session.
@@ -654,12 +648,10 @@ server.
   the next state packet, and past that bound the link is stale anyway.
 - **One controller recipe.** `control.factory.build_arm_controller` resolves
   gains, executor, execution policy, model token, pose provenance and
-  settling for the supervisor and `RemoteHardware` (the Dora `arm_controller`
-  node is retired, 2026-10-09); each passes only its node, clocks and health reporting.
-  The in-process controller seam (`control.inprocess.QueueControllerNode`)
-  sits under both the supervisor and `multi_arm`. The shared MuJoCo pair
-  (`multi_arm.simulation`) still builds its sim controllers directly: no
-  gains table, no deadline policy, simulation time.
+  settling for the supervisor (the Dora `arm_controller` node and the direct
+  dual runtime are retired, 2026-10-09); it passes only its node, clocks and
+  health reporting. The in-process controller seam
+  (`control.inprocess.QueueControllerNode`) sits under the supervisor.
 - **Install.**
   - The minimal SDK needs numpy only (`pip install .`).
   - The supervisor needs `.[supervisor]` (pyarrow for the controller's
@@ -677,10 +669,8 @@ server.
 Not in this slice:
 
 - `RobotGroup` and group reservation (CTRL-040)
-- `RemoteHardware`'s pair execution onto supervisors (the Dora `arm_controller`
-  node and the consoles are on the SDK since 2026-10-09) (after CTRL-040, which
-  gives the pair a scheduled group commit; until then the pair keeps its
-  shared PC reference clock in one process)
+- an RT-side group start for the dual console's pair (CTRL-040 group/1; the
+  console's pair starts at one scheduled PC stamp)
 - a client lease or heartbeat beyond connection liveness
 - clearing a completion-timeout freeze without DISARM: a FAULTED settle
   leaves the controller frozen, and later submits are refused until DISARM

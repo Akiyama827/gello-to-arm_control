@@ -288,8 +288,15 @@ class ArmClient:
         proceeds in the supervisor; follow it with ``status``/``wait``."""
         return _dec(codec.status_from, self._channel.call("submit", request=codec.encode(request)))
 
-    def release(self, execution_id: str) -> ExecutionStatus:
-        return _dec(codec.status_from, self._channel.call("release", execution_id=execution_id))
+    def release(self, execution_id: str, start_at: Stamp | None = None) -> ExecutionStatus:
+        """``start_at`` (scheduled_release/1, a stamp of this supervisor's ``now()`` clock): the trajectory starts then,
+        not on arrival; refused unless it is 10 to 150 ms ahead when the supervisor takes it."""
+        if start_at is None:
+            return _dec(codec.status_from, self._channel.call("release", execution_id=execution_id))
+        if self.extensions.get('scheduled_release') != 1:
+            raise Refused('the supervisor does not offer scheduled_release/1')
+        return _dec(codec.status_from, self._channel.call("release", execution_id=execution_id,
+                                                          start_at=codec.encode(start_at)))
 
     def status(self, execution_id: str) -> ExecutionStatus:
         return _dec(codec.status_from, self._channel.call("status", execution_id=execution_id))

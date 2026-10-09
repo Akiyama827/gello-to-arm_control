@@ -15,8 +15,8 @@ What it models of the RT server, and nothing more:
   configured hold gains before any), after ``fault_ms`` it latches ``FAULT_CMD_LOST`` and keeps holding until DISARM;
 * a DISARM releases the plant (zero-gain word), and so does a plant failure (``FAULT_PLANT``).
 
-What it does not: no native reference (v7) path, no group record, no pose-hold, no clock domain (a simulation has no RT host
-clock), and no RT-side torque clamp or slew beyond what the plant itself applies. Every servo parameter comes from the config's
+What it does not: no native reference (v7) path, no group record, no pose-hold (its clock domain is this PC's monotonic clock,
+not an RT host's), and no RT-side torque clamp or slew beyond what the plant itself applies. Every servo parameter comes from the config's
 ``sim_servo`` block with no defaults: ``state_hz``, ``hold_ms``, ``fault_ms``, ``hold_kp``, ``hold_kd``. A simulation
 that is not told them does not invent them.
 """
@@ -78,7 +78,10 @@ class SimLink:
         self._hold_kd = np.full(self.n, kd)
         self.backend_name = "sim"
         self.rt_setup = "sim"
-        self.clock_domain = None             # a simulation has no RT host clock to attest
+        # A simulation's state stamps are this PC's CLOCK_MONOTONIC (t_mono_ns at publish): its domain is this host's boot,
+        # the same for every simulated arm on it (two co-hosted arms align their feedback on it, state_history/1).
+        from arm_control.supervisor.runtime import monotonic_domain
+        self.clock_domain = tuple(monotonic_domain().split(":"))
         self.group_capable = False
         self.supports_pose_hold = False
         self.identity: rtp.Identity | None = None
@@ -161,6 +164,11 @@ class SimLink:
         return cls(RtConfig.from_config(cfg), joints, plant, servo=servo, observe=cfg.get("sim_observe"), hand=hand)
 
     @property
+    def _fingers(self):
+        """This link's Hand's fingers in its world (a scene actor's own); None: every finger (one model)."""
+        return getattr(self._plant, "finger_indices", None)
+
+    @property
     def _backend(self):
         """The MuJoCo backend under the plant (a scene's world, or the one model itself): the Hand's fingers live there."""
         return getattr(self._plant, "backend", self._plant)
@@ -189,7 +197,7 @@ class SimLink:
     def open(self) -> None:
         self._plant.load()
         if self._hand is not None:
-            if self._backend.gripper_positions().size != 2:
+            if self._backend.gripper_positions(self._fingers).size != 2:
                 raise ValueError("sim_hand needs a plant with the Hand's two finger joints")
             if self._hand._server is None:
                 self._hand.start()
@@ -404,9 +412,9 @@ class SimLink:
             backend = self._backend
             shared = getattr(self._plant, "shared", None)
             with shared.lock if shared is not None else nullcontext():  # a co-hosted actor reads the same world
-                finger = self._hand.on_sample(backend.gripper_positions(), backend.gripper_efforts(), now)
+                finger = self._hand.on_sample(backend.gripper_positions(self._fingers), backend.gripper_efforts(self._fingers), now)
                 if finger is not None:
-                    backend.apply_gripper_command(finger[0], force_n=float(finger[1]))
+                    backend.apply_gripper_command(finger[0], force_n=float(finger[1]), fingers=self._fingers)
         # stamped AFTER the step: a step that waited out a paused world must not publish a sample dated before the pause
         self._publish(time.monotonic(), motor=motor, command=command, snapshot=snapshot)
         if self.observing:

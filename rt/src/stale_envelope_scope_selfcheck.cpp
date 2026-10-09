@@ -1,5 +1,6 @@
 // Exercise the actual servo loop with a persistent UDP mailbox across ARM
 // epochs. No socket, device, or wall-clock timing is involved.
+#include <vector>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -175,7 +176,7 @@ class ScriptedBackend final : public Backend {
 }  // namespace
 
 uint64_t mono_ns() { return 10'000'000'000ull + uint64_t(tick) * 1'000'000 + skew_ns; }
-std::unique_ptr<Backend> make_fake_backend(int) {
+std::unique_ptr<Backend> make_fake_backend(int, const std::vector<double>&) {
   return std::make_unique<ScriptedBackend>();
 }
 std::unique_ptr<Backend> make_franka_backend(const std::string&, double,

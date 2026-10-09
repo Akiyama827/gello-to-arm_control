@@ -693,8 +693,11 @@ class ArmController:
                 self._plan["positions"][0], self.last_state.position)
         return ""
 
-    def _release(self, plan_id: str) -> None:
+    def _release(self, plan_id: str, start: float | None = None) -> None:
         """Start a named plan. Anchors t_start NOW, never at plan time.
+
+        ``start`` (on ``exec_time``'s clock) schedules the anchor instead: a pair's two supervisors anchor both members at
+        one stamp so their reference phases agree (the reference holds its first point until then).
 
         Review time must not be charged against the trajectory: anchoring at
         the planner's send made an arbitrarily long gate pause play out as
@@ -729,7 +732,7 @@ class ArmController:
                 self._pending_traj = None
                 return
         self._jog.clear()  # a released plan owns the arm: a jog set before it must not resume after the leg
-        start = self.exec_time
+        start = self.exec_time if start is None else start
         source = self._reference_source
         self._reference = TrajectoryReference(
             self._pending_traj, None if source else start, sample_source=source)

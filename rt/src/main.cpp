@@ -55,7 +55,7 @@ void guarded(const char* thread, arm_rt::ServerCtx& ctx, Fn fn) {
 void usage(const char* argv0) {
   std::printf(
       "usage: %s [--backend fake|franka|dm] [--instance-id ID] [--joint-names A,B,..]\n"
-      "          [--n N] [--udp-port P] [--tcp-port P]\n"
+      "          [--n N] [--fake-q0 Q1,Q2,..] [--udp-port P] [--tcp-port P]\n"
       "          [--state-hz HZ] [--hold-ms MS] [--fault-ms MS] [--slew NM]\n"
       "          [--hold-kp V] [--hold-kd V] [--franka-ip IP] [--can-if IF]\n"
       "          [--ee-mass KG] [--ee-com X,Y,Z] [--tau-max NM]\n"
@@ -134,6 +134,24 @@ int main(int argc, char** argv) {
       }
     }
     else if (!std::strcmp(argv[i], "--n")) cfg.n = std::atoi(next("--n"));
+    else if (!std::strcmp(argv[i], "--fake-q0")) {
+      // test double only: the fake plant's start pose, so a client whose envelope excludes zero can ARM it
+      std::string list = next("--fake-q0");
+      cfg.fake_q0.clear();
+      for (size_t start = 0; start <= list.size();) {
+        const size_t comma = list.find(',', start);
+        const std::string item = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        char* end = nullptr;
+        const double v = std::strtod(item.c_str(), &end);
+        if (item.empty() || *end || !std::isfinite(v)) {
+          std::fprintf(stderr, "--fake-q0 needs comma-separated radians (got %s)\n", list.c_str());
+          return 2;
+        }
+        cfg.fake_q0.push_back(v);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
+    }
     else if (!std::strcmp(argv[i], "--udp-port")) cfg.udp_port = parse_port("--udp-port", next("--udp-port"));
     else if (!std::strcmp(argv[i], "--tcp-port")) cfg.tcp_port = parse_port("--tcp-port", next("--tcp-port"));
     else if (!std::strcmp(argv[i], "--bind")) {
@@ -224,6 +242,10 @@ int main(int argc, char** argv) {
   }
   if (cfg.n < 1 || cfg.n > arm_rt::MAX_JOINTS) {
     std::fprintf(stderr, "--n must be 1..%d\n", arm_rt::MAX_JOINTS);
+    return 2;
+  }
+  if (!cfg.fake_q0.empty() && (cfg.backend != "fake" || int(cfg.fake_q0.size()) != cfg.n)) {
+    std::fprintf(stderr, "--fake-q0 is for the fake backend and needs exactly --n values\n");
     return 2;
   }
   // A misconfigured safety flag must refuse to start, not silently disable a

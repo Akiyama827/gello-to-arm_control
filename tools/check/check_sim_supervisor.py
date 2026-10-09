@@ -172,7 +172,9 @@ def link_unit(tmp):
                 pass
             else:
                 raise AssertionError(f'{list(extra)} accepted by a joint-only link')
-        assert link.negotiate_reference('token') is False and not link.group_capable and link.clock_domain is None
+        from arm_control.supervisor.runtime import monotonic_domain  # a simulation's stamps are this PC's monotonic clock
+        assert link.negotiate_reference('token') is False and not link.group_capable
+        assert ':'.join(link.clock_domain) == monotonic_domain(), link.clock_domain
         link._cmd_seq = 0
         # a disarmed servo ignores commands (the sequence is still handed out)
         seq = link.apply_command(command([.1, 0, 0]))
@@ -703,7 +705,7 @@ def main():
         assert arm.cancel(running.execution_id).phase is Phase.CANCELLED
         # the negotiated reads work over the simulated link
         history = arm.state_history()
-        assert history['samples'] and history['clock_domain'] is None, history['clock_domain']
+        assert history['samples'] and history['clock_domain'].startswith('pc:'), history['clock_domain']
         trace = arm.trace_samples(0)
         assert trace['samples'] and trace['errors'] == 0 and trace['samples'][-1]['seq'] == trace['latest_seq']
         # DISARM, then ARM again: a new ARM epoch

@@ -1480,7 +1480,7 @@ class MuJoCoBackend:
                 found.append(i)
         return found
 
-    def apply_gripper_command(self, positions, force_n: float = 0.0) -> None:
+    def apply_gripper_command(self, positions, force_n: float = 0.0, *, fingers=None) -> None:
         """Servo the finger joints toward ``positions`` (clamped to travel).
 
         ``force_n`` > 0 lowers the finger servos' force cap to it for this and
@@ -1498,26 +1498,35 @@ class MuJoCoBackend:
         equally (-10/-10 N, both in contact).
 
         The plant takes every command verbatim: gripper OWNERSHIP (grasp
-        vs orchestrator open/hold) is policy above the plant, not plant policy."""
-        self._gripper_force_mode = force_n > 0.0
-        self._set_gripper_force(force_n if force_n > 0.0 else self.gripper_force_n)
-        self._set_gripper_targets(positions)
+        vs orchestrator open/hold) is policy above the plant, not plant policy.
 
-    def _set_gripper_force(self, force_n: float) -> None:
-        """Cap every finger servo at ``force_n`` (N)."""
+        ``fingers``: indices into the world's finger joints (one Hand of a world with several, ``ScenePlant.finger_indices``);
+        None is every finger."""
+        # ponytail: one force-mode flag for the world (read by the in-hand monitor); per Hand if two Hands ever grasp at once
+        self._gripper_force_mode = force_n > 0.0
+        idx = self._finger_indices(fingers)
+        self._set_gripper_force(force_n if force_n > 0.0 else self.gripper_force_n, idx)
+        self._set_gripper_targets(positions, idx)
+
+    def _finger_indices(self, fingers) -> list[int]:
+        return list(range(len(getattr(self, "_gripper_act", None) or []))) if fingers is None else list(fingers)
+
+    def _set_gripper_force(self, force_n: float, idx) -> None:
+        """Cap the selected finger servos at ``force_n`` (N)."""
         if not getattr(self, "_gripper_act", None):
             return
-        for act in self._gripper_act:
-            self.model.actuator_forcerange[act] = (-float(force_n), float(force_n))
+        for i in idx:
+            self.model.actuator_forcerange[self._gripper_act[i]] = (-float(force_n), float(force_n))
 
-    def _set_gripper_targets(self, positions) -> None:
+    def _set_gripper_targets(self, positions, idx) -> None:
         if not getattr(self, "_gripper_act", None):
             return
         p = np.asarray(positions, dtype=float).reshape(-1)
-        for act, value, (lo, hi) in zip(self._gripper_act, p, self._gripper_range):
-            self.data.ctrl[act] = float(np.clip(value, lo, hi))
+        for i, value in zip(idx, p):
+            lo, hi = self._gripper_range[i]
+            self.data.ctrl[self._gripper_act[i]] = float(np.clip(value, lo, hi))
 
-    def gripper_positions(self) -> np.ndarray:
+    def gripper_positions(self, fingers=None) -> np.ndarray:
         """TRUE finger joint positions (empty when the scene has no gripper).
 
         The bridge echoes these into the 7th motor slot — a jammed finger
@@ -1527,17 +1536,17 @@ class MuJoCoBackend:
             return np.empty(0)
         self.load()
         return np.array(
-            [float(self.data.joint(str(n)).qpos[0]) for n in self._gripper_names]
+            [float(self.data.joint(str(self._gripper_names[i])).qpos[0]) for i in self._finger_indices(fingers)]
         )
 
-    def gripper_efforts(self) -> np.ndarray:
+    def gripper_efforts(self, fingers=None) -> np.ndarray:
         """Per-finger servo forces in N (plant SENSING). Grasp success is
         policy above the plant and does not live here."""
         if not getattr(self, "_gripper_act", None):
             return np.empty(0)
         self.load()
         return np.array(
-            [float(self.data.actuator_force[a]) for a in self._gripper_act]
+            [float(self.data.actuator_force[self._gripper_act[i]]) for i in self._finger_indices(fingers)]
         )
 
     # -- motor I/O --------------------------------------------------------

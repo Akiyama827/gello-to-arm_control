@@ -1,16 +1,21 @@
-"""Dual hardware console against two C++ fake RT servers, never robot addresses.
+"""The dual console over two arm supervisors and two C++ fake RT servers, never robot addresses (CTRL-053).
 
-Pass a staged remote_rt pair config and a locally built arm_rt_server binary.
-The fake plant starts at zero; a test-only coordinate offset maps that zero to
-the configured ready joints. Measured motion, authority and faults use the wire.
-Hand feedback is a local double; physical Hand transport is not qualified here.
+    python tools/check/check_dual_hardware.py <staged remote_rt pair> <arm_rt_server> [--refine]
+
+The pair is staged as ``multi_arm.launch`` stages it for the bench (``plant rt``); ONLY each arm's RT endpoint moves to a
+local fake server, which starts at that arm's scene pose (``--fake-q0``: the FR3 envelope refuses zero). Each arm's
+supervisor is started as the launcher starts it; the console reaches them through ``ARM_CONTROL_PAIR_SOCKETS``. Measured
+motion, authority and faults use the wire; Hands are a local double (physical Hand transport is not qualified here).
+SupervisedHardware's own surface (pending ARM, close while ARM is in flight, trace/1 drops) is check_supervised_hardware.
 """
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import ctypes
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -18,20 +23,23 @@ import tempfile
 import threading
 import time
 from unittest.mock import patch
-from types import SimpleNamespace
 
 import numpy as np
+import yaml
 
-from arm_control.config import gripper_joints
+from arm_control.config import arm_joints, gripper_joints
+from arm_control.execution.contract import Lifecycle
+from arm_control.multi_arm import diagnostics, supervised_hardware
 from arm_control.multi_arm.config import load_pair_config
-from arm_control.multi_arm import diagnostics
-from arm_control.multi_arm import hardware
 from arm_control.multi_arm.cooperative import pose_error, virtual_capture_reason
-from arm_control.multi_arm.hardware import RemoteHardware
-from arm_control.plants.remote_rt.client import RtBackend, RtConfig
-from arm_control.ui.dual_arm_console import DualArmConsole, _pose_matrix
-from arm_control.ui import dual_arm_console
+from arm_control.multi_arm.feedback import FeedbackGap
+from arm_control.multi_arm.launch import SOCKETS_ENV, stage_pair
+from arm_control.multi_arm.supervised_hardware import SupervisedHardware
+from arm_control.sdk import ArmClient
 from arm_control.simulation import rerun_scene
+from arm_control.supervisor.launch import start_supervisor, stop_supervisor
+from arm_control.ui import dual_arm_console
+from arm_control.ui.dual_arm_console import DualArmConsole, _pose_matrix
 
 
 class FakeHand:
@@ -68,42 +76,46 @@ class FakeHand:
         return results
 
 
-class OffsetFakeRt(RtBackend):
-    def __init__(self, config, joints, offset):
-        assert config.host == "127.0.0.1"
-        super().__init__(config, joints)
-        self.offset = np.asarray(offset)
-        self.invalid = False
-        self.measurement_delta = np.zeros_like(self.offset)
-
-    def motor_state(self, *, state=None):
-        state = super().motor_state(state=state)
-        for key in ("position", "position_cmd"):
-            state[key] = state[key] + self.offset
-        state["position"] += self.measurement_delta
-        if self.invalid:
-            state["position"][0] = np.nan
-        return state
-
-    def apply_command(self, command):
-        super().apply_command(dict(command, position=command["position"] - self.offset))
-
-
 def free_port(kind):
     with socket.socket(socket.AF_INET, kind) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
 
-def check_virtual(app, action, wait, refinement):
-    """Exercise virtual grasps with empty Hands over real RT wire protocols."""
-    assert app.config.shared_object.virtual and not app.config.scene.welds
+def tracked_releases(app, delay_s=.02):
+    """Patch both members' release RPCs: record each start stamp; the second member's arrives ``delay_s`` late."""
+    stamps = []
+    patches = []
+    for index, handle in enumerate(app.runtime.handles.values()):
+        client = handle._inner._arm
+        real = client.release
+
+        def release(eid, start_at=None, real=real, late=index == 1):
+            if late:
+                time.sleep(delay_s)
+            stamps.append(start_at)
+            return real(eid, start_at=start_at)
+
+        patches.append(patch.object(client, "release", release))
+    return stamps, patches
+
+
+def released_together(app, action, pair):
+    """Release a staged pair with the partner's release 20 ms late: both members carry ONE start stamp."""
+    stamps, patches = tracked_releases(app)
+    for p in patches:
+        p.start()
     try:
-        RemoteHardware(replace(app.config, shared_object=replace(app.config.shared_object, virtual=False)))
-    except ValueError as exc:
-        assert "not qualified" in str(exc)
-    else:
-        raise AssertionError("physical shared-object hardware was admitted")
+        action("execute", pair_id=pair)
+    finally:
+        for p in patches:
+            p.stop()
+    assert len(stamps) == 2 and stamps[0] is not None and stamps[0] == stamps[1], stamps
+
+
+def check_virtual(app, action, wait, refinement, probe):
+    """Exercise virtual grasps with empty Hands over real RT wire protocols."""
+    assert not app.config.scene.welds  # coupling is virtual: nothing is welded (load_pair_config refuses anything else)
 
     def refused(name, **kw):
         try:
@@ -118,19 +130,7 @@ def check_virtual(app, action, wait, refinement):
         pair = state["preview_id"]
         action("stage", pair_id=pair, reviewed=True)
         wait(lambda s: s["pair"]["lifecycle"] == "ready")
-        right = list(app.runtime.handles.values())[1]
-        execute_member = right.execute
-
-        def delayed_release(plan_id):
-            time.sleep(.02)
-            execute_member(plan_id)
-
-        with patch.object(right, "execute", delayed_release):
-            action("execute", pair_id=pair)
-        with app._lock:
-            starts = [c.reference.t_start for c in app.runtime.controllers.values()]
-            assert starts[0] == starts[1], starts
-            assert app.coordinator.pair_state().release_skew_sec >= .02
+        released_together(app, action, pair)
         state = wait(lambda s: s["pair"]["lifecycle"] in {"complete", "faulted", "cancelled"}, timeout=60)
         assert state["pair"]["lifecycle"] == "complete", state["error"]
         wait(lambda s: not s["transition_reason"])
@@ -165,15 +165,16 @@ def check_virtual(app, action, wait, refinement):
         object_before = app.runtime.object_pose().copy()
         action("set_mode", mode="shared", empty_hands_confirmed=True)
         np.testing.assert_array_equal(app.runtime.joint_state()["position"], before)
-        np.testing.assert_allclose(app.runtime.object_pose(), object_before, atol=1e-12)
+        # the object is inferred from common-time TCPs now (not the display pose): it agrees to the capture
+        np.testing.assert_allclose(app.runtime.object_pose(), object_before, atol=1e-6)
         assert app.runtime.kinematics.grasps is not nominal
         captured = app._virtual_grasps()
         assert captured and app.snapshot()["shared_object"]["captured_offsets"][first]["position_mm"] > 1
-        assert app.snapshot()["shared_object"]["closure_mm"] < 1e-8
+        assert app.snapshot()["shared_object"]["closure_mm"] < 1e-6
     assert app.snapshot()["mode"] == "shared" and app.snapshot()["preview_id"] is None
     assert hands == {a: (h.width, h.moves) for a, h in app.runtime.hands.items()}
     assert all(h.width == .08 for h in app.runtime.hands.values())
-    assert all(c.executor._payload == (0.0, None) for c in app.runtime.controllers.values())
+    assert all(c.controller_state().payload.value.mass_kg == 0 for c in app.runtime.clients.values())
     refused("stage", pair_id=approach, reviewed=True)
     refused("gripper", arm_id=next(iter(hands)), width_mm=10)
     print("Opposite-edge preparation -> explicit empty-Hand coupling, no weld/payload/Hand command: PASS", flush=True)
@@ -187,54 +188,37 @@ def check_virtual(app, action, wait, refinement):
     idle_pair = state["preview_id"]
     action("stage", pair_id=idle_pair, reviewed=True)
     wait(lambda s: s["pair"]["lifecycle"] == "ready")
-    align, invalidate = hardware.align_feedback, app._invalidate
+    holds = {a: np.asarray(p.state().q, float) for a, p in probe.items()}
+    align, invalidate = supervised_hardware.align_arms, app._invalidate
     injected, cancelled = [], []
-    holds = {a: c.last_command.q_des.copy() for a, c in app.runtime.controllers.items()}
 
-    def gap_once(links, histories, **kwargs):
-        if not injected:
+    def gap_once(clients, **kwargs):
+        if not injected:  # the operator's 20.525493 ms bracket, once
             injected.append(True)
-            a, b = links
-            left, right = histories[a][-1], histories[b][-1]
-            target = min(left[0].t_mono_ns, right[0].t_mono_ns)
-            histories = {
-                a: [(replace(left[0], t_mono_ns=target), left[1])],
-                b: [(replace(right[0], t_mono_ns=target - 20_000_000,
-                             state_seq=right[0].state_seq - 3), right[1]),
-                    (replace(right[0], t_mono_ns=target + 525_493), right[1])],
-            }
-        return align(links, histories, **kwargs)
+            raise FeedbackGap("paired feedback interpolation gap", arm_id=list(clients)[1], interval_s=.020525493)
+        return align(clients, **kwargs)
 
     def observe_cancel(reason):
         if "feedback interrupted" in reason:
-            assert not app.runtime.feedback_ready and not app.runtime.fresh
-            assert all(not h.state().ready for h in app.runtime.handles.values())
+            assert not app.runtime.feedback_ready
             cancelled.append(True)
         invalidate(reason)
 
-    with patch.object(hardware, "align_feedback", gap_once), patch.object(app, "_invalidate", observe_cancel):
+    with patch.object(supervised_hardware, "align_arms", gap_once), patch.object(app, "_invalidate", observe_cancel):
         state = wait(lambda s: s["status"] in {"cancelled", "faulted"})
         assert state["status"] == "cancelled", state["error"]
     assert injected and cancelled and app.fault_trace is None
     assert state["pair"]["lifecycle"] == "cancelled" and state["preview_id"] is None
     assert all(a["released_at"] is None for a in state["pair"]["members"])
     wait(lambda s: app.runtime.feedback_ready and app.runtime.fresh)
-    with app._lock:
-        for a, c in app.runtime.controllers.items():
-            assert c.armed and not c._running and c._plan is None
-            np.testing.assert_array_equal(c.last_command.q_des, holds[a])
+    for a, p in probe.items():
+        assert p.authority().lifecycle is Lifecycle.ARMED
+        np.testing.assert_allclose(p.state().q, holds[a], atol=1e-3)  # still holding where it was
+    assert not any(h.state().executing for h in app.runtime.handles.values())
     refused("execute", pair_id=idle_pair)
     print("Idle 20.525493 ms feedback gap cancels staged pair, preserves hold, requires new plan: PASS", flush=True)
     action("plan", object_target=goal)
-    first_executor = next(iter(app.runtime.controllers.values())).executor
-    step = first_executor.step
-
-    def delayed_dynamics(*args, **kwargs):
-        time.sleep(.003)
-        return step(*args, **kwargs)
-
-    with patch.object(first_executor, "step", delayed_dynamics):
-        shared = execute()
+    shared = execute()
     state = app.snapshot()
     error = pose_error(_pose_matrix(state["shared_object"]["values"]), _pose_matrix(goal))
     assert error[0] < .001 and error[1] < np.deg2rad(.5), error
@@ -242,14 +226,19 @@ def check_virtual(app, action, wait, refinement):
     assert app._virtual_grasps() == captured, "captured grasps changed during motion"
     print(f"Virtual 10 mm / 2 degree move ({refinement}): PASS; error {error[0]*1000:.4f} mm / {np.rad2deg(error[1]):.5f} degrees", flush=True)
     moving = [s for s in app._trace.samples if s.get("closure") is not None
-              and all(a["plan_id"] == f"{shared}:{name}" and a["trajectory_elapsed_s"] is not None
+              and all(a.get("plan_id") == f"{shared}:{name}" and a.get("trajectory_elapsed_s") is not None
                       for name, a in s["arms"].items())]
-    assert moving, "no moving shared-object samples captured"
-    for s in moving:
-        phases = [a["trajectory_elapsed_s"] for a in s["arms"].values()]
-        np.testing.assert_allclose(phases[0], phases[1], atol=1e-12)
+    assert moving, ("no moving shared-object samples captured", shared, sorted({
+        (n, a.get("plan_id"), a.get("trajectory_elapsed_s") is not None, s.get("closure") is not None)
+        for s in app._trace.samples for n, a in s["arms"].items()}, key=str)[-12:])
+    # Each supervisor's tick: reference start = its PC time minus the elapsed phase. One start stamp => one start.
+    starts = {name: np.median([s["arms"][name]["pc_monotonic"] - s["arms"][name]["trajectory_elapsed_s"] for s in moving])
+              for name in moving[0]["arms"]}
+    spread = max(starts.values()) - min(starts.values())
+    assert spread < .002, starts
     peak = max(s["closure"][0] for s in moving) * 1000
-    print(f"20 ms release / 3 ms dynamics delays: equal reference phases, peak closure {peak:.4f} mm: PASS", flush=True)
+    print(f"20 ms late partner release: one start stamp, reference starts {spread * 1000:.2f} ms apart, "
+          f"peak closure {peak:.4f} mm: PASS", flush=True)
     refused("set_mode", mode="independent", support_confirmed=True)
     action("set_mode", mode="independent", virtual_release_confirmed=True)
     assert app.runtime.kinematics.grasps is nominal and app.runtime.grasp_capture is None
@@ -270,16 +259,25 @@ def check_virtual(app, action, wait, refinement):
     wait(lambda s: s["pair"]["lifecycle"] == "ready")
     action("execute", pair_id=pair)
     time.sleep(.04)
-    # Change only measured feedback, not the fake plant's command coordinates.
-    # This breaks TCP agreement and must stop both RT servers immediately.
-    peer = list(app.runtime.links.values())[1]
-    peer.measurement_delta[0] = .05
-    state = wait(lambda s: s["status"] == "faulted")
+    # Change only the peer's common-time measurement, not either plant: TCP agreement breaks and both arms must stop.
+    peer = list(app.runtime.clients)[1]
+
+    def diverged(clients, **kwargs):
+        positions, report = align(clients, **kwargs)
+        positions, report = dict(positions), copy.deepcopy(report)
+        positions[peer] = positions[peer].copy()
+        positions[peer][0] += .05
+        bracket = report["brackets"][peer]
+        bracket["q"] = list(positions[peer])
+        return positions, report
+
+    with patch.object(supervised_hardware, "align_arms", diverged):
+        state = wait(lambda s: s["status"] == "faulted")
     assert "TCP grasp agreement" in state["error"], state["error"]
     deadline = time.monotonic() + 3
-    while any(link.motor_health()["armed"] for link in app.runtime.links.values()) and time.monotonic() < deadline:
+    while any(p.authority().lifecycle is Lifecycle.ARMED for p in probe.values()) and time.monotonic() < deadline:
         time.sleep(.01)
-    assert not any(link.motor_health()["armed"] for link in app.runtime.links.values())
+    assert not any(p.authority().lifecycle is Lifecycle.ARMED for p in probe.values())
     assert "measured " in state["error"]
     app._fault_writer.join(timeout=3)
     trace = json.loads(Path(app.fault_trace).read_text())
@@ -339,7 +337,36 @@ def check_virtual(app, action, wait, refinement):
     assert app.runtime._closed
     print("Blocked diagnostic writer does not block transport shutdown: PASS", flush=True)
     print("Fault trace retains triggering measurements/references/timestamps and preserves stop on write failure: PASS", flush=True)
-    print("Virtual release freezes pose; TCP divergence stops both RT servers: PASS", flush=True)
+    print("Virtual release freezes pose; TCP divergence stops both arms through their supervisors: PASS", flush=True)
+
+
+def start_fakes(pair_path, binary, root):
+    """Stage the pair for the bench, move each arm's RT endpoint to a local fake started at the arm's scene pose; return
+    ``(pair config path, {arm: supervisor config}, fake servers, logs)``."""
+    staged, configs = stage_pair(pair_path, plant="rt")
+    raw = yaml.safe_load(staged.read_text())
+    poses = {a.name: a.q for a in load_pair_config(staged).scene.actors}
+    servers, logs, paths = [], [], {}
+    for name, source in configs.items():
+        cfg = yaml.safe_load(source.read_text())
+        udp, tcp = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
+        cfg["rt"] = dict(cfg["rt"], host="127.0.0.1", udp_port=udp, tcp_port=tcp)  # ONLY the RT endpoint moves
+        paths[name] = Path(root) / f"{name}.yaml"
+        paths[name].write_text(yaml.safe_dump(cfg, sort_keys=False))
+        raw["arms"][name]["config"] = str(paths[name])
+        joints = arm_joints(cfg)
+        log = Path(root) / f"{name}.log"
+        logs.append(log)
+        with log.open("w") as output:
+            servers.append(subprocess.Popen(
+                [binary, "--backend", "fake", "--n", str(len(joints)), "--fake-q0", ",".join(map(repr, poses[name])),
+                 "--instance-id", cfg["rt"]["instance_id"], "--joint-names", ",".join(joints),
+                 "--bind", "127.0.0.1", "--udp-port", str(udp), "--tcp-port", str(tcp)],
+                stdout=output, stderr=subprocess.STDOUT))
+    pair = Path(root) / "pair.yaml"
+    pair.write_text(yaml.safe_dump(raw, sort_keys=False))
+    time.sleep(.3)
+    return pair, paths, servers, logs
 
 
 def main(pair_path, binary, refinement="none"):
@@ -350,133 +377,101 @@ def main(pair_path, binary, refinement="none"):
     with tempfile.TemporaryDirectory() as trace_root, patch.object(diagnostics, "CONTROL_ROOT", Path(trace_root)):
         report = json.loads(trace.save("test", {}).read_text())
         assert report["samples"][-1]["value"] is None
-    # A queued enable must not run after close begins, even if the authority
-    # worker is occupied. This regression needs no socket or controller tick.
-    entered, release = threading.Event(), threading.Event()
-    calls = []
-    rt = RemoteHardware.__new__(RemoteHardware)
-    rt._closed, rt.hands = False, {}
-    rt._pending, rt._authority_generation = {"test": []}, {"test": 0}
-    rt._rpc = {"test": ThreadPoolExecutor(max_workers=1)}
-    rt.links = {"test": SimpleNamespace(enable_all=lambda: calls.append("ARM"),
-                                       safe_stop=lambda: calls.append("STOP"),
-                                       close=lambda: calls.append("CLOSE"))}
-
-    def block_worker():
-        entered.set()
-        assert release.wait(3)
-
-    rt._rpc["test"].submit(block_worker)
-    assert entered.wait(1)
-    rt._request_authority("test", True)
-    closing = threading.Thread(target=rt.close)
-    closing.start()
-    deadline = time.monotonic() + 1
-    while not rt._closed and time.monotonic() < deadline:
-        time.sleep(.01)
-    assert rt._closed
-    release.set()
-    closing.join(timeout=3)
-    assert not closing.is_alive() and calls == ["STOP", "CLOSE"], calls
-    print("Shutdown cancels queued ARM before transport close: PASS", flush=True)
     config = load_pair_config(pair_path)
     assert config.backend == "remote_rt"
-    ports, servers = {}, []
+    if config.shared_object is not None:  # a shared object must be stated virtual: a physical one is refused at load
+        raw = yaml.safe_load(Path(pair_path).read_text())
+        for value in (False, None):
+            obj = dict(raw["shared_object"])
+            obj.pop("virtual") if value is None else obj.update(virtual=value)
+            probe_path = Path(pair_path).with_name(f".virtual-probe-{os.getpid()}.yaml")  # beside it: relative paths hold
+            probe_path.write_text(yaml.safe_dump(dict(raw, shared_object=obj)))
+            try:
+                load_pair_config(probe_path)
+            except ValueError as exc:
+                assert "virtual must be true" in str(exc), exc
+            else:
+                raise AssertionError(f"shared_object.virtual={value} was admitted")
+            finally:
+                probe_path.unlink()
+        print("A shared object not stated virtual is refused at load: PASS", flush=True)
     app = None
+    supervisors, servers, probe = [], [], {}
     with tempfile.TemporaryDirectory(prefix="dual-hardware-check-") as root, patch.object(
         diagnostics, "CONTROL_ROOT", Path(root)
     ):
         logs = []
         try:
-            for actor in config.scene.actors:
-                udp, tcp = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
-                ports[actor.name] = (udp, tcp)
-                log = Path(root) / f"{actor.name}.log"
-                logs.append(log)
-                with log.open("w") as output:
-                    servers.append(subprocess.Popen(
-                        [binary, "--backend", "fake", "--n", str(len(actor.joints)),
-                         "--instance-id", actor.name, "--joint-names", ",".join(actor.joints),
-                         "--bind", "127.0.0.1", "--udp-port", str(udp), "--tcp-port", str(tcp)],
-                        stdout=output, stderr=subprocess.STDOUT,
-                    ))
-            time.sleep(.3)
-            offsets = {a.name: a.q for a in config.scene.actors}
-
-            def backend(cfg):
-                rt = RtConfig.from_config(cfg)
-                udp, tcp = ports[rt.instance_id]
-                return OffsetFakeRt(replace(rt, host="127.0.0.1", udp_port=udp, tcp_port=tcp),
-                                    list(cfg.joint_names), offsets[rt.instance_id])
-
+            pair, configs, servers, logs = start_fakes(pair_path, binary, root)
+            env, sockets = dict(os.environ), {}
+            for name, path in configs.items():
+                proc, out = start_supervisor(path, env, plant="rt")
+                supervisors.append(proc)
+                sockets[name] = out["ARM_CONTROL_SOCKET"]
+            env[SOCKETS_ENV] = ",".join(f"{k}={v}" for k, v in sockets.items())
+            config = load_pair_config(pair)
+            probe = {a: ArmClient(config.robots[a].get("rt")["instance_id"], socket_path=s) for a, s in sockets.items()}
             runtimes = []
-            opened = []
 
             def runtime(cfg):
-                rt = RemoteHardware(cfg, backend_factory=backend, hand_factory=FakeHand)
+                rt = SupervisedHardware(cfg, env=env, hand_factory=FakeHand)
                 runtimes.append(rt)
-                for a, link in rt.links.items():
-                    original = link.open
-
-                    def open_link(a=a, original=original):
-                        opened.append(a)
-                        return original()
-
-                    link.open = open_link
                 return rt
+
+            def unclaimed():
+                end = time.monotonic() + 3  # a closed session's claim is released by its supervisor
+                while time.monotonic() < end:
+                    if all(p.authority().lifecycle is Lifecycle.CONNECTED for p in probe.values()):
+                        return True
+                    time.sleep(.02)
+                return False
 
             with patch("arm_control.ui.dual_arm_console._visuals", side_effect=ValueError("visual failure")):
                 try:
-                    DualArmConsole(pair_path, start_server=False, runtime_factory=runtime)
+                    DualArmConsole(pair, start_server=False, runtime_factory=runtime)
                 except ValueError as exc:
                     assert str(exc) == "visual failure"
                 else:
                     raise AssertionError("visual failure was not raised")
-            assert runtimes[-1]._closed
-            assert all(link._tcp is None for link in runtimes[-1].links.values())
-            assert not opened
-            print("Visual setup failure opens no RT or Hand transport: PASS", flush=True)
+            assert runtimes[-1]._closed and not runtimes[-1].hands and unclaimed()
+            print("Visual setup failure claims no arm and opens no Hand: PASS", flush=True)
             with patch("arm_control.ui.dual_arm_console.ConsoleServer", side_effect=ValueError("server failure")):
                 try:
-                    DualArmConsole(pair_path, runtime_factory=runtime)
+                    DualArmConsole(pair, runtime_factory=runtime)
                 except ValueError as exc:
                     assert str(exc) == "server failure"
                 else:
                     raise AssertionError("server failure was not raised")
-            assert len(opened) == 2
-            assert runtimes[-1]._closed
-            assert all(link._tcp is None for link in runtimes[-1].links.values())
-            print("Post-connection startup failure closes both links: PASS", flush=True)
+            assert runtimes[-1]._closed and len(runtimes[-1].hands) == 2 and unclaimed()
+            print("Post-connection startup failure releases both claims: PASS", flush=True)
             original_visuals = dual_arm_console._visuals
             original_meshes = rerun_scene.static_mesh_geoms
 
-            def before_transport():
-                assert all(link._tcp is None for link in runtimes[-1].links.values())
+            def before_claim():
+                assert all(p.authority().lifecycle is Lifecycle.CONNECTED for p in probe.values())
                 assert not runtimes[-1].hands
 
             def stalled_visuals(config):
-                before_transport()
-                # PyDLL retains the GIL. Reproduce native mesh loading longer
-                # than the unchanged 1.2 s RT deadline, not time.sleep (which
-                # would allow the heartbeat threads to run).
+                before_claim()
+                # PyDLL retains the GIL: native mesh loading longer than the RT deadline, not time.sleep.
                 assert ctypes.PyDLL(None).usleep(1_600_000) == 0
                 return original_visuals(config)
 
-            def meshes_before_transport(*args, **kwargs):
-                before_transport()
+            def meshes_before_claim(*args, **kwargs):
+                before_claim()
                 return original_meshes(*args, **kwargs)
 
             with patch.object(dual_arm_console, "_visuals", stalled_visuals), patch.object(
-                rerun_scene, "static_mesh_geoms", meshes_before_transport
+                rerun_scene, "static_mesh_geoms", meshes_before_claim
             ):
-                app = DualArmConsole(pair_path, start_server=False, runtime_factory=runtime)
-            sessions = {a: link.session_id for a, link in app.runtime.links.items()}
+                app = DualArmConsole(pair, start_server=False, runtime_factory=runtime)
+            sessions = {a: c.session for a, c in app.runtime.clients.items()}
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 assert app.runtime.fresh
-                assert all(not link.motor_health()["armed"] for link in app.runtime.links.values())
+                assert all(p.authority().lifecycle is Lifecycle.CLAIMED for p in probe.values())
                 time.sleep(.05)
-            assert sessions == {a: link.session_id for a, link in app.runtime.links.items()}
+            assert sessions == {a: c.session for a, c in app.runtime.clients.items()}
             np.testing.assert_allclose(
                 app.runtime.world.data.qpos[app.runtime.world._qadr],
                 app.runtime.joint_state()["position"],
@@ -485,7 +480,7 @@ def main(pair_path, binary, refinement="none"):
                 for j in gripper_joints(cfg):
                     adr = app.runtime.world.model.joint(f"{a}__{j}").qposadr[0]
                     assert app.runtime.world.data.qpos[adr] == app.runtime.fingers[a]
-            print("GIL-blocking asset setup precedes connections; fresh disarmed sessions survive: PASS", flush=True)
+            print("GIL-blocking asset setup precedes the claims; claimed, disarmed sessions survive: PASS", flush=True)
 
             def action(name, **kw):
                 s = app.snapshot()
@@ -502,7 +497,7 @@ def main(pair_path, binary, refinement="none"):
                 raise AssertionError(state)
 
             state = app.snapshot()
-            assert state["backend"] == "remote_rt" and state["connected"]
+            assert state["backend"] == "remote_rt" and state["connected"]  # the page's REAL HARDWARE banner keys on it
             assert not any(a["armed"] for a in state["arms"].values())
             assert (state["shared_object"] is None) == (config.shared_object is None)
             try:
@@ -510,40 +505,36 @@ def main(pair_path, binary, refinement="none"):
             except ValueError:
                 pass
             else:
-                raise AssertionError("hardware admitted unqualified shared-object mode")
+                raise AssertionError("shared-object mode admitted without the empty-Hand confirmation")
             a = next(iter(state["arms"]))
-            # A Hand command needs the handle's readiness, not only an armed controller.
-            real_state = app.runtime.handles[a].state
-            with patch.object(app.runtime.handles[a], "state", lambda: replace(real_state(), armed=True, ready=False)):
+            # A Hand command needs the handle's readiness, not only an armed arm.
+            handle = app.runtime.handles[a]
+            real_state = handle.state
+            with patch.object(handle, "state", lambda: replace(real_state(), armed=True, ready=False)):
                 try:
                     action("gripper", arm_id=a, width_mm=40)
                 except ValueError as exc:
                     assert "arm the controller" in str(exc), exc
                 else:
                     raise AssertionError("Hand commanded while the handle was not ready")
-            link = app.runtime.links[a]
-            link.invalid = True
-            wait(lambda s: not s["connected"])
-            assert app.runtime.controllers[a]._last_state_at is None
-            with app._lock:
-                sample = app.runtime.diagnostic_sample()["arms"][a]
-            assert np.isnan(sample["q_rt"][0])
-            assert sample["controller_observed_at_pc"] is None
-            assert not sample["controller_measurement_valid"]
-            link.invalid = False
+            inner_state = handle._inner.state
+            with patch.object(handle._inner, "state", lambda: replace(inner_state(), position=None, velocity=None)):
+                wait(lambda s: not s["connected"])
+                with app._lock:
+                    assert not app.runtime.diagnostic_sample()["arms"][a]["measurement_valid"]
             wait(lambda s: s["connected"])
-            print("Non-finite feedback refuses freshness; valid measurements recover: PASS", flush=True)
-            # Hold an authority RPC in flight: repeated UI requests must not
-            # accumulate enables behind a disarm.
+            print("Invalid feedback refuses freshness; valid measurements recover: PASS", flush=True)
+            # Hold an ARM in flight: repeated UI requests must not accumulate enables behind a disarm.
             entered, release = threading.Event(), threading.Event()
-            enable = link.enable_all
+            client = handle._inner._arm
+            enable = client.arm
 
-            def delayed_enable():
+            def delayed_enable(*args, **kwargs):
                 entered.set()
                 assert release.wait(3)
-                return enable()
+                return enable(*args, **kwargs)
 
-            with patch.object(link, "enable_all", delayed_enable):
+            with patch.object(client, "arm", delayed_enable):
                 action("arm", arm_id=a)
                 assert entered.wait(1)
                 action("disarm", arm_id=a)
@@ -554,9 +545,10 @@ def main(pair_path, binary, refinement="none"):
                         pass
                     else:
                         raise AssertionError("pending authority admitted re-arm")
-                assert len(app.runtime._pending[a]) <= 2
+                assert len(handle._pending) <= 2
                 release.set()
-                wait(lambda s: not app.runtime._pending[a] and not s["arms"][a]["armed"])
+                wait(lambda s: not handle._pending and not s["arms"][a]["armed"])
+            assert probe[a].authority().lifecycle is not Lifecycle.ARMED
             print("Disarm supersedes pending ARM; repeated ARM requests refused: PASS", flush=True)
             for a in state["arms"]:
                 action("arm", arm_id=a)
@@ -586,50 +578,28 @@ def main(pair_path, binary, refinement="none"):
             action("plan", targets=targets, active_arms=list(targets))
             state = wait(lambda s: s["status"] in {"preview", "failed"})
             assert state["status"] == "preview", state["error"]
-            pair = state["preview_id"]
-            action("stage", pair_id=pair, reviewed=True)
+            pair_id = state["preview_id"]
+            action("stage", pair_id=pair_id, reviewed=True)
             wait(lambda s: s["pair"]["lifecycle"] == "ready")
-            action("execute", pair_id=pair)
-            # CTRL-010 bounded controller diagnostics flow through the
-            # existing observation history: the PC integral term is
-            # separated from the model feedforward, the raw algebraic PD+FF
-            # is the command's own sum against the measurement its cycle
-            # consumed, and the RT's limited output and measured torque
-            # arrive from the same state packet. Read under the console lock
-            # so the sample and the controller state are one consistent tick.
-            with app._lock:
-                sample = app.runtime.diagnostic_sample()["arms"][a]
-                ctrl = app.runtime.controllers[a]
-                command, measured, bias = ctrl.last_command, ctrl.last_state, ctrl.integral.bias
-            if command is not None:
-                assert (np.asarray(sample["tau_ff_pc"]).tobytes()
-                        == np.asarray(command.tau_ff).tobytes())
-                assert (np.asarray(sample["integral_bias_pc"]).tobytes()
-                        == np.asarray(bias).tobytes())
-                expected = (command.kp * (command.q_des - measured.position)
-                            + command.kd * (command.qd_des - measured.velocity)
-                            + command.tau_ff)
-                assert np.asarray(sample["raw_pc"]).tobytes() == expected.tobytes()
-            assert sample["tau_cmd_rt"] is not None
-            assert np.isfinite(np.asarray(sample["tau_cmd_rt"])).all()
-            assert sample["tau_meas_rt"] is not None
-            assert np.isfinite(np.asarray(sample["tau_meas_rt"])).all()
+            released_together(app, action, pair_id)
             state = wait(lambda s: s["pair"]["lifecycle"] in {"complete", "faulted", "cancelled"})
             assert state["pair"]["lifecycle"] == "complete", state
             assert all(np.max(np.abs(np.array(s["q_deg"]) - targets[a]["values"])) < .7
                        for a, s in state["arms"].items())
-            # CTRL-051: reconstruct the executed chain from the bounded trace
-            # the console kept — detached, read-only analysis of the recorded
-            # samples. A lineage report is never an executable trajectory.
+            with app._lock:
+                sample = app.runtime.diagnostic_sample()["arms"][a]
+            for key in ("tau_cmd_rt", "tau_meas_rt", "tau_ff_pc", "raw_pc"):  # trace/1: the supervisor's controller tick
+                assert sample[key] is not None and np.isfinite(np.asarray(sample[key])).all(), key
+            # CTRL-051: reconstruct the executed chain from the bounded trace the console kept -- detached, read-only
+            # analysis of the recorded samples. A lineage report is never an executable trajectory.
             lineage = diagnostics.reconstruct_lineage(
                 list(app._trace.samples), pair_id=state["pair"]["pair_id"])
             assert lineage["complete"], lineage["missing"]
             assert lineage["ticks"] > 0
             assert set(lineage["links"]) == set(diagnostics.LINE_LINKS)
             assert lineage["declared_plans"] and not lineage["foreign_arms"], lineage
-            # Field presence is not correlation. A controller still holding a
-            # foreign plan, or a pair that never reached an admitted phase,
-            # must NOT reconstruct as a complete chain.
+            # Field presence is not correlation: a controller holding a foreign plan, or a pair that never reached an
+            # admitted phase, must NOT reconstruct as a complete chain.
             foreign_samples = [
                 dict(s, arms={a: dict(v, plan_id="some-other-run")
                               for a, v in (s.get("arms") or {}).items()})
@@ -644,9 +614,8 @@ def main(pair_path, binary, refinement="none"):
                 pair_id=state["pair"]["pair_id"])
             assert not never_admitted["complete"], never_admitted
             assert "admitted" in never_admitted["missing"], never_admitted
-            # A command link must come from a JOINED arm: strip the joined
-            # arm's command data and let the foreign-plan arm keep its own —
-            # the chain must stay incomplete, not borrow the foreign numbers.
+            # A command link must come from a JOINED arm: strip the joined arm's command data and let the foreign-plan
+            # arm keep its own -- the chain must stay incomplete, not borrow the foreign numbers.
             declared = lineage["declared_plans"]
             joined_arm, other_arm = sorted(declared)
             command_only_foreign = [
@@ -678,40 +647,45 @@ def main(pair_path, binary, refinement="none"):
             assert "reference" in partial["missing"], partial
             assert partial["joined_arms"] == [joined_arm], partial
             print("Execution lineage reconstructs from the bounded trace: PASS", flush=True)
-            print("Two RT sessions: disarmed startup, measured planning, reviewed paired execution: PASS", flush=True)
+            print("Two supervisors: disarmed startup, measured planning, one-stamp paired execution: PASS", flush=True)
             if config.shared_object is not None:
-                check_virtual(app, action, wait, refinement)
+                check_virtual(app, action, wait, refinement, probe)
                 return
-            # Kill one state/control server while a plan is staged. Peer must
-            # receive cancellation and stale feedback must refuse new motion.
+            # Kill one RT server while a plan is staged: the peer must be cancelled and stale feedback refuse new motion.
             action("plan", targets=targets, active_arms=list(targets))
             state = wait(lambda s: s["status"] in {"preview", "failed"})
             assert state["status"] == "preview", state["error"]
-            pair = state["preview_id"]
-            action("stage", pair_id=pair, reviewed=True)
+            pair_id = state["preview_id"]
+            action("stage", pair_id=pair_id, reviewed=True)
             wait(lambda s: s["pair"]["lifecycle"] == "ready")
             servers[0].terminate()
             servers[0].wait(timeout=3)
             wait(lambda s: not s["connected"] and s["pair"]["lifecycle"] in {"cancelled", "faulted"})
             wait(lambda s: not s["pair"]["cancellation_pending"])
-            print("Lost RT peer cancels pair; no shared-object hardware admission: PASS", flush=True)
+            print("Lost RT peer cancels pair: PASS", flush=True)
             app._stop.set()
             app._thread.join(timeout=2)
             assert not app._thread.is_alive()
             app.runtime.stop()
-            survivor = app.runtime.links[config.scene.actors[1].name]
+            survivor = probe[config.scene.actors[1].name]
             deadline = time.monotonic() + 3
-            while survivor.motor_health()["armed"] and time.monotonic() < deadline:
+            while survivor.authority().lifecycle is Lifecycle.ARMED and time.monotonic() < deadline:
                 time.sleep(.01)
-            assert not survivor.motor_health()["armed"]
-            print("Runtime stop revokes surviving RT authority without further ticks: PASS", flush=True)
+            assert survivor.authority().lifecycle is not Lifecycle.ARMED
+            print("Runtime stop disarms the surviving arm without further ticks: PASS", flush=True)
         except BaseException:
             for log in logs:
                 print(log.read_text()[-5000:])
+            for proc in supervisors:
+                print(Path(proc._workdir, "supervisor.log").read_text()[-5000:])
             raise
         finally:
             if app:
                 app.close()
+            for p in probe.values():
+                p.close()
+            for proc in supervisors:
+                stop_supervisor(proc)
             for process in servers:
                 if process.poll() is None:
                     process.terminate()
