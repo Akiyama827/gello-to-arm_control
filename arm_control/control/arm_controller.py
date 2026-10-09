@@ -392,8 +392,8 @@ class ArmController:
 
         Refused while a plan runs: a reviewed plan owns the arm until it ends
         or is cancelled, and a jog arriving underneath it would fight the
-        trajectory for the same joints. The Dora node drops the reason (the
-        console re-sends while a button is held); the supervisor returns it.
+        trajectory for the same joints. The supervisor returns the reason
+        (setpoint/1).
         """
         refusal = self.jog_refusal()
         if refusal is None:
@@ -552,7 +552,7 @@ class ArmController:
         self._hold_anchor = anchor
 
     def tick(self):
-        """One deadline-driven command; unused by event-driven deployments."""
+        """One deadline-driven command: the supervisor's servo loop calls it once per period."""
         if self.execution_policy is None or self.stopped:
             return
         reason = self._observation_error()
@@ -746,9 +746,6 @@ class ArmController:
             f"({plan_id}, {self._pending_traj.duration_sec:.2f}s)",
             flush=True,
         )
-
-    def on_plant_capabilities(self, value) -> None:
-        self.supports_pose_hold = bool(unpack_json_message(value).get("supports_pose_hold", False))
 
     def validate_pose_hold(self, spec: dict) -> dict:
         """Pure admission shared with the supervisor; never retires execution."""

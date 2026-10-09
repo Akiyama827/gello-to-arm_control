@@ -102,7 +102,7 @@ def static_scene_geoms(cfg, *, strict: bool = False) -> list:
             data = mujoco.MjData(model)
             # Pose the body's own joints exactly as the sim holds them, so a
             # rotated dock socket renders rotated here too.
-            hold = spec.get("hold_q") or cfg.get("sim_base_hold_q") or []
+            hold = spec.get("hold_q") or []
             for j, value in enumerate(hold[: model.nq]):
                 data.qpos[j] = float(value)
             mujoco.mj_forward(model, data)

@@ -120,7 +120,24 @@ def settle(rt: RobotRuntime, eid: str, timeout_s: float = 6.0):
     return rt.status(eid, wait_s=timeout_s)
 
 
+def check_stall_schedule() -> None:
+    """The servo loop's schedule (rt_mod.next_tick), modelled as the loop runs it: tick, take the next deadline, sleep to it.
+    A late wake (40 ms) and a slow step (40 ms) each give one late tick and then a full period: no tick closer than a period,
+    no burst."""
+    period, deadline, now, ticks = .01, 0., 0., []
+    for step in range(60):
+        ticks.append(now)
+        now += .04 if step == 30 else .001                              # the step itself (one slow one)
+        deadline = rt_mod.next_tick(deadline, now, period)
+        now = max(now, deadline) + (.04 if step == 15 else 0.)        # sleep; one late wake
+    gaps = np.diff(ticks)
+    assert gaps.min() >= period - 1e-9, gaps
+    assert (gaps > .03).sum() == 2 and (gaps > .051).sum() == 0, gaps   # exactly the two stalls, each one late tick
+    assert np.isclose(rt_mod.next_tick(0., .005, .01), .01) and np.isclose(rt_mod.next_tick(0., .05, .01), .06)
+
+
 def main() -> None:
+    check_stall_schedule()
     # Completion observed on feedback, but the plant never accepted a command.
     rt = runtime(StubLink(accept=False))
     try:

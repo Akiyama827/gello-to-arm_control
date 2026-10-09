@@ -66,6 +66,14 @@ RETAINED = 512
 TRACE_TICKS = 64
 
 
+def next_tick(previous: float, now: float, period: float) -> float:
+    """The servo loop's next deadline, taken after a tick at ``now``: one period after the previous deadline; when the loop
+    is more than a period behind (a late wake or a slow step), a full period after ``now`` -- the late tick was the one
+    tick, never a catch-up burst nor a second tick right behind it."""
+    due = previous + period
+    return now + period if now - due > period else due
+
+
 def offered_profiles(link, *, native: bool, cartesian_kp_min: float | None) -> tuple[str, ...]:
     """The controller profiles a supervisor admits. ``cartesian_impedance`` only when the plant runs the law (the RT box's v8,
     the twin's), legs are STREAMED (the native reference plays joints only, operator 2026-10-09) and the robot's policy states
@@ -1802,10 +1810,8 @@ class RobotRuntime:
                     print(f"[supervisor] step failed: {exc!r}", flush=True)
                     self.controller.on_control(pack_control_update(stop=True, reason=repr(exc)))
                 self._cv.notify_all()
-            next_t += self.period
             now = time.monotonic()
-            if now - next_t > self.period:
-                next_t = now  # after a stall: one tick, never a catch-up burst
+            next_t = next_tick(next_t, now, self.period)
             time.sleep(max(0.0, next_t - now))
 
     def _step(self) -> None:
