@@ -2,7 +2,7 @@
 //
 // Backends (one protocol, admission and stop path for both):
 //   hand_bridge [robot_ip [port [bind_ip]]]            the Franka Hand (libfranka)
-//   hand_bridge --backend dm --can-if IF --motor ID:TYPE[:MST]
+//   hand_bridge --backend dm --can-if IF --motor ID:TYPE:MST
 //       --mimic OPEN,CLOSED,STROKE --kp KP --kd KD --tau-cap N.M --speed-max M/S
 //       [--port P] [--bind IP]                         a DM motor gripper (hand_dm.hpp)
 // Every DM value is a flag (nothing assumed). The bridge states its gripper's
@@ -547,13 +547,42 @@ private:
 // One served device, so SIGTERM/SIGINT can release it (DM: zero torque, then disable).
 std::function<void()> release_device = [] {};
 
+const char* const kFlags[] = {"--backend", "--port", "--bind", "--robot-ip", "--can-if", "--motor", "--mimic",
+                              "--kp", "--kd", "--tau-cap", "--speed-max"};
+
+// Flag mode: every argument is a known flag followed by its value, each flag at most once; a typo must not fall back
+// to a default (a misspelt --bind would expose the jaws on every interface).
+void check_flags(int argc, char** argv) {
+  std::vector<std::string> seen;
+  for (int i = 1; i < argc; i += 2) {
+    const bool known = std::any_of(std::begin(kFlags), std::end(kFlags),
+                                   [&](const char* f) { return !std::strcmp(argv[i], f); });
+    if (!known || i + 1 >= argc || !std::strncmp(argv[i + 1], "--", 2) ||
+        std::find(seen.begin(), seen.end(), argv[i]) != seen.end()) {
+      std::fprintf(stderr, "[hand] bad argument '%s': flags are --name value, each known flag once\n", argv[i]);
+      std::exit(2);
+    }
+    seen.push_back(argv[i]);
+  }
+}
+
 bool flag(int argc, char** argv, const char* name, std::string& out) {
-  for (int i = 1; i + 1 < argc; ++i)
+  for (int i = 1; i + 1 < argc; i += 2)
     if (!std::strcmp(argv[i], name)) {
       out = argv[i + 1];
       return true;
     }
   return false;
+}
+
+std::vector<std::string> split(const std::string& text, char sep) {
+  std::vector<std::string> out;
+  for (size_t at = 0;;) {
+    const size_t end = text.find(sep, at);
+    out.push_back(text.substr(at, end - at));
+    if (end == std::string::npos) return out;
+    at = end + 1;
+  }
 }
 
 double number(const std::string& text, const char* what) {
@@ -566,7 +595,7 @@ double number(const std::string& text, const char* what) {
   return v;
 }
 
-// "--motor ID:TYPE[:MST]" and "--mimic OPEN,CLOSED,STROKE" into a DM gripper config; exits on error.
+// "--motor ID:TYPE:MST" and "--mimic OPEN,CLOSED,STROKE" into a DM gripper config; exits on error.
 DmGripperConfig dm_config(int argc, char** argv, std::string& iface, uint32_t& reply_id) {
   std::string motor, mimic, kp, kd, cap, speed;
   for (auto [name, out] : {std::pair{"--can-if", &iface}, {"--motor", &motor}, {"--mimic", &mimic},
@@ -576,27 +605,26 @@ DmGripperConfig dm_config(int argc, char** argv, std::string& iface, uint32_t& r
       std::exit(2);
     }
   DmGripperConfig c;
-  std::vector<std::string> m;
-  for (size_t at = 0;;) {
-    const size_t colon = motor.find(':', at);
-    m.push_back(motor.substr(at, colon - at));
-    if (colon == std::string::npos) break;
-    at = colon + 1;
-  }
-  if (m.size() < 2 || m.size() > 3 || !arm_rt::limits_for(m[1], c.lim)) {
-    std::fprintf(stderr, "[hand] --motor ID:TYPE[:MST], TYPE 4310|4310p|4340|4340p\n");
+  const std::vector<std::string> m = split(motor, ':');
+  if (m.size() != 3 || !arm_rt::limits_for(m[1], c.lim)) {
+    std::fprintf(stderr, "[hand] --motor ID:TYPE:MST (TYPE 4310|4310p|4340|4340p; MST = the reply CAN id)\n");
     std::exit(2);
   }
-  c.id = int(number(m[0], "motor id"));
-  reply_id = m.size() == 3 ? uint32_t(number(m[2], "Master ID")) : 0;  // DM factory default
-  double v[3];
-  if (std::sscanf(mimic.c_str(), "%lf,%lf,%lf", &v[0], &v[1], &v[2]) != 3) {
+  const double id = number(m[0], "motor id"), mst = number(m[2], "Master ID");
+  if (id != std::floor(id) || id < 1 || id > 15 || mst != std::floor(mst) || mst < 0 || mst > 0x7FF) {
+    std::fprintf(stderr, "[hand] motor id must be an integer 1..15 and Master ID 0..0x7FF\n");
+    std::exit(2);
+  }
+  c.id = int(id);
+  reply_id = uint32_t(mst);
+  const std::vector<std::string> v = split(mimic, ',');
+  if (v.size() != 3) {
     std::fprintf(stderr, "[hand] --mimic OPEN_RAD,CLOSED_RAD,FINGER_STROKE_M\n");
     std::exit(2);
   }
-  c.motor_open = v[0];
-  c.motor_closed = v[1];
-  c.finger_stroke_m = v[2];
+  c.motor_open = number(v[0], "--mimic OPEN_RAD");
+  c.motor_closed = number(v[1], "--mimic CLOSED_RAD");
+  c.finger_stroke_m = number(v[2], "--mimic FINGER_STROKE_M");
   c.kp = number(kp, "--kp");
   c.kd = number(kd, "--kd");
   c.tau_cap = number(cap, "--tau-cap");
@@ -613,7 +641,11 @@ int main(int argc, char** argv) {
   std::string backend = "franka", port_text = "47802", bind_text, robot_text = "172.16.0.3";
   const bool flags = argc > 1 && !std::strncmp(argv[1], "--", 2);
   if (flags) {
-    flag(argc, argv, "--backend", backend);
+    check_flags(argc, argv);
+    if (!flag(argc, argv, "--backend", backend)) {
+      std::fprintf(stderr, "[hand] flag mode needs --backend franka|dm\n");
+      return 2;
+    }
     flag(argc, argv, "--port", port_text);
     flag(argc, argv, "--bind", bind_text);
     flag(argc, argv, "--robot-ip", robot_text);

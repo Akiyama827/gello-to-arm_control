@@ -47,7 +47,7 @@
 struct CanPort {
   virtual ~CanPort() = default;
   virtual bool send(uint32_t can_id, const uint8_t data[8]) = 0;
-  // One frame into data (8 bytes): 1, 0 when none arrived within timeout_ms, -1 on error.
+  // One usable frame into data (8 bytes): 1; 0 ONLY once timeout_ms has passed with none; -1 on error.
   virtual int recv(uint8_t data[8], int timeout_ms) = 0;
 };
 
@@ -83,15 +83,25 @@ public:
     return ::write(fd_, &f, CANFD_MTU) == ssize_t(CANFD_MTU);
   }
   int recv(uint8_t data[8], int timeout_ms) override {
-    pollfd p{fd_, POLLIN, 0};
-    const int ready = ::poll(&p, 1, timeout_ms);
-    if (ready <= 0) return ready < 0 && errno != EINTR ? -1 : 0;
-    canfd_frame f{};
-    const ssize_t got = ::read(fd_, &f, sizeof f);
-    if (got != ssize_t(CAN_MTU) && got != ssize_t(CANFD_MTU)) return got < 0 ? -1 : 0;
-    if ((f.can_id & CAN_ERR_FLAG) || f.len < 8) return 0;
-    std::memcpy(data, f.data, 8);
-    return 1;
+    // Unusable frames and EINTR are skipped against the SAME deadline: returning early would read as "the period is
+    // over" and pace the servo by bus traffic instead of the clock.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now()).count();
+      pollfd p{fd_, POLLIN, 0};
+      const int ready = ::poll(&p, 1, int(std::max<int64_t>(left, 0)));
+      if (ready < 0 && errno != EINTR) return -1;
+      if (ready == 0 && left <= 0) return 0;
+      if (ready <= 0) continue;
+      canfd_frame f{};
+      const ssize_t got = ::read(fd_, &f, sizeof f);
+      if (got < 0 && errno != EINTR && errno != EAGAIN) return -1;
+      if ((got == ssize_t(CAN_MTU) || got == ssize_t(CANFD_MTU)) && !(f.can_id & CAN_ERR_FLAG) && f.len >= 8) {
+        std::memcpy(data, f.data, 8);
+        return 1;
+      }
+    }
   }
 
 private:
@@ -130,10 +140,23 @@ public:
   static constexpr double kSettleWindowS = 0.2, kSettleTolM = 5e-4, kMoveTolM = 1e-3;  // the sim Hand's
   static constexpr double kMoveGraceS = 2.0;    // past the travel time, an unsettled move fails
   static constexpr double kEdgeTolM = 2e-3;     // measured width clamped to the stroke within this
+  static constexpr int kListenMs = 100;         // passive listen before the first frame: is the motor already driven?
 
   DmGripper(const DmGripperConfig& cfg, std::unique_ptr<CanPort> port)
       : cfg_(cfg), port_(std::move(port)) {
     if (const char* why = cfg_.invalid()) throw std::invalid_argument(why);
+    // DM motors reply only when spoken to: replies from this motor before we have sent anything mean another driver
+    // (an arm server whose spec includes it, the PC-side DM driver) is commanding it. Never take over a live motor.
+    // (A motor left ENABLED by a crashed bridge is silent and cannot be detected this way: see the record.)
+    for (auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenMs);;) {
+      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now());
+      if (left.count() <= 0) break;
+      uint8_t data[8];
+      const int got = port_->recv(data, int(left.count()));
+      if (got < 0) throw DeviceLost("CAN receive failed");
+      if (got > 0 && (data[0] & 0x0F) == cfg_.id)
+        throw DeviceLost("DM motor " + std::to_string(cfg_.id) + " already answers on the bus: another driver owns it");
+    }
     servo_ = std::thread([this] { servo(); });
     std::unique_lock<std::mutex> lk(m_);
     if (!cv_.wait_for(lk, std::chrono::milliseconds(200), [this] { return seq_ > 0 || !lost_.empty(); }) ||
@@ -266,7 +289,10 @@ private:
           fail("CAN receive failed");
           return;
         }
-        if (got == 0) break;
+        if (got == 0) {
+          if (std::chrono::steady_clock::now() >= next) break;
+          continue;  // an early 0 is not the end of the period
+        }
         arm_rt::MitReply r;
         if ((data[0] & 0x0F) != cfg_.id || !arm_rt::decode_mit(data, 8, cfg_.lim, r)) continue;
         last_rx = now_s();

@@ -37,12 +37,13 @@ engineering checks; they are not certification of a particular deployment.
 ## The DM gripper (`--backend dm`)
 
 ```
-hand_bridge --backend dm --can-if IF --motor ID:TYPE[:MST] --mimic OPEN,CLOSED,STROKE \
+hand_bridge --backend dm --can-if IF --motor ID:TYPE:MST --mimic OPEN,CLOSED,STROKE \
     --kp KP --kd KD --tau-cap N.M --speed-max M/S [--port P] [--bind IP]
 ```
 
-Every value is a flag; nothing is assumed. One motor, on its own SocketCAN socket
-filtered to its Master ID; the arm's server owns the other motors on the same bus
+Every value is a flag; nothing is assumed (an unknown or valueless flag is refused). One motor, on its own
+SocketCAN socket filtered to its Master ID; it refuses to start if that motor already answers on the bus (another
+driver owns it); the arm's server owns the other motors on the same bus
 and ignores this one's replies (payload-nibble routing). Width =
 2 * STROKE * (q - CLOSED) / (OPEN - CLOSED); the stated envelope is that stroke,
 `--speed-max`, and no force grasp (GRASP is REJECTed `uncalibrated_force`). MOVE
