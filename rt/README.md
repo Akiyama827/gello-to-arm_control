@@ -25,13 +25,33 @@ no daemon, no Python, no graph lifecycle owning the arm.
 | `src/backend_fake.cpp` | Damped-integrator loopback plant — the PERMANENT test double (see below) |
 | `src/backend_franka.cpp` | FR3 over libfranka ActiveControl (`-DWITH_FRANKA=ON`); hardware-run at `c23a0c7` ([timing report](https://github.com/Westlake-Work/modular_robotic_arm/blob/f042a681841393a5a0ad7b82469f8ef0997290c8/Control/docs/status/2026-09-24-dual-arm-rt-timing.md)), later changes offline-checked only |
 | `src/backend_dm.cpp` | DM FDCAN backend with exact reply-ID filters and MIT wire-format self-check |
-| `src/hand_bridge.cpp` | Generic Franka Hand TCP bridge; built with libfranka |
+| `src/hand_bridge.cpp` | Gripper TCP bridge: the Franka Hand (with libfranka, positional args) or a DM motor gripper (`--backend dm`, `src/hand_dm.hpp`, always built) |
+| `src/dm_mit.hpp` | DM MIT codec shared by `backend_dm.cpp` and the DM gripper |
 | `bindings/` | Optional pybind module `arm_rt_servo` so the MuJoCo twin closes the same compiled law |
 
 Concrete service units and device-specific bridges belong to the consuming
 project's deployment tree, not this reusable core. Moving those files does
 not alter an installed RT host. The bring-up notes below record existing
 engineering checks; they are not certification of a particular deployment.
+
+## The DM gripper (`--backend dm`)
+
+```
+hand_bridge --backend dm --can-if IF --motor ID:TYPE[:MST] --mimic OPEN,CLOSED,STROKE \
+    --kp KP --kd KD --tau-cap N.M --speed-max M/S [--port P] [--bind IP]
+```
+
+Every value is a flag; nothing is assumed. One motor, on its own SocketCAN socket
+filtered to its Master ID; the arm's server owns the other motors on the same bus
+and ignores this one's replies (payload-nibble routing). Width =
+2 * STROKE * (q - CLOSED) / (OPEN - CLOSED); the stated envelope is that stroke,
+`--speed-max`, and no force grasp (GRASP is REJECTed `uncalibrated_force`). MOVE
+ramps the motor target at the commanded speed under an on-motor MIT PD at KP/KD,
+every frame clamped to within TAU_CAP/KP of the measured angle (kp * error <=
+TAU_CAP); success = settled within 1 mm. GSTOP holds the measured angle; HOME is a
+no-op. Enabled on the first action, independent of the arm's ARM; a silent motor
+(50 ms) or SIGTERM/SIGINT: zero torque, then disable. A crashed process leaves the
+motor on its last frame (the motor's CAN-timeout register is a bench decision).
 
 ## Hand active STOP
 
@@ -145,8 +165,9 @@ fake-RT regression benches. `reference_session_selfcheck` and
 through the existing `reference_upload.py` and `native_reference.py` probes.
 The command prints a revision-labeled PASS/FAIL line for every check and writes
 `rt/build-offline/offline-summary.json` plus individual logs. This does not
-connect to an RT host or qualify physical control. With `WITH_FRANKA=ON`, CTest
-also registers `hand_bridge_selfcheck`.
+connect to an RT host or qualify physical control. `hand_bridge_selfcheck` (the
+socket protocol, no libfranka) and `hand_dm_selfcheck` (the DM gripper against a
+fake motor, no CAN) are always registered.
 
 ## DM wire mappings
 
