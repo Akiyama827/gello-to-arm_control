@@ -21,8 +21,8 @@ base's). Motor 7 gets a distinct Master ID, flashed at the bench. Hold 20 / 0.5,
   Limits:
   - it detects only during those windows. A server for the other robot is refused by the units' Conflicts, but the
     other robot POWERED after the window is caught by nothing in software: the main socket filters to our Master, so the
-    base's motor 1 would take our joint 1 commands silently. Only the operator rule covers it (open, raised with the
-    operator: keep the probe for the whole run, at one more non-blocking drain per tick);
+    base's motor 1 would take our joint 1 commands silently. Only the operator rule covers it. Operator 2026-10-09:
+    accepted, startup-only (the DM arm is nearly obsolete and is not used with the base);
   - it cannot tell two robots apart if they share a Master ID (the base is 0x11/0x12, the DM arm 0: distinct today).
 
 Checks: `dm_backend_selfcheck` (new shared-bus cases: another driver before start refused; another robot's motor answering
@@ -45,3 +45,5 @@ Bench, unqualified: cpu 1 jitter with the DM loop; the 4 Mbit/s reflash and `har
 PC-side driver, after the reflash); the motor 7 Master ID; the interlock against the powered base; the units' install
 (operator); `rt.state_timeout_s` 0.2 / `rt.max_fault_ms` 5000, taken from the FR3/base and not yet confirmed for the
 DM arm.
+
+Review: stopped by the operator before it reported (2026-10-09); merged UNREVIEWED, ahead of removing the DM arm from the stack.
