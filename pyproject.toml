@@ -19,7 +19,7 @@ dependencies = [
 # The headless supervisor (arm_control.supervisor): ArmController's wire
 # codecs (contracts/, pyarrow) and robot configs (config.py, pyyaml).
 supervisor = ["pyarrow", "pyyaml"]
-# Dora process adapters (nodes/, dataflows/, arm_control.control.adapter).
+# Dora process adapters (nodes/, dataflows/: supervised_arm, scene_observer, the consoles).
 dora = ["pyarrow", "pyyaml", "dora-rs"]
 # --- pip-installable extras -------------------------------------------------
 # simulation/ + planning/mujoco_collision.py import mujoco at MODULE top level,

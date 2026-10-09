@@ -67,7 +67,7 @@ def open_jaws(backend, cfg) -> None:
 
         backend.apply_gripper_command([finger_from_width(open_w)] * fingers)
         print(
-            f"[mujoco_interface] jaws spawned OPEN at {open_w * 1000:.0f} mm",
+            f"[sim_world] jaws spawned OPEN at {open_w * 1000:.0f} mm",
             flush=True,
         )
 

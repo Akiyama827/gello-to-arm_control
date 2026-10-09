@@ -23,6 +23,8 @@ Differences from the in-process node (stated, not hidden):
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import os
 import time
 
@@ -357,6 +359,11 @@ def release_after_loss(instance_id: str, socket_path=None) -> str:
 
 
 # -- the Dora seam -------------------------------------------------------------------------------------------------------
+#: the Dora inputs this node handles, by topic: the bridge method each goes to (a replay graph's are the console's twins)
+INPUTS = {'plan': 'on_plan', 'control': 'on_control', 'jog': 'on_jog', 'gripper': 'on_gripper',
+          'plan_replay': 'on_plan', 'control_replay': 'on_control'}
+
+
 def main() -> None:
     """Dora node: ``arm_controller``'s contract served by the arm's supervisor (``ARM_CONTROL_CONFIG`` picks the arm, ``ARM_ID`` names
     it, ``ARM_CONTROL_SOCKET`` the supervisor socket; default: the per-user socket of ``rt.instance_id``)."""
@@ -380,8 +387,7 @@ def main() -> None:
     bridge = DoraArmBridge(arm, handle, presets, node.send_output, arm_id=os.environ.get('ARM_ID', 'arm'))
     bridge.check_config(kp, kd)
     bridge.start()
-    handlers = {'plan': bridge.on_plan, 'control': bridge.on_control, 'jog': bridge.on_jog, 'gripper': bridge.on_gripper,
-                'plan_replay': bridge.on_plan, 'control_replay': bridge.on_control}
+    handlers = {topic: getattr(bridge, method) for topic, method in INPUTS.items()}
     print(f"[supervised_arm] {instance_id}: DISARMED, the supervisor owns control (nothing moves without an operator)", flush=True)
     last_pump = 0.0
     try:
@@ -411,6 +417,15 @@ def main() -> None:
             print(f"[supervised_arm] supervisor lost: {bridge.lost}; {release_after_loss(instance_id, os.environ.get('ARM_CONTROL_SOCKET') or None)}", flush=True)
     if bridge.lost is not None:
         raise SystemExit(1)
+
+
+def unhandled_inputs(graph_path) -> list[str]:
+    """``supervised_arm`` inputs a graph wires that this node has no handler for (each would be dropped silently)."""
+    import yaml
+
+    spec = yaml.safe_load(Path(graph_path).read_text()) or {}
+    return [f"{node['id']}.{topic}" for node in spec.get("nodes", []) if str(node.get("path", "")).endswith("supervised_arm.py")
+            for topic in (node.get("inputs") or {}) if topic not in INPUTS]
 
 
 def cli() -> None:

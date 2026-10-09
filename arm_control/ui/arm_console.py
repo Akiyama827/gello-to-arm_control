@@ -1683,7 +1683,7 @@ def _check_planner_limits() -> None:
 
 def _check_graphs() -> None:
     """Every console in every graph has exactly one authority feedback source (the controller's motor_health or its
-    controller_arm), never an optimistic ARM badge. (The in-process arm_controller node this also checked is retired: every
+    controller_arm), never an optimistic ARM badge, and every supervised_arm input has a handler. (The in-process arm_controller node this also checked is retired: every
     graph's controller is its supervisor's, through supervised_arm.)"""
     import yaml
 
@@ -1700,6 +1700,9 @@ def _check_graphs() -> None:
                 )
         assert not any(str(n.get("path", "")).endswith("arm_controller.py") for n in spec.get("nodes", [])), (
             f"{graph.name}: the retired in-process arm_controller node is wired")
+        from arm_control.supervisor.dora_arm import unhandled_inputs
+        unhandled = unhandled_inputs(graph)
+        assert not unhandled, f"{graph.name}: supervised_arm is wired {unhandled}, which it has no handler for (dropped silently)"
     assert checked, "no console found in any graph -- did paths change?"
     print(f"arm_console: {checked} console wirings have one authority feedback source")
 

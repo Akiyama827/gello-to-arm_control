@@ -22,11 +22,12 @@ Project:
   `configs/{entries/sim_single_arm,simulation/single_arm}.yaml` and the launcher's asset machinery (`ASSET_COMMANDS`,
   `--regenerate-assets`, `--skip-assets`; it built rep1d only).
 * `sim view` is supervised (`supervised=True`, the FR3 motion profile).
-* Config ownership (allow-list OPEN debt, step 4b), every resolved config before/after identical (61 files compared):
+* Config ownership (allow-list OPEN debt, step 4b), every resolved config before/after identical (62 files; the reviewer re-ran it from scratch trees):
   - the RT box (`rt.host`, `rt.state_timeout_s`, `rt.max_fault_ms`, `listen_mode`): `configs/deployments/rt_box.yaml`,
-    included by the FR3 deployment and the base hardware;
+    included by the FR3 deployment and the base hardware (the registry's `rt_host.address` in `instances.yaml` stays the
+    second statement of the address, held equal by `apply_instance` and the deployment self-check);
   - `arm.plant_gravity_comp: true`: the FR3's own description (`robots/fr3/description.yaml`), not the deployment, the bench
-    or the example;
+    or the library example (`examples/configs/franka.yaml`);
   - `sim_self_collision: false` (with its reason): `configs/simulation/hosted_world.yaml`.
 * Checks updated: check_add_contracts builds the controller with the factory (as the supervisor), check_node_shutdown drops
   the controller node, check_supervised_sims expects the observer's constraint_force (from the sim-add slice),
@@ -36,6 +37,23 @@ Checks: check_node_shutdown, check_arm_controller, check_scene_core, arm_console
 scenarios incl. view), check_supervised_real, check_base_supervisor, check_add_contracts, check_calibration_contract,
 check_franka_ownership (config duplicates 91 in 26 groups), deployment self-check, check_rt_deployment, check_bench_twin,
 the WITH_FRANKA build + CTest, `run.py sim view --dry-run`, ruff: PASS.
+
+Also fixed here, left failing by the sim-add merge: `console_graphs` (above) and `check_supervised_sims` (the observer's new
+`constraint_force`).
+
+Review round 1 (opus): ACCEPT. SHOULDs taken:
+* Two safety keys now come from an include, so a later layer could override them silently. `check_franka_ownership` pins
+  their owners on the real FR3 entries: `arm.plant_gravity_comp` -> the FR3 description, `rt.state_timeout_s` and
+  `rt.max_fault_ms` -> `rt_box.yaml`. `check_bench_twin` asserts `sim_self_collision` is false for every config that hosts a
+  composed world.
+* Live docs (`rt/README.md`, `docs/ARCHITECTURE.md`) no longer describe the retired nodes as current.
+* The console self-check's lost "unhandled input" rule now applies to `supervised_arm`: `dora_arm.INPUTS` is the node's input
+  table, `unhandled_inputs(graph)` is checked over the library graphs (console self-check) and the project graphs
+  (`check_add_contracts`); none is unhandled.
+* NITs taken: stale comments (franka_bench, hosted_world, check_add_contracts, pyproject, the base unit file's comment,
+  arm_planner, RUNBOOK), the RT README's CTest count, the supervisor's sim log prefix `[mujoco_interface]` -> `[sim_world]`,
+  the unused `REPO_ROOT` in run.py.
+* NIT not taken: an offline SIGTERM/STOP -> DISARM check for `supervised_arm` (the gap predates this slice).
 
 OPEN:
 * 8 allow-list groups, all the legacy `franka_bench` restating other files (camera parameters, Hand task, pick choreography,
