@@ -401,7 +401,7 @@ def main():
         assert not [e for e in seen if e['kind'] == 'leg_result' and e['plan_id'].startswith('p2')], seen
 
         # A member the supervisor path cannot carry rejects the pair; the partner's staged plan is cleared.
-        cart = dict(cartesian=dict(task_R=np.eye(3), kc=[1.] * 6, dc=[1.] * 6))
+        cart = dict(cartesian=dict(frame='base', task_R=np.eye(3), kc=[1.] * 6, dc=[1.] * 6))
         stage('p3', **{b: cart})
         pump_until(coordinator, lambda: coordinator.lifecycle.terminal and not coordinator.pair_state('p3').cancellation_pending)
         assert coordinator.lifecycle is PairLifecycle.REJECTED and 'Cartesian' in coordinator.pair_state('p3').reason, \

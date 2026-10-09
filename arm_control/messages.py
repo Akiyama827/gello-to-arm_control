@@ -107,7 +107,7 @@ def _self_check() -> None:
             times=times, positions=q, velocities=q * 0.0,
             kp=np.full(n, 1200.0), kd=np.full(n, 30.0),
             cartesian_poses=np.tile([0, 0, 0, 1, 0, 0, 0], (samples, 1)),
-            cartesian={"task_R": np.eye(3), "kc": np.ones(6), "dc": np.ones(6)},
+            cartesian={"frame": "base", "task_R": np.eye(3), "kc": np.ones(6), "dc": np.ones(6)},
             completion={"vel_tol": 0.002, "goal_q": np.arange(n, dtype=float),
                         "residual_max": 0.01},
         )
@@ -115,7 +115,22 @@ def _self_check() -> None:
     assert plan["plan_id"] == "p1" and plan["gated"] is True
     assert plan["positions"].shape == (samples, n), plan["positions"].shape
     assert plan["cartesian_poses"].shape == (samples, 7)
-    assert plan["cartesian"]["task_R"].shape == (3, 3)
+    assert plan["cartesian"]["task_R"].shape == (3, 3) and plan["cartesian"]["frame"] == "base"
+    # The Cartesian spec is the robot BASE frame's, checked at pack time: a world-frame or out-of-envelope spec never ships.
+    for bad in ({"task_R": np.eye(3), "kc": np.ones(6), "dc": np.ones(6)},
+                {"frame": "world", "task_R": np.eye(3), "kc": np.ones(6), "dc": np.ones(6)},
+                {"frame": "base", "task_R": np.eye(3), "kc": np.full(6, 2000.0), "dc": np.ones(6)}):
+        try:
+            pack_plan(plan_id="p", phase="x", gated=False, times=times, positions=q, velocities=q,
+                      kp=np.ones(n), kd=np.ones(n), cartesian=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"cartesian={bad} must be refused")
+    # motor_command: the 21-value tail round-trips as the same spec, with no pose in it.
+    command = unpack_motor_command(pack_motor_command(q[0], q[0], q[0], q[0], q[0],
+                                                      pack_cartesian_block(plan["cartesian"])), n)
+    assert command["cartesian"]["frame"] == "base" and "pose" not in command["cartesian"]
+    assert np.array_equal(command["cartesian"]["task_R"], np.eye(3)) and np.array_equal(command["cartesian"]["kc"], np.ones(6))
     assert plan["completion"]["goal_q"].shape == (n,), plan["completion"]
     assert plan["completion"]["vel_tol"] == 0.002
 

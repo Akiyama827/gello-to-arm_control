@@ -50,7 +50,7 @@ REGRESSIONS = (
 # Device-free checks that need no build: run whether or not the build passed. A device-free check no suite runs is deleted.
 # An entry is a script in tools/check/ and its arguments.
 CHECKS = (
-    "check_arm_controller", "check_bimanual_contract", "check_bimanual_sync", "check_closure_record",
+    "check_arm_controller", "check_bimanual_contract", "check_cartesian_sim", "check_bimanual_sync", "check_closure_record",
     "check_console_authority", "check_console_grasp", "check_cooperative", "check_dual_console", "check_dual_modes",
     "check_dual_modes --refine", "check_execution_policy", "check_hand_grasp", "check_motion_profiles", "check_node_shutdown",
     "check_pair_planning", "check_pose_hold", "check_pose_hold_sim", "check_refinement", "check_retiming", "check_rt_telemetry",
@@ -62,7 +62,7 @@ TIMED = {"check_refinement"}
 # These simulate the staged FR3 (franka/, gitignored, staged by tools/assets/setup_fr3.py). Unstaged, they do not run and one
 # fr3_assets FAIL names them: a fresh checkout is red until the assets are staged, never silently smaller.
 FR3_ASSET = ROOT / "franka/urdf/fr3.urdf"
-NEEDS_FR3 = {"check_cooperative", "check_dual_console", "check_dual_modes", "check_dual_modes --refine", "check_pair_planning",
+NEEDS_FR3 = {"check_cartesian_sim", "check_cooperative", "check_dual_console", "check_dual_modes", "check_dual_modes --refine", "check_pair_planning",
              "check_pose_hold_sim", "check_refinement"}
 # Module self-checks: `python -m <module> [args]`. Not here: node CLIs without a self-check flag (they run a node), kinematic_fit
 # and model_bundle (they read the project's FT description; the project suite P1 creates is to run them, nothing runs them until

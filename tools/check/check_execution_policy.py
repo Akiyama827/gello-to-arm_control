@@ -31,7 +31,7 @@ def setup(*, strict=True, health=True, **kw):
     policy = ExecutionPolicy(
         command_rate_hz=100, state_timeout_sec=.25, health_timeout_sec=1,
         start_pos_tol_rad=.1, abort_pos_err_rad=.35, hold_relatch_rad=.3,
-        torque_limits=np.array([87]*4+[12]*3),
+        torque_limits=np.array([87]*4+[12]*3), cartesian_kp_min=20.,
     ) if strict else None
     c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
                       clock=lambda: clock[0], plant_reports_health=health,
@@ -445,35 +445,45 @@ def check_modes_and_validation():
 
 
 def cartesian_plan(**changes):
-    spec = dict(task_R=np.eye(3), kc=np.ones(6), dc=np.ones(6))
+    spec = dict(frame="base", task_R=np.eye(3), kc=np.ones(6), dc=np.ones(6))
     poses = np.array([[.4, 0, .3, 1, 0, 0, 0]] * 2)
     return plan(**(dict(cartesian=spec, cartesian_poses=poses) | changes))
 
 
 def check_cartesian_lifecycle():
     c, clock = setup()
-    bad = dict(task_R=np.eye(3), kc=np.full(6, float("nan")), dc=np.ones(6))
-    for value in (cartesian_plan(cartesian=bad),
-                  cartesian_plan(cartesian_poses=np.full((2, 7), float("nan"))),
-                  cartesian_plan(cartesian_poses=None)):
-        c.on_plan(value)
-        assert c._plan is None, "malformed Cartesian tail accepted"
-    # The packer enforces some shapes, but a received plan must be checked
-    # independently of whichever producer constructed its JSON.
+    # The packer refuses a malformed spec, but a received plan is checked independently of whichever producer built its JSON.
     from arm_control.messages import unpack_plan
-    body = unpack_plan(cartesian_plan())
-    body["cartesian"]["kc"] = np.ones(5)
-    assert c.execution_policy.plan_error(body, c.last_state.position, 7)
+    measured = c.last_state.position
+    assert not c.execution_policy.plan_error(unpack_plan(cartesian_plan()), measured, 7)
+    assert not c.execution_policy.plan_error(unpack_plan(cartesian_plan(cartesian_poses=None)), measured, 7), \
+        "poses are visualisation only: the plant targets FK(q_des)"
+    for key, value in (("kc", np.ones(5)), ("kc", np.full(6, float("nan"))), ("kc", np.full(6, 1001.)),
+                       ("frame", "world"), ("task_R", -np.eye(3))):
+        body = unpack_plan(cartesian_plan())
+        body["cartesian"][key] = value
+        assert "Cartesian impedance spec refused" in c.execution_policy.plan_error(body, measured, 7), (key, value)
     body = unpack_plan(cartesian_plan())
     body["cartesian_poses"] = np.zeros((1, 7))
-    assert c.execution_policy.plan_error(body, c.last_state.position, 7)
+    assert c.execution_policy.plan_error(body, measured, 7)
+    # Operator 2026-10-09: the RT's fault hold keeps only the joint law, so a Cartesian leg carries kp >= the floor everywhere.
+    low = cartesian_plan(kp=[600] * 6 + [19.9])
+    c.on_plan(low)
+    assert c._plan is None, "a Cartesian leg under the joint-kp floor was accepted"
+    assert "joint kp >= 20" in c.execution_policy.plan_error(unpack_plan(low), measured, 7)
+    assert not c.execution_policy.plan_error(unpack_plan(plan(kp=[600] * 6 + [19.9])), measured, 7), \
+        "the floor binds Cartesian legs only"
+    from dataclasses import replace
+    floorless = replace(c.execution_policy, cartesian_kp_min=None)
+    assert "no cartesian_kp_min" in floorless.plan_error(unpack_plan(cartesian_plan()), measured, 7)
 
     for stop in ("outage", "abort", "cancel"):
         c, clock = setup()
         c.on_plan(cartesian_plan())
         c.on_control(pack_control_update(execute="p"))
         c.tick()
-        assert commands(c)[-1]["cartesian"] is not None
+        sent = commands(c)[-1]["cartesian"]
+        assert sent is not None and sent["frame"] == "base" and "pose" not in sent, sent  # the plant targets FK(q_des)
         if stop == "outage":
             clock[0] += .26
             c.tick()
@@ -485,7 +495,52 @@ def check_cartesian_lifecycle():
         c.tick()
         assert commands(c)[-1]["cartesian"] is None, (stop, commands(c)[-1])
         assert c._cartesian_now is None and c.reference is None
-        assert c._last_cartesian_pose is None
+
+    # The law lives with its leg and nowhere else: every hold is the joint law only (the RT box's own hold), so no later event
+    # can leave a spring on under joint gains the floor never admitted. With and without a policy.
+    for strict in (True, False):
+        for after in ("complete", "disarm_rearm", "gains"):
+            c, clock = setup(strict=strict, health=False, settle_dwell_s=0.)
+            c.on_plan(cartesian_plan())
+            c.on_control(pack_control_update(execute="p"))
+            advance(c, clock, .1)
+            assert commands(c)[-1]["cartesian"] is not None, (strict, after)
+            if after == "complete":
+                c.executor.at_goal = lambda *args, **kwargs: True
+                advance(c, clock, 1.2)
+                assert not c._running, (strict, after)
+            elif after == "disarm_rearm":
+                c._set_arm(False)
+                c._set_arm(True)
+            else:
+                c.on_control(pack_control_update(gains=dict(kp=[5.] * 7, kd=[1.] * 7)))
+            sent = len(commands(c))
+            for _ in range(3):
+                clock[0] += .01
+                c.on_motor_state(state())
+                c.tick()
+            later = commands(c)[sent:]
+            assert later and all(m["cartesian"] is None for m in later), (strict, after, [m["cartesian"] for m in later])
+
+    # A jog while a gated Cartesian plan is staged (loaded, not released) is the joint law: the spec belongs to the leg.
+    c, clock = setup()
+    c.on_plan(cartesian_plan())
+    assert c._plan is not None and not c._running
+    c.on_jog(pack_jog(q=[.02] * 7))
+    c.tick()
+    assert np.allclose(commands(c)[-1]["position"], .02) and commands(c)[-1]["cartesian"] is None
+
+    # A plan that names itself but does not decode is refused with its reason; the controller lives on.
+    import json
+    body = json.loads(json.dumps(unpack_json_message(cartesian_plan(), expected_schema="plan")))
+    body["cartesian"]["kc"] = [2000.] * 6
+    c, clock = setup()
+    c.on_plan(pack_json_message("plan", body))
+    assert c._plan is None and not c.stopped
+    events = [unpack_json_message(v) for t, v in c.node.sent if t == "controller_event"]
+    assert any(e.get("kind") == "leg_result" and not e["ok"] and "malformed plan" in e["reason"] for e in events), events
+    c.on_plan(cartesian_plan())
+    assert c._plan is not None, "a good plan after a malformed one must load"
 
 
 def check_completion_order():

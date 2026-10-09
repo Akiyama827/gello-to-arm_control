@@ -10,3 +10,6 @@ execution_policy:
   hold_relatch_rad: 0.3
   velocity_limits: [0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4]
   acceleration_limits: [0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]
+  # Operator 2026-10-09: a cartesian_impedance leg carries at least this joint kp (N.m/rad) on every joint, so the RT's fault
+  # hold (joint law only) is not limp. The bench's dock leg (kp_scale 0.35) has 21 at its softest joint.
+  cartesian_kp_min: 20.0
