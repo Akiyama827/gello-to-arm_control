@@ -386,6 +386,9 @@ class RobotRuntime:
         if not isinstance(model, dict) or list(model.get('joints') or []) != list(self.joints):
             raise Refused(f'load model joints must be this arm\'s, in order: {list(self.joints)}')
         c = self.controller
+        timeout = c.execution_policy.state_timeout_sec if c.execution_policy is not None else 0.5
+        if c._last_state_at is None or c._clock() - c._last_state_at > timeout:
+            raise Refused('no fresh measured pose to check the load model at')
         try:
             dynamics = BodyListDynamics(model)
             tau = dynamics.gravity(np.asarray(c.last_state.position, float))

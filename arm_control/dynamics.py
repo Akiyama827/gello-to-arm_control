@@ -158,7 +158,7 @@ class BodyListDynamics:
     ``joint`` {name, kind, axis, pos}), ``gravity``, ``inactive_joints`` (command slots the tree does not contain: held at
     model zero) and optional ``unmeasured_joints`` (tree joints no motor reports: model zero). Joint ``kind`` is MuJoCo's
     ``mjtJoint`` value (hinge 3, slide 2), the composer the model comes from. A load model's body list (the base, with the
-    modules grafted onto it) is one of these; the supervisor installs it with ``controller_load_model``.
+    modules grafted onto it) is one of these; the supervisor installs it with load_model/1 (``ArmClient.set_load_model``).
     """
 
     def __init__(self, description):
