@@ -259,6 +259,17 @@ def main():
         bridge.on_control(pack_control_update(execute='s1'))
         failed = [e for e in cap.events('leg_result') if e['plan_id'] == 's1']
         assert failed and failed[0]['ok'] is False and 'superseded by a jog' in failed[0]['reason'], failed
+        # one big setpoint, held: the arm moves no faster than planned motion may (the policy's 1.0 rad/s here; review 2026-10-09
+        # measured 2.26 rad/s for this step before the per-tick saturation)
+        q_big = np.asarray(arm.state().q)
+        peak, end = 0., time.monotonic() + 1.2
+        while time.monotonic() < end:
+            arm.setpoint(q_big + [.3, 0, 0])
+            peak = max(peak, abs(arm.state().dq[0]))
+            time.sleep(.01)
+        # (the fixture's P law sags ~0.03 rad short at these poses: a steady-state error, not the ramp)
+        assert peak <= 1.0 * 1.15 and abs(arm.state().q[0] - (q_big[0] + .3)) < .05, (peak, arm.state().q, q_big)
+        time.sleep(.6)
         # a target beyond the policy's abort_pos_err_rad (0.35 here) is refused, not taken and then dropped by the controller
         refused(np.asarray(arm.state().q) + [.5, 0, 0], 'abort_pos_err_rad')
         # a failed settle freezes the controller (a completion goal the plan never reaches): setpoints and plans are refused until
@@ -315,17 +326,22 @@ def main():
         # an owner that leaves takes its setpoint with it: the arm holds where it is, not at the departed owner's target
         arm.arm()
         end = time.monotonic() + 5.
+        q_go = np.asarray(arm.state().q)
         while True:
             try:
-                arm.setpoint(np.asarray(arm.state().q) + [.3, 0, 0])
+                arm.setpoint(q_go + [.3, 0, 0])
                 break
             except Refused as exc:
                 assert 'fresh measured pose' in str(exc) and time.monotonic() < end, exc
                 time.sleep(.02)
+        end = time.monotonic() + .35  # under way (the setpoint ramps up to speed), then the owner leaves mid-travel
+        while time.monotonic() < end:
+            arm.setpoint(q_go + [.3, 0, 0])
+            time.sleep(.02)
         arm.unclaim()
         left = np.asarray(arm.state().q)
         time.sleep(.25)  # inside the 0.3 s deadman: without the clear the arm would still be travelling to the target
-        assert abs(arm.state().q[0] - left[0]) < .03, (arm.state().q, left)
+        assert abs(arm.state().q[0] - left[0]) < .05, (arm.state().q, left, q_go)
         arm.claim()
         arm.disarm()
         for t, v in cap.out:
