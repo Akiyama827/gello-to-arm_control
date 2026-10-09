@@ -191,6 +191,8 @@ def main() -> int:
                                                    str(ROOT / "tools/check/check_supervised_hardware.py"),
                                                    "--server", server],
                            logs=logs, env=env, timeout=180))
+        results.append(run("installed_sdk", [sys.executable, str(ROOT / "tools/check/check_installed_sdk.py"),
+                                             "--server", server], logs=logs, env=env, timeout=300))
         results.append(run("state_history", [sys.executable,
                                              str(ROOT / "tools/check/check_state_history.py"),
                                              "--server", server],
