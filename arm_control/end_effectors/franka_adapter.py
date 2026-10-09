@@ -54,7 +54,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from arm_control.end_effectors.franka_hand import (
-    FRANKA_HAND, GRASP_TIMEOUT_S, HandGraspFsm, parse_limits, resolve_grasp_parameters,
+    FRANKA_HAND, GRASP_TIMEOUT_S, HandGraspFsm, parse_limits, require_force_grasp, resolve_grasp_parameters,
 )
 from arm_control.end_effectors.hand_move import HandMove
 from arm_control.config import load_robot_config
@@ -109,6 +109,7 @@ def submit_grasp_request(client, fsm: HandGraspFsm, req: dict, now: float, *,
             raise ValueError('hand busy: position completion is pending')
         if fsm.awaiting_result:
             raise ValueError("hand busy: previous grasp result has not been consumed")
+        require_force_grasp(fsm.limits, req.get("mode", "close"))
         p = resolve_grasp_parameters(fsm._config, req, fsm.limits)
         line = _request_line(p, req.get("mode", "close"))
         gdone_base = client.gdone_count
@@ -170,7 +171,7 @@ class BridgeClient(threading.Thread):
             state = dict(self.state or {})
             state.update(
                 available=self._connected and state.get("available", False),
-                force_grasp=self._epoch is not None and self.limits.force_grasp,
+                force_grasp=self._epoch is not None,   # the epoch protocol; the gripper's own: limits.force_grasp
                 limits=self.limits._asdict(),
                 active_stop=self._connected and self._active_stop,
                 busy=bool(self._cancel_waiting or self._inflight or state.get("busy", False)),
@@ -189,6 +190,7 @@ class BridgeClient(threading.Thread):
             if len(parts) == 3 and parts[0] == "MOVE":
                 resolve_grasp_parameters({}, dict(width_m=float(parts[1]), speed_mps=float(parts[2])), self.limits)
             elif len(parts) == 6 and parts[0] == "GRASP":
+                require_force_grasp(self.limits)
                 resolve_grasp_parameters({}, dict(zip(
                     ("width_m", "speed_mps", "force_n", "epsilon_inner_m", "epsilon_outer_m"),
                     map(float, parts[1:]))), self.limits)

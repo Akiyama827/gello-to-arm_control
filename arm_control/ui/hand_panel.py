@@ -22,6 +22,7 @@ from arm_control.end_effectors.franka_hand import (
     FRANKA_HAND,
     GRASP_TIMEOUT_S,
     HandLimits,
+    require_force_grasp,
     resolve_grasp_parameters,
 )
 
@@ -70,7 +71,7 @@ class HandPanel:
     @property
     def limits(self) -> HandLimits:
         """The connected gripper's stated envelope (``gripper_state.limits``; none stated: the Franka Hand)."""
-        stated = self._state.get("limits") if isinstance(getattr(self, "_state", None), dict) else None
+        stated = self._state.get("limits")
         return HandLimits(**stated) if stated else FRANKA_HAND
 
     def set_state(self, state: dict) -> None:
@@ -181,6 +182,7 @@ class HandPanel:
         if reason:
             raise ValueError(reason)
         mode = payload.get("mode", "close")
+        require_force_grasp(self.limits, mode)
         params = resolve_grasp_parameters(self._cfg, payload, self.limits)
         self._request_id = uuid.uuid4().hex
         self._pending = {

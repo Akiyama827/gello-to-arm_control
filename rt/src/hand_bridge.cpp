@@ -13,6 +13,10 @@
 //   PC -> "CMD <epoch> MOVE <width_m> <speed_mps>\n" | "CMD <epoch> HOME\n"
 //      | "CMD <epoch> GRASP <width_m> <speed_mps> <force_n> <eps_in_m> <eps_out_m>\n"
 //      | "GSTOP\n" (cancel pending and actively stop a running move/grasp)
+//   <-  "LIMITS <width_max_m> <speed_max_mps> <force_min_n> <force_max_n>\n"
+//       (~10 Hz, first in every report, before STATE; a bridge that omits it
+//       is the Franka Hand. FROZEN at four fields: clients refuse any other
+//       count, so a new field goes on a new line)
 //   <-  "STATE <width_m> <0|1>\n"   (~10 Hz, streams DURING moves too)
 //   <-  "GDONE <0|1>\n"             (once per completed GRASP: the
 //                                    franka::Gripper::grasp verdict — object
@@ -21,8 +25,6 @@
 //                                    client owns the timeout.)
 //   <-  "META 2 <epoch> <available> <busy> <measured> <sample_seq>\n"
 //   <-  "CAPS active_stop\n" (the older mailbox-only bridge omits this)
-//   <-  "LIMITS <width_max_m> <speed_max_mps> <force_min_n> <force_max_n>\n"
-//       (~10 Hz, before STATE; a bridge that omits it is the Franka Hand)
 //   <-  "STOPPING <epoch>\n" (request admitted, NOT physical stop completion)
 //   <-  "ACCEPT|REJECT <command_epoch> <reason>\n" | "DONE <command_epoch> <ok>\n"
 // Epoch changes on every admission/cancellation/client or robot disconnect.

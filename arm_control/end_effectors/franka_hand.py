@@ -56,6 +56,12 @@ def parse_limits(parts: list[str]) -> HandLimits:
     return limits
 
 
+def require_force_grasp(limits: HandLimits, mode: str = "close") -> None:
+    """A close is a force GRASP: refused on a gripper that states none (MOVE, HOME and release still work)."""
+    if mode == "close" and not limits.force_grasp:
+        raise ValueError("this gripper has no calibrated force grasp (GRASP refused until its force map is measured)")
+
+
 def resolve_grasp_parameters(config: dict, payload: dict, limits: HandLimits = FRANKA_HAND) -> dict:
     """Validate an isolated request without changing configured defaults, inside the gripper's stated envelope.
 
@@ -65,8 +71,6 @@ def resolve_grasp_parameters(config: dict, payload: dict, limits: HandLimits = F
     mode = payload.get("mode", "close")
     if mode not in ("close", "release"):
         raise ValueError("mode must be close or release")
-    if mode == "close" and not limits.force_grasp:
-        raise ValueError("this gripper has no calibrated force grasp (GRASP refused until its force map is measured)")
     result = {
         "width_m": config.get("open_width_m", 0.075) if mode == "release"
         else config.get("grasp_width_m", 0.045),
@@ -81,7 +85,8 @@ def resolve_grasp_parameters(config: dict, payload: dict, limits: HandLimits = F
             result[key] = payload[key]
     for key, value in result.items():
         if key == "force_n" and not limits.force_grasp:
-            continue  # a release on a gripper without force grasp: no force is commanded
+            result[key] = 0.0  # no force grasp: no force is commanded (a close is refused by require_force_grasp)
+            continue
         low, high = ((limits.force_min_n, limits.force_max_n) if key == "force_n"
                      else (0.0, limits.speed_max_mps) if key == "speed_mps"
                      else (0.0, limits.width_max_m))
@@ -136,6 +141,7 @@ class HandGraspFsm:
         rid = str(payload.get("request_id", ""))
         tid = str(payload.get("target_id", ""))
         try:
+            require_force_grasp(self.limits, str(payload.get("mode", "close")))
             parameters = resolve_grasp_parameters(self._config, payload, self.limits)
         except ValueError as exc:
             return None, _result(rid, tid, False, str(exc))
@@ -225,5 +231,5 @@ class HandGraspFsm:
         return None
 
 
-__all__ = ["HandGraspFsm", "GRASP_TIMEOUT_S", "resolve_grasp_parameters",
+__all__ = ["HandGraspFsm", "GRASP_TIMEOUT_S", "require_force_grasp", "resolve_grasp_parameters",
            "HandLimits", "FRANKA_HAND", "parse_limits"]
