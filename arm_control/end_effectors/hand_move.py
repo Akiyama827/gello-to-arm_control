@@ -1,7 +1,7 @@
 """Measured completion for a position-only Hand operation, without grasp ownership."""
 import math
 
-from arm_control.end_effectors.franka_hand import resolve_grasp_parameters
+from arm_control.end_effectors.franka_hand import FRANKA_HAND, resolve_grasp_parameters
 
 
 class HandMove:
@@ -9,6 +9,7 @@ class HandMove:
 
     def __init__(self):
         self.pending = None
+        self.limits = FRANKA_HAND  # the bridge's stated envelope (the adapter keeps it current)
 
     def start(self, request, state, now):
         if self.pending is not None:
@@ -22,7 +23,7 @@ class HandMove:
             raise ValueError('position move refused while holding an object')
         if any(key not in request for key in ('width_m', 'speed_mps')):
             raise ValueError('position move requires explicit width and speed')
-        parameters = resolve_grasp_parameters({}, request)
+        parameters = resolve_grasp_parameters({}, request, self.limits)
         self.pending = dict(request_id=rid, width_m=parameters['width_m'],
                             deadline=now + 8., done_seq=None)
         return f"MOVE {parameters['width_m']:.8f} {parameters['speed_mps']:.8f}"

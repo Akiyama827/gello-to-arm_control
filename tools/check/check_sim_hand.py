@@ -13,7 +13,8 @@ import time
 import numpy as np
 
 from arm_control.end_effectors.franka_adapter import BridgeClient, submit_grasp_request
-from arm_control.end_effectors.franka_hand import HandGraspFsm
+from arm_control.end_effectors.franka_hand import FRANKA_HAND, HandGraspFsm, HandLimits, parse_limits
+from arm_control.end_effectors.hand_move import HandMove
 from arm_control.end_effectors.sim_hand_bridge import SimHandBridge, parse_command
 
 
@@ -107,7 +108,7 @@ class Raw:
         try:
             return wait(lambda: self.pump() or next((ln for ln in self.lines if ln.startswith(prefix)), None), 3, prefix)
         except AssertionError:
-            raise AssertionError(f'no {prefix}; replies: {[ln for ln in self.lines if not ln.startswith(("STATE", "META", "CAPS"))]}')
+            raise AssertionError(f'no {prefix}; replies: {[ln for ln in self.lines if not ln.startswith(("STATE", "META", "CAPS", "LIMITS"))]}')
 
     def take(self, prefix):
         line = self.reply(prefix)
@@ -130,6 +131,64 @@ def parser_cases():
                 'CMD 3 GRASP 0.04 0.05 29 0.02 0.02', 'CMD 3 GRASP 0.04 0.05 71 0.02 0.02', 'CMD 3 MOVE 0.04 0.05 1',
                 'MOVE 0.04 0.05', 'CMD 3 JUMP', 'CMD 3 GRASP 0.04 0.05 55 0.02 nan'):
         assert parse_command(bad) is None, bad
+    # a stated envelope replaces the Franka Hand's: a wider stroke admits wider widths; force_max 0 admits no GRASP
+    wide = HandLimits(.0878, .2, 0., 0.)
+    assert parse_command('CMD 3 MOVE 0.085 0.15', wide)['w'] == .085 and parse_command('CMD 3 MOVE 0.085 0.05') is None
+    assert parse_command('CMD 3 GRASP 0.04 0.05 55 0.02 0.02', wide) is None
+    assert parse_command('CMD 3 MOVE 0.04 0.21', wide) is None
+    for bad in ('LIMITS 0.08 0.1 30', 'LIMITS 0 0.1 30 70', 'LIMITS 0.08 0.1 70 30', 'LIMITS 0.08 nan 30 70',
+                'LIMITS 0.08 0.1 -1 70'):
+        try:
+            parse_limits(bad.split())
+        except ValueError:
+            continue
+        raise AssertionError(f'accepted {bad}')
+
+
+def client_limits_cases():
+    """The client validates against the envelope the bridge states (absent: the Franka Hand's), and refuses a force grasp
+    a gripper without one cannot do -- before anything reaches the wire."""
+    def fed(*lines):
+        """A never-started client, connected in name, fed these lines (then a fresh measured Hand)."""
+        c = BridgeClient('127.0.0.1', 1)
+        c._connected = True
+        for line in (*lines, b'STATE 0.050 0', b'CAPS active_stop', b'META 2 3 1 0 1 5'):
+            c._receive(line)
+        c._sample_at = time.monotonic()
+        return c
+
+    no_force = b'LIMITS 0.08780 0.20000 0.000 0.000'
+    # no force grasp refuses a close ONLY: position moves, HOME and release still go out
+    assert fed(no_force).snapshot()['force_grasp'], 'force_grasp is the epoch protocol, not the gripper'
+    assert fed(no_force).send_line('MOVE 0.08500 0.150') and fed(no_force).send_line('HOME')
+    move = HandMove()
+    move.limits = HandLimits(.0878, .2, 0., 0.)
+    assert move.start(dict(request_id='m', width_m=.085, speed_mps=.15), fed(no_force).snapshot(), 0.).startswith('MOVE')
+    c = fed(no_force)
+    fsm = HandGraspFsm({'grasp_width_m': .045, 'speed_mps': .05, 'force_n': 40, 'open_width_m': .075})
+    fsm.limits = c.limits
+    released = submit_grasp_request(c, fsm, {'request_id': 'r', 'target_id': 'm', 'mode': 'release'}, time.monotonic())
+    assert released and released['ok'] and c._inflight is not None, (released, c._inflight)
+    assert fsm.parameters['force_n'] == 0.
+    assert fed().send_line('MOVE 0.06000 0.100') and not fed().send_line('MOVE 0.08500 0.100')  # absent: the Franka Hand
+
+    client = BridgeClient('127.0.0.1', 1)  # never started: lines are fed to the receiver directly
+    assert client.limits == FRANKA_HAND
+    try:
+        client._receive(b'STATE 0.085 0')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a width past the Franka stroke was accepted before any LIMITS')
+    client._receive(b'LIMITS 0.08780 0.20000 0.000 0.000')
+    client._receive(b'STATE 0.085 0')
+    assert client.state['width'] == .085 and not client.snapshot()['force_grasp']
+    assert client.snapshot()['limits'] == HandLimits(.0878, .2, 0., 0.)._asdict()
+    fsm = HandGraspFsm({'grasp_width_m': .045, 'speed_mps': .05, 'force_n': 40})
+    fsm.limits = client.limits
+    result = submit_grasp_request(client, fsm, {'request_id': 'g', 'target_id': 'm'}, time.monotonic())
+    assert result and not result['ok'] and 'no calibrated force grasp' in result['reason'], result
+    assert not client.send_line('GRASP 0.04 0.05 40 0.02 0.02') and client._inflight is None
 
 
 def raw_cases(bridge, fingers):
@@ -287,8 +346,37 @@ def client_cases(bridge, fingers):
         client.close()
 
 
+def reconnect_cases():
+    """A reconnect forgets the previous bridge's envelope: one that states none is the Franka Hand."""
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    wide = SimHandBridge(port, limits=HandLimits(.0878, .2, 0., 0.))
+    wide.start()
+    client = BridgeClient('127.0.0.1', port)
+    client.start()
+    try:
+        wait(lambda: client.limits.width_max_m == .0878, 3, 'the stated envelope')
+        wide.close()
+        wait(lambda: not client.snapshot()['available'], 3, 'the client sees the bridge gone')
+        old = socket.socket()  # an old bridge: META and CAPS, no LIMITS
+        old.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        old.bind(('127.0.0.1', port))
+        old.listen(1)
+        old.settimeout(5)
+        conn, _ = old.accept()
+        conn.sendall(b'CAPS active_stop\nMETA 2 1 1 0 0 0\n')
+        wait(lambda: client.snapshot()['active_stop'], 3, 'the client on the old bridge')
+        assert client.limits == FRANKA_HAND, client.limits
+        conn.close()
+        old.close()
+    finally:
+        client.close()
+
+
 def main():
     parser_cases()
+    client_limits_cases()
     fingers = FakeFingers()
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
@@ -301,17 +389,24 @@ def main():
     time.sleep(.35)
     first.pump()
     assert first.meta() is not None and not any(ln.startswith('STATE') for ln in first.lines), first.lines
+    assert first.lines[0] == 'LIMITS 0.08000 0.10000 30.000 70.000', first.lines  # the envelope leads every report
     first.close()
     thread = threading.Thread(target=plant, args=(bridge, fingers, stop), daemon=True)
     thread.start()
     try:
+        report = Raw(port)
+        wait(lambda: report.pump() or any(ln.startswith('STATE') for ln in report.lines), 2, 'a report with STATE')
+        report.close()
+        at = next(i for i, ln in enumerate(report.lines) if ln.startswith('STATE'))
+        assert report.lines[at - 1].startswith('LIMITS '), report.lines  # a client validates STATE against it
         raw_cases(bridge, fingers)
         client_cases(bridge, fingers)
+        reconnect_cases()
     finally:
         stop.set()
         thread.join(2)
         bridge.close()
-    print('sim Hand bridge: PASS (parser bounds, epochs and busy/stale/invalid rejects, MOVE/GRASP DONE and GDONE, held grasp '
+    print('sim Hand bridge: PASS (parser bounds, stated LIMITS (wire, client validation, no-force-grasp refusal), epochs and busy/stale/invalid rejects, MOVE/GRASP DONE and GDONE, held grasp '
           'survives a disconnect, GSTOP releases and stops mid-move silently, disconnect stops committed work, '
           'BridgeClient + HandGraspFsm grasp)')
 

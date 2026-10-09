@@ -14,6 +14,13 @@ int main() {
     assert(!parse_hand_command(bad, action));
   }
   assert(parse_hand_command("CMD 1 HOME", action));
+  // A stated envelope replaces the Franka Hand's; force_max 0 admits no GRASP.
+  const HandLimits wide{.0878, .2, 0, 0};
+  assert(parse_hand_command("CMD 1 MOVE 0.085 0.15", action, wide) && action.w == .085);
+  assert(!parse_hand_command("CMD 1 MOVE 0.085 0.05", action));
+  assert(!parse_hand_command("CMD 1 MOVE 0.04 0.21", action, wide));
+  assert(!parse_hand_command("CMD 1 GRASP 0.04 0.05 0 0.02 0.02", action, wide));
+  assert(parse_hand_command("CMD 1 HOME", action, wide));
   action.token = gate.epoch;
   assert(gate.admit(action, true) != nullptr); // offline
   gate.client = gate.connected = true;

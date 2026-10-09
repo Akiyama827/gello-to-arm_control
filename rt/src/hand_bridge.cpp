@@ -13,6 +13,10 @@
 //   PC -> "CMD <epoch> MOVE <width_m> <speed_mps>\n" | "CMD <epoch> HOME\n"
 //      | "CMD <epoch> GRASP <width_m> <speed_mps> <force_n> <eps_in_m> <eps_out_m>\n"
 //      | "GSTOP\n" (cancel pending and actively stop a running move/grasp)
+//   <-  "LIMITS <width_max_m> <speed_max_mps> <force_min_n> <force_max_n>\n"
+//       (~10 Hz, first in every report, before STATE; a bridge that omits it
+//       is the Franka Hand. FROZEN at four fields: clients refuse any other
+//       count, so a new field goes on a new line)
 //   <-  "STATE <width_m> <0|1>\n"   (~10 Hz, streams DURING moves too)
 //   <-  "GDONE <0|1>\n"             (once per completed GRASP: the
 //                                    franka::Gripper::grasp verdict — object
@@ -107,7 +111,7 @@ void observe_state(const franka::GripperState& st) {
   const auto stamp = st.time.toMSec();
   if (seen_robot_sample && stamp <= robot_sample_time) return;
   if (!std::isfinite(st.width) || st.width < -width_measurement_tolerance_m ||
-      st.width > .08 + width_open_tolerance_m) {
+      st.width > franka_hand.width_max_m + width_open_tolerance_m) {
     // Throttled, NOT gated on have_real: the first bad sample clears the
     // very flag such a gate would test, so a Hand that never once reports a
     // usable width stays completely silent -- which is the failure that is
@@ -128,7 +132,7 @@ void observe_state(const franka::GripperState& st) {
   real_t = mono_s();
   ++sample_seq;
   admission.sampled();
-  real_w = std::clamp(st.width, 0.0, .08);
+  real_w = std::clamp(st.width, 0.0, franka_hand.width_max_m);
   real_grasped = st.is_grasped;
 }
 
@@ -453,6 +457,13 @@ void serve(int fd) {
           w = real_w;
         }
       }
+      // The envelope first: a client validates STATE against it, and one that
+      // has not seen it assumes the Franka Hand's.
+      char limits[96];
+      const int nl = std::snprintf(limits, sizeof(limits), "LIMITS %.5f %.5f %.3f %.3f\n",
+          franka_hand.width_max_m, franka_hand.speed_max_mps, franka_hand.force_min_n,
+          franka_hand.force_max_n);
+      if (send(fd, limits, size_t(nl), MSG_NOSIGNAL) != nl) return;
       if (valid) {
         char out[64];
         const int n = std::snprintf(out, sizeof(out), "STATE %.5f %d\n", w,

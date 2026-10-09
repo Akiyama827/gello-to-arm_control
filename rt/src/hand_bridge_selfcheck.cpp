@@ -141,7 +141,7 @@ int main() {
     sample_seq = 7;
   }
   std::thread server([&] { serve(pair[1]); close(pair[1]); });
-  auto until = [&](const std::string& expected) {
+  auto until = [&](const std::string& expected) -> std::string {
     std::string response;
     for (int i = 0; i < 30; ++i) {
       pollfd event{pair[0], POLLIN, 0};
@@ -150,15 +150,17 @@ int main() {
         const auto got = recv(pair[0], buf, sizeof(buf), 0);
         assert(got > 0);
         response.append(buf, size_t(got));
-        if (response.find(expected) != std::string::npos) return;
+        if (response.find(expected) != std::string::npos) return response;
       }
     }
     assert(false && "bridge response timeout");
+    return response;
   };
   auto send_line = [&](const std::string& line) {
     assert(send(pair[0], line.data(), line.size(), MSG_NOSIGNAL) == ssize_t(line.size()));
   };
-  until("META 2");
+  // The stated envelope leads every report: a client validates STATE against it.
+  assert(until("META 2").rfind("LIMITS 0.08000 0.10000 30.000 70.000\nSTATE 0.07500 ", 0) == 0);
   uint64_t epoch;
   { std::lock_guard<std::mutex> lock(mx); epoch = admission.epoch; }
   send_line("CMD " + std::to_string(epoch) + " MOVE nan 0.05\n");

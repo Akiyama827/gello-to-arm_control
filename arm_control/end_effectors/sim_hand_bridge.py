@@ -9,7 +9,9 @@ finger actuators, so the Hand path (``franka_adapter`` + ``HandGraspFsm``) is on
   admission, cancellation and client change; REJECT reasons ``offline``, ``stopping``, ``stale_epoch``, ``busy``,
   ``stale_state``, ``invalid_command``;
 * a new action needs a measured sample under 0.6 s old, taken after the previous action ended;
-* every 0.1 s ``STATE <width> <grasped>``, ``CAPS active_stop`` and ``META 2 <epoch> <available> <busy> <measured> <seq>``;
+* every 0.1 s ``LIMITS <width_max_m> <speed_max_mps> <force_min_n> <force_max_n>`` (the envelope it admits; the Franka
+  Hand's unless constructed with another), ``STATE <width> <grasped>``, ``CAPS active_stop`` and
+  ``META 2 <epoch> <available> <busy> <measured> <seq>``;
   ``ACCEPT|REJECT <token> <reason>`` per command, ``DONE <token> <ok>`` per finished action, ``GDONE <ok>`` per finished
   GRASP, ``STOPPING <epoch>`` per GSTOP; a stopped action reports nothing (its epoch is gone);
 * a disconnect stops committed work, and otherwise only cancels (a completed grasp keeps holding); one client at a time.
@@ -33,9 +35,10 @@ import socket
 import threading
 import time
 
-MAX_WIDTH_M = 0.08          # FR3 Hand travel
+from arm_control.end_effectors.franka_hand import FRANKA_HAND, HandLimits
+
 CLOSED_TOL_M = 1e-5         # the C++ observe_state's sample envelope: below -1e-5 or above 0.082 the sample is rejected
-OPEN_TOL_M = 2e-3           # (no STATE, not fresh); inside it the width is clamped to [0, 0.08]
+OPEN_TOL_M = 2e-3           # (no STATE, not fresh); inside it the width is clamped to [0, width_max_m]
 SEND_TIMEOUT_S = 0.2        # the C++ server's SO_SNDTIMEO: a client that stops reading is disconnected
 _NUMBER = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\Z", re.ASCII)   # what `istream >> double` reads, ASCII only
 HOME_SPEED_MPS = 0.05
@@ -49,8 +52,9 @@ MOVE_TOL_M = 0.001          # a MOVE that settles within this of its goal succee
 EFFORT_FLOOR_N = 2.0        # a held module keeps the servos loaded (5-12 N measured)
 
 
-def parse_command(line: str) -> dict | None:
-    """``CMD <token> MOVE w s`` | ``CMD <token> HOME`` | ``CMD <token> GRASP w s f eps_in eps_out``, as the C++ parser."""
+def parse_command(line: str, limits: HandLimits = FRANKA_HAND) -> dict | None:
+    """``CMD <token> MOVE w s`` | ``CMD <token> HOME`` | ``CMD <token> GRASP w s f eps_in eps_out``, as the C++ parser,
+    inside ``limits`` (``force_max_n == 0``: no GRASP)."""
     parts = line.split(" ")
     if len(parts) < 3 or parts[0] != "CMD" or not (parts[1].isascii() and parts[1].isdigit()):
         return None
@@ -67,11 +71,13 @@ def parse_command(line: str) -> dict | None:
         action.update(w=values[0], s=values[1], f=values[2], ei=values[3], eo=values[4])
     else:
         return None
-    if not (math.isfinite(action["w"]) and 0 <= action["w"] <= MAX_WIDTH_M
-            and math.isfinite(action["s"]) and 0 < action["s"] <= 0.10):
+    wmax = limits.width_max_m
+    if not (math.isfinite(action["w"]) and 0 <= action["w"] <= wmax
+            and math.isfinite(action["s"]) and 0 < action["s"] <= limits.speed_max_mps):
         return None
-    if verb == "GRASP" and not (math.isfinite(action["f"]) and 30 <= action["f"] <= 70   # Hand manual 1.2 5.1
-                                and all(math.isfinite(action[k]) and 0 <= action[k] <= MAX_WIDTH_M for k in ("ei", "eo"))):
+    if verb == "GRASP" and not (limits.force_grasp and math.isfinite(action["f"])
+                                and limits.force_min_n <= action["f"] <= limits.force_max_n
+                                and all(math.isfinite(action[k]) and 0 <= action[k] <= wmax for k in ("ei", "eo"))):
         return None
     return action
 
@@ -126,7 +132,8 @@ class _Admission:
 class _Fingers:
     """SimHand's finger physics (plant thread only): per tick, the finger command to apply, and an action's verdict."""
 
-    def __init__(self) -> None:
+    def __init__(self, width_max_m: float) -> None:
+        self.width_max_m = width_max_m
         self.mode = "idle"          # idle | move | grasp | holding
         self.action: dict | None = None
         self.cmd_w: float | None = None
@@ -137,7 +144,7 @@ class _Fingers:
     def start(self, action: dict, width: float, now: float) -> None:
         self.action = dict(action)
         if action["kind"] == "HOME":
-            self.action.update(w=MAX_WIDTH_M, s=HOME_SPEED_MPS)
+            self.action.update(w=self.width_max_m, s=HOME_SPEED_MPS)
         self.mode = "grasp" if action["kind"] == "GRASP" else "move"
         self.cmd_w = width           # ramp from where the fingers ARE
         self.force_n = 0.0
@@ -192,11 +199,12 @@ class SimHandBridge:
     """The ``hand_bridge`` protocol over a hosted world's fingers. ``on_sample`` runs on the plant thread, once per tick, after
     the step; the server thread only parses, admits and reports. One lock, as the C++ server's ``mx``."""
 
-    def __init__(self, port: int, *, bind: str = "127.0.0.1") -> None:
+    def __init__(self, port: int, *, bind: str = "127.0.0.1", limits: HandLimits = FRANKA_HAND) -> None:
         self.addr = (bind, int(port))
+        self.limits = limits
         self._lock = threading.Lock()
         self._adm = _Admission()
-        self._fingers = _Fingers()
+        self._fingers = _Fingers(limits.width_max_m)
         self._acting: dict | None = None
         self.have_real, self.real_t, self.real_w, self.real_grasped, self.sample_seq = False, 0.0, 0.0, False, 0
         self.grasp_seq, self.grasp_ok, self.done_seq, self.done_token, self.done_ok = 0, False, 0, 0, False
@@ -242,13 +250,13 @@ class SimHandBridge:
                 adm.acting = adm.dispatch_committed = False
                 self._acting, adm.stopping, self.have_real = None, False, False
                 return self._fingers.command()
-            if not math.isfinite(width) or width < -CLOSED_TOL_M or width > MAX_WIDTH_M + OPEN_TOL_M:
+            if not math.isfinite(width) or width < -CLOSED_TOL_M or width > self.limits.width_max_m + OPEN_TOL_M:
                 self.have_real = False   # the C++ observe_state: no STATE, not fresh, until a usable sample
                 if now - getattr(self, "_rejected_at", -1e9) > 2.0:
                     self._rejected_at = now
                     print(f"[sim_hand] rejected measured width {width:.6g} m (no STATE until a sample is usable)", flush=True)
             else:
-                self.have_real, self.real_t, self.real_w = True, now, min(max(width, 0.0), MAX_WIDTH_M)
+                self.have_real, self.real_t, self.real_w = True, now, min(max(width, 0.0), self.limits.width_max_m)
                 self.real_grasped = self._fingers.grasped(width, efforts)
                 self.sample_seq += 1
             if self._acting is not None:
@@ -328,6 +336,7 @@ class SimHandBridge:
                     adm = self._adm
                     busy = adm.acting or adm.pending is not None or adm.stopping
                     fresh = self.have_real and now - self.real_t < FRESH_S
+                    out.append("LIMITS {:.5f} {:.5f} {:.3f} {:.3f}\n".format(*self.limits))  # before STATE, as the C++
                     if self.have_real or adm.acting:
                         out.append(f"STATE {self.real_w:.5f} {int(self.real_grasped)}\n")
                     out.append(f"CAPS active_stop\nMETA 2 {adm.epoch} 1 {int(busy)} {int(fresh and not busy)} "
@@ -341,7 +350,7 @@ class SimHandBridge:
                 self._adm.request_stop()
                 self.have_real = False
                 return f"STOPPING {self._adm.epoch}\n"
-        action = parse_command(line)
+        action = parse_command(line, self.limits)
         if action is None:
             # as the C++: the token is reported only once `CMD <token> <verb>` read and the token parsed
             parts = line.split(" ")
