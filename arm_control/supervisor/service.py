@@ -51,6 +51,10 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
             return enc(runtime.hold(session, str(args.get('reason') or 'hold')))
         if op == 'controller_payload':
             return enc(runtime.set_payload(session, codec.payload_from(args['payload'])))
+    if op == 'load_model_set':
+        if runtime.extensions.get('load_model') != 1:
+            raise Refused('load_model/1 is unavailable')
+        return runtime.set_load_model(session, args['revision'], args['model'])
     if op.startswith('stream_'):
         if runtime.extensions.get('stream') != 1:
             raise Refused('stream/1 is unavailable')

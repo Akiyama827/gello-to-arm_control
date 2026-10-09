@@ -353,6 +353,14 @@ class ArmClient:
         return _dec(codec.payload_state_from, self._controller_call(
             'controller_payload', payload=codec.encode(payload)))
 
+    def set_load_model(self, revision: int, model: dict) -> int:
+        """Install a revisioned rigid-body load model (``arm_control.dynamics.BodyListDynamics``'s description, over this arm's
+        joints in order) as the controller's RNEA. Refused while an execution is live, for a revision not above the installed
+        one, and for gravity above the policy's torque limits. Returns the installed revision."""
+        if self.extensions.get('load_model') != 1:
+            raise Refused('supervisor does not advertise load_model/1')
+        return int(self._channel.call('load_model_set', revision=int(revision), model=model))
+
     # -- negotiated stream/1 ----------------------------------------------------
     def _stream_call(self, op, **args):
         if self.extensions.get('stream') != 1:
