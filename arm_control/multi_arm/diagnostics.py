@@ -235,6 +235,7 @@ class PairFaultTrace:
             observed_at_utc=now.isoformat(),
             reason=reason,
             session=self.session,
+            sim=bool(sim),
             timestamp_note=(
                 "PC receipt/tick times are not physical capture times. RT state "
                 "timestamps share a clock only when their attested clock_domain matches "
@@ -317,7 +318,7 @@ class SupervisorFaultTrace:
         now, stamp = _stamp()
         header = dict(
             schema="arm_control.supervisor_fault/v1", schema_version=1, observed_at_utc=now.isoformat(),
-            instance_id=self.instance_id, reason=w["faults"][0]["reason"], faults=w["faults"], more_faults=w["more"],
+            instance_id=self.instance_id, sim=self.sim, reason=w["faults"][0]["reason"], faults=w["faults"], more_faults=w["more"],
             fault_at_pc_monotonic=start, pre_s=self.pre_s, post_s=self.post_s, post_window_complete=complete,
             window_pc_monotonic=[samples[0].get("pc_monotonic"), samples[-1].get("pc_monotonic")] if samples else None,
             dropped_samples=0, skipped_traces_before=self.skipped, write_errors_before=self.errors,

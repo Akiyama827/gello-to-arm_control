@@ -198,8 +198,9 @@ class RobotRuntime:
         self.fault_trace = SupervisorFaultTrace(self.instance_id, self.period, context=dict(
             joints=list(self.joints), rt_host=getattr(self.link.config, 'host', None)),
             sim=getattr(self.link, 'backend_name', '') == 'sim')  # a simulated plant's traces never prune the hardware's
-        self._latched_seen = ''       # the latched fault's kind last tick: a new kind opens a fault window, its changing
-                                      # age does not (e.g. "rt state stream stale (0.42s)")
+        self._latched_kinds = set()   # fault kinds seen while the latch has stayed set: only a kind not yet seen in this
+                                      # episode opens a window (its changing age, e.g. "rt state stream stale (0.42s)", and a
+                                      # degraded link flapping between "stale" and "frozen" do not); cleared with the latch
         self._profile_gains = (self.controller.executor.kp.copy(),
                                self.controller.executor.kd.copy())
         self.identity: RobotIdentity | None = None
@@ -1866,9 +1867,11 @@ class RobotRuntime:
         self._record_trace(health)
         latched = str(health["latched_fault"] or "")
         kind = re.sub(r'\s*\([^)]*\)', '', latched)  # the fault without its parenthesised age/detail
-        if kind and kind != self._latched_seen:
+        if not kind:
+            self._latched_kinds.clear()
+        elif kind not in self._latched_kinds:
+            self._latched_kinds.add(kind)
             self.fault_trace.trigger(f'latched fault: {latched}', time.monotonic())
-        self._latched_seen = kind
         for ex in list(self._executions.values()):
             if (ex.first_seq is not None and not ex.status.terminal
                     and self._tracker.fault_seen(ex.epoch)):

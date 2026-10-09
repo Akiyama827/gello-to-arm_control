@@ -119,14 +119,18 @@ def main(argv=None) -> int:
     ap.add_argument("--root", type=Path, default=None, help="fault-trace directory (default: the console's; a supervisor's: .cache/supervisor/<instance>/faults)")
     ap.add_argument("--verify", action="store_true", help="list traces and their verification")
     ap.add_argument("--dest", nargs="?", const="", default=None,
-                    help=f"copy verified traces and a manifest here (no value: ${EXPORT_ROOT_ENV}/<date>/faults-<source>-<time>)")
+                    help=f"copy verified traces and a manifest here (no value: ${EXPORT_ROOT_ENV}/<date>/<faults|sim_faults>-<source>-<time>)")
     ap.add_argument("--include-unverified", action="store_true")
     ap.add_argument("--prune", action="store_true", help="remove the oldest traces beyond the capacity policy")
     ap.add_argument("--keep-files", type=int, default=RETAIN_FILES)
     ap.add_argument("--yes", action="store_true", help="actually delete (default is a dry run)")
     ap.add_argument("--confirm-exported", type=Path, help="with --prune --yes: only traces with a byte-identical copy in this directory are deleted")
     args = ap.parse_args(argv)
-    root = fault_root() if args.root is None else args.root
+    try:
+        root = fault_root() if args.root is None else args.root
+    except ValueError as exc:  # a relative ARM_CONTROL_FAULT_ROOT
+        print(exc)
+        return 2
     if args.prune:
         if args.keep_files < 0:
             print("--keep-files must be >= 0")
@@ -147,7 +151,7 @@ def main(argv=None) -> int:
     if args.dest is not None:
         if args.dest == "":
             try:
-                auto = export_dir(f"faults-{root.parent.name}")
+                auto = export_dir(f"{root.name}-{root.parent.name}")  # faults-fr3_1 / sim_faults-fr3_1
             except ValueError as exc:
                 print(exc)
                 return 2

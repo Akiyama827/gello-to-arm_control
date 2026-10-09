@@ -209,6 +209,18 @@ def check_fault_trace() -> None:
         time.sleep(post + .2)
         assert len(rt.fault_trace.written) == before + 2, len(rt.fault_trace.written) - before
         assert not rt.fault_trace.sim, "a stub (non-sim) link's traces went to the simulation directory"
+        # A degraded link flapping between "stale" and "frozen" for 1.5 s, the latch never clearing: one episode, one trace.
+        link.fault = ""
+        time.sleep(.05)
+        before = len(rt.fault_trace.written)
+        stop = time.monotonic() + 1.5
+        while time.monotonic() < stop:
+            link.fault = "rt servo frozen (0.30s, link alive)"
+            time.sleep(.15)
+            link.fault = "rt state stream stale (0.45s)"
+            time.sleep(.15)
+        time.sleep(post + .2)
+        assert len(rt.fault_trace.written) == before + 1, len(rt.fault_trace.written) - before
         # A trace that fails inside the loop is counted, never raised: the arm stays armed.
         link.fault = ""
         time.sleep(.05)
@@ -242,7 +254,7 @@ def check_fault_trace() -> None:
             rt.close()
     last = json.loads(rt.fault_trace.written[-1].read_text())
     assert last["reason"] == "latched fault: sixth" and last["post_window_complete"] is False, last["reason"]
-    assert len(list((tmp / "faults").glob("*.json"))) == 6, sorted((tmp / "faults").iterdir())
+    assert len(list((tmp / "faults").glob("*.json"))) == 7, sorted((tmp / "faults").iterdir())
     print(f"  supervisor fault trace: {len(stamps)} ticks [-{pre}, +{post}] s, faults joined, busy writer skipped, "
           f"write failure counted, a changing fault text traced once, a failing trace leaves the arm armed, "
           f"open window written on close after the DISARM")

@@ -8,8 +8,9 @@ inside a repository (2026-10-09).
 New:
 * `multi_arm.diagnostics.SupervisorFaultTrace`, owned by every `RobotRuntime` (`runtime.fault_trace`): a ring of the
   supervisor's trace/1 rows sized for `FAULT_PRE_S` + `FAULT_POST_S` (10 + 2 s). A fault opens a window: a FAULTED receipt
-  (`_receipt`), a new KIND of latched fault in the link health (the RT's, or the supervisor's own authority fault; the
-  kind is the text without its parenthesised age, so "rt state stream stale (0.42s)" is one fault however long it lasts),
+  (`_receipt`), a KIND of latched fault not yet seen while the latch has stayed set (the RT's, or the supervisor's own
+  authority fault; the kind is the text without its parenthesised age, so "rt state stream stale (0.42s)" is one fault
+  however long it lasts, and a link flapping between "stale" and "frozen" is one episode; the set clears with the latch),
   or a controller stop (with its reason). Faults inside the window join it (`faults`, at most 50 listed, the rest counted). 2 s after the first
   fault the window's rows go to ONE writer thread; the loop never encodes or touches the disk. A window that closes while the
   writer is still busy is SKIPPED and counted (`skipped`, and `skipped_traces_before` in the next trace), never queued
@@ -88,3 +89,14 @@ reproduction now writes one trace and keeps the onset; close -> DISARM 9-10 ms w
   already set; the export-root message no longer claims to check "outside any repository"; a failed fault-trace close is
   counted; a raising native-reference close no longer skips the rest of `RobotRuntime.close` (including the DISARM: that
   gap predated this slice). Left: the suites' scratch fault roots are not removed.
+
+Review round 3 (Opus xhigh, PASS-WITH-FIXES, no MUST; sim/hardware split verified live: the sim bench pair wrote to
+`fr3_1/sim_faults`, the RT staging to `faults`; every latched_fault producer checked against the kind regex):
+* SHOULD (conditional): a degraded link flips between "rt servo frozen (...)" and "rt state stream stale (...)" when
+  re-sends are lost, and each flip after a window closed reopened one (9 traces in 4 s on the stub) -> the kinds seen in
+  one latched episode are remembered until the latch clears; check: 1.5 s of flapping = one trace (a last-kind-only
+  rule fails it, verified), frozen -> "rt fault 3" still two.
+* NITs taken: both trace headers carry `sim`; a bare `--dest` names the export `<faults|sim_faults>-<source>-<time>`;
+  trace_export refuses a relative fault root cleanly; both RUNBOOKs describe `sim_faults/` and the checks' scratch root.
+  Left: an authority fault with an empty message never triggers (pre-existing); two SimLink plant failures of one exception
+  type share a trace.

@@ -285,7 +285,8 @@ Reports written before sidecars existed show as `legacy` and export normally.
 Every arm's supervisor also writes its own fault trace, whatever console or client
 is attached: on a FAULTED execution, a latched RT fault or a controller stop, the
 supervisor's controller ticks (trace/1 rows) from 10 s before the fault to 2 s after,
-under `$ARM_CONTROL_ROOT/.cache/supervisor/<instance>/faults/` (schema
+under `$ARM_CONTROL_ROOT/.cache/supervisor/<instance>/faults/` (a simulated plant's under `.../sim_faults/`, and a
+simulated pair console's under `.cache/dual_arm/sim_faults/`, so simulations never prune hardware traces; schema
 `arm_control.supervisor_fault/v1`; faults inside the window join it). A background
 thread writes it, so the servo loop does not wait for the disk; a fault while the
 previous trace is still being written is skipped and counted, a failed write is
