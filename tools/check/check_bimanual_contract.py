@@ -32,9 +32,6 @@ class Harness:
                 QueueControllerNode(),
                 _FakeExecutor(n),
                 arm_id=a,
-                gripper=dict(
-                    n_motors=n, mimic=None, open_finger_m=0.04, gains=(100.0, 1.0)
-                ),
                 clock=lambda: self.t,
                 plant_reports_health=False,
                 model_token=f"{a}:model:r2",

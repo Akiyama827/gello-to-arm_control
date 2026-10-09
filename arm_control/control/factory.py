@@ -28,12 +28,11 @@ from arm_control.control.execution_policy import build_execution_policy
 from arm_control.control.trajectory_executor import JointTrajectoryExecutor
 from arm_control.control.gains import validate_integral_vector
 from arm_control.control.integral import IntegralState
-from arm_control.joint_motor_map import gripper_mimic
 from arm_control.model_bundle import execution_gravity, model_token, pose_provenance
 from arm_control.node_utils import planner_speed_limits, resolve_gains
 
 __all__ = [
-    "arm_urdf", "gain_vector", "gripper_command_cfg", "build_executor",
+    "arm_urdf", "gain_vector", "build_executor",
     "build_arm_controller",
 ]
 
@@ -104,31 +103,6 @@ def arm_speed_limits(cfg, n: int, *, required: bool = True):
         except ValueError as exc:
             raise ValueError(f"arm.{key}: {exc}".replace(f"planner.{plan_key} ", "")) from None
     return limits[0], limits[1]
-
-
-def gripper_command_cfg(cfg) -> dict:
-    """Gripper packing parameters for the arm+gripper motor command.
-
-    Returns ``None`` for ``mimic`` on arms whose gripper is not a motor slot on
-    the same bus: the FR3's Franka Hand (no mimic), and a gripper whose mimic
-    source is not one of this config's motors -- its own device behind a
-    hand_bridge (the DM gripper once the arm runs on its supervisor). The mimic
-    still states how its finger joints run; it no longer implies a slot.
-    """
-    mimic = gripper_mimic(cfg)
-    if mimic is not None and str(mimic.get("source")) not in list(cfg.get("motor_names") or []):
-        mimic = None
-    grasp = cfg.get("grasp") or {}
-    return {
-        "mimic": mimic,
-        # Held open through the arm-motion legs; the bridge's grasp gate owns the
-        # gripper slot from close_gripper onward, so this never fights the grasp.
-        "open_finger_m": float(
-            cfg.get("gripper_open_finger_m", (mimic or {}).get("lower", 0.0))
-        ),
-        "gains": (float(grasp.get("close_kp", 40.0)), float(grasp.get("close_kd", 2.0))),
-        "n_motors": int(cfg.get("num_motors", 7)),
-    }
 
 
 def build_executor(
@@ -234,7 +208,7 @@ def build_arm_controller(
     # scheduling hiccup stutters the arm, too loose and it coasts after the button is released).
     options.setdefault("jog_timeout_s", float((mode_cfg.get("jog") or {}).get("timeout_s", 0.2)))
     return ArmController(
-        node, executor, arm_id=arm_id, gripper=gripper_command_cfg(cfg),
+        node, executor, arm_id=arm_id,
         integral_state=integral, execution_policy=policy, model_token=model_token(cfg),
         pose_provenance=pose_provenance(cfg),
         settle_timeout_s=float(arm.get("settle_timeout_s", 5.0)),

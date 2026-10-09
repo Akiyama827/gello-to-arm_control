@@ -20,10 +20,6 @@ MUJOCO_LOG.TXT
 dataflows/out/
 Log/
 
-# Vendor DM CAN shared objects (dlopen'd by hardware/dm_backend.py). Untracked
-# AND unignored in Control today, which is how it went missing; name it here.
-dlls/
-
 rt/build*/
 
 __pycache__/

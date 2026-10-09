@@ -2,7 +2,7 @@
 import numpy as np
 
 from arm_control.control.arm_controller import ArmController
-from arm_control.control.doubles import _FakeExecutor, _FakeNode, _GRIPPER, _state
+from arm_control.control.doubles import _FakeExecutor, _FakeNode, _state
 from arm_control.contracts.motion import pack_controller_event, unpack_controller_event
 from arm_control.messages import pack_control_update, pack_json_message, pack_plan
 
@@ -20,8 +20,7 @@ def snapshot(c, law, kp, kd, *, ok=True):
 
 def main():
     clock = [0.0]
-    c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
-                      clock=lambda: clock[0], plant_reports_health=False)
+    c = ArmController(_FakeNode(), _FakeExecutor(), clock=lambda: clock[0], plant_reports_health=False)
     c.on_motor_state(_state())
     assert events(c), "fresh disarmed state must publish actual controller gains"
     snapshot(c, "joint", [1200.] * 7, [30.] * 7)
@@ -82,8 +81,7 @@ def main():
                              health_timeout_sec=1, start_pos_tol_rad=.1,
                              abort_pos_err_rad=.35, hold_relatch_rad=.3,
                              torque_limits=np.full(7, 10.))
-    c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
-                      clock=lambda: clock[0], plant_reports_health=False,
+    c = ArmController(_FakeNode(), _FakeExecutor(), clock=lambda: clock[0], plant_reports_health=False,
                       execution_policy=policy)
     c._set_arm(True)
     c.on_motor_state(_state())

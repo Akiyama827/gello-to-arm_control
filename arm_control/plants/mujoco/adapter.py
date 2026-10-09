@@ -5,7 +5,7 @@ Drop-in successor to the removed ``drake_interface``; identical Dora contract:
 - Composed scene (config ``scene`` block): one ``motor_command_<arm>`` input
   per ``scene.arm_slices`` entry, one ``motor_state_<arm>`` output per arm,
   ``topology_state`` + ``model_revision`` on topology change. NO grasp
-  protocol: the bridge's GraspGate owns close/success/drop policy; this plant
+  protocol: close/success/drop policy lives above the plant; this plant
   only senses (gripper_state positions+efforts) and reacts to its own world
   (fixture yields to grip force, keyed dock mate engages only on a release
   actually AT the seat — no magnets; the orchestrator's position-sensed
@@ -403,7 +403,7 @@ def main() -> None:
                                 {
                                     "positions": finger_q.tolist(),
                                     # Raw per-finger servo forces (N): the
-                                    # bridge's grasp gate thresholds these —
+                                    # grasp policy above the plant reads these —
                                     # the plant only senses.
                                     "efforts": backend.gripper_efforts().tolist(),
                                 },

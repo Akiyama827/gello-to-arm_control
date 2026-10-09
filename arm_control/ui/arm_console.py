@@ -50,7 +50,7 @@ from arm_control.contracts.gripper import pack_grasp_request, unpack_grasp_resul
 from arm_control.ui.hand_panel import HandPanel
 from arm_control.ui.jog_panel import JogPanel
 from arm_control.grasp_visual import VisualFK
-from arm_control.joint_motor_map import finger_from_width, gripper_mimic, gripper_motor_to_finger
+from arm_control.joint_motor_map import finger_from_width
 from arm_control.messages import (
     pack_control_update,
     pack_motor_command,
@@ -173,8 +173,7 @@ class ControlPanel:
         refinement: str = "none",
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
-        # arm config (gripper_range_m) or its joint_mimics entry — never a
-        # robot-shaped constant here.
+        # arm config (gripper_range_m) — never a robot-shaped constant here.
         self._lock = threading.Lock()
         # Named base-frame poses the operator can FILL into Desired. They are
         # a convenience over typing six numbers, not an authority: filling
@@ -937,19 +936,10 @@ def _run(
         ik.fk, urdf_path=cfg.urdf_path, joint_names=planned, ee_link=ee_link,
         gripper_joints=gj,
     )
-    # First mimic entry = the gripper's motor slot, whatever this arm calls it.
-    mimic = gripper_mimic(cfg) or {}
-    # Finger travel for the slider. An arm with no `joint_mimics` (its gripper is
-    # not a motor on this bus — the FR3's Franka Hand) has no mimic to read, and
-    # the old fallback silently handed it the DM arm's 0.0439 m. State it in the
-    # arm config instead: `gripper_range_m: [lower, upper]`, per FINGER.
+    # Finger travel for the slider, stated in the arm config: `gripper_range_m: [lower, upper]`, per FINGER. Absent: (0,0),
+    # no slider, rather than inventing another robot's numbers.
     explicit = cfg.get("gripper_range_m")
-    if explicit is not None:
-        grip_range = (float(explicit[0]), float(explicit[1]))
-    else:
-        # A mimic without travel bounds is a config error for a slider; (0,0)
-        # renders no slider rather than inventing another robot's numbers.
-        grip_range = (float(mimic.get("lower", 0.0)), float(mimic.get("upper", 0.0)))
+    grip_range = (float(explicit[0]), float(explicit[1])) if explicit is not None else (0.0, 0.0)
     # The page must SAY which arm it drives: a browser tab from a sim
     # rehearsal silently reattaches to a real graph on the same port, and the
     # first click lands on hardware.
@@ -1070,11 +1060,6 @@ def _run(
                 if not synced_once:
                     # First state: start the target at the real pose, no surprises.
                     panel.set_sliders(measured)
-                    if n > len(planned) and mimic:
-                        panel.set_gripper(
-                            gripper_motor_to_finger(float(pos[len(planned)]), mimic),
-                            dirty=False,
-                        )
                     synced_once = True
                 if now - last_ghost >= 0.1:
                     last_ghost = now
@@ -1087,7 +1072,7 @@ def _run(
                 width = float(hand_state["width"])
                 if not np.isfinite(width):
                     continue
-                mgrip_f = finger_from_width(width, mimic or None)
+                mgrip_f = finger_from_width(width)
                 panel.set_measured_grip(mgrip_f)
                 scene.set_finger_state(mgrip_f)
                 if not grip_synced:
@@ -1222,7 +1207,7 @@ def _run(
                 shown_attachment = scene_actions.attachment
             width = scene_context['hand']['measured_width_mm']
             if state['status'] != 'stored' and width is not None:
-                panel.set_gripper(finger_from_width(width / 1000, mimic or None), dirty=False)
+                panel.set_gripper(finger_from_width(width / 1000), dirty=False)
             panel.set_scene_state(state)
 
         if panel.clicked("Sync target to robot") and measured is not None:

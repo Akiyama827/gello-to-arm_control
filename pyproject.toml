@@ -41,7 +41,6 @@ trajopt = ["toppra==0.6.10", "tesseract-robotics-nanobind==0.35.0.7", "scipy", "
 #   pinocchio / hpp-fcl — dynamics, FK/IK, geometry and preview.
 #   ompl — optional planning bindings.
 #   pylibfranka — direct Franka backend bindings, provisioned with libfranka.
-#   dmcan — vendor USB2FDCAN SDK and its shared library when that transport is selected.
 # See docs/RUNBOOK.md; installing extras does not provision vendor toolchains.
 # Perception implementation and camera dependencies belong to consumers.
 

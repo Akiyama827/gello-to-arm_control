@@ -21,7 +21,7 @@ records; they are not current operating instructions.
 | `arm_control/multi_arm/` | Pair lifecycle, transport handles, shared-world and fixed-grasp object planning, simulation |
 | `arm_control/planning/` | IK, collision checking, planning, retiming, preview builders |
 | `arm_control/contracts/` | Central Dora/Arrow wire contracts |
-| `arm_control/plants/` | Plant protocol; DM, Franka, remote RT, MuJoCo adapters |
+| `arm_control/plants/` | Plant protocol; Franka, remote RT, MuJoCo adapters; the DM motor wire codec (the base's RT server) |
 | `arm_control/end_effectors/` | Generic grasp and Hand behavior |
 | `arm_control/ui/`, `arm_control/viz/` | Operator adapters, packaged web assets, telemetry |
 | `arm_control/simulation/` | Compatibility imports, generic convex decomposition and scene mirroring |

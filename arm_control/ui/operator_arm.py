@@ -287,10 +287,8 @@ def main() -> None:
             triggered = True
         if panel is not None and panel.take_replay():
             # View-only channel, sent ONLY while orchestrator status shows a
-            # held plan. In graphs where this node feeds the real bridge's
-            # `arm` input directly (real_motion) there is never a status feed,
-            # so a replay can never reach a consumer that would read the
-            # non-armed message as a DISARM.
+            # held plan, so a replay can never reach a consumer that would
+            # read the non-armed message as a DISARM.
             if panel.status_holding():
                 node.send_output("arm", pack_json_message("arm", {"replay": True}))
                 panel.log("PLAY — flying the plan preview")

@@ -17,12 +17,12 @@ from arm_control.messages import (
     pack_json_message,
     pack_jog,
     unpack_controller_event,
+    unpack_motor_command as _umc,
 )
 from arm_control.control.doubles import (
     _controller,
     _FakeExecutor,
     _FakeNode,
-    _GRIPPER,
     _plan_msg,
     _state,
 )
@@ -40,7 +40,7 @@ def _check_clock_policies() -> None:
     # WALL policy: no period configured. Time must move without any state.
     ticks = iter([10.0, 10.5, 11.25])
     c = ArmController(
-        _FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), clock=lambda: next(ticks)
+        _FakeNode(), _FakeExecutor(), clock=lambda: next(ticks)
     )
     assert c.exec_time == 10.0
     assert c.exec_time == 10.5
@@ -48,8 +48,7 @@ def _check_clock_policies() -> None:
 
     # PLANT policy: time moves per state message and NOT with wall time.
     frozen = ArmController(
-        _FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
-        state_period_s=0.02, clock=lambda: 999.0,
+        _FakeNode(), _FakeExecutor(), state_period_s=0.02, clock=lambda: 999.0,
     )
     assert frozen.exec_time == 0.0
     frozen.on_motor_state(_state())
@@ -60,8 +59,7 @@ def _check_clock_policies() -> None:
     # silently switching clocks on a typo is how the original bug felt normal.
     for bad in (0.0, -0.01, float("inf"), float("nan")):
         try:
-            ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
-                          state_period_s=bad)
+            ArmController(_FakeNode(), _FakeExecutor(), state_period_s=bad)
         except ValueError:
             pass
         else:
@@ -153,8 +151,7 @@ def _self_check() -> None:
     # 7. Disarmed, no commands stream (the bridge zero-holds); mode feedback
     #    still reports gains. Commands wait for the health ACK after arming.
     node = _FakeNode()
-    c = ArmController(node, _FakeExecutor(), gripper=dict(_GRIPPER),
-                      state_period_s=0.01)
+    c = ArmController(node, _FakeExecutor(), state_period_s=0.01)
     c.on_motor_state(_state())
     assert node.topics() == ["controller_event"], node.topics()
     assert unpack_controller_event(node.sent[-1][1])["kind"] == "mode"
@@ -248,8 +245,7 @@ def _self_check() -> None:
     # (built raw, not via _controller(), which pre-sets bridge_armed for the
     #  checks above -- that shortcut is the very thing under test here)
     c = ArmController(
-        _FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER),
-        state_period_s=0.01, plant_reports_health=False,
+        _FakeNode(), _FakeExecutor(), state_period_s=0.01, plant_reports_health=False,
     )
     c._set_arm(True)
     c.on_motor_state(_state())
@@ -257,7 +253,7 @@ def _self_check() -> None:
     assert any(t == "motor_command" for t, _a in c.node.sent), c.node.topics
 
     c = ArmController(
-        _FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), state_period_s=0.01,
+        _FakeNode(), _FakeExecutor(), state_period_s=0.01,
     )  # the default: there IS a bridge
     c._set_arm(True)
     c.on_motor_state(_state())
@@ -265,37 +261,6 @@ def _self_check() -> None:
     c.on_motor_health(pack_json_message("motor_health", {"armed": True}))
     c.on_motor_state(_state())
     assert c.ready_sent, "the armed edge should have released it"
-
-    # N+2. The console's gripper slider reaches the jaws. Needs an arm whose
-    #      gripper IS a motor slot (mimic_cfg=None means the jaws are their own
-    #      device and no slot is packed at all -- the FR3 case). Default is the
-    #      configured open width: the assembly path never sends this input,
-    #      because the bridge's grasp gate owns the slot there and two writers
-    #      would fight over it.
-    from arm_control.joint_motor_map import gripper_finger_to_motor
-    from arm_control.messages import pack_motor_command
-    from arm_control.messages import unpack_motor_command as _umc
-
-    mimic = {"source": "Gripper", "motor_open": 0.0, "motor_closed": -4.985,
-             "lower": 0.0, "upper": 0.0439}
-    node = _FakeNode()
-    c = ArmController(
-        node, _FakeExecutor(n=6), state_period_s=0.01,
-        gripper={"n_motors": 7, "mimic": mimic, "open_finger_m": 0.04,
-                 "gains": (40.0, 2.0)},
-    )
-    c._set_arm(True)
-    c.bridge_armed = True
-    c.on_motor_state(_state(n=7))
-    held = _umc([a for t, a in node.sent if t == "motor_command"][-1], 7)
-    assert held["position"][6] == gripper_finger_to_motor(0.04, mimic), held["position"][6]
-
-    zeros2 = np.zeros(2)
-    c.on_gripper(pack_motor_command([0.01, 0.01], zeros2, zeros2, zeros2, zeros2))
-    c.on_motor_state(_state(n=7))
-    moved = _umc([a for t, a in node.sent if t == "motor_command"][-1], 7)
-    assert moved["position"][6] == gripper_finger_to_motor(0.01, mimic), moved["position"][6]
-    assert moved["position"][6] != held["position"][6]
 
     # N+3. Gains change the control law, so a running leg is cancelled first --
     #      float (kp=0) applied to a moving trajectory would drop the arm

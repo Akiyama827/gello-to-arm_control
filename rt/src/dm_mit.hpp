@@ -1,7 +1,6 @@
 #pragma once
-// DM-motor MIT codec, shared by the arm backend (backend_dm.cpp) and the DM
-// gripper behind hand_bridge (hand_dm.hpp). Bit-for-bit with the Python
-// arm_control/plants/dm/backend.py.
+// DM-motor MIT codec of the base's backend (backend_dm.cpp). Bit-for-bit with
+// the Python arm_control/plants/dm/backend.py.
 #include <cstdint>
 #include <string>
 

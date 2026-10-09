@@ -18,5 +18,5 @@ sim_servo:
 # The execution policy a supervisor requires is the ARM's own, included by the entry config (the FR3's robots/fr3/execution.yaml;
 # a project arm's from its project): not restated here.
 # The Hand on its own protocol (the real hand_bridge wire), backed by the plant's fingers: franka_gripper drives it as on the bench.
-# A gripper other than the Franka Hand states its envelope (sim_hand.limits) and its finger map (the arm's joint_mimics).
+# A gripper other than the Franka Hand states its envelope (sim_hand.limits).
 sim_hand: {port: 47812}

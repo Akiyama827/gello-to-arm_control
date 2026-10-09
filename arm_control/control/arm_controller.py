@@ -46,14 +46,12 @@ from arm_control.control.integral import IntegralState
 from arm_control.control.reference import TrajectoryReference
 from arm_control.control.trajectory_executor import gain_error
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
-from arm_control.joint_motor_map import (
-    pack_arm_gripper_command,
-    unpack_motor_state_to_joint,
-)
 from arm_control.messages import (
+    pack_cartesian_block,
     pack_controller_event,
+    pack_motor_command,
     unpack_jog,
-    unpack_motor_command,
+    unpack_motor_state,
     pack_json_message,
     unpack_control_update,
     unpack_json_message,
@@ -70,7 +68,6 @@ class ArmController:
         executor,
         *,
         arm_id: str = "arm",
-        gripper: dict,
         state_period_s: float | None = None,
         plant_reports_health: bool = True,
         jog_timeout_s: float = 0.2,
@@ -97,7 +94,6 @@ class ArmController:
         self._track_kp = executor.kp.copy()
         self._track_kd = executor.kd.copy()
         self.arm_id = str(arm_id)
-        self.gripper = dict(gripper)
         self.n_arm = executor.n_joints
         self.integral = integral_state if integral_state is not None else IntegralState(self.n_arm)
         if self.integral.bias.shape != (self.n_arm,):
@@ -152,14 +148,6 @@ class ArmController:
         self._rt_holding = False
         self._observation_paused = False
         self._plant_t = 0.0
-        self._finger_m = 0.0
-        # Operator-commanded finger target, or None to hold the configured open
-        # width. The assembly path leaves this None on purpose: the bridge's
-        # grasp gate owns the gripper slot from close_gripper onward, and a
-        # second writer would fight it. A manual console has no grasp gate, so
-        # its slider has to reach the jaws somehow -- this is that path, and it
-        # is the capability the trajectory executor used to provide.
-        self._finger_cmd: float | None = None
         # A jog is a hold whose anchor MOVES, and which dies of old age. The
         # timeout is the safety property: the console re-sends while a button
         # is held, so a closed tab, a wedged console, a dropped network or a
@@ -168,7 +156,7 @@ class ArmController:
         # stop; not sending IS the stop.
         self._jog = JogHold(timeout_s=jog_timeout_s, n_joints=self.n_arm)
         # A streamed target (console jog, setpoint/1) moves no faster than planned motion may: saturated per tick at the
-        # policy's velocity/acceleration limits (operator 2026-10-09). No policy limits (the legacy DM path): unsaturated.
+        # policy's velocity/acceleration limits (operator 2026-10-09). No policy limits: unsaturated.
         policy = execution_policy
         self._jog_ramp = (JogRamp(policy.velocity_limits, policy.acceleration_limits,
                                   lower=policy.position_lower, upper=policy.position_upper)
@@ -455,11 +443,6 @@ class ArmController:
             )
         return q_des, expired
 
-    def on_gripper(self, value) -> None:
-        """A commanded finger width, in metres, from an operator console."""
-        command = unpack_motor_command(value, 2)
-        self._finger_cmd = float(np.asarray(command["position"], dtype=float)[0])
-
     def on_motor_health(self, value) -> None:
         payload = unpack_json_message(value)
         if self.execution_policy is not None:
@@ -502,9 +485,8 @@ class ArmController:
             return
         if self._state_period is not None:
             self._plant_t += self._state_period  # one message == one plant period
-        arm, finger_m = unpack_motor_state_to_joint(
-            value, self.gripper["n_motors"], self.gripper["mimic"], n_arm=self.n_arm
-        )
+        state = unpack_motor_state(value, self.n_arm)
+        arm = JointState(position=state["position"].copy(), velocity=state["velocity"].copy())
         if self.execution_policy is not None:
             if not (np.isfinite(arm.position).all() and np.isfinite(arm.velocity).all()):
                 self._last_state_at = None
@@ -523,8 +505,6 @@ class ArmController:
                 self._arm_pose = q.copy()  # where it rests, until the first command
             self._been = (np.vstack([q, q]) if self._been is None
                           else np.vstack([np.minimum(self._been[0], q), np.maximum(self._been[1], q)]))
-        if finger_m is not None:
-            self._finger_m = float(finger_m)
         if self.execution_policy is None:
             self._stream()
         if (np.isfinite(arm.position).all() and np.isfinite(arm.velocity).all()
@@ -1103,18 +1083,13 @@ class ArmController:
         self.last_law = "cartesian_impedance" if spec is not None else "pose_hold" if self._pose_hold else "joint"
         self.node.send_output(
             "motor_command",
-            pack_arm_gripper_command(
-                command.q_des,
-                command.qd_des,
-                command.tau_ff,
-                command.kp,
-                command.kd,
-                self.gripper["open_finger_m"]
-                if self._finger_cmd is None
-                else self._finger_cmd,
-                self.gripper["gains"],
-                self.gripper["mimic"],
-                cartesian=spec,
+            pack_motor_command(
+                np.asarray(command.q_des, dtype=float),
+                np.asarray(command.qd_des, dtype=float),
+                np.asarray(command.tau_ff, dtype=float),
+                np.asarray(command.kp, dtype=float),
+                np.asarray(command.kd, dtype=float),
+                None if spec is None else pack_cartesian_block(spec),
                 pose_hold=self._pose_hold,
             ),
         )
@@ -1190,7 +1165,6 @@ class ArmController:
             "plant_capabilities": self.on_plant_capabilities,
             "plan": self.on_plan,
             "control": self.on_control,
-            "gripper": self.on_gripper,
             "jog": self.on_jog,
             # A second motion source speaks the same contract under its own
             # topic name (dora maps one producer per input, so an alias is how

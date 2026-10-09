@@ -42,7 +42,6 @@ def build_mujoco_model(
     meshdir. Two cases:
 
     - all refs resolve into ONE directory -> ``meshdir`` + ``strippath="true"``
-      (the DM assembler arm, and how this always worked)
     - refs span several directories AND are all relative -> keep the paths
       (``strippath="false"``) with ``meshdir`` at the URDF's own directory, so
       ``../meshes/{collision,visual}/...`` resolves as written. The FR3 needs

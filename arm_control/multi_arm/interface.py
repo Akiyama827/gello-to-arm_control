@@ -17,7 +17,6 @@ from typing import Any, Protocol, runtime_checkable
 from arm_control.control.inprocess import QueueControllerNode
 from arm_control.messages import (
     pack_control_update,
-    pack_motor_command,
     unpack_controller_event,
 )
 from arm_control.multi_arm.coordinator import BimanualCoordinator
@@ -74,7 +73,6 @@ class LocalArmHandle:
         *,
         node: QueueControllerNode | None = None,
         clock: Callable[[], float] | None = None,
-        gripper_slots: int = 2,
     ) -> None:
         self._controller = controller
         self._node = node if node is not None else controller.node
@@ -84,7 +82,6 @@ class LocalArmHandle:
                 "(use QueueControllerNode)"
             )
         self._clock = clock or time.monotonic
-        self._gripper_slots = int(gripper_slots)
 
     @property
     def arm_id(self) -> str:
@@ -166,10 +163,7 @@ class LocalArmHandle:
             self._controller.on_control(pack_control_update(gains=fields))
 
     def command_gripper(self, finger_m: float) -> None:
-        n = self._gripper_slots
-        z = [0.0] * n
-        width = float(finger_m)
-        self._controller.on_gripper(pack_motor_command([width] * n, z, z, z, z))
+        raise ValueError("an arm controller drives no gripper: the Hand is its own device (hand_bridge / the sim Hand)")
 
 
 class BimanualInterface:
