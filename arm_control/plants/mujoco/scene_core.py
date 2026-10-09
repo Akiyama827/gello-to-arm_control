@@ -1,8 +1,8 @@
 """The simulated world's per-tick logic, with no transport: one MuJoCo world, its command vector, and the rules that keep it safe.
 
-Extracted from the Dora ``mujoco_interface`` node (2026-10-08-scene-hosting-design.md, step 2a) so that two front ends drive the
-SAME world code: the Dora node (messages in, messages out) and the supervisor's scene link (admission in, ``observe/1`` out). The
-behaviour is the node's, moved, not rewritten:
+Extracted from the Dora ``mujoco_interface`` node (2026-10-08-scene-hosting-design.md, step 2a; the node is retired since
+2026-10-09) and driven by the supervisor's scene link (admission in, ``observe/1`` out). The behaviour is the node's, moved, not
+rewritten:
 
 * per-actor command SLICES of one command vector (``arm_slices``), each with its own deadman: a slice whose commander has been
   silent longer than ``idle_timeout`` has its gains zeroed (said once per gap), counting only time this host was listening --

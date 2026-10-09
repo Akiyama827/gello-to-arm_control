@@ -3,6 +3,9 @@
 # torque ratings (the URDF `effort` values; add_contracts asserts them against the description). No addresses, calibration, scene or
 # operating choice belongs here: those have their own homes (deployment registry, model bundles, workcells, control profiles).
 arm:
+  # The FR3's control box compensates gravity itself (and every FR3 twin models that with sim_gravcomp): the controller ships
+  # RNEA minus gravity, or the arm gets it twice.
+  plant_gravity_comp: true
   joints: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
   gripper_joints: [fr3_finger_joint1, fr3_finger_joint2]
   ee_frame: fr3_hand_tcp

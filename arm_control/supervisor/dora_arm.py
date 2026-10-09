@@ -1,7 +1,7 @@
-"""The Dora controller contract over ONE arm's supervisor: a drop-in for the ``arm_controller`` node in a console graph.
+"""The Dora controller contract over ONE arm's supervisor: the graph's controller node (``supervised_arm``).
 
-``arm_controller`` (``control.adapter``) is a Dora node around an in-process ``ArmController``. In the supervisor architecture the
-controller lives in the supervisor, so this bridge takes the same Dora inputs (``plan``, ``control``, ``jog``, ``gripper``) and
+The retired ``arm_controller`` node (deleted 2026-10-09) was a Dora node around an in-process ``ArmController``. In the supervisor
+architecture the controller lives in the supervisor, so this bridge takes the same Dora inputs (``plan``, ``control``, ``jog``, ``gripper``) and
 produces the same outputs the console and planner read (``controller_event``, ``arm``, ``motor_state``, ``model_revision``) by talking to
 the supervisor only through the SDK: one ``ArmClient``, one non-blocking ``AsyncAuthorityHandle``, and the console control adapter
 (gains/Soft/payload become preset and payload calls). It owns no authority of its own and no control law.

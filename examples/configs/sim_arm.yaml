@@ -26,8 +26,8 @@ include:
   - ../../robots/fr3/execution.yaml  # the FR3 admission limits; the console plans within them
 
 # --- Plant: MuJoCo, no libfranka, no FCI, no RT box -------------------------
-# WHICH plant runs is the GRAPH's choice, not a key here: sim_franka_motion.yml
-# names nodes/mujoco_interface.py, and that is the whole switch. (Three keys
+# WHICH plant runs is the LAUNCHER's choice, not a key here: the supervisor's
+# `--plant sim` (examples/run_console.py), and that is the whole switch. (Three keys
 # used to sit here pretending otherwise -- `real_backend: mujoco`,
 # `sim_backend: mujoco`, `listen_mode: true`. Nothing in this graph read any
 # of them, and `real_backend` is worse than inert: on a HARDWARE graph it

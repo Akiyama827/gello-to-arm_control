@@ -114,15 +114,6 @@ def child(kind: str, stop: str, directory: Path) -> None:
             return original_next(self, timeout=timeout)
 
         Node.next = next_connected
-    else:
-        from arm_control.control import adapter
-        from arm_control.control.arm_controller import ArmController
-        from arm_control.control.doubles import _FakeExecutor
-
-        adapter.load_robot_config = lambda: SimpleNamespace(get=lambda key: None)
-        adapter._load_mode_config = lambda: {}
-        adapter.build_arm_controller = lambda cfg, node, *, arm_id, mode_cfg, **kw: (
-            ArmController(node, _FakeExecutor(), arm_id=arm_id, **kw))
     adapter.Node = Node
     try:
         adapter.main()
@@ -142,7 +133,7 @@ def main() -> None:
     panel._server = SimpleNamespace(close=lambda: closed.append(True))
     panel.close()
     assert closed == [True]
-    for kind in ("logger", "controller", "replay", "hand"):
+    for kind in ("logger", "replay", "hand"):
         for stop in ("SIGTERM", "SIGINT", "STOP", "ERROR"):
             with tempfile.TemporaryDirectory(prefix="arm-shutdown-") as directory:
                 result = subprocess.run(

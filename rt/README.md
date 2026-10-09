@@ -139,7 +139,8 @@ python tools/check/suite.py
 ```
 
 It builds with `WITH_FRANKA=OFF`, runs all 19 available C++ self-checks through
-CTest, checks the SDK in streamed and native modes, then runs the fast local
+CTest, builds again with `WITH_FRANKA=ON` (`<build>-franka`; FAIL, not skip, without libfranka)
+and runs that CTest too (23, with `hand_bridge_selfcheck`), checks the SDK in streamed and native modes, then runs the fast local
 fake-RT regression benches. `reference_session_selfcheck` and
 `reference_runtime_selfcheck` need socket/port harnesses; CTest runs them
 through the existing `reference_upload.py` and `native_reference.py` probes.

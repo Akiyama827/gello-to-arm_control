@@ -1,6 +1,6 @@
-"""SceneCore (plants/mujoco/scene_core): the world rules the Dora plant node and the supervisor's scene link share.
+"""SceneCore (plants/mujoco/scene_core): the world rules of the supervisor's scene link.
 
-The rules moved out of the Dora ``mujoco_interface`` node unchanged; this checks them directly, without Dora: a silent slice's
+The rules moved out of the (retired) Dora ``mujoco_interface`` node unchanged; this checks them directly, without Dora: a silent slice's
 gains are zeroed after the idle timeout (and only that slice's), time the host spent blocked is credited back, the single-model
 ARM gate drops effort and refuses commands while disarmed, Soft mode expires with its commander, a stale or scene-less scene
 change is refused, and the drift warning is rate-limited.

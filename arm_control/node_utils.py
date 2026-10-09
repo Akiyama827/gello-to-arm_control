@@ -267,7 +267,7 @@ def scene_injections() -> dict:
 def _check_resolve_gains() -> None:
     """The three config shapes that reach resolve_gains, including the empty one.
 
-    The last case is a regression guard. Wiring ``nodes/arm_controller.py`` to
+    The last case is a regression guard. Wiring the controller factory to
     this function assumed every arm config names its motors at the top level.
     A composed-SCENE config does not -- its joints live under
     ``scene.arm.joint_names`` and the plant prefixes them -- so ``names`` came

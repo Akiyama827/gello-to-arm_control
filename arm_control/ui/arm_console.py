@@ -1682,55 +1682,26 @@ def _check_planner_limits() -> None:
 
 
 def _check_graphs() -> None:
-    """Every arm_controller in every graph must be able to stream.
-
-    The controller waits for a bridge's armed health edge before its first
-    command, because a bridge publishes motor_state while DISARMED and only a
-    state after that edge is provably post-enable. A graph whose plant has no
-    bridge publishes no motor_health at all, so the wait never ends and the arm
-    simply never moves -- with no error anywhere, which is the worst shape a
-    bug can have. Exactly one of the two must hold per graph: a motor_health
-    wire, or the ARM_CONTROL_PLANT_HEALTH=0 opt-out.
-    """
-    import re
-
+    """Every console in every graph has exactly one authority feedback source (the controller's motor_health or its
+    controller_arm), never an optimistic ARM badge. (The in-process arm_controller node this also checked is retired: every
+    graph's controller is its supervisor's, through supervised_arm.)"""
     import yaml
 
-    root = REPO_ROOT
-    controller = (root / "arm_control" / "control" / "arm_controller.py").read_text()
-    handled = set(re.findall(r'"(\w+)": self\.on_', controller))
-
     checked = 0
-    for graph in sorted((root / "dataflows").glob("*.yml")):
+    for graph in sorted((REPO_ROOT / "dataflows").glob("*.yml")):
         spec = yaml.safe_load(graph.read_text()) or {}
         for console in spec.get("nodes", []):
             if str(console.get("path", "")).endswith("arm_console.py"):
+                checked += 1
                 inputs = console.get("inputs") or {}
                 assert ("motor_health" in inputs) != ("controller_arm" in inputs), (
                     f"{graph.name}/{console['id']}: console needs exactly one "
                     "authority feedback source, never an optimistic ARM badge"
                 )
-        for node in spec.get("nodes", []):
-            if not str(node.get("path", "")).endswith("arm_controller.py"):
-                continue
-            checked += 1
-            inputs = set(node.get("inputs") or {})
-            unhandled = sorted(inputs - handled)
-            assert not unhandled, (
-                f"{graph.name}: arm_controller is wired {unhandled}, which it "
-                f"has no handler for -- the input would be silently dropped"
-            )
-            has_health = "motor_health" in inputs
-            opts_out = str(
-                (node.get("env") or {}).get("ARM_CONTROL_PLANT_HEALTH", "")
-            ) in ("0", "false", "no")
-            assert has_health != opts_out, (
-                f"{graph.name}: arm_controller has motor_health={has_health} and "
-                f"ARM_CONTROL_PLANT_HEALTH opt-out={opts_out}. Exactly one is "
-                f"needed, or it waits forever for an armed edge and never streams"
-            )
-    assert checked, "no arm_controller found in any graph -- did paths change?"
-    print(f"arm_console: {checked} arm_controller wirings can stream")
+        assert not any(str(n.get("path", "")).endswith("arm_controller.py") for n in spec.get("nodes", [])), (
+            f"{graph.name}: the retired in-process arm_controller node is wired")
+    assert checked, "no console found in any graph -- did paths change?"
+    print(f"arm_console: {checked} console wirings have one authority feedback source")
 
 
 def cli() -> None:

@@ -566,7 +566,7 @@ def main():
     else:
         raise AssertionError('a sim plant was built without sim_servo')
     print('SimLink servo semantics: PASS', flush=True)
-    # the single-model plant builder shared with the Dora mujoco_interface node reads its keys from the config
+    # the single-model plant builder reads its keys from the config
     from arm_control.plants.mujoco.single import build_single_model_backend
     keyed = cfg_path.read_text().replace("  ee_frame: l3\n", "  ee_frame: l3\n  gripper_joints: []\n")
     keyed_path = tmp / 'keyed.yaml'

@@ -3,8 +3,8 @@ server (``rt/``) instead of a device on this host.
 
 Same method surface as ``dm_backend`` / ``franka_backend`` (``open`` /
 ``enable_all`` / ``apply_command`` / ``motor_state`` / ``motor_health`` /
-``safe_stop`` / ``close``), so ``nodes/rt_interface.py`` stays a thin adapter
-and the graph cannot tell which transport a plant is behind.
+``safe_stop`` / ``close``), so the supervisor (``RtBackend``) cannot tell which
+transport a plant is behind.
 
 Split of responsibilities with the server:
 - The SERVER owns safety: staleness->hold, fault latching, torque
