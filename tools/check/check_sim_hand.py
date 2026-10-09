@@ -1,7 +1,7 @@
 """The simulated Hand serves the real hand_bridge protocol: admission, replies and finger semantics, against a fake plant.
 
 A fake two-finger plant (fingers servo toward their targets, blocked by an object of a given width, loaded while blocked)
-steps at 250 Hz and feeds ``SimHandBridge.on_sample`` exactly as ``ScenePlant`` does. The protocol is driven two ways: a raw
+steps at 250 Hz and feeds ``SimHandBridge.on_sample`` exactly as ``SimLink`` does (for every sim plant). The protocol is driven two ways: a raw
 socket (every reply checked) and the project's own client (``BridgeClient`` + ``HandGraspFsm``).
 """
 from __future__ import annotations

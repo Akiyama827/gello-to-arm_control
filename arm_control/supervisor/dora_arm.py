@@ -11,8 +11,12 @@ Differences from the in-process node (stated, not hidden):
     native-reference supervisor); ``gripper`` is refused (an arm supervisor serves no gripper: the graph runs its own Hand
     node); neither is silently ignored;
   * gains must be a named preset (``gain_presets`` in the control mode config); anything else is refused with a ``mode`` event;
-  * ``hold`` cancels the live leg and leaves the arm held by the supervisor (there is no latched "frozen" controller state);
-    ``stop`` cancels and DISARMs;
+  * an untargeted ``cancel`` (the console's Stop) also clears the supervisor controller's ``frozen`` hold after a failed settle
+    (``ArmClient.hold``), as in-process; ``hold`` (the planner's milestone) cancels the live leg and leaves the arm held by the
+    supervisor, without the in-process freeze; ``stop`` cancels and DISARMs;
+  * Soft (pose hold) is not offered: ``plant_capabilities`` says ``supports_pose_hold: False`` (the in-process MuJoCo plant offered
+    it; a supervisor offers Soft through its presets once the bridge advertises the plant's capability: open, with the real
+    graphs);
   * ``motor_state`` reports the supervisor's measured joints and its selected reference; gains and measured torque are zeros where the
     supervisor does not publish them;
   * a plan the supervisor refuses (e.g. a Cartesian-impedance leg on a plant without the law, or on the native reference path)
@@ -184,7 +188,7 @@ class DoraArmBridge:
             self.handle.execute(plan_id)
         elif 'cancel' in group:
             self._staged.clear()  # a cancel clears whatever was staged (a targeted one names it)
-            self._cancel_leg(str(group.get('reason') or 'cancelled'), group.get('cancel_plan_id'))
+            self._cancel_leg(str(group.get('reason') or 'cancelled'), group.get('cancel_plan_id'), unfreeze=True)
         elif 'hold' in group:
             self._staged.clear()
             self._cancel_leg(str(group.get('reason') or 'hold'), None)
@@ -193,14 +197,17 @@ class DoraArmBridge:
             self._cancel_leg(str(group.get('reason') or group['stop'] or 'stop'), None)
             self.handle.set_armed(False)
 
-    def _cancel_leg(self, reason: str, plan_id) -> None:
+    def _cancel_leg(self, reason: str, plan_id, *, unfreeze: bool = False) -> None:
         """Cancel, and say what the in-process controller says: a cancelled RUNNING leg is a failed leg_result, not only a clear."""
         now = self.handle.state()
         running = now.running_plan_id if now.executing else None
         self.handle.cancel(reason, plan_id=plan_id)
         if running and plan_id in (None, running):
             self._event('leg_result', str(running), False, f'cancelled: {reason}')
-        if plan_id is None:  # an untargeted cancel/hold/stop also clears the hold a failed settle froze in (as in-process)
+        # The console's Stop is an untargeted cancel: as in-process it also clears the hold a failed settle froze in. Not for
+        # `hold` (the planner's milestone hold: in-process it FREEZES at the anchor, it never re-latches) nor for `stop` (the
+        # DISARM that follows cancels everything).
+        if unfreeze and plan_id is None:
             try:
                 self.arm.hold(reason)
             except (SupervisorError, TimeoutError, OSError) as exc:

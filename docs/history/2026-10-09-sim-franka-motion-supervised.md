@@ -47,3 +47,20 @@ Console parity (the setpoint/1 review's open item, taken here because this graph
 * `check_dora_arm`: a plan whose completion goal it never reaches freezes the controller (setpoint refused 'frozen'); the console's
   Hold clears it, still ARMed. Mutant (bridge never calls hold) caught.
 * `franka_gripper` address check: `check_node_shutdown` states the fixture's address and asserts a config without one never starts.
+
+Review round 1: BLOCK. Taken:
+* (BLOCK) The project branch pinned the library BEFORE this slice: at that pin the bench config (its own sim Hand address removed)
+  resolved to no address and the pinned franka_gripper defaulted to the real RT box, so `sim bench` would have driven the bench's
+  Hand. The project branch now pins the library branch tip, and the merge order is: library merge, then the pin bump to that
+  merge ON THE PROJECT TASK BRANCH, then the project merge (no commit on the integration branch has project configs without the
+  library they need).
+* `hold` (the planner's milestone hold: in-process it FREEZES at the anchor) was mapped to the supervisor's unfreeze, which
+  re-latches at the measured pose: every planner hold (sequence done, grasp lost, slip) would have re-latched. Only an untargeted
+  `cancel` (the console's Stop) calls `ArmClient.hold` now; `hold` stays the cancel it was; `stop` does not call it (its DISARM
+  cancels everything, and the RPC delayed the DISARM). The check sends Stop as the console does (`cancel`) and asserts that
+  neither `hold` nor `stop` calls the supervisor hold (mutant "hold unfreezes" caught).
+* Soft (pose hold) is not offered on the supervised FR3 sim (the retired MuJoCo plant offered it): said in the graph header and
+  the bridge docstring; truthful advertisement (the plant's capability) is open, with the real graphs.
+* `configs/entries/sim_console_demo.yaml` (and `_b`, through it) inherited the real Hand address and was safe only through
+  run_console's overlay replacing the whole `rt` block; it now includes `sim_supervised.yaml` last.
+* NITs: check_sim_hand's docstring; check_supervised_sims' labels.
