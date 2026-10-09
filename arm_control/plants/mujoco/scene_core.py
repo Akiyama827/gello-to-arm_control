@@ -1,8 +1,8 @@
 """The simulated world's per-tick logic, with no transport: one MuJoCo world, its command vector, and the rules that keep it safe.
 
-Extracted from the Dora ``mujoco_interface`` node (2026-10-08-scene-hosting-design.md, step 2a) so that two front ends drive the
-SAME world code: the Dora node (messages in, messages out) and the supervisor's scene link (admission in, ``observe/1`` out). The
-behaviour is the node's, moved, not rewritten:
+Extracted from the Dora ``mujoco_interface`` node (2026-10-08-scene-hosting-design.md, step 2a; the node is retired since
+2026-10-09) and driven by the supervisor's scene link (admission in, ``observe/1`` out). The behaviour is the node's, moved, not
+rewritten:
 
 * per-actor command SLICES of one command vector (``arm_slices``), each with its own deadman: a slice whose commander has been
   silent longer than ``idle_timeout`` has its gains zeroed (said once per gap), counting only time this host was listening --
@@ -62,7 +62,7 @@ def build_world(cfg, *, period: float):
             chain_factory=injections["chain_factory"],
         )
         print(
-            f"[mujoco_interface] generic workcell: {n} actuators, slices={arm_slices}",
+            f"[sim_world] generic workcell: {n} actuators, slices={arm_slices}",
             flush=True,
         )
     elif describes_scene(cfg):
@@ -90,7 +90,7 @@ def build_world(cfg, *, period: float):
                 raise ValueError("sim_gravcomp on a composed scene needs scene.arm.prefix (which bodies are the arm)")
             backend.gravcomp_prefixes = (prefix,)
         print(
-            f"[mujoco_interface] composed scene: {n} actuators, slices={arm_slices}",
+            f"[sim_world] composed scene: {n} actuators, slices={arm_slices}",
             flush=True,
         )
     else:
@@ -98,7 +98,7 @@ def build_world(cfg, *, period: float):
             # Say so out loud. A partial scene block is legitimate (see above)
             # but "the plant ignored part of your config" must never be silent.
             print(
-                f"[mujoco_interface] scene block present but names no `arm` "
+                f"[sim_world] scene block present but names no `arm` "
                 f"({sorted(scene_cfg)}) — running SINGLE-MODEL. That block is "
                 f"for other consumers (visualizer, planner obstacles); a "
                 f"composed plant scene needs scene.arm.",
@@ -110,7 +110,7 @@ def build_world(cfg, *, period: float):
         n = len(joint_names) if joint_names else cfg.num_motors
         arm_slices = {}
         backend = build_single_model_backend(cfg, control_period=period)
-        print(f"[mujoco_interface] single model: {backend.model_path}", flush=True)
+        print(f"[sim_world] single model: {backend.model_path}", flush=True)
     backend.load()
 
     # THE PLANT DECLARES THE STARTING STATE. On the bench the arm is wherever
@@ -249,7 +249,7 @@ class SceneCore:
                 if not self._idle_warned[arm] and active:
                     # Said once per gap: a silent slice going limp looks downstream like a servo that cannot track.
                     self._idle_warned[arm] = True
-                    self._log(f"[mujoco_interface] {arm}: no command for {now - self.last_cmd_time[arm]:.2f} s — zeroing gains "
+                    self._log(f"[sim_world] {arm}: no command for {now - self.last_cmd_time[arm]:.2f} s — zeroing gains "
                               f"(idle_timeout_sec={self.idle_timeout})", flush=True)
                 self.zero_slice(arm)
             elif self.last_cmd_time[arm] > 0.0:
@@ -268,7 +268,7 @@ class SceneCore:
         debt = (now - self._wall_t0) - self.sim_steps * self.period
         if debt > 0.5 and debt - self._slow_debt > 0.25 and now - self._slow_warned_at > 5.0:
             self._slow_warned_at, self._slow_debt = now, debt
-            self._log(f"[mujoco_interface] sim time {debt:.1f} s behind wall clock and falling further (plant-clock pacing "
+            self._log(f"[sim_world] sim time {debt:.1f} s behind wall clock and falling further (plant-clock pacing "
                       "keeps execution safe; motion plays in slow motion)", flush=True)
         return state
 

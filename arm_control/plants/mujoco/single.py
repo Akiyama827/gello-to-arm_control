@@ -1,7 +1,7 @@
 """The single-model MuJoCo plant a robot config describes (one MJCF/URDF, no scene, no welds, no ground).
 
-Shared by the Dora ``mujoco_interface`` node and the supervisor's simulated link, so both build the same plant from the same
-keys: ``sim_model_path``, ``sim_timestep``, ``sim_launch_viewer``, ``sim_default_joint_positions``, ``sim_gravcomp`` and the
+Built by the supervisor's simulated link (``SimLink``; the Dora ``mujoco_interface`` node that shared it is retired) from the
+keys ``sim_model_path``, ``sim_timestep``, ``sim_launch_viewer``, ``sim_default_joint_positions``, ``sim_gravcomp`` and the
 arm block (``arm.gripper_joints``, the EE frame).
 """
 from arm_control.config import ee_frame, gripper_joints
@@ -53,8 +53,8 @@ def build_single_model_backend(cfg, *, control_period: float) -> MuJoCoBackend:
 def open_jaws(backend, cfg) -> None:
     """The plant declares its starting state: the Hand spawns OPEN at the arm's configured width (MuJoCo's zero is a SHUT hand).
 
-    Shared by the Dora ``mujoco_interface`` node and the supervisor's simulated link, so both spawn the same twin (an open hand, not
-    MuJoCo's zero). It does not change the wrist behaviour of the simulated FR3, which is the same with the jaws shut.
+    Used by the supervisor's simulated link, so the twin spawns with an open hand, not
+    MuJoCo's zero. It does not change the wrist behaviour of the simulated FR3, which is the same with the jaws shut.
     """
     backend.load()
     fingers = int(backend.gripper_positions().size)
@@ -67,7 +67,7 @@ def open_jaws(backend, cfg) -> None:
 
         backend.apply_gripper_command([finger_from_width(open_w)] * fingers)
         print(
-            f"[mujoco_interface] jaws spawned OPEN at {open_w * 1000:.0f} mm",
+            f"[sim_world] jaws spawned OPEN at {open_w * 1000:.0f} mm",
             flush=True,
         )
 

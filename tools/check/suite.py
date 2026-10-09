@@ -154,6 +154,17 @@ def main() -> int:
                                       str(ROOT / "tools/check/check_sdk_supervisor.py"),
                                       "--server", server, *extra],
                                logs=logs, env=env, timeout=180))
+        # The FR3 build (libfranka, found by CMake like the box's build; this PC's /usr is 0.21.2): backend_franka, hand_bridge and
+        # flange_probe compile, and CTest adds hand_bridge_selfcheck. Without libfranka it FAILs with that reason, never silently.
+        franka = build.parent / (build.name + "-franka")
+        results.append(run("configure_franka", ["cmake", "-S", str(ROOT / "rt"), "-B", str(franka), "-G", "Ninja",
+                                                "-DWITH_FRANKA=ON", "-DBUILD_TESTING=ON"], logs=logs, env=env, timeout=120))
+        if results[-1]["status"] == "PASS":
+            results.append(run("build_franka", ["cmake", "--build", str(franka), "--parallel", str(args.jobs)],
+                               logs=logs, env=env, timeout=600))
+        if results[-1]["status"] == "PASS":
+            results.append(run("ctest_franka", ["ctest", "--test-dir", str(franka), "--output-on-failure", "--timeout", "120"],
+                               logs=logs, env=env, timeout=900))
         results.append(run("dual_supervisor", [sys.executable,
                                                str(ROOT / "tools/check/check_dual_supervisor.py"),
                                                "--server", server],
@@ -162,7 +173,7 @@ def main() -> int:
                                           str(ROOT / "tools/check/check_dual_group.py"),
                                           "--server", server],
                            logs=logs, env=env, timeout=240))
-        # every console graph has exactly one authority source and can stream
+        # every console graph has exactly one authority feedback source
         pool.append(("console_graphs", [sys.executable, str(ROOT / "arm_control/ui/arm_console.py"), "--self-check"], env, 180))
         # dora_arm (supervisor deadman windows) and sim_supervisor (rate windows, >= .95x real time under its own readers)
         # assert wall-clock behaviour: they run alone.

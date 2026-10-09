@@ -1,4 +1,4 @@
-"""The supervisor-hosted world (observe/1), republished on the Dora topics the in-process ``mujoco_interface`` plant node serves.
+"""The supervisor-hosted world (observe/1), republished on the Dora topics the retired ``mujoco_interface`` plant node served.
 
 When a graph's plant moves into its arm's supervisor (scene hosting, 2026-10-08-scene-hosting-design.md), the nodes that read
 the world -- simulated perception (``sim_qpos``), an in-hand slip monitor (``inhand_pose``) -- keep their inputs: this node reads
@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import time
 
-#: the plant node's publication periods for the same topics (plants/mujoco/adapter.py)
+#: the retired plant node's publication periods for the same topics
 PERIODS_S = {"sim_qpos": 0.2, "inhand_pose": 0.1, "constraint_force": 0.05, "scene_state": 2.0}
 #: how often observe/1 is read (the supervisor's ring holds about a second at its 100 Hz default)
 POLL_S = 0.05

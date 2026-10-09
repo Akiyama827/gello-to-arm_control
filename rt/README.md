@@ -2,9 +2,9 @@
 
 One C++ binary (`arm_rt_server`) that owns the arm's RT servo loop
 on a realtime Linux box, speaking a small UDP/TCP protocol to the PC's Dora
-graph. The PC-side counterpart is `arm_control/plants/remote_rt/client.py` behind
-`nodes/rt_interface.py` — the same plant-node contract every other bridge
-speaks, so graphs move an arm onto the RT machine by swapping one node path.
+graph. The PC-side counterpart is `arm_control/plants/remote_rt/client.py` (`RtBackend`), the link of the arm's supervisor
+(`python -m arm_control.supervisor.service --plant rt`); graphs reach the arm only through the supervisor (`supervised_arm`),
+whatever its plant.
 
 **Design rule:** this process is a servo with reflexes, never a brain. Torque
 ceilings, staleness thresholds, and slew are launch flags; everything
@@ -138,8 +138,9 @@ The consolidated device-free check is:
 python tools/check/suite.py
 ```
 
-It builds with `WITH_FRANKA=OFF`, runs all 19 available C++ self-checks through
-CTest, checks the SDK in streamed and native modes, then runs the fast local
+It builds with `WITH_FRANKA=OFF`, runs its 22 CTest checks
+CTest, builds again with `WITH_FRANKA=ON` (`<build>-franka`; FAIL, not skip, without libfranka)
+and runs that CTest too (23, with `hand_bridge_selfcheck`), checks the SDK in streamed and native modes, then runs the fast local
 fake-RT regression benches. `reference_session_selfcheck` and
 `reference_runtime_selfcheck` need socket/port harnesses; CTest runs them
 through the existing `reference_upload.py` and `native_reference.py` probes.
@@ -441,10 +442,10 @@ review-caught, all in the stale-authority class):
    (2026-08-06, twice, before the flag existed).
    A hard shove trips the collision reflex — the safe outcome; recover
    DISARM→ARM (the backend runs `automaticErrorRecovery` on re-arm).
-3. **FR3 tracking**: slow sine from the PC graph via `rt_interface`;
+3. **FR3 tracking**: slow sine through the arm's supervisor (SDK or the motion console);
    compare `q_cmd` vs `q` in the state stream against the sim twin.
-4. **Graph integration**: the real motion graph with `plant_interface` →
-   `nodes/rt_interface.py`; then the project's task-specific validation.
+4. **Graph integration**: the real motion graph (`supervised_arm` over the supervisor's
+   `--plant rt`); then the project's task-specific validation.
 
 ## Process-local RT setup gates ARM
 

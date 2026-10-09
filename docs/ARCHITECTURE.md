@@ -654,8 +654,8 @@ server.
   the next state packet, and past that bound the link is stale anyway.
 - **One controller recipe.** `control.factory.build_arm_controller` resolves
   gains, executor, execution policy, model token, pose provenance and
-  settling for the supervisor, the Dora `arm_controller` node and
-  `RemoteHardware`; each passes only its node, clocks and health reporting.
+  settling for the supervisor and `RemoteHardware` (the Dora `arm_controller`
+  node is retired, 2026-10-09); each passes only its node, clocks and health reporting.
   The in-process controller seam (`control.inprocess.QueueControllerNode`)
   sits under both the supervisor and `multi_arm`. The shared MuJoCo pair
   (`multi_arm.simulation`) still builds its sim controllers directly: no
@@ -670,16 +670,15 @@ server.
   - `tools/check/check_supervisor_ledger.py` covers the ledger rules the fake
     server cannot provoke: completion without acceptance, ARM during a
     pending DISARM, and retention.
-- **One writer.** Until the Dora adapters delegate to the supervisor, a robot
-  is driven by either the supervisor or a Dora graph (PC-controlled mode),
-  never both. The RT server admits one control session, so a second commander
-  is refused at CLAIM.
+- **One writer.** Every graph drives its arm through the arm's supervisor
+  (`supervised_arm`); the RT server admits one control session, so a second
+  commander is refused at CLAIM.
 
 Not in this slice:
 
 - `RobotGroup` and group reservation (CTRL-040)
-- moving the Dora `arm_controller` node and the consoles onto the SDK, and
-  `RemoteHardware`'s pair execution onto supervisors (after CTRL-040, which
+- `RemoteHardware`'s pair execution onto supervisors (the Dora `arm_controller`
+  node and the consoles are on the SDK since 2026-10-09) (after CTRL-040, which
   gives the pair a scheduled group commit; until then the pair keeps its
   shared PC reference clock in one process)
 - a client lease or heartbeat beyond connection liveness
@@ -690,8 +689,8 @@ Not in this slice:
 
 ## Known unfinished boundaries
 
-- Motion and calibration use `arm_controller`; the duplicate standalone
-  executor process is retired, not the reusable executor class. Consumers can
+- Motion and calibration run on the arm's supervisor (`supervised_arm`); the
+  duplicate standalone executor process is retired, not the reusable executor class. Consumers can
   explicitly select `control.execution_policy.ExecutionPolicy` for legacy
   start/tracking limits, deadline scheduling, freshness and hold-relatch guards.
   Entries without that policy retain existing event-driven behavior.

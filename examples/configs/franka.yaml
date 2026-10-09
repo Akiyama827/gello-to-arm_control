@@ -7,7 +7,6 @@ include:
 
 # Example-only: an arm at the world origin, not a deployed bench (the deployed placement lives with the project's workcell).
 arm:
-  plant_gravity_comp: true
   world_origin: [0.0, 0.0, 0.0]
   world_rpy: [0.0, 0.0, 0.0]
 # The simulation node uses this to initialize finger opening.
