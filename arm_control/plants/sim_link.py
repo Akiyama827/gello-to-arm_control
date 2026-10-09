@@ -45,7 +45,7 @@ OBSERVE_LIMIT_MAX = 64
 
 
 class SimLink:
-    def __init__(self, config: RtConfig, joint_names, plant, *, servo: dict, observe: dict | None = None) -> None:
+    def __init__(self, config: RtConfig, joint_names, plant, *, servo: dict, observe: dict | None = None, hand=None) -> None:
         missing = [k for k in _SERVO_KEYS if k not in servo]
         if missing:
             raise ValueError(f"sim_servo needs {', '.join(_SERVO_KEYS)} (missing: {', '.join(missing)}): nothing is assumed")
@@ -55,6 +55,9 @@ class SimLink:
         self.joint_names = list(joint_names)
         self.n = len(self.joint_names)
         self._plant = plant
+        # The Hand's own device (``sim_hand``): the real hand_bridge wire, backed by the plant's fingers, stepped on the servo
+        # thread (a sample after each step, a command for the next). One place for every sim plant: a scene's world or one model.
+        self._hand = hand
         try:
             hz, self.hold_ms, fault_ms, kp, kd = (float(servo[k]) for k in _SERVO_KEYS)
         except (TypeError, ValueError) as exc:
@@ -139,7 +142,20 @@ class SimLink:
         else:
             plant = build_single_model_backend(cfg, control_period=period)
             open_jaws(plant, cfg)  # the Hand spawns open, as in the Dora plant node (MuJoCo's zero is a shut hand)
-        return cls(RtConfig.from_config(cfg), joints, plant, servo=servo, observe=cfg.get("sim_observe"))
+        hand = None
+        if cfg.get("sim_hand") is not None:
+            from arm_control.end_effectors.sim_hand_bridge import SimHandBridge
+
+            spec = dict(cfg.get("sim_hand"))
+            if "port" not in spec:
+                raise ValueError("sim_hand needs port (where the Hand's protocol is served): nothing is assumed")
+            hand = SimHandBridge(int(spec["port"]), bind=str(spec.get("bind", "127.0.0.1")))
+        return cls(RtConfig.from_config(cfg), joints, plant, servo=servo, observe=cfg.get("sim_observe"), hand=hand)
+
+    @property
+    def _backend(self):
+        """The MuJoCo backend under the plant (a scene's world, or the one model itself): the Hand's fingers live there."""
+        return getattr(self._plant, "backend", self._plant)
 
     @property
     def supports_cartesian(self) -> bool:
@@ -153,6 +169,11 @@ class SimLink:
     # -- lifecycle ---------------------------------------------------------------------------------------------
     def open(self) -> None:
         self._plant.load()
+        if self._hand is not None:
+            if self._backend.gripper_positions().size != 2:
+                raise ValueError("sim_hand needs a plant with the Hand's two finger joints")
+            if self._hand._server is None:
+                self._hand.start()
         joint_hash = rtp.joint_order_hash(self.joint_names)
         self.session_id = secrets.randbits(63) | 1
         self.identity = rtp.Identity(self.config.instance_id, self.config.task_model, self.session_id, joint_hash,
@@ -176,6 +197,8 @@ class SimLink:
                 print("[sim_link] servo thread did not stop; the plant is left open", flush=True)
                 return
             self._thread = None
+        if self._hand is not None:
+            self._hand.close()
         self._plant.close()
 
     # -- authority ---------------------------------------------------------------------------------------------
@@ -356,6 +379,11 @@ class SimLink:
             # kept under the lock BEFORE the step: if the step raises, the failure sample is the one this step ran under
             self._tick_snap = dict(snapshot, gen=(self._arm_epoch, self._stop_epoch))
         motor = self._plant.step(command)
+        if self._hand is not None:
+            backend = self._backend
+            finger = self._hand.on_sample(backend.gripper_positions(), backend.gripper_efforts(), now)
+            if finger is not None:
+                backend.apply_gripper_command(finger[0], force_n=float(finger[1]))
         self._publish(now, motor=motor, command=command, snapshot=snapshot)
         if self.observing:
             self._observe()

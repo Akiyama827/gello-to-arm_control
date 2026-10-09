@@ -86,7 +86,11 @@ With dependencies and assets ready, these commands launch simulation and UI:
 PYTHONPATH=. python -B examples/run_console.py
 ```
 
-The single-arm console defaults to loopback port 7500.
+The single-arm console defaults to loopback port 7500. The launcher starts the
+arm's supervisor over a simulated plant first (the control authority, as on
+the bench) and the graph reaches it through `supervised_arm`; jog is a
+supervisor setpoint, and the Hand runs on its own protocol against the sim
+Hand at 127.0.0.1:47812.
 For a reviewed move, sync the target, plan, inspect
 the preview, press ARM, wait for the armed indication, then click Execute once.
 The arm console uses this policy for both sim and hardware: there is no separate

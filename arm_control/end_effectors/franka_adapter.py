@@ -408,9 +408,11 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
 
     cfg = load_robot_config()
     rt = dict(cfg.get("rt") or {})
-    client = BridgeClient(
-        str(rt.get("host", "172.16.1.2")), int(rt.get("hand_port", 47802))
-    )
+    # The Hand's address is never assumed: a default here was the REAL RT box, so a sim graph that forgot rt.host would have
+    # driven the bench's Hand.
+    if not rt.get("host") or rt.get("hand_port") is None:
+        raise SystemExit("[franka_gripper] the config states no rt.host and rt.hand_port: the Hand's address is never assumed")
+    client = BridgeClient(str(rt["host"]), int(rt["hand_port"]))
     require_authority = bool(cfg.get('hand_move_requires_arm', False))
     grasp_fsm = HandGraspFsm(dict((cfg.get("franka") or {}).get("gripper") or {}),
                              measured_completion=require_authority)

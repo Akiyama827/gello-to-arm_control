@@ -103,7 +103,7 @@ def child(kind: str, stop: str, directory: Path) -> None:
                 closed.set()
 
         adapter.socket.create_connection = lambda *args, **kwargs: Socket()
-        adapter.load_robot_config = lambda: {}
+        adapter.load_robot_config = lambda: {"rt": {"host": "127.0.0.1", "hand_port": 1}}  # the Hand's address is required
         adapter.HOME_FILE = directory / "home"
         client = adapter.BridgeClient("127.0.0.1", 1)
         adapter.BridgeClient = lambda *args: client
@@ -161,6 +161,16 @@ def main() -> None:
                         rows = list(csv.DictReader(stream))
                     assert len(rows) == 1 and float(rows[0]["motor_0_pos"]) == 0, rows
                 print(f"{kind}: {stop} OK")
+    # The Hand node never assumes an address (its old default was the real RT box): no rt.host/rt.hand_port, no start.
+    from arm_control.end_effectors import franka_adapter
+    franka_adapter.load_robot_config = lambda: {"rt": {"hand_port": 47802}}
+    try:
+        franka_adapter._run(None, None)
+    except SystemExit as exc:
+        assert "never assumed" in str(exc), exc
+    else:
+        raise AssertionError("franka_gripper started with no rt.host")
+    print("hand: no stated address, no start OK")
 
 
 if __name__ == "__main__":
