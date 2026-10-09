@@ -31,7 +31,7 @@ Do not assume every optional module imports without its dependency installed.
 PYTHONPATH=. python -B -m arm_control.config
 PYTHONPATH=. python -B -m arm_control.frames
 PYTHONPATH=. python -B -m arm_control.scene
-PYTHONPATH=. python -B -m arm_control.messages
+PYTHONPATH=. python -B -m arm_control.contracts
 PYTHONPATH=. python -B -m arm_control.planning.jog
 PYTHONPATH=. python -B -m arm_control.plants.base
 PYTHONPATH=. python -B -m arm_control.plants.franka.backend

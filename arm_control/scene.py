@@ -174,16 +174,6 @@ class SceneState:
         self.revision += 1
         return attachment
 
-    def set_actor_q(self, spec: SceneSpec, actor_name: str, q: list[float]) -> None:
-        actor = next((actor for actor in spec.actors if actor.name == actor_name), None)
-        if actor is None:
-            raise KeyError(f"unknown scene actor: {actor_name}")
-        values = [float(value) for value in q]
-        if len(values) != len(actor.joints) or not all(isfinite(value) for value in values):
-            raise ValueError(f"{actor_name}.q must contain {len(actor.joints)} finite values")
-        self.actor_q[actor_name] = values
-        self.revision += 1
-
     def set_constraint(self, name: str, active: bool) -> None:
         if not name:
             raise ValueError("constraint name must be non-empty")

@@ -398,7 +398,7 @@ def scenario(sock: Path, rt: subprocess.Popen, sup: subprocess.Popen) -> None:
     heavy = sorted(m for m in sys.modules if m.split(".")[0] in {
         "pyarrow", "dora", "mujoco", "rerun", "pinocchio", "yaml", "torch"}
         or m.startswith(("arm_control.control", "arm_control.supervisor",
-                         "arm_control.messages", "arm_control.contracts")))
+                         "arm_control.contracts",)))
     assert not heavy, f"the SDK process imported {heavy}"
     print("  receipts, ownership, idempotency, supersession, expiry, cancel, stalls, "
           "disarm, owner loss, plant loss: ok; SDK process imported nothing heavy")

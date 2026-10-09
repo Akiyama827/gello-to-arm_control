@@ -25,7 +25,6 @@ remain consumer policy.
 
 from arm_control.multi_arm.interface import (
     ArmHandle,
-    BimanualInterface,
 )
 from arm_control.multi_arm.types import (
     ArmControlState,
@@ -41,7 +40,6 @@ __all__ = [
     "ArmControlState",
     "ArmHandle",
     "ArmPlan",
-    "BimanualInterface",
     "BimanualPlan",
     "BimanualState",
     "PairLifecycle",

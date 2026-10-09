@@ -45,7 +45,7 @@ From this repository, in an environment containing the required dependencies:
 ```bash
 PYTHONPATH=. python -B -m arm_control.config
 PYTHONPATH=. python -B -m arm_control.frames
-PYTHONPATH=. python -B -m arm_control.messages
+PYTHONPATH=. python -B -m arm_control.contracts
 PYTHONPATH=. python -B examples/run_console.py --check
 ```
 

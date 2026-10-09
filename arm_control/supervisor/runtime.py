@@ -48,10 +48,9 @@ from arm_control.execution.contract import (
     Receipt, RobotIdentity, RobotState, Stamp, Start, TrajectoryRequest, Validity,
     admission_refusal, selection_refusal, supersession_refusal,
 )
-from arm_control.messages import (
-    pack_control_update, pack_json_message, pack_motor_state_dict, pack_plan,
-    unpack_controller_event, unpack_json_message, unpack_motor_command,
-)
+from arm_control.contracts._arrow import pack_json_message, unpack_json_message
+from arm_control.contracts.motion import pack_control_update, pack_plan, unpack_controller_event
+from arm_control.contracts.motor import pack_motor_state_dict, unpack_motor_command
 from arm_control.control.inprocess import QueueControllerNode
 from arm_control.multi_arm.diagnostics import SupervisorFaultTrace
 from arm_control.multi_arm.group import GROUP_BUDGET_S, GROUP_MIN_LEAD_MS

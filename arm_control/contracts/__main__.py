@@ -1,103 +1,31 @@
-"""Compatibility imports for the wire contracts; schemas live in contracts/."""
+"""``python -m arm_control.contracts``: round-trip the planner/controller wire pair and the scene codecs (moved from the
+retired ``arm_control.messages`` alias)."""
 from __future__ import annotations
 
-import json as json  # retained compatibility attribute
-
 import numpy as np
-import pyarrow as pa  # noqa: F401 - retained compatibility attribute
 
-from arm_control.contracts._arrow import (
-    _pack as _pack,
-    _unpack as _unpack,
-    _check_length as _check_length,
-    pack_json_message as pack_json_message,
-    unpack_json_message as unpack_json_message,
-)
 from arm_control.contracts.motor import (
-    _MS as _MS,
-    _MC as _MC,
-    _CART as _CART,
-    pack_motor_state as pack_motor_state,
-    pack_motor_state_dict as pack_motor_state_dict,
-    unpack_motor_state as unpack_motor_state,
-    pack_cartesian_block as pack_cartesian_block,
-    pack_motor_command as pack_motor_command,
-    unpack_motor_command as unpack_motor_command,
+    pack_cartesian_block,
+    pack_motor_command,
+    unpack_motor_command,
 )
 from arm_control.contracts.motion import (
-    _completion_body as _completion_body,
-    pack_trajectory as pack_trajectory,
-    unpack_trajectory as unpack_trajectory,
-    pack_plan as pack_plan,
-    unpack_plan as unpack_plan,
-    pack_control_update as pack_control_update,
-    unpack_control_update as unpack_control_update,
-    pack_controller_event as pack_controller_event,
-    unpack_controller_event as unpack_controller_event,
-    pack_controller_settings as pack_controller_settings,
-    unpack_controller_settings as unpack_controller_settings,
-    pack_jog as pack_jog,
-    unpack_jog as unpack_jog,
+    pack_plan,
+    unpack_plan,
+    pack_control_update,
+    unpack_control_update,
+    pack_controller_event,
+    unpack_controller_event,
 )
 from arm_control.contracts.scene import (
-    _scene_message as _scene_message,
-    pack_scene_command as pack_scene_command,
-    unpack_scene_command as unpack_scene_command,
-    pack_scene_result as pack_scene_result,
-    pack_scene_state as pack_scene_state,
-    scene_command_state as scene_command_state,
-    scene_state_payload as scene_state_payload,
-    scene_state_from_payload as scene_state_from_payload,
+    scene_command_state,
+    scene_state_payload,
+    scene_state_from_payload,
 )
-from arm_control.contracts.gripper import (
-    pack_grasp_request as pack_grasp_request,
-    unpack_grasp_request as unpack_grasp_request,
-    pack_grasp_result as pack_grasp_result,
-    unpack_grasp_result as unpack_grasp_result,
-)
-from arm_control.contracts.perception import (
-    pack_points as pack_points,
-    unpack_points as unpack_points,
-    pack_object_poses as pack_object_poses,
-    unpack_object_poses as unpack_object_poses,
-)
-
-
-__all__ = [
-    "pack_motor_state",
-    "pack_motor_state_dict",
-    "unpack_motor_state",
-    "pack_motor_command",
-    "unpack_motor_command",
-    "pack_cartesian_block",
-    "pack_trajectory",
-    "unpack_trajectory",
-    "pack_plan",
-    "unpack_plan",
-    "pack_control_update",
-    "unpack_control_update",
-    "pack_controller_event",
-    "unpack_controller_event",
-    "pack_controller_settings",
-    "unpack_controller_settings",
-    "scene_command_state",
-    "scene_state_payload",
-    "scene_state_from_payload",
-    "pack_json_message",
-    "unpack_json_message",
-    "pack_jog",
-    "unpack_jog",
-    "pack_grasp_request",
-    "unpack_grasp_request",
-    "pack_grasp_result",
-    "unpack_grasp_result",
-    "pack_object_poses",
-    "unpack_object_poses",
-]
 
 
 def _self_check() -> None:
-    """Round-trip the planner/controller wire pair (arm_control/messages)."""
+    """Round-trip the planner/controller wire pair."""
     n, samples = 7, 5
     times = np.linspace(0.0, 1.0, samples)
     q = np.tile(np.arange(n, dtype=float), (samples, 1))
@@ -183,7 +111,7 @@ def _self_check() -> None:
         pass
     else:
         raise AssertionError("pack_controller_event accepted an unknown kind")
-    print("messages self-check ok")
+    print("contracts self-check ok")
 
 
 def _check_scene_codec() -> None:

@@ -11,14 +11,9 @@ from __future__ import annotations
 import numpy as np
 
 from arm_control.control.arm_controller import ArmController
-from arm_control.messages import (
-    pack_control_update,
-    pack_controller_event,
-    pack_json_message,
-    pack_jog,
-    unpack_controller_event,
-    unpack_motor_command as _umc,
-)
+from arm_control.contracts._arrow import pack_json_message
+from arm_control.contracts.motion import pack_control_update, pack_controller_event, pack_jog, unpack_controller_event
+from arm_control.contracts.motor import unpack_motor_command as _umc
 from arm_control.control.doubles import (
     _controller,
     _FakeExecutor,

@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pyarrow as pa
 
-from ._arrow import _pack, _unpack, pack_json_message, unpack_json_message
+from ._arrow import _pack, _unpack, unpack_json_message
 
 
 def pack_points(points: np.ndarray) -> pa.Array:
@@ -33,33 +33,6 @@ def unpack_points(arrow: pa.Array) -> np.ndarray:
 # and naming them in the wire format is what made this codec look like an
 # assembly-task message rather than the pose contract it is.
 # --------------------------------------------------------------------------- #
-
-
-def pack_object_poses(
-    *,
-    camera: str,
-    frame: str,
-    stamp: float,
-    objects: list[dict],
-    tags: list[dict] | None = None,
-) -> pa.Array:
-    """``objects``: dicts with ``object_id`` and ``pose_xyzquat`` (7 floats,
-    [x y z qw qx qy qz]) plus free-form extras (``fitness``…). ``frame`` names
-    the frame the poses are expressed in — consumers assert on it."""
-    for m in objects:
-        pose = m.get("pose_xyzquat")
-        if pose is None or len(pose) != 7:
-            raise ValueError(f"object entry needs a 7-float pose_xyzquat: {m}")
-    return pack_json_message(
-        "object_poses",
-        {
-            "camera": camera,
-            "frame": frame,
-            "stamp": float(stamp),
-            "objects": objects,
-            "tags": list(tags or []),
-        },
-    )
 
 
 def unpack_object_poses(payload: pa.Array) -> dict:

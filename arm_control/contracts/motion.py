@@ -301,8 +301,7 @@ def unpack_controller_event(payload: pa.Array) -> dict:
     return body
 
 
-def pack_controller_settings(payload: dict) -> pa.Array:
-    return pack_json_message("controller_settings", payload)
+
 
 
 def unpack_controller_settings(arrow: pa.Array) -> dict:

@@ -4,7 +4,8 @@ import numpy as np
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.doubles import _FakeExecutor, _FakeNode, _state
 from arm_control.contracts.motion import pack_controller_event, unpack_controller_event
-from arm_control.messages import pack_control_update, pack_json_message, pack_plan
+from arm_control.contracts._arrow import pack_json_message
+from arm_control.contracts.motion import pack_control_update, pack_plan
 
 
 def events(c):

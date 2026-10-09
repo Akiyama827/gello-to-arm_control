@@ -6,10 +6,9 @@ from dataclasses import replace
 
 from arm_control.control.arm_controller import ArmController
 from arm_control.control.doubles import _FakeExecutor, _FakeNode
-from arm_control.messages import (
-    pack_control_update, pack_json_message, pack_motor_state, pack_plan,
-    pack_jog, unpack_json_message, unpack_motor_command,
-)
+from arm_control.contracts._arrow import pack_json_message, unpack_json_message
+from arm_control.contracts.motion import pack_control_update, pack_plan, pack_jog
+from arm_control.contracts.motor import pack_motor_state, unpack_motor_command
 
 
 def state(q=0.0, velocity=0.0):
@@ -514,7 +513,7 @@ def cartesian_plan(**changes):
 def check_cartesian_lifecycle():
     c, clock = setup()
     # The packer refuses a malformed spec, but a received plan is checked independently of whichever producer built its JSON.
-    from arm_control.messages import unpack_plan
+    from arm_control.contracts.motion import unpack_plan
     measured = c.last_state.position
     assert not c.execution_policy.plan_error(unpack_plan(cartesian_plan()), measured, 7)
     assert not c.execution_policy.plan_error(unpack_plan(cartesian_plan(cartesian_poses=None)), measured, 7), \

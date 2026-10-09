@@ -36,10 +36,8 @@ from arm_control.joint_motor_map import finger_from_width
 # Same scene draw as the teleop preview — one implementation, so the two Rerun
 # recordings can never disagree about where the dock stands.
 from arm_control.viz.preview import log_static_scene
-from arm_control.messages import (
-    unpack_motor_state,
-    unpack_json_message,
-)
+from arm_control.contracts._arrow import unpack_json_message
+from arm_control.contracts.motor import unpack_motor_state
 
 try:
     import pinocchio as pin

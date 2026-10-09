@@ -23,7 +23,7 @@ import time
 
 import numpy as np
 
-from arm_control.messages import scene_state_from_payload, scene_state_payload
+from arm_control.contracts.scene import scene_state_from_payload, scene_state_payload
 from arm_control.node_utils import entry_point, scene_injections
 from arm_control.plants.mujoco.composer import build_scene_backend, build_workcell_backend
 from arm_control.plants.mujoco.single import build_single_model_backend, open_jaws
@@ -199,9 +199,6 @@ class SceneCore:
         # Cartesian impedance is an EE-level term: the arm that owns the configured EE body owns it (last writer wins).
         self.command["cartesian"] = sub["cartesian"]
         return True
-
-    def apply_gripper(self, position, *, force_n: float) -> None:
-        self.backend.apply_gripper_command(position, force_n=float(force_n))
 
     def apply_scene(self, request: dict) -> dict:
         """An optimistic scene change. Returns the scene_state payload after it; raises ValueError (stale revision) or the

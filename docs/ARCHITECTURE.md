@@ -105,15 +105,16 @@ Neutral values live in `motion/types.py`; retiming algorithms remain under
 
 `multi_arm` coordinates two named arm endpoints. Each retains its own
 `ArmController`, joint order, model token and motor-command authority. The
-pair coordinator never sends motor commands. Its local and Dora handles expose
-the same staging, release, cancellation and per-arm control operations.
+pair coordinator never sends motor commands. Its handle over each arm's
+supervisor (`SdkArmHandle`) exposes staging, release, cancellation and per-arm
+control operations; a pair is driven through the SDK, not Dora topics (the Dora
+pair adapter was retired 2026-10-10: it released members without a common start).
 
 | Owner | Responsibility |
 |---|---|
 | `multi_arm/types.py`, `interface.py` | Public pair values and handles; arm ids remain attached to each member |
 | `multi_arm/coordinator.py`, `synchronization.py` | Fresh-state admission, session/model binding, both-member ACK barrier, cancellation acknowledgements and timing records |
 | `multi_arm/feedback.py` | Same-host timestamp alignment for the closure monitor; bounded interpolation, raw controller feedback unchanged |
-| `contracts/multi_arm.py`, `multi_arm/adapter.py` | Arrow envelope and Dora transport; `nodes/multi_arm_coordinator.py` is only an entry point |
 | `multi_arm/planning.py` | Combined joint-space search with both moving geometries and one retimed trajectory, split back into arm-keyed plans |
 | `multi_arm/cooperative.py` | Fixed object-to-TCP transforms, continuation IK along one object path, grasp/path checks on the retimed Hermite curve |
 | `multi_arm/supervised.py`, `multi_arm/supervised_hardware.py` | An `ArmHandle` over one arm's supervisor (SDK); the dual console's runtime over two of them, virtual coupling from common-time feedback (`supervised_feedback.align_arms`) |
@@ -253,20 +254,11 @@ not silently clipped.
 wire schemas. The byte-level remote RT protocol remains separate in
 `plants/remote_rt/protocol.py`.
 
-Intentional public compatibility aliases remain:
-
-| API | Canonical owner | Reason | Retire when |
-|---|---|---|---|
-| `arm_control.messages` | `arm_control.contracts` | Existing independent consumers use the codecs | Its importers here, in `Control/assembly` and in perceptions import `contracts`, and the README self-check moves with them |
-| `arm_control.rt_protocol` | `arm_control.plants.remote_rt.protocol` | Preserve protocol imports and `python -m ... --hex` | No current command or importer uses it; remove one release after a deprecation notice |
-| `arm_control.simulation.mujoco_backend` | `arm_control.plants.mujoco.backend` | Preserve class/helper identities and module CLI | No current command or importer uses it; remove one release after a deprecation notice |
-| `arm_control.simulation.scene_backend` | `arm_control.plants.mujoco.composer` | Independent simulated perception consumes the injected builder | perceptions `nodes/sim_perception.py` imports `plants.mujoco.composer` |
-
-Callers were audited on 2026-09-24 across this library, `Control/` and
-perceptions.
-
-These are package-level re-exports, not node-source APIs. Removing them requires
-an explicit consumer migration, not a directory-cleanup sweep.
+No compatibility aliases remain: `arm_control.messages`, `arm_control.rt_protocol`,
+`arm_control.simulation.mujoco_backend` and `arm_control.simulation.scene_backend`
+were retired on 2026-10-10 after their consumers (this library, `Control/`,
+perceptions) moved to `arm_control.contracts`, `plants.remote_rt.protocol`,
+`plants.mujoco.backend` and `plants.mujoco.composer`.
 
 ## Instances, models and calibration
 

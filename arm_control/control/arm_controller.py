@@ -46,17 +46,9 @@ from arm_control.control.integral import IntegralState
 from arm_control.control.reference import TrajectoryReference
 from arm_control.control.trajectory_executor import gain_error
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
-from arm_control.messages import (
-    pack_cartesian_block,
-    pack_controller_event,
-    pack_motor_command,
-    unpack_jog,
-    unpack_motor_state,
-    pack_json_message,
-    unpack_control_update,
-    unpack_json_message,
-    unpack_plan,
-)
+from arm_control.contracts._arrow import pack_json_message, unpack_json_message
+from arm_control.contracts.motion import pack_controller_event, unpack_jog, unpack_control_update, unpack_plan
+from arm_control.contracts.motor import pack_cartesian_block, pack_motor_command, unpack_motor_state
 
 
 class ArmController:
@@ -222,11 +214,6 @@ class ArmController:
         if self._running and self.current_plan_id == plan_id and self._reference_source is None:
             self._stream_sent_target = np.asarray(q_des, dtype=float).copy()
             self._stream_sent_at = sent_at
-
-    # -- clock ---------------------------------------------------------------
-    @property
-    def plant_time(self) -> float:
-        return self._plant_t
 
     # -- inputs --------------------------------------------------------------
     @property

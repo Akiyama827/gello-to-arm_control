@@ -28,7 +28,7 @@ from pathlib import Path
 from dora import Node
 
 
-from arm_control.messages import pack_json_message
+from arm_control.contracts._arrow import pack_json_message
 from arm_control.node_utils import instance_scoped, next_event_gil_friendly
 
 _PANEL_PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -265,7 +265,7 @@ def main() -> None:
             and event["id"] == "status"
             and panel is not None
         ):
-            from arm_control.messages import unpack_json_message
+            from arm_control.contracts._arrow import unpack_json_message
 
             panel.set_status(unpack_json_message(event["value"]))
         if panel is not None and panel.evicted:
