@@ -432,11 +432,8 @@ def link_races(tmp):
     link._thread.join(5) if link._thread is not None else None
 
 
-def scene_plant_unit(tmp):
-    """The supervisor hosts a scene world (step 2b): SimLink's authority over ONE actor's slice; the other actors keep the world's
-    spawn hold; observe/1 names every actor and the free objects; a refused config names what it lacks."""
-    from arm_control.plants.mujoco.scene_core import ScenePlant
-
+def write_scene(tmp):
+    """A two-actor world (``arm``: three hinges, ``peer``: one, spawned at q 0.3) and one free part; returns scene.yaml."""
     root = tmp / 'scene'
     root.mkdir()
     hinge = "<body name='l{i}' pos='0 0 .1'><joint name='j{i}' type='hinge' axis='0 1 0' armature='.1'/><geom type='capsule' size='.02 .05'/>"
@@ -450,6 +447,15 @@ def scene_plant_unit(tmp):
         "    arm: {path: arm.xml, joints: [j1, j2, j3], pos: [0, 0, 0], rpy: [0, 0, 0]}\n"
         "    peer: {path: peer.xml, joints: [j1], pos: [1, 0, 0], rpy: [0, 0, 0], q: [.3]}\n"
         "  objects:\n    item: {path: item.xml, pos: [.5, .5, .2], rpy: [0, 0, 0]}\n")
+    return root / 'scene.yaml'
+
+
+def scene_plant_unit(tmp):
+    """The supervisor hosts a scene world (step 2b): SimLink's authority over ONE actor's slice; the other actors keep the world's
+    spawn hold; observe/1 names every actor and the free objects; a refused config names what it lacks."""
+    from arm_control.plants.mujoco.scene_core import ScenePlant
+
+    root = write_scene(tmp).parent
     base = write_config(tmp, 0, 0).read_text().replace("  native_reference: true\n", "")
     servo = ("sim_servo: {" + ", ".join(f"{k}: {v}" for k, v in SERVO.items()) + "}\nsim_observe: {rate_hz: 250, ring_s: 1}\n")
 

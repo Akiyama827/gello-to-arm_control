@@ -23,6 +23,7 @@ that is not told them does not invent them.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from itertools import islice
 import secrets
 import threading
@@ -125,9 +126,10 @@ class SimLink:
             self._obs = deque(maxlen=max(1, int(np.ceil(ring_s * self.observe_rate_hz))))
 
     @classmethod
-    def from_config(cls, cfg) -> "SimLink":
+    def from_config(cls, cfg, *, cohost_of=None) -> "SimLink":
         """The simulated plant a robot config describes: its ``sim_*`` plant keys (``plants.mujoco.single``), its ``rt`` block for
-        the instance id and freshness bounds, and the required ``sim_servo`` block."""
+        the instance id and freshness bounds, and the required ``sim_servo`` block. ``cohost_of``: a ``SharedWorld`` another
+        link in this process hosts; this config's ``sim_actor`` is then driven in that world, which it never steps."""
         from arm_control.config import arm_joints
         from arm_control.plants.mujoco.scene_core import ScenePlant, describes_scene
         from arm_control.plants.mujoco.single import build_single_model_backend, open_jaws
@@ -137,7 +139,9 @@ class SimLink:
             raise ValueError("config has no sim_servo.state_hz: nothing is assumed")
         period = 1.0 / float(servo["state_hz"])
         joints = arm_joints(cfg)
-        if describes_scene(cfg):  # the supervisor hosts the whole world and drives one actor of it (``sim_actor``)
+        if cohost_of is not None:
+            plant = ScenePlant.cohost(cohost_of, cfg, joints, period=period)
+        elif describes_scene(cfg):  # the supervisor hosts the whole world and drives one actor of it (``sim_actor``)
             plant = ScenePlant.from_config(cfg, joints, period=period)
         else:
             plant = build_single_model_backend(cfg, control_period=period)
@@ -160,6 +164,11 @@ class SimLink:
     def _backend(self):
         """The MuJoCo backend under the plant (a scene's world, or the one model itself): the Hand's fingers live there."""
         return getattr(self._plant, "backend", self._plant)
+
+    @property
+    def scene_world(self):
+        """The ``SharedWorld`` this link HOSTS (steps), for co-hosted actors and scene_action/1; None otherwise."""
+        return self._plant.shared if getattr(self._plant, "host", False) else None
 
     @property
     def supports_cartesian(self) -> bool:
@@ -385,9 +394,11 @@ class SimLink:
         motor = self._plant.step(command)
         if self._hand is not None:
             backend = self._backend
-            finger = self._hand.on_sample(backend.gripper_positions(), backend.gripper_efforts(), now)
-            if finger is not None:
-                backend.apply_gripper_command(finger[0], force_n=float(finger[1]))
+            shared = getattr(self._plant, "shared", None)
+            with shared.lock if shared is not None else nullcontext():  # a co-hosted actor reads the same world
+                finger = self._hand.on_sample(backend.gripper_positions(), backend.gripper_efforts(), now)
+                if finger is not None:
+                    backend.apply_gripper_command(finger[0], force_n=float(finger[1]))
         self._publish(now, motor=motor, command=command, snapshot=snapshot)
         if self.observing:
             self._observe()

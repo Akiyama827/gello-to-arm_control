@@ -143,14 +143,26 @@ def build_executor(
             return gain_vector(cfg, arm_key, n)
         return np.asarray(gains[key], dtype=float).ravel()[:n]
 
-    executor = JointTrajectoryExecutor(
-        arm_id=arm_id,
-        joint_names=joints,
-        dynamics=PinocchioDynamics(
+    if arm_blk.get("body_list") is not None:
+        # A body-list arm (arm.body_list: BodyListDynamics' description, e.g. the base and the module above it, composed from the
+        # world it moves in): no URDF, and no payload -- the load is in the bodies, revised with load_model/1.
+        from arm_control.dynamics import BodyListDynamics
+
+        dynamics = BodyListDynamics(arm_blk["body_list"])
+        if dynamics.joints != joints:
+            raise ValueError("arm.body_list joints differ from the arm's joints (order included)")
+        payload_frame = ""
+    else:
+        dynamics = PinocchioDynamics(
             arm_urdf(cfg), joints,
             gravity=(execution_gravity(cfg, arm_urdf(cfg)) if simulation_gravity is None
                      else simulation_gravity),
-        ),
+        )
+        payload_frame = ee_frame(cfg)
+    executor = JointTrajectoryExecutor(
+        arm_id=arm_id,
+        joint_names=joints,
+        dynamics=dynamics,
         kp_default=_gain("kp", "kp"),
         kd_default=_gain("kd", "kd"),
         max_torque=_gain("torque_limits", "max_tau"),
@@ -159,7 +171,7 @@ def build_executor(
         # twice. The legacy standalone executor already honoured this flag; this
         # path silently ignored it.
         gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
-        payload_frame=ee_frame(cfg),
+        payload_frame=payload_frame,
         **tolerances,
     )
     return executor

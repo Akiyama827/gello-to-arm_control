@@ -17,6 +17,7 @@ What to publish, and when, stays with the front end.
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import numpy as np
@@ -278,19 +279,42 @@ class SceneCore:
         return pos_cmd
 
 
+class SharedWorld:
+    """One composed world and its ``SceneCore``, shared by every supervised actor this process hosts (scene-hosting D1(a)/D2(a),
+    operator 2026-10-09: the FR3 and the base in one sim world, each on its own supervisor). The HOST actor's servo thread steps
+    it; the others write their slice and read the state the last step left. Every write, step and read is under ``lock``."""
+
+    def __init__(self, world, *, period: float, idle_timeout: float) -> None:
+        backend, slices, names, n = world
+        if not (np.isfinite(idle_timeout) and idle_timeout > 0):
+            raise ValueError("idle_timeout_sec must be finite and positive")
+        self.backend, self.slices, self.names = backend, dict(slices), list(names)
+        self.core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
+        self.lock = threading.Lock()
+        self.last: dict | None = None  # the backend state after the last step
+
+    def apply_scene(self, request: dict) -> dict:
+        """scene_action/1: an optimistic scene change, between steps (``SceneCore.apply_scene``)."""
+        with self.lock:
+            return self.core.apply_scene(request)
+
+
 class ScenePlant:
     """One actor of a scene world, as the plant behind a ``SimLink`` (scene hosting, step 2b; 2026-10-08-scene-hosting-design.md).
 
     The supervisor hosts the world: ``SimLink`` keeps its authority, deadman and observe/1 rules unchanged, and this adapter gives
     it the supervised actor's slice of a ``SceneCore`` -- the same world code the Dora plant node runs. Each step writes the
     actor's slice (``SimLink`` writes every tick: a command, a hold or a release word, so the slice's own idle deadman never
-    fires for it) and steps the whole world once. The other actors keep the world's spawn hold until their own writers exist
-    (step 3, D1). The Hand (``sim_hand``) is served by ``SimLink`` for every sim plant, from the world's ``backend``.
-    Driven by ``SimLink``'s one servo thread, as ``SceneCore`` requires.
+    fires for it); the HOST actor's step also steps the whole world once, a co-hosted actor's (``cohost``) reads the state the
+    host's last step left (one host tick of latency). Actors with no supervisor keep the world's spawn hold. The Hand
+    (``sim_hand``) is served by ``SimLink`` for every sim plant, from the world's ``backend``. Every touch of the world is under
+    the ``SharedWorld`` lock.
     """
 
-    def __init__(self, world, actor: str, joints: list, *, period: float, idle_timeout: float) -> None:
-        backend, slices, names, n = world
+    def __init__(self, world, actor: str, joints: list, *, period: float, idle_timeout: float, host: bool = True) -> None:
+        """``world``: a ``build_world`` tuple (this actor hosts it) or a ``SharedWorld`` another actor hosts (``host=False``)."""
+        shared = world if isinstance(world, SharedWorld) else SharedWorld(world, period=period, idle_timeout=idle_timeout)
+        backend, slices, names = shared.backend, shared.slices, shared.names
         if actor not in slices:
             raise ValueError(f"sim_actor {actor!r} is not an actor of this world (actors: {sorted(slices)})")
         width = len(joints)
@@ -302,11 +326,10 @@ class ScenePlant:
         world_joints = list(names)[start: start + width]
         if not all(w.endswith(j) for w, j in zip(world_joints, joints)):
             raise ValueError(f"sim_actor {actor!r} joints {world_joints} are not the arm config's {list(joints)} in order")
-        if not (np.isfinite(idle_timeout) and idle_timeout > 0):
-            raise ValueError("idle_timeout_sec must be finite and positive")
         self.actor, self.backend, self._slices = actor, backend, dict(slices)
         self._span = slice(start, start + width)
-        self._core = SceneCore(backend, slices, n, period=period, idle_timeout=idle_timeout)
+        self.shared, self.host = shared, bool(host)
+        self._core = shared.core
 
     @classmethod
     def from_config(cls, cfg, joints: list, *, period: float) -> "ScenePlant":
@@ -318,6 +341,14 @@ class ScenePlant:
             raise ValueError("a scene plant needs idle_timeout_sec (the other actors' deadman): nothing is assumed")
         return cls(build_world(cfg, period=period), str(actor), list(joints), period=period, idle_timeout=float(idle))
 
+    @classmethod
+    def cohost(cls, shared: SharedWorld, cfg, joints: list, *, period: float) -> "ScenePlant":
+        """Another actor (``sim_actor``) of a world this process already hosts: it writes its slice, the host steps the world."""
+        actor = cfg.get("sim_actor")
+        if not actor:
+            raise ValueError("a co-hosted actor needs sim_actor (the world's actor its supervisor drives): nothing is assumed")
+        return cls(shared, str(actor), list(joints), period=period, idle_timeout=shared.core.idle_timeout, host=False)
+
     @property
     def supports_cartesian(self) -> bool:
         """The world's EE chain is this actor's: a Cartesian spec from it drives its own arm, never another actor's."""
@@ -325,10 +356,12 @@ class ScenePlant:
         return bool(self.backend.supports_cartesian and set(self.backend.ee_chain_joints) <= mine)
 
     def load(self) -> None:
-        self.backend.load()
+        if self.host:
+            self.backend.load()
 
     def close(self) -> None:
-        self.backend.close()
+        if self.host:
+            self.backend.close()
 
     def _mine(self, state: dict) -> dict:
         return {"position": np.asarray(state["position"], float)[self._span].copy(),
@@ -336,14 +369,22 @@ class ScenePlant:
 
     def step(self, command: dict) -> dict:
         now = time.monotonic()
-        self._core.set_slice(self.actor, dict(command, cartesian=command.get("cartesian")), now)
-        return self._mine(self._core.tick(now))
+        with self.shared.lock:
+            self._core.set_slice(self.actor, dict(command, cartesian=command.get("cartesian")), now)
+            if self.host:
+                self.shared.last = self._core.tick(now)
+            return self._mine(self.shared.last if self.shared.last is not None else self.backend.motor_state())
 
     def motor_state(self) -> dict:
-        return self._mine(self.backend.motor_state())
+        with self.shared.lock:
+            return self._mine(self.backend.motor_state())
+
+    def apply_scene(self, request: dict) -> dict:
+        return self.shared.apply_scene(request)
 
     def observe(self) -> dict:
-        world = self.backend.observe()
+        with self.shared.lock:
+            world = self.backend.observe()
         names = list(self.backend.joint_names)
         world["actors"] = {a: names[s["start"]: s["start"] + s["n"]] for a, s in self._slices.items()}
         return world

@@ -1,11 +1,14 @@
 """The supervisor process: one robot, one local socket (CTRL-022).
 
-    python -m arm_control.supervisor.service --config <robot.yaml> [--socket PATH]
+    python -m arm_control.supervisor.service --config <robot.yaml> [--socket PATH] [--plant sim [--cohost CFG=SOCKET ...]]
 
 Serves ``arm_control.sdk.ArmClient``: newline-delimited JSON over a Unix
 socket in an owner-only directory. One connection is one client session; its
 thread only parses and waits, so a stalled client blocks nobody but itself.
 Starting the service claims the RT server and never arms.
+
+``--cohost`` (sim only; scene-hosting D2(a)): another supervised actor of the SAME world -- its own config, runtime, socket,
+claim and ARM -- in this process. The ``--config`` robot's servo thread steps the world; a co-host writes its slice.
 """
 from __future__ import annotations
 
@@ -82,6 +85,13 @@ def dispatch(runtime: RobotRuntime, session: str, op: str, args: dict):
             return runtime.group_report(str(args['execution_id']))
         if op == 'group_events':
             return runtime.group_events(session)
+    if op.startswith('scene_'):
+        if runtime.extensions.get('scene_action') != 1:
+            raise Refused('scene_action/1 is unavailable')
+        if op == 'scene_claim':
+            return runtime.scene_claim(session)
+        if op == 'scene_apply':
+            return runtime.scene_apply(session, str(args['request_id']), int(args['revision']), dict(args['state']))
     if op == 'setpoint':
         if runtime.extensions.get('setpoint') != 1:
             raise Refused('setpoint/1 is unavailable (this supervisor plays the native reference: use stream/1)')
@@ -226,6 +236,8 @@ def main(argv=None, *, stream_admission=None) -> None:
     parser.add_argument("--socket", help="socket path (default: per-user, per-instance)")
     parser.add_argument("--plant", choices=("rt", "sim"), default="rt",
                         help="rt: an arm_rt_server (default); sim: the config's MuJoCo plant behind the same supervisor")
+    parser.add_argument("--cohost", action="append", default=[], metavar="CONFIG=SOCKET",
+                        help="sim: another actor of the hosted world, served on SOCKET (repeatable)")
     args = parser.parse_args(argv)
     cfg = load_robot_config(args.config)
     link = None
@@ -233,21 +245,43 @@ def main(argv=None, *, stream_admission=None) -> None:
         from arm_control.plants.sim_link import SimLink
 
         link = SimLink.from_config(cfg)
+    elif args.cohost:
+        raise SystemExit("--cohost needs --plant sim (a real device has its own supervisor)")
     runtime = RobotRuntime(cfg, link=link, stream_admission=stream_admission)
     if not runtime.instance_id:
         raise SystemExit("config has no rt.instance_id")
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
-    runtime.start()
-    service = Service(runtime, args.socket or default_socket_path(runtime.instance_id))
-    print(f"[supervisor] {runtime.instance_id} serving {service.path} -- DISARMED, no owner",
-          flush=True)
+    runtime.start()  # opens the host link: the world is loaded before any co-host touches it
+    served = [(runtime, Service(runtime, args.socket or default_socket_path(runtime.instance_id)))]
+    threads = []
     try:
-        service.serve(stop)
+        for spec in args.cohost:
+            path, sep, sock = spec.partition("=")
+            if not (sep and path and sock):
+                raise SystemExit(f"--cohost {spec!r}: expected CONFIG=SOCKET")
+            if link.scene_world is None:
+                raise SystemExit("--cohost needs a --config that hosts a scene world")
+            co_cfg = load_robot_config(path)
+            co = RobotRuntime(co_cfg, link=SimLink.from_config(co_cfg, cohost_of=link.scene_world))
+            if not co.instance_id:
+                raise SystemExit(f"{path}: config has no rt.instance_id")
+            co.start()
+            served.append((co, Service(co, sock)))
+            threads.append(threading.Thread(target=served[-1][1].serve, args=(stop,), name=f"service-{co.instance_id}",
+                                             daemon=True))
+            threads[-1].start()
+        for rt, svc in served:
+            print(f"[supervisor] {rt.instance_id} serving {svc.path} -- DISARMED, no owner", flush=True)
+        served[0][1].serve(stop)
     finally:
-        service.close()
-        runtime.close()
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        for rt, svc in reversed(served):  # co-hosts first: the host's close closes the world under them
+            svc.close()
+            rt.close()
         print("[supervisor] stopped", flush=True)
 
 

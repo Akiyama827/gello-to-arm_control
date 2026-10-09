@@ -215,6 +215,13 @@ class BodyListDynamics:
         represented = set(self.model.names[1:])
         if represented != (set(self.joints) - set(inactive)) | set(description.get('unmeasured_joints', [])):
             raise ValueError('model does not represent every required base and attached joint')
+        n = len(self.joints)
+        limits = description.get('joint_limits')
+        self._limits = (np.full(n, -np.inf), np.full(n, np.inf)) if limits is None else (
+            np.asarray(limits['lower'], dtype=float), np.asarray(limits['upper'], dtype=float))
+        if (any(v.shape != (n,) or np.isnan(v).any() for v in self._limits)
+                or np.any(self._limits[0] > self._limits[1])):
+            raise ValueError('invalid joint limits')
         self.slots, self.indices = [], []
         for slot, name in enumerate(self.joints):
             if self.model.existJointName(name):
@@ -235,6 +242,13 @@ class BodyListDynamics:
             raise ValueError('invalid dynamics quaternion')
         w, x, y, z = quat  # MuJoCo and the scene contract store w,x,y,z
         return pin.Quaternion(w, x, y, z).matrix()
+
+    @property
+    def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        """(lower, upper) per commanded joint, from the description's optional ``joint_limits`` {lower, upper} (as the model's
+        source states them, e.g. MuJoCo's ``jnt_range``); +/-inf where none is stated -- an honest infinity, never a made-up bound.
+        Read only when this model is an executor's CONSTRUCTION model (a body-list arm, ``arm.body_list``)."""
+        return self._limits
 
     def rnea(self, q, qd, qdd):
         vectors = [self._array(v, (len(self.joints),)) for v in (q, qd, qdd)]
