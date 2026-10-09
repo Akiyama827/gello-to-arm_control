@@ -64,6 +64,13 @@ RETAINED = 512
 TRACE_TICKS = 64
 
 
+def offered_profiles(link, *, native: bool) -> tuple[str, ...]:
+    """The controller profiles a supervisor admits. ``cartesian_impedance`` only when the plant runs the law (the RT box's v8,
+    the twin's) and legs are STREAMED: the native reference plays joints only (operator 2026-10-09)."""
+    cartesian = bool(getattr(link, "supports_cartesian", False)) and not native
+    return ("joint_impedance",) + (("cartesian_impedance",) if cartesian else ())
+
+
 class Refused(Exception):
     """An operation the supervisor declines; no state changed."""
 
@@ -723,7 +730,8 @@ class RobotRuntime:
         self.identity = RobotIdentity(self.instance_id, tuple(self.joints),
                                       f"rt:{self.link.backend_name}", ident.model_id)
         self.capabilities = Capabilities(
-            CONTRACT_VERSION, ("joint_impedance",), protocol_version=rtp.VERSION,
+            CONTRACT_VERSION, offered_profiles(self.link, native=self._native is not None),
+            protocol_version=rtp.VERSION,
             pose_hold=bool(self.link.supports_pose_hold),
             rt_setup=str(getattr(self.link, "rt_setup", "unknown")))
         self._thread = threading.Thread(target=self._loop, name="supervisor", daemon=True)
@@ -1059,7 +1067,7 @@ class RobotRuntime:
                 if request.supersedes and self._native is not None
                 and self._native.key == request.supersedes
                 and self._native.selection_requested else "")
-            or ("the joint_impedance profile needs waypoint velocities"
+            or (f"the {request.profile} profile needs waypoint velocities"
                 if request.trajectory.velocities is None else ""))
         if refusal:
             self._receipt(ex, Phase.REJECTED, refusal)
@@ -1076,6 +1084,7 @@ class RobotRuntime:
             plan = pack_plan(plan_id=eid, phase=request.request_id, gated=True, times=traj.times,
                              positions=traj.positions, velocities=traj.velocities,
                              kp=kp, kd=kd, completion=completion,
+                             cartesian=None if request.cartesian is None else request.cartesian.spec(),
                              model_token=request.model_token)
             self.controller.on_plan(plan)
         except (TypeError, ValueError) as exc:

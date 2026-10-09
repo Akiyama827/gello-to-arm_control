@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_sdk_supervisor import JOINTS, completed_chain, move, write_config  # noqa: E402
 
 from arm_control.config import load_robot_config  # noqa: E402
-from arm_control.execution.contract import Lifecycle, Phase, Start  # noqa: E402
+from arm_control.execution.contract import CartesianImpedance, JointGains, Lifecycle, Phase, Start  # noqa: E402
 from arm_control.plants.mujoco.backend import MuJoCoBackend  # noqa: E402
 from arm_control.plants.remote_rt import protocol as rtp  # noqa: E402
 from arm_control.plants.remote_rt.client import RtConfig, RtLinkError  # noqa: E402
@@ -141,6 +141,13 @@ def link_unit(tmp):
             raise AssertionError(f'accepted a bad sim_servo {bad}')
     link = SimLink(cfg, JOINTS, plant(tmp / 'three.urdf'), servo=SERVO)
     link.open()
+    # the profiles a supervisor offers over it: this plant has no EE, so no cartesian_impedance; a plant that runs the law offers
+    # it on streamed legs and never on the native reference (joints only)
+    from arm_control.supervisor.runtime import offered_profiles
+    assert offered_profiles(link, native=False) == ('joint_impedance',)
+    lawful = type('L', (), {'supports_cartesian': True})()
+    assert offered_profiles(lawful, native=False) == ('joint_impedance', 'cartesian_impedance')
+    assert offered_profiles(lawful, native=True) == ('joint_impedance',)
     # a plant without the Cartesian law refuses a spec rather than running the joint word alone (the Dora plant path), and
     # atomically: the word it was running stays installed
     before = link._plant._last_command
@@ -644,6 +651,25 @@ def main():
         assert done.phase is Phase.COMPLETED, (done.phase, [r.phase.value for r in arm.receipts(status.execution_id)])
         completed_chain(arm, status.execution_id)
         assert np.allclose(arm.state().q, q0 + [.2, -.1, .1], atol=.05), (arm.state().q, q0)
+        # cartesian_impedance (RT Cartesian 2b): offered because the twin runs the law; a leg runs it through execution and
+        # settling (trace/1 law_pc) and every word after it is the joint law; a leg under the joint-kp floor is refused
+        assert 'cartesian_impedance' in arm.capabilities.profiles, arm.capabilities
+        law = CartesianImpedance(np.eye(3), [500., 500., 500., 0., 0., 0.], [40., 40., 40., 0., 0., 0.])
+        q1 = np.asarray(arm.state().q)
+        weak = arm.execute(move('c0', q1, q1 + [.1, .1, -.1], 1.5, start=Start.ON_ADMIT, profile='cartesian_impedance',
+                                cartesian=law, gains=JointGains([10.] * 3, [5.] * 3)))
+        assert weak.phase is Phase.REJECTED and 'joint kp >= 20' in weak.reason, weak
+        cart = arm.execute(move('c1', q1, q1 + [.1, .1, -.1], 1.5, start=Start.ON_ADMIT, profile='cartesian_impedance',
+                                cartesian=law))
+        assert cart.phase is not Phase.REJECTED, cart
+        assert arm.wait(cart.execution_id, 15).phase is Phase.COMPLETED, [r.phase.value for r in arm.receipts(cart.execution_id)]
+        assert np.allclose(arm.state().q, q1 + [.1, .1, -.1], atol=.05), (arm.state().q, q1)
+        time.sleep(.3)
+        ticks = arm.trace_samples(0)['samples']
+        mine = [t for t in ticks if t['plan_id'] == 'c1']
+        assert mine and {t['law_pc'] for t in mine} == {'cartesian_impedance'}, {t['law_pc'] for t in mine}
+        after = [t['law_pc'] for t in ticks if t['seq'] > mine[-1]['seq']]
+        assert after and set(after) == {'joint'}, set(after)
         # a cancel mid-run is CANCELLED, the arm holds, and a later move still runs
         q1 = np.asarray(arm.state().q)
         running = arm.execute(move('m2', q1, q1 + [.3, .3, .3], 4.0, start=Start.ON_ADMIT))
@@ -676,6 +702,7 @@ def main():
         except subprocess.TimeoutExpired:
             sup.kill()
     print('PASS: the supervisor over a simulated plant (SimLink): servo semantics, claim/arm, a move through SENT and APPLIED, '
+          'a cartesian_impedance leg (the law through its leg only; under the kp floor refused), '
           'cancel, DISARM and a new ARM epoch, state_history/trace, no stream or group advertised')
 
 

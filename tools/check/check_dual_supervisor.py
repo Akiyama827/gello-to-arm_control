@@ -212,12 +212,17 @@ def unit_cases():
                                           velocities=np.zeros((2, 3)), kp=[1.] * 3, kd=[1.] * 3, model_token='tok',
                                           cartesian_poses=np.zeros((2, 7)),
                                           completion=dict(vel_tol=.02, goal_q=[0., 0., 0.], residual_max=.01)))
+    # a base-frame Cartesian spec becomes the cartesian_impedance profile (the supervisor decides whether it is offered)
+    law = plan_request(dict(with_completion, cartesian=dict(frame='base', task_R=np.eye(3), kc=[1.] * 6, dc=[1.] * 6)),
+                       'fake', ('j1', 'j2', 'j3'))[0]
+    assert law.profile == 'cartesian_impedance' and np.array_equal(law.cartesian.kc, np.ones(6)), law
     request, dropped = plan_request(with_completion, 'fake', ('j1', 'j2', 'j3'))
     assert request.completion.vel_tol == .02 and request.completion.residual_max == .01 and dropped == ['cartesian_poses']
     for name, bad in (('empty kp and kd', dict(with_completion, kp=np.array([]), kd=np.array([]))),
                       ('empty kp', dict(with_completion, kp=np.array([]))), ('ungated', dict(with_completion, gated=False)),
                       ('unknown field', dict(with_completion, extra=1)),
-                      ('cartesian', dict(with_completion, cartesian=dict(task_R=np.eye(3))))):
+                      ('cartesian without its frame', dict(with_completion, cartesian=dict(task_R=np.eye(3), kc=[1.] * 6,
+                                                                                          dc=[1.] * 6)))):
         try:
             plan_request(bad, 'fake', ('j1', 'j2', 'j3'))
         except ValueError:
@@ -400,11 +405,12 @@ def main():
 
         assert not [e for e in seen if e['kind'] == 'leg_result' and e['plan_id'].startswith('p2')], seen
 
-        # A member the supervisor path cannot carry rejects the pair; the partner's staged plan is cleared.
+        # A member its supervisor refuses rejects the pair; the partner's staged plan is cleared. Here: a Cartesian leg on a
+        # fake RT server, which does not run the law, so its supervisor does not offer cartesian_impedance.
         cart = dict(cartesian=dict(frame='base', task_R=np.eye(3), kc=[1.] * 6, dc=[1.] * 6))
         stage('p3', **{b: cart})
         pump_until(coordinator, lambda: coordinator.lifecycle.terminal and not coordinator.pair_state('p3').cancellation_pending)
-        assert coordinator.lifecycle is PairLifecycle.REJECTED and 'Cartesian' in coordinator.pair_state('p3').reason, \
+        assert coordinator.lifecycle is PairLifecycle.REJECTED and "'cartesian_impedance' not offered" in coordinator.pair_state('p3').reason, \
             coordinator.pair_state('p3').to_payload()
         eid = handles[a].execution_of('p3:' + a)
         assert arms[a].status(eid).phase is Phase.CANCELLED, arms[a].status(eid)

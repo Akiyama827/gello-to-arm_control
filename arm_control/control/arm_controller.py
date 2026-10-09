@@ -174,6 +174,7 @@ class ArmController:
         self.last_command: JointServoCommand | None = None
         self._hold_anchor: JointServoCommand | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
+        self.last_law: str | None = None           # the law of the last word sent
         self._pose_hold: dict | None = None
         self.supports_pose_hold = False
 
@@ -1028,6 +1029,8 @@ class ArmController:
         spec = None
         if self._cartesian_now is not None and cartesian:
             spec = self._cartesian_now
+        # Which law this word asks the plant for (trace/1's law_pc: "did this leg run compliant or stiff?").
+        self.last_law = "cartesian_impedance" if spec is not None else "pose_hold" if self._pose_hold else "joint"
         self.node.send_output(
             "motor_command",
             pack_arm_gripper_command(

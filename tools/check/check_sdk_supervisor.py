@@ -99,6 +99,7 @@ execution_policy:
   hold_relatch_rad: 0.3
   velocity_limits: [1.0, 1.0, 1.0]
   acceleration_limits: [2.0, 2.0, 2.0]
+  cartesian_kp_min: 20.0
 """)
     return cfg
 

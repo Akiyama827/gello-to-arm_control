@@ -405,7 +405,7 @@ contract versions.
 | `RobotState.output_tau` | `StatePacket.tau_cmd`: the final torque written to the plant (DM: the backend's prediction from its encoded MIT frames) |
 | `RobotState.last_command_seq` | `StatePacket.last_cmd_seq`: the freshest command the servo selected |
 | `Validity` | `ArmControlState` "None is unknown", `align_feedback` age bounds, execution-policy freshness |
-| `TrajectoryRequest` | `pack_plan`. `plan_id` is `request_id` today. `gated` becomes `Start.ON_RELEASE`. `kp/kd` become `gains`, and `completion` keeps its meaning. `phase` stays a label. `cartesian_poses` belongs to a later Cartesian request. `pair_id` and `execute_pair` are CTRL-040. |
+| `TrajectoryRequest` | `pack_plan`. `plan_id` is `request_id` today. `gated` becomes `Start.ON_RELEASE`. `kp/kd` become `gains`, and `completion` keeps its meaning. `phase` stays a label. A plan's `cartesian` spec (robot base frame) becomes `cartesian=CartesianImpedance(task_R, kc, dc)` with `profile="cartesian_impedance"`; `cartesian_poses` is visualisation only and is dropped. `pair_id` and `execute_pair` are CTRL-040. |
 | `CancelRequest` | control `cancel` + `cancel_plan_id`, which produces `plan_cleared` |
 
 ### Execution phases and the evidence for each
@@ -536,7 +536,11 @@ terminal phase carries a reason. `ExecutionStatus.apply` enforces this.
 - **Capability, version and qualification.**
   - An unknown controller profile or contract version is refused before
     actuation.
-  - `Capabilities` is what the backend advertises.
+  - `Capabilities` is what the backend advertises. Profiles: `joint_impedance` always; `cartesian_impedance` when the plant
+    runs the RT v8 Cartesian law (the RT box with `CAP_CARTESIAN_TRAJECTORY`, the MuJoCo twin) and legs are streamed (never
+    on the native reference). Its `CartesianImpedance` is base-frame task axes plus K_c/D_c inside the RT envelope; the plant
+    targets FK(q_des) with its own model; the joint gains must clear the robot's `execution_policy.cartesian_kp_min`; the
+    law runs through the leg and its settling only, every hold is the joint law.
   - Qualification is a separate deployment/evidence record.
 - **Completion.**
   - `vel_tol` (rad/s) and `residual_max` are finite and positive.

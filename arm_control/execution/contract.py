@@ -344,6 +344,34 @@ class Completion:
         object.__setattr__(self, "goal_q", _vector("goal_q", self.goal_q))
 
 
+@dataclass(frozen=True)
+class CartesianImpedance:
+    """The ``cartesian_impedance`` profile's law settings, in the robot BASE frame: ``task_R`` (3x3, its COLUMNS are the task
+    axes), ``kc``/``dc`` the task-frame stiffness and damping diagonals ``[x, y, z, rx, ry, rz]`` (N/m, N.m/rad; N.s/m,
+    N.m.s/rad). No pose: the plant aims the spring at FK(q_des) of the trajectory with its own model, so a request carries
+    nothing a different robot model could disagree about. Bounds: ``contracts.impedance.cartesian_values`` (the RT envelope).
+    The law runs with the trajectory and its settling only; every hold is the joint law (operator 2026-10-09)."""
+
+    task_R: np.ndarray
+    kc: np.ndarray
+    dc: np.ndarray
+
+    def __post_init__(self) -> None:
+        from arm_control.contracts.impedance import cartesian_values  # stdlib-only module
+
+        values = cartesian_values(dict(frame="base", task_R=np.asarray(self.task_R, dtype=float).tolist(),
+                                       kc=np.asarray(self.kc, dtype=float).ravel().tolist(),
+                                       dc=np.asarray(self.dc, dtype=float).ravel().tolist()))
+        for name, value in (("task_R", np.reshape(values[:9], (3, 3))), ("kc", np.array(values[9:15])),
+                            ("dc", np.array(values[15:21]))):
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+    def spec(self) -> dict:
+        """The plan/motor_command form (``{frame: "base", task_R, kc, dc}``)."""
+        return dict(frame="base", task_R=self.task_R, kc=self.kc, dc=self.dc)
+
+
 class Start(str, Enum):
     ON_ADMIT = "on_admit"      # selected as soon as it is admitted
     ON_RELEASE = "on_release"  # admitted for review; selected only by release(execution_id)
@@ -381,9 +409,16 @@ class TrajectoryRequest:
     admit_by: Stamp | None = None
     completion: Completion | None = None
     supersedes: str | None = None
+    # The cartesian_impedance profile's settings: given exactly when the profile is "cartesian_impedance". The joint gains
+    # still apply (the law adds to them) and must clear the robot's cartesian_kp_min, checked at admission.
+    cartesian: CartesianImpedance | None = None
 
     def __post_init__(self) -> None:
         _identifier("request_id", self.request_id)
+        if (self.profile == "cartesian_impedance") != (self.cartesian is not None):
+            raise ValueError("the cartesian_impedance profile and its CartesianImpedance settings come together")
+        if self.cartesian is not None and not isinstance(self.cartesian, CartesianImpedance):
+            raise ValueError("cartesian must be a CartesianImpedance")
         if self.supersedes is not None:
             _identifier("supersedes", self.supersedes)
         if not isinstance(self.start, Start):
@@ -668,12 +703,24 @@ def _self_check() -> None:
     swapped = replace(req, joint_names=fr3.joint_names[::-1])
     for request, authority, token, why in (
             (swapped, armed, "m1", "joint order"),
-            (replace(req, profile="cartesian_impedance"), armed, "m1", "not offered"),
+            (replace(req, profile="cartesian_impedance",
+                     cartesian=CartesianImpedance(np.eye(3), [1000, 200, 200, 20, 5, 5], [130, 40, 40, 1, .5, .5])),
+             armed, "m1", "not offered"),
             (req, armed, "m2", "planned against"),
             (req, faulted, "m1", "claimed owner"),
             (req, Authority(Lifecycle.OBSERVING), "m1", "claimed owner")):
         assert why in admission_refusal(request, fr3, caps, authority, now=at(), model_token=token)
     assert "not armed" in selection_refusal(faulted)
+    # A Cartesian request: the profile and its settings together, the settings inside the RT envelope, in the base frame.
+    law = CartesianImpedance(np.eye(3), [1000, 200, 200, 20, 5, 5], [130, 40, 40, 1, .5, .5])
+    cartesian = replace(req, profile="cartesian_impedance", cartesian=law)
+    offered = replace(caps, profiles=("joint_impedance", "cartesian_impedance"))
+    assert admission_refusal(cartesian, fr3, offered, armed, now=at(), model_token="m1") == ""
+    assert law.spec()["frame"] == "base" and not law.kc.flags.writeable
+    refused(lambda: replace(req, profile="cartesian_impedance"), "the Cartesian profile without settings")
+    refused(lambda: replace(req, cartesian=law), "Cartesian settings on the joint profile")
+    refused(lambda: CartesianImpedance(np.eye(3), [2000, 200, 200, 20, 5, 5], np.zeros(6)), "K_c outside the envelope")
+    refused(lambda: CartesianImpedance(-np.eye(3), np.zeros(6), np.zeros(6)), "a reflection for a task frame")
     assert "contract v" in replace(caps, contract_version=0).refusal("joint_impedance")
     refused(lambda: Authority(Lifecycle.CLAIMED, "s1", holding=True), "disarmed holding")
 
