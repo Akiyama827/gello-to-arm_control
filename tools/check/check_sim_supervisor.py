@@ -144,10 +144,12 @@ def link_unit(tmp):
     # the profiles a supervisor offers over it: this plant has no EE, so no cartesian_impedance; a plant that runs the law offers
     # it on streamed legs and never on the native reference (joints only)
     from arm_control.supervisor.runtime import offered_profiles
-    assert offered_profiles(link, native=False) == ('joint_impedance',)
+    assert offered_profiles(link, native=False, cartesian_kp_min=20.) == ('joint_impedance',)
     lawful = type('L', (), {'supports_cartesian': True})()
-    assert offered_profiles(lawful, native=False) == ('joint_impedance', 'cartesian_impedance')
-    assert offered_profiles(lawful, native=True) == ('joint_impedance',)
+    assert offered_profiles(lawful, native=False, cartesian_kp_min=20.) == ('joint_impedance', 'cartesian_impedance')
+    assert offered_profiles(lawful, native=True, cartesian_kp_min=20.) == ('joint_impedance',)
+    # a policy without the joint-kp floor would refuse every Cartesian leg: the profile is not advertised then
+    assert offered_profiles(lawful, native=False, cartesian_kp_min=None) == ('joint_impedance',)
     # a plant without the Cartesian law refuses a spec rather than running the joint word alone (the Dora plant path), and
     # atomically: the word it was running stays installed
     before = link._plant._last_command
@@ -659,15 +661,33 @@ def main():
         weak = arm.execute(move('c0', q1, q1 + [.1, .1, -.1], 1.5, start=Start.ON_ADMIT, profile='cartesian_impedance',
                                 cartesian=law, gains=JointGains([10.] * 3, [5.] * 3)))
         assert weak.phase is Phase.REJECTED and 'joint kp >= 20' in weak.reason, weak
-        cart = arm.execute(move('c1', q1, q1 + [.1, .1, -.1], 1.5, start=Start.ON_ADMIT, profile='cartesian_impedance',
+        # staged for review (ON_RELEASE) while the arm holds: the hold words are the joint law, the spec waits with its leg
+        cart = arm.execute(move('c1', q1, q1 + [.1, .1, -.1], 1.5, start=Start.ON_RELEASE, profile='cartesian_impedance',
                                 cartesian=law))
-        assert cart.phase is not Phase.REJECTED, cart
-        assert arm.wait(cart.execution_id, 15).phase is Phase.COMPLETED, [r.phase.value for r in arm.receipts(cart.execution_id)]
+        assert cart.phase is Phase.ADMITTED, cart
+        cursor = arm.trace_samples(0)['latest_seq']
+        time.sleep(.3)
+        staged = arm.trace_samples(cursor)['samples']
+        assert staged and {t['law_pc'] for t in staged} == {'joint'}, {t['law_pc'] for t in staged}
+        # released: every tick of the leg (the ring holds 0.64 s, so it is read DURING the leg) runs the law, and every tick
+        # after it is the joint law
+        cursor = staged[-1]['seq']
+        arm.release(cart.execution_id)
+        ticks, end = [], time.monotonic() + 15
+        while time.monotonic() < end:
+            batch = arm.trace_samples(cursor)
+            ticks += batch['samples']
+            cursor = batch['latest_seq']
+            if arm.status(cart.execution_id).phase.terminal:
+                break
+            time.sleep(.1)
+        assert arm.status(cart.execution_id).phase is Phase.COMPLETED, [r.phase.value for r in arm.receipts(cart.execution_id)]
         assert np.allclose(arm.state().q, q1 + [.1, .1, -.1], atol=.05), (arm.state().q, q1)
         time.sleep(.3)
-        ticks = arm.trace_samples(0)['samples']
-        mine = [t for t in ticks if t['plan_id'] == 'c1']
-        assert mine and {t['law_pc'] for t in mine} == {'cartesian_impedance'}, {t['law_pc'] for t in mine}
+        ticks += arm.trace_samples(cursor)['samples']
+        assert [t['seq'] for t in ticks] == list(range(ticks[0]['seq'], ticks[-1]['seq'] + 1)), 'trace ticks were lost'
+        mine = [t for t in ticks if t['plan_id'] == 'c1' and t['executing']]
+        assert len(mine) > 100 and {t['law_pc'] for t in mine} == {'cartesian_impedance'}, (len(mine), {t['law_pc'] for t in mine})
         after = [t['law_pc'] for t in ticks if t['seq'] > mine[-1]['seq']]
         assert after and set(after) == {'joint'}, set(after)
         # a cancel mid-run is CANCELLED, the arm holds, and a later move still runs

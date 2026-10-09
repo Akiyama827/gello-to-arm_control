@@ -30,6 +30,7 @@ import time
 
 import numpy as np
 
+from arm_control.contracts.impedance import cartesian_values
 from arm_control.execution.contract import (
     CartesianImpedance, Completion, JointGains, Lifecycle, Phase, Start, TrajectoryRequest, Validity,
 )
@@ -59,8 +60,10 @@ def plan_request(body: dict, instance_id: str, joint_names, *, start=Start.ON_RE
         raise ValueError(f'plan carries fields this handle does not understand: {sorted(unknown)}')
     law = body.get('cartesian')
     if law is not None:
-        if law.get('frame') != 'base':
-            raise ValueError('a Cartesian plan carries its task frame in the robot base frame (frame: base)')
+        if not isinstance(law, dict):
+            raise ValueError('a plan\'s cartesian spec is a mapping {frame: base, task_R, kc, dc}')
+        # exactly the RT tail's keys (an extra world-frame pose is refused, not dropped); frame must be base
+        cartesian_values({k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in law.items()})
         law = CartesianImpedance(law['task_R'], law['kc'], law['dc'])
     if body.get('gated') is not True:
         raise ValueError('a pair member plan must be gated')

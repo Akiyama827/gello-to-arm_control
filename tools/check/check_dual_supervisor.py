@@ -222,7 +222,10 @@ def unit_cases():
                       ('empty kp', dict(with_completion, kp=np.array([]))), ('ungated', dict(with_completion, gated=False)),
                       ('unknown field', dict(with_completion, extra=1)),
                       ('cartesian without its frame', dict(with_completion, cartesian=dict(task_R=np.eye(3), kc=[1.] * 6,
-                                                                                          dc=[1.] * 6)))):
+                                                                                          dc=[1.] * 6))),
+                      ('cartesian with a world pose', dict(with_completion, cartesian=dict(
+                          frame='base', task_R=np.eye(3), kc=[1.] * 6, dc=[1.] * 6, pose=[0.] * 7))),
+                      ('cartesian not a mapping', dict(with_completion, cartesian=[1.] * 21))):
         try:
             plan_request(bad, 'fake', ('j1', 'j2', 'j3'))
         except ValueError:
@@ -406,11 +409,12 @@ def main():
         assert not [e for e in seen if e['kind'] == 'leg_result' and e['plan_id'].startswith('p2')], seen
 
         # A member its supervisor refuses rejects the pair; the partner's staged plan is cleared. Here: a Cartesian leg on a
-        # fake RT server, which does not run the law, so its supervisor does not offer cartesian_impedance.
+        # supervisor playing the NATIVE reference (this fixture runs --enable-reference), refused by its own reason: Cartesian
+        # legs are streamed only (operator 2026-10-09), enforced at submission as well as by the profile not being offered.
         cart = dict(cartesian=dict(frame='base', task_R=np.eye(3), kc=[1.] * 6, dc=[1.] * 6))
         stage('p3', **{b: cart})
         pump_until(coordinator, lambda: coordinator.lifecycle.terminal and not coordinator.pair_state('p3').cancellation_pending)
-        assert coordinator.lifecycle is PairLifecycle.REJECTED and "'cartesian_impedance' not offered" in coordinator.pair_state('p3').reason, \
+        assert coordinator.lifecycle is PairLifecycle.REJECTED and 'streamed only' in coordinator.pair_state('p3').reason, \
             coordinator.pair_state('p3').to_payload()
         eid = handles[a].execution_of('p3:' + a)
         assert arms[a].status(eid).phase is Phase.CANCELLED, arms[a].status(eid)

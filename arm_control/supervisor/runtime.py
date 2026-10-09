@@ -64,10 +64,11 @@ RETAINED = 512
 TRACE_TICKS = 64
 
 
-def offered_profiles(link, *, native: bool) -> tuple[str, ...]:
+def offered_profiles(link, *, native: bool, cartesian_kp_min: float | None) -> tuple[str, ...]:
     """The controller profiles a supervisor admits. ``cartesian_impedance`` only when the plant runs the law (the RT box's v8,
-    the twin's) and legs are STREAMED: the native reference plays joints only (operator 2026-10-09)."""
-    cartesian = bool(getattr(link, "supports_cartesian", False)) and not native
+    the twin's), legs are STREAMED (the native reference plays joints only, operator 2026-10-09) and the robot's policy states
+    the joint-kp floor such a leg must clear (without one every Cartesian request would be refused: never advertise that)."""
+    cartesian = bool(getattr(link, "supports_cartesian", False)) and not native and cartesian_kp_min is not None
     return ("joint_impedance",) + (("cartesian_impedance",) if cartesian else ())
 
 
@@ -730,7 +731,8 @@ class RobotRuntime:
         self.identity = RobotIdentity(self.instance_id, tuple(self.joints),
                                       f"rt:{self.link.backend_name}", ident.model_id)
         self.capabilities = Capabilities(
-            CONTRACT_VERSION, offered_profiles(self.link, native=self._native is not None),
+            CONTRACT_VERSION, offered_profiles(self.link, native=self._native is not None,
+                                               cartesian_kp_min=self.controller.execution_policy.cartesian_kp_min),
             protocol_version=rtp.VERSION,
             pose_hold=bool(self.link.supports_pose_hold),
             rt_setup=str(getattr(self.link, "rt_setup", "unknown")))
@@ -1060,7 +1062,11 @@ class RobotRuntime:
         self._executions[eid] = ex
         self._by_request[request.request_id] = eid
         refusal = (
-            admission_refusal(request, self.identity, self.capabilities, self._authority,
+            # Operator 2026-10-09, enforced here as well as by not offering the profile: the native reference uploads joints
+            # only, so a Cartesian leg on it would run as joints. A distinct reason, checked first.
+            ("Cartesian legs are streamed only; this supervisor plays the native reference"
+             if request.cartesian is not None and self._native is not None else "")
+            or admission_refusal(request, self.identity, self.capabilities, self._authority,
                               now=self.now(), model_token=self.controller.model_token)
             or supersession_refusal(request, current)
             or ("reference selection is in flight; cancel before a new admission"
