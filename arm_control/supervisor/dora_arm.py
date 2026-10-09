@@ -7,8 +7,9 @@ the supervisor only through the SDK: one ``ArmClient``, one non-blocking ``Async
 (gains/Soft/payload become preset and payload calls). It owns no authority of its own and no control law.
 
 Differences from the in-process node (stated, not hidden):
-  * ``jog`` and ``gripper`` are refused: the supervisor has no raw-jog (CTRL-033/052 open) and no gripper; the console is told once a
-    second, never silently ignored;
+  * ``jog`` is a supervisor setpoint (setpoint/1; refused with the reason, at most once a second, e.g. while a plan runs or on a
+    native-reference supervisor); ``gripper`` is refused (an arm supervisor serves no gripper: the graph runs its own Hand
+    node); neither is silently ignored;
   * gains must be a named preset (``gain_presets`` in the control mode config); anything else is refused with a ``mode`` event;
   * ``hold`` cancels the live leg and leaves the arm held by the supervisor (there is no latched "frozen" controller state);
     ``stop`` cancels and DISARMs;
@@ -25,17 +26,19 @@ import time
 import numpy as np
 
 from arm_control.contracts._arrow import pack_json_message
-from arm_control.contracts.motion import pack_controller_event, unpack_control_update, unpack_plan
+from arm_control.contracts.motion import pack_controller_event, unpack_control_update, unpack_jog, unpack_plan
 from arm_control.contracts.motor import pack_motor_state_dict
 from arm_control.multi_arm.supervised import AsyncAuthorityHandle
 from arm_control.multi_arm.types import ArmPlan
-from arm_control.sdk import SupervisorError
+from arm_control.sdk import Refused, SupervisorError
 from arm_control.supervisor.console_adapter import ConsoleControlAdapter
 
 #: how often the unsupported-input refusals and the mode heartbeat may repeat
 NOTICE_PERIOD_S = 1.0
 #: the bridge publishes state and drains events at the controller's 100 Hz
 PUMP_PERIOD_S = 0.01
+#: superseded plan ids remembered for a late execute
+SUPERSEDED_KEPT = 64
 #: motor_health is published on change and at least this often (the console treats silence as stale)
 HEALTH_PERIOD_S = 0.5
 
@@ -78,6 +81,7 @@ class DoraArmBridge:
         self._health_sent: tuple | None = None
         self._fault_text = ''                      # a recoverable supervisor fault, shown through motor_health like a server latch
         self.lost: str | None = None               # why the supervisor is unreachable (terminal for this node)
+        self._superseded: dict[str, None] = {}     # staged plans a jog cancelled (oldest first): an execute naming one fails its leg
 
     # -- startup ---------------------------------------------------------------------------------------------------
     def check_config(self, kp, kd) -> None:
@@ -105,6 +109,7 @@ class DoraArmBridge:
             self._event('plan_staged', '', False, f'unreadable plan: {exc}')
             return
         plan_id = str(body['plan_id'])
+        self._superseded.pop(plan_id, None)  # a plan staged again under this id is that plan now
         now = self.handle.state()
         running = now.running_plan_id if now.executing else None
         if running:  # as in-process: a plan is refused while one RUNS (only a staged, unreleased one is replaced)
@@ -136,7 +141,30 @@ class DoraArmBridge:
             self._mode_event(ok=True)
 
     def on_jog(self, value) -> None:
-        self._notice('jog', 'jog is not available through the supervisor (no raw-jog)')
+        """A console jog is a supervisor setpoint (setpoint/1): the same deadman, the same hold at the measured pose on expiry.
+
+        A staged, unreleased plan was planned from the pose this jog leaves: it is cancelled (``plan_cleared``; the supervisor
+        refuses setpoints while any execution is live). An ``execute`` that later names it answers a failed ``leg_result``
+        ('superseded by a jog'), so a console that kept it as pending is not left waiting. The in-process controller kept such
+        a plan and ran it at execute if the jog stayed within start tolerance, else failed it."""
+        try:
+            q = unpack_jog(value)['q']
+        except (ValueError, KeyError, TypeError) as exc:
+            self._notice('jog', f'unreadable jog: {exc}')
+            return
+        for old in self._staged:
+            self._release_on_stage.discard(old)
+            self._superseded[old] = None
+            while len(self._superseded) > SUPERSEDED_KEPT:  # oldest first: a console keeps one pending plan
+                del self._superseded[next(iter(self._superseded))]
+            self.handle.cancel('superseded by a jog', plan_id=old)
+        self._staged.clear()
+        try:
+            self.arm.setpoint(q)
+        except Refused as exc:  # nothing changed; the console re-sends
+            self._notice('jog', f'jog refused: {exc}')
+        except (SupervisorError, TimeoutError, OSError) as exc:  # lost, garbled or unanswered: the outcome is unknown
+            self._notice('jog', f'jog not confirmed (outcome unknown): {exc}')
 
     def on_gripper(self, value) -> None:
         self._notice('gripper', 'the gripper is not served by an arm supervisor')
@@ -146,9 +174,14 @@ class DoraArmBridge:
         if 'arm' in group:
             self.handle.set_armed(bool(group['arm']))
         elif 'execute' in group:
-            if str(group['execute']) in self._staged:
-                self._staged.remove(str(group['execute']))
-            self.handle.execute(str(group['execute']))
+            plan_id = str(group['execute'])
+            if plan_id in self._superseded:
+                del self._superseded[plan_id]
+                self._event('leg_result', plan_id, False, 'superseded by a jog: plan again from the new pose')
+                return
+            if plan_id in self._staged:
+                self._staged.remove(plan_id)
+            self.handle.execute(plan_id)
         elif 'cancel' in group:
             self._staged.clear()  # a cancel clears whatever was staged (a targeted one names it)
             self._cancel_leg(str(group.get('reason') or 'cancelled'), group.get('cancel_plan_id'))

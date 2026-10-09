@@ -226,6 +226,9 @@ def build_arm_controller(
     if require_policy and policy is None:
         raise ValueError(f"{arm_id}: needs an execution_policy (100 Hz deadline mode)")
     arm = cfg.get("arm") or {}
+    # How long a jog/setpoint stays live: read from the mode config the console reads, so both deadmen agree (too tight and a
+    # scheduling hiccup stutters the arm, too loose and it coasts after the button is released).
+    options.setdefault("jog_timeout_s", float((mode_cfg.get("jog") or {}).get("timeout_s", 0.2)))
     return ArmController(
         node, executor, arm_id=arm_id, gripper=gripper_command_cfg(cfg),
         integral_state=integral, execution_policy=policy, model_token=model_token(cfg),
