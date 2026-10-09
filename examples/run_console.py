@@ -30,6 +30,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from arm_control.supervisor.launch import start_supervisor, stop_supervisor  # noqa: E402  (after the path bootstrap)
+
 SINGLE = REPO_ROOT / "dataflows" / "sim_franka_motion.yml"
 SUPERVISED = REPO_ROOT / "dataflows" / "sim_franka_motion_supervised.yml"
 SUPERVISED_PROFILE = REPO_ROOT / "examples" / "profiles" / "sim_supervised.yaml"
@@ -195,12 +197,13 @@ def main() -> int:
         signal.signal(sig, _stop)
     if args.supervised:
         try:
-            supervisor, env = start_supervisor(config, env, stopped=lambda: bool(stopped_by))
+            supervisor, env = start_supervisor(config, env, overlays=(SUPERVISED_PROFILE,), control_mode=MODE_PROFILE,
+                                               cwd=REPO_ROOT, stopped=lambda: bool(stopped_by))
         except RuntimeError as exc:
             print(f"[run_console] {exc}", file=sys.stderr)
             return 128 + stopped_by[0] if stopped_by else 1
     if stopped_by:
-        _stop_supervisor(supervisor)
+        stop_supervisor(supervisor)
         return 128 + stopped_by[0]
     if not args.no_viewer:
         ensure_rerun_viewer()
@@ -221,7 +224,7 @@ def main() -> int:
     except FileNotFoundError:
         print("`dora` is not on PATH — is the dora-rs CLI installed?",
               file=sys.stderr)
-        _stop_supervisor(supervisor)
+        stop_supervisor(supervisor)
         return 1
 
     live["graph"] = proc
@@ -240,78 +243,9 @@ def main() -> int:
         return proc.returncode
     finally:
         _terminate_graph(proc)
-        _stop_supervisor(supervisor)  # after the graph: its SIGTERM DISARMs the plant through the link
+        stop_supervisor(supervisor)  # after the graph: its SIGTERM DISARMs the plant through the link
         if stopped_by:
             raise SystemExit(128 + stopped_by[0])
-
-
-def start_supervisor(config: Path, env: dict, stopped=lambda: False):
-    """Start the arm's supervisor over the simulated plant and return ``(process, env for the graph)``.
-
-    One merged config is written (the entry config, the stated sim servo parameters, the mode profile as ``control_mode``) and given to
-    the supervisor AND every node, so they cannot run different configurations; the bridge node also checks the supervisor's gains.
-    """
-    import tempfile
-
-    import yaml
-
-    from arm_control.config import load_config_tree
-
-    merged = load_config_tree(config)
-    merged.update(load_config_tree(SUPERVISED_PROFILE))
-    merged["control_mode"] = load_config_tree(MODE_PROFILE)
-    workdir = Path(tempfile.mkdtemp(prefix="supervised_console_"))
-    merged_path = workdir / "supervised_arm.yaml"
-    merged_path.write_text(yaml.safe_dump(merged))
-    sock = workdir / "arm.sock"
-    log = open(workdir / "supervisor.log", "w")
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "arm_control.supervisor.service", "--config", str(merged_path), "--socket", str(sock), "--plant", "sim"],
-        env=dict(env, ARM_CONTROL_CONFIG=str(merged_path)), cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True)  # its own session: a Ctrl-C reaches the graph, and the supervisor outlives it long enough to be stopped after
-    proc._workdir, proc._log = workdir, log
-    import socket as _socket
-
-    deadline = time.monotonic() + 60
-    while True:
-        if proc.poll() is not None:
-            raise RuntimeError(f"the supervisor exited ({proc.returncode}); see {workdir / 'supervisor.log'}")
-        if stopped():
-            _stop_supervisor(proc)
-            raise RuntimeError("stopped while the supervisor was starting")
-        if time.monotonic() > deadline:
-            _stop_supervisor(proc)
-            raise RuntimeError(f"the supervisor did not come up; see {workdir / 'supervisor.log'}")
-        probe = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        try:
-            probe.connect(str(sock))
-            break
-        except OSError:
-            time.sleep(0.2)
-        finally:
-            probe.close()
-    print(f"[run_console] supervisor up on {sock} (config {merged_path})", flush=True)
-    return proc, dict(env, ARM_CONTROL_CONFIG=str(merged_path), ARM_CONTROL_SOCKET=str(sock))
-
-
-def _stop_supervisor(proc) -> None:
-    """SIGTERM (the supervisor DISARMs the plant on the way out), then kill if it does not stop. Safe with None and twice."""
-    if proc is None:
-        return
-    if proc.poll() is None:
-        proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    try:
-        proc._log.close()
-    except Exception:  # noqa: BLE001
-        pass
-    if proc.returncode in (0, -signal.SIGTERM):  # a clean stop leaves nothing behind; a failure keeps its log
-        import shutil
-
-        shutil.rmtree(proc._workdir, ignore_errors=True)
 
 
 def _port_holder(config) -> int | None:
