@@ -35,18 +35,27 @@ def start_supervisor(config: Path, env: dict, *, overlays=(), control_mode: Path
     merged_path.write_text(yaml.safe_dump(merged))
     sock = workdir / "arm.sock"
     log = open(workdir / "supervisor.log", "w")
+    # The supervisor writes its log FILE directly (never a pipe: a stalled or suspended reader must never block the control
+    # loop's prints); the launcher TAILS that file to echo the controller's own lines (a fault, a refused ARM, a stale stream) to
+    # the operator's terminal.
     proc = subprocess.Popen(
         [sys.executable, "-u", "-m", "arm_control.supervisor.service", "--config", str(merged_path), "--socket", str(sock),
          "--plant", plant],
-        env=dict(env, ARM_CONTROL_CONFIG=str(merged_path)), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, start_new_session=True)  # its own session: a Ctrl-C reaches the graph, and the supervisor outlives it long enough to be stopped after
+        env=dict(env, ARM_CONTROL_CONFIG=str(merged_path)), cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True)  # its own session: a Ctrl-C reaches the graph, and the supervisor outlives it long enough to be stopped after
     proc._workdir, proc._log = workdir, log
+    proc._echo_stop = threading.Event()
 
-    def _echo():  # the controller's own lines (a fault, a refused ARM, a stale stream) reach the operator's terminal AND the log
-        for line in proc.stdout:
-            log.write(line)
-            log.flush()
-            print(f"[supervisor] {line}" if not line.startswith("[") else line, end="", flush=True)
+    def _echo():
+        with open(workdir / "supervisor.log") as tail:
+            while True:
+                line = tail.readline()
+                if line:
+                    print(line if line.startswith("[") else f"[supervisor] {line}", end="", flush=True)
+                elif proc._echo_stop.is_set():
+                    return
+                else:
+                    time.sleep(.1)
     proc._echo = threading.Thread(target=_echo, name="supervisor-log", daemon=True)
     proc._echo.start()
     deadline = time.monotonic() + timeout_s
@@ -76,7 +85,7 @@ def start_supervisor(config: Path, env: dict, *, overlays=(), control_mode: Path
 def stop_supervisor(proc, *, keep_log: bool = False) -> None:
     """SIGTERM (the supervisor DISARMs the plant on the way out), then kill if it does not stop. Safe with None and twice. A clean
     stop removes its work directory unless ``keep_log`` (hardware runs keep it: the bench's evidence); a failure always keeps it,
-    and a kept log's path is printed. Every supervisor line was also echoed to the launcher's terminal while it ran."""
+    and a kept log's path is printed. Every supervisor line was also echoed (tailed from the log) to the launcher's terminal."""
     if proc is None:
         return
     if proc.poll() is None:
@@ -85,7 +94,8 @@ def stop_supervisor(proc, *, keep_log: bool = False) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
-    proc._echo.join(timeout=2)  # the pipe closes with the process: the last lines are written before the log closes
+    proc._echo_stop.set()  # the process has ended: the tail prints what is left, then stops
+    proc._echo.join(timeout=2)
     try:
         proc._log.close()
     except Exception:  # noqa: BLE001

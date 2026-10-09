@@ -44,8 +44,9 @@ graphs). Not run on hardware: every behaviour change for the operator is a track
 Review round 1: ACCEPT (no wiring error, nothing producing unsafe motion; RT server down at launch: the supervisor exits in
 0.2 s, run.py returns 1 with the log kept). Taken:
 * (SHOULD) A bench fault left no evidence: the supervisor's own lines went only to a temp log deleted on a clean stop. Every
-  supervisor line is now ECHOED to the launcher's terminal and written to the log (`launch.py`), and a hardware run (`plant=rt`)
-  keeps the log and prints its path.
+  supervisor line is now ECHOED to the launcher's terminal -- tailed from its log FILE, which the supervisor writes directly (a
+  first cut piped it: a suspended launcher would have filled the pipe and blocked the control loop's prints) -- and a hardware
+  run (`plant=rt`) keeps the log and prints its path.
 * (SHOULD) The trace CSV repeated the last RT packet as a measurement while the stream was stale (a 0.4 s SIGSTOP of the fake:
   41 ticks, one state_seq): a tick without a fresh packet now writes nan in the RT columns (the PC's own `qdes` stays).
 * NITs: the logger reads once more after STOP (the DISARM ticks) and survives a transient SDK error (counted); `qdes` is the
