@@ -370,6 +370,8 @@ def start_fakes(pair_path, binary, root):
 
 
 def main(pair_path, binary, refinement="none"):
+    # the staged pair's instance ids are the real arms': its supervisors' fault traces go to a scratch root, never theirs
+    os.environ.setdefault(diagnostics.FAULT_ROOT_ENV, tempfile.mkdtemp(prefix="dual_hardware_faults_"))
     trace = diagnostics.PairFaultTrace("self-check")
     for i in range(510):
         trace.record(dict(index=i, value=float("nan")))

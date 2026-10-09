@@ -196,7 +196,8 @@ class RobotRuntime:
         # CTRL-051: this supervisor's own fault record (the ticks 10 s before a fault to 2 s after), written off the loop
         self.fault_trace = SupervisorFaultTrace(self.instance_id, self.period, context=dict(
             joints=list(self.joints), rt_host=getattr(self.link.config, 'host', None)))
-        self._latched_seen = ''       # the latched fault already traced (a new or changed one opens a fault window)
+        self._latched_seen = False    # a latched fault was present last tick: only its rising edge opens a fault window (the
+                                      # text can carry an age that changes every tick, e.g. "rt state stream stale (0.42s)")
         self._profile_gains = (self.controller.executor.kp.copy(),
                                self.controller.executor.kd.copy())
         self.identity: RobotIdentity | None = None
@@ -892,7 +893,6 @@ class RobotRuntime:
         if self._thread is not None:
             self._thread.join(timeout=timeout_s)
         self._stream_worker.shutdown(wait=False, cancel_futures=True)
-        self.fault_trace.close(timeout_s, record_errors=self._trace_errors)
         self._tracker.disarm_sent()
         if self._native is not None:
             self._native.close()
@@ -904,6 +904,8 @@ class RobotRuntime:
         except Exception as exc:  # noqa: BLE001 -- reported, shutdown continues
             print(f"[supervisor] link close: {exc}", flush=True)
         self._rpc.shutdown(wait=False, cancel_futures=True)
+        # After the DISARM: an open fault window is written with what it has; it never delays the stop (never raises).
+        self.fault_trace.close(timeout_s, record_errors=self._trace_errors)
 
     def now(self) -> Stamp:
         return Stamp(time.monotonic_ns(), Clock.PC, self.domain)
@@ -1858,9 +1860,9 @@ class RobotRuntime:
         self._pump_controller(sent_for=rs["plan_id"] if rs["executing"] else None)
         self._record_trace(health)
         latched = str(health["latched_fault"] or "")
-        if latched and latched != self._latched_seen:
+        if latched and not self._latched_seen:
             self.fault_trace.trigger(f'latched fault: {latched}', time.monotonic())
-        self._latched_seen = latched
+        self._latched_seen = bool(latched)
         for ex in list(self._executions.values()):
             if (ex.first_seq is not None and not ex.status.terminal
                     and self._tracker.fault_seen(ex.epoch)):
@@ -1873,7 +1875,7 @@ class RobotRuntime:
                     self._receipt(ex, Phase.APPLIED, command_seq=confirmed, arm_epoch=ex.epoch)
         self._reconcile()
         if c.stopped:
-            self.fault_trace.trigger('controller stopped', time.monotonic())
+            self.fault_trace.trigger(f'controller stopped: {getattr(c, "stop_reason", "")}', time.monotonic())
             # A stopped ArmController is terminal (its Dora node exits). Here a
             # fresh one replaces it: disarmed, nothing staged, new admission.
             print("[supervisor] controller stopped; replaced with a fresh, disarmed one",

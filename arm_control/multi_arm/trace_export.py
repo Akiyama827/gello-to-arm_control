@@ -146,7 +146,11 @@ def main(argv=None) -> int:
         return 2
     if args.dest is not None:
         if args.dest == "":
-            auto = export_dir(f"faults-{root.parent.name}")
+            try:
+                auto = export_dir(f"faults-{root.parent.name}")
+            except ValueError as exc:
+                print(exc)
+                return 2
             if auto is None:
                 print(f"--dest without a directory needs {EXPORT_ROOT_ENV} (the deployment's export root)")
                 return 2
@@ -155,7 +159,11 @@ def main(argv=None) -> int:
         if args.dest.exists() and not args.dest.is_dir():
             print(f"--dest is not a directory: {args.dest}")
             return 2
-        manifest = export(root, args.dest, include_unverified=args.include_unverified)
+        try:
+            manifest = export(root, args.dest, include_unverified=args.include_unverified)
+        except (ValueError, FileExistsError) as exc:
+            print(f"export refused: {exc}")
+            return 2
         bad = [t for t in manifest["traces"] if not t["ok"]]
         print(f"exported {sum(t['exported'] for t in manifest['traces'])} trace(s) to {args.dest}; "
               f"{len(bad)} failed verification")

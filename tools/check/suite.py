@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -132,6 +133,7 @@ def main() -> int:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["ARM_CONTROL_ROOT"] = str(ROOT)
+    env["ARM_CONTROL_FAULT_ROOT"] = tempfile.mkdtemp(prefix="suite_faults_")  # checks' fault traces stay out of real directories
     revision = git("rev-parse", "HEAD")
     dirty = bool(git("status", "--porcelain"))
     print(f"RT OFFLINE SUITE revision={revision} dirty={dirty} root={ROOT}", flush=True)

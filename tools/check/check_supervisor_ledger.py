@@ -136,14 +136,17 @@ def check_fault_trace() -> None:
     pre, post = .5, .3
     rt.fault_trace = diagnostics.SupervisorFaultTrace("sdk_arm", rt.period, root=tmp / "faults", pre_s=pre, post_s=post)
     rt.start()
+    closed = False
     try:
         rt.claim("owner")
         armed(rt)
         time.sleep(pre + .3)
         t0 = time.monotonic()
         link.fault = "test fault"
-        time.sleep(.1)
-        link.fault = "a second fault"   # inside the window: the same trace
+        time.sleep(.05)
+        link.fault = ""
+        time.sleep(.03)
+        link.fault = "a second fault"   # a second rising edge inside the window: the same trace
         deadline = time.monotonic() + 3
         while not rt.fault_trace.written and time.monotonic() < deadline:
             time.sleep(.02)
@@ -170,6 +173,8 @@ def check_fault_trace() -> None:
             link.fault = "third"
             time.sleep(post + .1)       # window 3 flushed; its writer sleeps
             seq0 = rt.trace_samples()["latest_seq"]
+            link.fault = ""
+            time.sleep(.03)
             link.fault = "fourth"
             time.sleep(post + .1)       # window 4 flushes while the writer is busy
             assert rt.fault_trace.skipped == 1, rt.fault_trace.skipped
@@ -183,18 +188,54 @@ def check_fault_trace() -> None:
             link.fault = "fifth"
             time.sleep(post + .2)
         assert rt.fault_trace.errors == 1 and rt.state().validity.value != "missing", rt.fault_trace.errors
-        # Closing with a window open writes what it has.
+        # A latched fault whose TEXT changes every tick (RtBackend's "rt state stream stale (0.42s)") is one fault: one window,
+        # one trace, however long it lasts.
+        link.fault = ""
+        time.sleep(.05)
+        before = len(rt.fault_trace.written)
+        stop = time.monotonic() + 1.2
+        while time.monotonic() < stop:
+            link.fault = f"rt state stream stale ({time.monotonic() - stop + 1.2:.2f}s)"
+            time.sleep(.005)
+        time.sleep(post + .2)
+        assert len(rt.fault_trace.written) == before + 1, len(rt.fault_trace.written) - before
+        # A trace that fails inside the loop is counted, never raised: the arm stays armed.
+        link.fault = ""
+        time.sleep(.05)
+        errors = rt.fault_trace.errors
+        with patch.object(rt.fault_trace, "_flush", side_effect=RuntimeError("cannot schedule new futures")):
+            link.fault = "seventh"
+            time.sleep(post + .2)
+        assert rt.fault_trace.errors == errors + 1 and link.armed, (rt.fault_trace.errors, link.armed)
+        # Closing with a window open writes what it has, AFTER the DISARM: a slow write never delays the stop.
         link.fault = ""
         time.sleep(.05)
         link.fault = "sixth"
         time.sleep(.05)
+        real_stop, stopped_at = link.safe_stop, []
+
+        def timed_stop():
+            stopped_at.append(time.monotonic())
+            return real_stop()
+        link.safe_stop = timed_stop
+
+        def slow(*a, **k):
+            time.sleep(1.)
+            return real_write(*a, **k)
+        with patch.object(diagnostics, "write_trace", slow):
+            closing = time.monotonic()
+            closed = True
+            rt.close()
+        assert stopped_at and stopped_at[0] - closing < .3, (stopped_at, closing)
     finally:
-        rt.close()
+        if not closed:
+            rt.close()
     last = json.loads(rt.fault_trace.written[-1].read_text())
     assert last["reason"] == "latched fault: sixth" and last["post_window_complete"] is False, last["reason"]
-    assert len(list((tmp / "faults").glob("*.json"))) == 3, sorted((tmp / "faults").iterdir())
+    assert len(list((tmp / "faults").glob("*.json"))) == 4, sorted((tmp / "faults").iterdir())
     print(f"  supervisor fault trace: {len(stamps)} ticks [-{pre}, +{post}] s, faults joined, busy writer skipped, "
-          f"write failure counted, open window written on close")
+          f"write failure counted, a changing fault text traced once, a failing trace leaves the arm armed, "
+          f"open window written on close after the DISARM")
 
 
 def check_stall_schedule() -> None:

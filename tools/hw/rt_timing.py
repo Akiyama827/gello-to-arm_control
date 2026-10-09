@@ -133,13 +133,16 @@ def main() -> None:
     if args.save:
         from arm_control.multi_arm.diagnostics import EXPORT_ROOT_ENV, export_dir
 
-        dest = export_dir("rt_timing")
+        try:
+            dest = export_dir("rt_timing")
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
         if dest is None:
             raise SystemExit(f"--save needs {EXPORT_ROOT_ENV} (the deployment's export root)")
+        dest.mkdir(parents=True, exist_ok=False)  # before the collection: a refused destination never loses a trial
     samples = collect(args.host, args.port, args.seconds)
     summary = report(samples, label)
     if dest is not None:
-        dest.mkdir(parents=True, exist_ok=False)
         with (dest / "rt_timing.json").open("x") as stream:
             json.dump(dict(schema="arm_control.rt_timing/v1", host=args.host, port=args.port, seconds=args.seconds,
                            summary=summary, columns=["state_seq", "t_server_ns", "t_arrival_pc_ns"],

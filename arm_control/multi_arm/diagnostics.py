@@ -50,8 +50,18 @@ FAULT_PRE_S = 10.0
 FAULT_POST_S = 2.0
 
 
+#: Checks point every fault directory (console and supervisors, including their subprocesses) here, so a check never writes
+#: into, or prunes, a real arm's traces.
+FAULT_ROOT_ENV = "ARM_CONTROL_FAULT_ROOT"
+
+
+def _fault_base():
+    override = os.environ.get(FAULT_ROOT_ENV)
+    return Path(override) if override else CONTROL_ROOT / ".cache"
+
+
 def fault_root():
-    return CONTROL_ROOT.joinpath(".cache", *FAULT_DIR)
+    return _fault_base().joinpath(*FAULT_DIR)
 
 
 #: An operator export's root (CTRL-010): set by the deployment, outside any repository (this project:
@@ -65,12 +75,14 @@ def export_dir(kind):
     root = os.environ.get(EXPORT_ROOT_ENV)
     if not root:
         return None
+    if not Path(root).is_absolute():
+        raise ValueError(f"{EXPORT_ROOT_ENV} must be an absolute path outside any repository, not {root!r}")
     now = datetime.now()
-    return Path(root) / f"{now:%Y-%m-%d}" / f"{kind}-{now:%H%M%S}"
+    return Path(root) / f"{now:%Y-%m-%d}" / f"{kind}-{now:%H%M%S-%f}"
 
 
 def supervisor_fault_root(instance_id):
-    return CONTROL_ROOT.joinpath(".cache", "supervisor", str(instance_id) or "unnamed", "faults")
+    return _fault_base().joinpath("supervisor", str(instance_id) or "unnamed", "faults")
 
 
 TRACE_GLOB = "2*.json"  # timestamped traces only: an EXPORT_MANIFEST.json in the directory is not a trace
@@ -78,30 +90,6 @@ TRACE_GLOB = "2*.json"  # timestamped traces only: an EXPORT_MANIFEST.json in th
 
 def _traces(root):
     return sorted(p for p in root.glob(TRACE_GLOB) if p.is_file() and not p.is_symlink())
-
-
-def _size(path):
-    try:
-        return path.stat().st_size
-    except OSError:  # a dangling link, or a file renamed by a concurrent save: not countable, never a reason to hide the rest
-        return 0
-
-
-def capacity_warning(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES):
-    """A message when the trace directory is over its capacity policy, else None. Never raises. Orphan ``*.partial`` files
-    (a save that never finished) count toward the bytes and are named in the message."""
-    try:
-        traces = _traces(root)
-        partials = [p for p in root.glob("*.partial") if not p.is_symlink()]
-    except OSError:
-        return None
-    total = sum(_size(p) for p in traces) + sum(_size(p) for p in partials)
-    if len(traces) > keep_files or total > keep_bytes:
-        orphans = f" (including {len(partials)} unfinished .partial file(s))" if partials else ""
-        return (f"{len(traces)} fault trace(s), {total / 2**20:.1f} MiB in {root}{orphans} exceed the capacity policy "
-                f"({keep_files} files / {keep_bytes / 2**20:.0f} MiB): the next save prunes to the newest {keep_files}; "
-                f"export first if they matter (python -m arm_control.multi_arm.trace_export --dest DIR)")
-    return None
 
 
 def prune_traces(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES, protect=None, dry_run=False, only=None):
@@ -154,11 +142,12 @@ def write_trace(root, name, header, samples):
     Samples are encoded one at a time, so a writer thread never holds the interpreter for a whole trace."""
     root.mkdir(parents=True, exist_ok=True)
     path = root / name
-    encoded = []
-    for k, s in enumerate(samples):
+    encoded, slice_start = [], time.monotonic()
+    for s in samples:
         encoded.append(json.dumps(_json_values(s), allow_nan=False))
-        if k % 50 == 49:
-            time.sleep(0.001)  # let a servo loop sharing this interpreter take the GIL between chunks
+        if time.monotonic() - slice_start > 0.002:  # every ~2 ms of encoding, let a servo loop sharing this interpreter run
+            time.sleep(0.001)
+            slice_start = time.monotonic()
     head = json.dumps(_json_values(dict(header, samples_kept=0, truncated_samples=0)), allow_nan=False)
     budget = MAX_TRACE_BYTES - len(head) - 64
     size, keep = 0, len(encoded)
@@ -256,7 +245,8 @@ class SupervisorFaultTrace:
     after, written by one background thread so the servo loop never waits for encoding or the disk.
 
     The loop calls ``record`` every tick, ``trigger`` on a fault and ``poll`` every tick. A fault opens a window; faults
-    inside it join it (``faults``); when ``post_s`` has passed, the window's samples are handed to the writer. A writer
+    inside it join it (``faults``) and get what remains of the FIRST fault's ``post_s``; then the window's samples are
+    handed to the writer. ``trigger``/``poll`` never raise (a failure is counted in ``errors``). A writer
     still busy with the previous trace makes the new one SKIPPED (counted in ``skipped`` and in the next trace), never
     queued without bound; a failed write (disk full) is counted in ``errors`` and printed, never raised into the loop.
     It does not depend on any trace/1 reader: a console that died still leaves the supervisor's record."""
@@ -278,6 +268,24 @@ class SupervisorFaultTrace:
         self._ring.append(sample)
 
     def trigger(self, reason, now):
+        try:
+            self._trigger(reason, now)
+        except Exception as exc:  # noqa: BLE001 -- the record must never stop the servo loop
+            self._failed(exc)
+
+    def poll(self, now, **extra):
+        try:
+            if self._window is not None and now >= self._window["start"] + self.post_s:
+                self._flush(complete=True, **extra)
+        except Exception as exc:  # noqa: BLE001
+            self._failed(exc)
+
+    def _failed(self, exc):
+        self._window = None
+        self.errors += 1
+        print(f"[fault trace] {self.instance_id}: trace failed ({exc!r}); {self.errors} so far", flush=True)
+
+    def _trigger(self, reason, now):
         w = self._window
         if w is None:
             self._window = dict(start=float(now), faults=[dict(at=float(now), reason=str(reason))], more=0)
@@ -285,10 +293,6 @@ class SupervisorFaultTrace:
             w["faults"].append(dict(at=float(now), reason=str(reason)))
         else:
             w["more"] += 1
-
-    def poll(self, now, **extra):
-        if self._window is not None and now >= self._window["start"] + self.post_s:
-            self._flush(complete=True, **extra)
 
     def _flush(self, *, complete, **extra):
         w, self._window = self._window, None
@@ -304,7 +308,7 @@ class SupervisorFaultTrace:
             schema="arm_control.supervisor_fault/v1", schema_version=1, observed_at_utc=now.isoformat(),
             instance_id=self.instance_id, reason=w["faults"][0]["reason"], faults=w["faults"], more_faults=w["more"],
             fault_at_pc_monotonic=start, pre_s=self.pre_s, post_s=self.post_s, post_window_complete=complete,
-            window_pc_monotonic=[samples[0]["pc_monotonic"], samples[-1]["pc_monotonic"]] if samples else None,
+            window_pc_monotonic=[samples[0].get("pc_monotonic"), samples[-1].get("pc_monotonic")] if samples else None,
             dropped_samples=0, skipped_traces_before=self.skipped, write_errors_before=self.errors,
             timestamp_note=("pc_monotonic is this supervisor's tick time on the PC; state_t_mono_ns is the RT host's "
                             "publication stamp (clock domain per the HELLO), not a physical capture time."),
@@ -329,15 +333,16 @@ class SupervisorFaultTrace:
         return path
 
     def close(self, timeout_s=5.0, **extra):
-        """Shutdown: a window still open is written with what it has (``post_window_complete`` false), waiting at most
-        ``timeout_s`` for the writer."""
-        if self._window is not None:
-            self._flush(complete=False, **extra)
-        if self._busy is not None:
-            try:
-                self._busy.result(timeout=timeout_s)
-            except Exception:  # noqa: BLE001 -- shutdown continues
-                pass
+        """Shutdown, after the arm is disarmed: a window still open is written with what it has
+        (``post_window_complete`` false); waits at most ``timeout_s`` per write. Never raises."""
+        try:
+            for flush in (self._window is not None, False):
+                if self._busy is not None:
+                    self._busy.result(timeout=timeout_s)
+                if flush:
+                    self._flush(complete=False, **extra)
+        except Exception as exc:  # noqa: BLE001 -- shutdown continues
+            print(f"[fault trace] {self.instance_id}: close: {exc!r}", flush=True)
         if self._writer is not None:
             self._writer.shutdown(wait=False)
 

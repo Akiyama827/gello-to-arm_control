@@ -8,8 +8,8 @@ inside a repository (2026-10-09).
 New:
 * `multi_arm.diagnostics.SupervisorFaultTrace`, owned by every `RobotRuntime` (`runtime.fault_trace`): a ring of the
   supervisor's trace/1 rows sized for `FAULT_PRE_S` + `FAULT_POST_S` (10 + 2 s). A fault opens a window: a FAULTED receipt
-  (`_receipt`), a new or changed latched fault in the link health (the RT's, or the supervisor's own authority fault), or a
-  controller stop. Faults inside the window join it (`faults`, at most 50 listed, the rest counted). 2 s after the first
+  (`_receipt`), the rising edge of a latched fault in the link health (the RT's, or the supervisor's own authority fault),
+  or a controller stop (with its reason). Faults inside the window join it (`faults`, at most 50 listed, the rest counted). 2 s after the first
   fault the window's rows go to ONE writer thread; the loop never encodes or touches the disk. A window that closes while the
   writer is still busy is SKIPPED and counted (`skipped`, and `skipped_traces_before` in the next trace), never queued
   without bound; a failed write (disk full) is printed and counted (`errors`). `close()` writes an open window with what it
@@ -19,9 +19,10 @@ New:
 * `diagnostics.write_trace` (the console's atomic writer, factored out and shared): temporary file + fsync + rename, SHA-256
   sidecar, never replaces a trace; then keeps the newest `RETAIN_FILES` (20) of its directory (the new trace protected).
   At most `MAX_TRACE_BYTES` (50 MB): the oldest samples go first, counted in `truncated_samples`. Samples are encoded one at
-  a time with a 1 ms yield every 50, so a writer thread sharing the servo's interpreter does not hold the GIL for a whole
-  trace. Measured (stub link, 1,202 rows, 1.2 MB): without the yield one servo tick came 21 ms after the previous one
-  during the write; with it the largest gap in two writes was 10.8 ms (none over 15 ms).
+  a time with a 1 ms yield after every ~2 ms of encoding, so a writer thread sharing the servo's interpreter does not hold
+  the GIL for a whole trace. Measured (stub link, 1,202 rows, 1.2 MB): without the yield one servo tick came 21 ms after
+  the previous one during the write; with it the largest gap in two writes was 11.9 ms. A 10 ms Python loop beside
+  synthetic traces: 3.8 MB 11.4 ms, 7.4 MB 12.6 ms, 19.4 MB 15.1 ms (the final join and write are not sliced).
 * `trace_export` verifies both schemas; `--root` reads a supervisor's directory; a bare `--dest` exports to
   `$ARM_CONTROL_EXPORT_ROOT/<date>/faults-<source>-<time>/` (CTRL-010; refused when the variable is unset).
   `tools/hw/rt_timing.py --save` writes the RT timing trial's raw samples and summary under the same root (`rt_timing-<time>/`).
@@ -45,3 +46,28 @@ check_supervised_sims, sim-add e2e (passed, 74.4 s; no fault trace written).
 
 Not done: copying the RT box's own gap journal off the box (an operator step at the bench; the box is never polled from
 here); a trace/1 or status field reporting the writer's skipped/errors counts (printed and carried in the next trace only).
+
+Review round 1 (Opus xhigh, BLOCK: 2 MUST) and what changed:
+* MUST: the trigger compared the latched fault TEXT with the last one, and `RtBackend`/`SimLink` put the age in that text
+  ("rt state stream stale (0.42s)"), so one stale link opened a new window every tick: a trace every ~2 s (reproduced on
+  the C++ fake server under SIGSTOP), and newest-20 pruning would have deleted the onset trace after ~42 s -> only the
+  rising edge of a latched fault opens a window. check_fault_trace: a latched text changing every 5 ms for 1.2 s gives
+  exactly one trace (the text-compare rule fails it, verified).
+* MUST: `close()` wrote the open window BEFORE the DISARM (a slow write delayed the stop up to `timeout_s`; a raise skipped
+  the DISARM and the remaining runtimes' close) -> the fault trace closes after the link's DISARM and never raises; the
+  check times close() -> DISARM < 0.3 s with a 1 s write (the old order fails it, verified).
+* SHOULD: `trigger`/`poll` could raise into the loop (a refused executor submit stopped the controller and disarmed the
+  arm) -> both are guarded, counted in `errors`; the check forces a failing flush and the arm stays armed.
+* SHOULD: checks wrote into, and would prune, real arms' directories (the staged pair and the real-add/calibrate stagings
+  use the real instance ids) -> `ARM_CONTROL_FAULT_ROOT` redirects every fault directory (console and supervisor
+  subprocesses); both suites set a scratch one, and check_dual_hardware, check_supervised_real and check_base_supervisor
+  default to one.
+* SHOULD: the project RUNBOOK's commands lacked the root/PYTHONPATH prefix and a bare `--dest` read the library's console
+  directory -> prefixed, `--root` explicit.
+* NITs taken: close() waits for a busy writer, then writes the open window; the yield is time-based; the controller-stop
+  trigger carries the stop reason (`ArmController.stop_reason`); `export_dir` names to the microsecond and refuses a
+  relative export root; trace_export reports a refused export instead of a traceback; rt_timing creates its destination
+  before the collection; `capacity_warning` (no production caller) and its helper deleted; joined faults get what remains
+  of the first fault's 2 s (documented). Left: an authority fault set and cleared within one drain never triggers; a single
+  sample larger than the 50 MB budget leaves an empty trace; crash-leftover `.partial` files are listed by trace_export but
+  never pruned.

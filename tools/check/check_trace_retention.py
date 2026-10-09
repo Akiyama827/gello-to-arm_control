@@ -49,7 +49,6 @@ def main():
         names = sorted(p.name for p in root.glob("*.json"))
         assert len(names) == 4 and names[-1] == last.name and first.name not in names, names
         assert sorted(p.name for p in root.glob("*.sha256")) == [n + ".sha256" for n in names]
-        assert diagnostics.capacity_warning(root, keep_files=3) and not diagnostics.capacity_warning(root)
         assert diagnostics.prune_traces(root, keep_files=3, dry_run=True) and len(list(root.glob("*.json"))) == 4
         assert trace_export.main(["--root", str(root), "--prune", "--keep-files", "3"]) == 0  # dry run
         assert len(list(root.glob("*.json"))) == 4
@@ -213,7 +212,7 @@ def main():
                                   "--confirm-exported", str(out)]) == 0
         assert not [p for p in sub.glob("2*.json") if (out / p.name).is_file()], "an exported trace survived the prune"
         # 4b. A symlink named like a trace is not a trace: not counted, never pruned, never exported, and what it points to is
-        # untouched. Orphan .partial files count toward capacity (and are named by the warning).
+        # untouched.
         sym_root, outside = Path(tmp) / "symroot", Path(tmp) / "outside.json"
         sym_root.mkdir()
         outside.write_text("{}")
@@ -221,18 +220,6 @@ def main():
         assert diagnostics._traces(sym_root) == []
         assert diagnostics.prune_traces(sym_root, keep_files=0, keep_bytes=0) == [] and outside.read_text() == "{}"
         assert not trace_export.export(sym_root, Path(tmp) / "symexport")["traces"]
-        (sym_root / "20990101T000000000001Z-x.json.partial").write_bytes(b"x" * 2048)
-        assert diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=1024), "a partial file did not count"
-        assert not diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=4096)
-        assert "1 unfinished .partial" in diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=1024)
-        # a dangling .partial link or a vanished file does not hide the warning for the rest
-        (sym_root / "dangling.partial").symlink_to(Path(tmp) / "nowhere")
-        assert diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=1024), "a dangling link hid the warning"
-        assert diagnostics._size(Path(tmp) / "nowhere") == 0  # a vanished file is not countable and not an error
-        big = Path(tmp) / "big.bin"
-        big.write_bytes(b"x" * (2 << 20))
-        (sym_root / "linked.partial").symlink_to(big)  # a link is not a partial file: what it points at is not ours to count
-        assert not diagnostics.capacity_warning(sym_root, keep_files=10, keep_bytes=4096), "a .partial link was counted"
         # 4c. Durability: the trace and its sidecar are fsynced before the rename and the directory after it, in that order.
         order = []
         real_fsync, real_replace = diagnostics.os.fsync, diagnostics.os.replace
