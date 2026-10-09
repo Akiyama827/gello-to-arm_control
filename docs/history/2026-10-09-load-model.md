@@ -44,3 +44,5 @@ Review round 1 (opus): BLOCK, fixed:
     restarts with the run);
   - load_model/1 is advertised on the FR3 too, where gravity compensation makes the model's gravity term moot;
   - the PD torque is bounded by the RT server's cap and the 0.35 rad abort, not by 5 N.m (track list).
+
+Review round 2 (opus): ACCEPT. Its SHOULDs are taken: a failed supervisor call (and a tilt submit that timed out) holds the base as well as latching the fault; the launcher ignores signals with a Python no-op, so dora's nodes do not inherit an ignored SIGTERM/SIGHUP. NITs recorded: a DISARM may wait up to 5 s behind an ARM being confirmed; check_load_model does not exercise the freshness refusal; a latched supervisor-call fault leaves the base unusable for the rest of the run (by design).
