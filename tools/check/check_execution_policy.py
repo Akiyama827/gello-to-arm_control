@@ -170,7 +170,7 @@ def main():
     clock[0] += .6
     c.on_motor_state(state())
     assert c._running and commands(c), "profile-off scheduling/recovery changed"
-    check_deadlines()
+    check_clock_rule()
     check_interpolated_limits()
     check_goal_on_limit()
     check_measured_outside()
@@ -181,39 +181,11 @@ def main():
     print("execution policy: start/release, tracking, outage, finite state, relatch, health, opt-out OK")
 
 
-def check_deadlines():
-    # A 1 kHz input source must still produce ~100 Hz commands, including
-    # non-state traffic. One 40 ms scheduler stall must not cause a burst.
-    c, clock = setup(health=False)
-    times = []
-    original_send = c.node.send_output
-    start = clock[0]
-
-    class Node:
-        polls = 0
-
-        def next(self, *, timeout):
-            self.polls += 1
-            clock[0] += min(timeout, .001)
-            if self.polls == 50:
-                clock[0] += .04
-            if clock[0] >= start + .3:
-                return {"type": "STOP"}
-            if self.polls % 2:
-                return {"type": "INPUT", "id": "motor_state", "value": state()}
-            return {"type": "INPUT", "id": "unwired", "value": None}
-
-        def send_output(self, topic, value):
-            if topic == "motor_command":
-                times.append(clock[0])
-            original_send(topic, value)
-
-    c.node = Node()
-    c.run()
-    assert 24 <= len(times) <= 28, times
-    assert np.min(np.diff(times)) >= .009 - 1e-9, times
-    # Idle inputs still wake on the deadline; invalid clock configuration
-    # cannot silently select a second, incompatible trajectory timebase.
+def check_clock_rule():
+    # The 100 Hz command schedule is the supervisor's servo loop now (ArmController.run, the Dora loop, is gone);
+    # here only the controller's own clock rule remains.
+    c, _ = setup(health=False)
+    # An invalid clock configuration cannot silently select a second, incompatible trajectory timebase.
     try:
         ArmController(_FakeNode(), _FakeExecutor(), execution_policy=c.execution_policy, state_period_s=.01)
     except ValueError:
