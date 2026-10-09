@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -35,11 +36,19 @@ def start_supervisor(config: Path, env: dict, *, overlays=(), control_mode: Path
     sock = workdir / "arm.sock"
     log = open(workdir / "supervisor.log", "w")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "arm_control.supervisor.service", "--config", str(merged_path), "--socket", str(sock),
+        [sys.executable, "-u", "-m", "arm_control.supervisor.service", "--config", str(merged_path), "--socket", str(sock),
          "--plant", plant],
-        env=dict(env, ARM_CONTROL_CONFIG=str(merged_path)), cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True)  # its own session: a Ctrl-C reaches the graph, and the supervisor outlives it long enough to be stopped after
+        env=dict(env, ARM_CONTROL_CONFIG=str(merged_path)), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, start_new_session=True)  # its own session: a Ctrl-C reaches the graph, and the supervisor outlives it long enough to be stopped after
     proc._workdir, proc._log = workdir, log
+
+    def _echo():  # the controller's own lines (a fault, a refused ARM, a stale stream) reach the operator's terminal AND the log
+        for line in proc.stdout:
+            log.write(line)
+            log.flush()
+            print(f"[supervisor] {line}" if not line.startswith("[") else line, end="", flush=True)
+    proc._echo = threading.Thread(target=_echo, name="supervisor-log", daemon=True)
+    proc._echo.start()
     deadline = time.monotonic() + timeout_s
     try:
         while True:
@@ -66,7 +75,8 @@ def start_supervisor(config: Path, env: dict, *, overlays=(), control_mode: Path
 
 def stop_supervisor(proc, *, keep_log: bool = False) -> None:
     """SIGTERM (the supervisor DISARMs the plant on the way out), then kill if it does not stop. Safe with None and twice. A clean
-    stop removes its work directory unless ``keep_log``; a failure always keeps it."""
+    stop removes its work directory unless ``keep_log`` (hardware runs keep it: the bench's evidence); a failure always keeps it,
+    and a kept log's path is printed. Every supervisor line was also echoed to the launcher's terminal while it ran."""
     if proc is None:
         return
     if proc.poll() is None:
@@ -75,6 +85,7 @@ def stop_supervisor(proc, *, keep_log: bool = False) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
+    proc._echo.join(timeout=2)  # the pipe closes with the process: the last lines are written before the log closes
     try:
         proc._log.close()
     except Exception:  # noqa: BLE001
@@ -83,3 +94,5 @@ def stop_supervisor(proc, *, keep_log: bool = False) -> None:
         import shutil
 
         shutil.rmtree(proc._workdir, ignore_errors=True)
+    else:
+        print(f"[supervisor] log kept: {proc._workdir / 'supervisor.log'}", flush=True)
