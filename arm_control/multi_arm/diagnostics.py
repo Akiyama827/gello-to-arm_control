@@ -10,6 +10,9 @@ import hashlib
 import json
 import math
 import os
+from pathlib import Path
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -31,17 +34,43 @@ def _json_values(value):
     return value
 
 
-#: Capacity policy for persisted fault traces (CTRL-051): nothing is ever deleted automatically (a trace can be the only
-#: record of a real fault); when the directory holds more than ``RETAIN_FILES`` traces or ``RETAIN_BYTES`` bytes every save
-#: prints a visible warning, and the operator exports and prunes explicitly (``trace_export --prune``, dry-run by default).
-#: A trace is ~5 MB (500 samples). Adjustable defaults, not safety constants.
+#: Capacity policy for persisted fault traces (CTRL-051, operator 2026-10-09/10): each save keeps the newest ``RETAIN_FILES``
+#: traces of its directory and deletes older ones (and their sidecars); a trace is at most ``MAX_TRACE_BYTES`` (the oldest
+#: samples go first, counted), so a directory holds at most ``RETAIN_BYTES``. Export before a trace ages out
+#: (``trace_export --dest``). A console trace is ~5 MB (500 samples), a supervisor trace ~2.5 MB (12 s of ticks).
 RETAIN_FILES = 20
-RETAIN_BYTES = 256 * 2**20
+MAX_TRACE_BYTES = 50 * 2**20
+RETAIN_BYTES = RETAIN_FILES * MAX_TRACE_BYTES
 FAULT_DIR = ("dual_arm", "faults")
+#: The trace schemas this module writes (trace_export verifies these).
+TRACE_SCHEMAS = ("arm_control.dual_fault/", "arm_control.supervisor_fault/")
+#: A supervisor's fault trace (CTRL-051, operator 2026-10-09): the ticks from FAULT_PRE_S before the first fault to
+#: FAULT_POST_S after it; faults inside that window join the same trace.
+FAULT_PRE_S = 10.0
+FAULT_POST_S = 2.0
 
 
 def fault_root():
     return CONTROL_ROOT.joinpath(".cache", *FAULT_DIR)
+
+
+#: An operator export's root (CTRL-010): set by the deployment, outside any repository (this project:
+#: /mnt/data/experiment_data/modular_arm/control_exports, operator 2026-10-09). Unset: no default, a destination is required.
+EXPORT_ROOT_ENV = "ARM_CONTROL_EXPORT_ROOT"
+
+
+def export_dir(kind):
+    """``$ARM_CONTROL_EXPORT_ROOT/<local date>/<kind>-<local time>``, a fresh directory name for one export, or None when
+    the variable is unset."""
+    root = os.environ.get(EXPORT_ROOT_ENV)
+    if not root:
+        return None
+    now = datetime.now()
+    return Path(root) / f"{now:%Y-%m-%d}" / f"{kind}-{now:%H%M%S}"
+
+
+def supervisor_fault_root(instance_id):
+    return CONTROL_ROOT.joinpath(".cache", "supervisor", str(instance_id) or "unnamed", "faults")
 
 
 TRACE_GLOB = "2*.json"  # timestamped traces only: an EXPORT_MANIFEST.json in the directory is not a trace
@@ -70,15 +99,14 @@ def capacity_warning(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES):
     if len(traces) > keep_files or total > keep_bytes:
         orphans = f" (including {len(partials)} unfinished .partial file(s))" if partials else ""
         return (f"{len(traces)} fault trace(s), {total / 2**20:.1f} MiB in {root}{orphans} exceed the capacity policy "
-                f"({keep_files} files / {keep_bytes / 2**20:.0f} MiB): export and prune explicitly "
-                f"(export first: python -m arm_control.multi_arm.trace_export --dest DIR; then --prune --yes --confirm-exported DIR); "
-                f"nothing is deleted automatically")
+                f"({keep_files} files / {keep_bytes / 2**20:.0f} MiB): the next save prunes to the newest {keep_files}; "
+                f"export first if they matter (python -m arm_control.multi_arm.trace_export --dest DIR)")
     return None
 
 
 def prune_traces(root, *, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES, protect=None, dry_run=False, only=None):
-    """Remove the oldest ``*.json`` traces (and their ``.sha256`` sidecars) beyond the limits. Called only by an
-    explicit operator action. Never raises, never removes ``protect`` and, when ``only`` is given, nothing outside that
+    """Remove the oldest ``*.json`` traces (and their ``.sha256`` sidecars) beyond the limits. Called by every save (the
+    newest ``RETAIN_FILES`` kept, the new trace protected) and by the operator's ``trace_export --prune``. Never raises, never removes ``protect`` and, when ``only`` is given, nothing outside that
     set of names; returns the names (that would be) removed.
     Names begin with a UTC timestamp, so name order is age."""
     removed = []
@@ -119,13 +147,74 @@ def _fsync_dir(root):
         pass
 
 
+def write_trace(root, name, header, samples):
+    """Persist one fault trace atomically (temporary file, fsync, rename) with a SHA-256 sidecar, then keep the newest
+    ``RETAIN_FILES`` traces of ``root``. A full disk or a crash never leaves a partial file that looks complete, and an
+    existing trace is never replaced. Over ``MAX_TRACE_BYTES`` the oldest samples are dropped (``truncated_samples``).
+    Samples are encoded one at a time, so a writer thread never holds the interpreter for a whole trace."""
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / name
+    encoded = []
+    for k, s in enumerate(samples):
+        encoded.append(json.dumps(_json_values(s), allow_nan=False))
+        if k % 50 == 49:
+            time.sleep(0.001)  # let a servo loop sharing this interpreter take the GIL between chunks
+    head = json.dumps(_json_values(dict(header, samples_kept=0, truncated_samples=0)), allow_nan=False)
+    budget = MAX_TRACE_BYTES - len(head) - 64
+    size, keep = 0, len(encoded)
+    for k in range(len(encoded) - 1, -1, -1):  # newest first: the fault end of the window is kept
+        if size + len(encoded[k]) + 1 > budget:
+            keep = len(encoded) - 1 - k
+            break
+        size += len(encoded[k]) + 1
+    truncated = len(encoded) - keep
+    encoded = encoded[truncated:]
+    head = json.dumps(_json_values(dict(header, samples_kept=len(encoded), truncated_samples=truncated)), allow_nan=False)
+    payload = (head[:-1] + ', "samples": [' + ",".join(encoded) + "]}\n").encode()
+    digest = hashlib.sha256(payload).hexdigest()
+    partial = path.with_name(path.name + ".partial")
+    sidecar = path.with_name(path.name + ".sha256")
+    created = []  # only what THIS call created is ever cleaned up (a name collision must not destroy another trace)
+    try:
+        with partial.open("xb") as stream:
+            created.append(partial)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        with sidecar.open("x") as stream:  # exclusive: never replaces another trace's sidecar
+            created.append(sidecar)
+            stream.write(f"{digest}  {path.name}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.exists():
+            raise FileExistsError(str(path))  # never replace an existing trace
+        os.replace(partial, path)  # the trace appears whole or not at all
+        created.remove(partial)
+        _fsync_dir(root)
+    except BaseException:
+        for leftover in created:
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+        raise
+    removed = prune_traces(root, keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES, protect=path)
+    if removed:
+        print(f"[fault trace] kept the newest {RETAIN_FILES} in {root}; removed {removed}", flush=True)
+    return path
+
+
+def _stamp():
+    now = datetime.now(timezone.utc)
+    return now, f"{now:%Y%m%dT%H%M%S%fZ}"
+
+
 class PairFaultTrace:
     """Last 500 console ticks; no disk I/O or JSON encoding in record().
 
     Overflow is explicit: the number of samples evicted from the bounded history is counted and written into the
-    persisted trace (``dropped_samples``), never silent. A trace is written atomically (temporary file, fsync, rename)
-    with a SHA-256 sidecar, so a full disk or a crash never leaves a partial file that looks complete, and old traces
-    are never removed by a save: exceeding the capacity policy prints a warning (``RETAIN_FILES`` / ``RETAIN_BYTES``).
+    persisted trace (``dropped_samples``), never silent. Written by :func:`write_trace` (atomic, sidecar, newest
+    ``RETAIN_FILES`` kept).
     """
 
     def __init__(self, session):
@@ -138,13 +227,10 @@ class PairFaultTrace:
         self.recorded += 1
 
     def save(self, reason, context, *, samples=None, root=None, recorded=None):
-        now = datetime.now(timezone.utc)
-        root = fault_root() if root is None else root
-        root.mkdir(parents=True, exist_ok=True)
-        path = root / f"{now:%Y%m%dT%H%M%S%fZ}-{self.session}.json"
+        now, stamp = _stamp()
         kept = list(self.samples) if samples is None else samples
         seen = self.recorded if recorded is None else recorded
-        report = dict(
+        header = dict(
             schema="arm_control.dual_fault/v2",
             schema_version=2,
             closure_schema="arm_control.closure/v1",  # samples carry `closure_v1` beside the older `closure`
@@ -158,44 +244,102 @@ class PairFaultTrace:
                 "(rt_host string equality is the fallback for unattested servers); "
                 "publication timestamps do not establish synchronized robot measurements."
             ),
-            samples_kept=len(kept),
             dropped_samples=max(0, seen - len(kept)),
             retention=dict(keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES),
             context=context,
-            samples=kept,
         )
-        payload = (json.dumps(_json_values(report), allow_nan=False) + "\n").encode()
-        digest = hashlib.sha256(payload).hexdigest()
-        partial = path.with_name(path.name + ".partial")
-        sidecar = path.with_name(path.name + ".sha256")
-        created = []  # only what THIS call created is ever cleaned up (a name collision must not destroy another trace)
+        return write_trace(fault_root() if root is None else root, f"{stamp}-{self.session}.json", header, kept)
+
+
+class SupervisorFaultTrace:
+    """A supervisor's own fault record (CTRL-051): its trace/1 ticks from ``pre_s`` before the first fault to ``post_s``
+    after, written by one background thread so the servo loop never waits for encoding or the disk.
+
+    The loop calls ``record`` every tick, ``trigger`` on a fault and ``poll`` every tick. A fault opens a window; faults
+    inside it join it (``faults``); when ``post_s`` has passed, the window's samples are handed to the writer. A writer
+    still busy with the previous trace makes the new one SKIPPED (counted in ``skipped`` and in the next trace), never
+    queued without bound; a failed write (disk full) is counted in ``errors`` and printed, never raised into the loop.
+    It does not depend on any trace/1 reader: a console that died still leaves the supervisor's record."""
+
+    MAX_FAULTS = 50  # per window; more are counted, not listed
+
+    def __init__(self, instance_id, period, *, root=None, pre_s=FAULT_PRE_S, post_s=FAULT_POST_S, context=None):
+        self.instance_id, self.root = str(instance_id), root
+        self.pre_s, self.post_s = float(pre_s), float(post_s)
+        self.context = dict(context or {})
+        self._ring = deque(maxlen=int(math.ceil((self.pre_s + self.post_s) / float(period))) + 2)
+        self._window = None
+        self._writer = None
+        self._busy = None
+        self.skipped = self.errors = 0
+        self.written = []
+
+    def record(self, sample):
+        self._ring.append(sample)
+
+    def trigger(self, reason, now):
+        w = self._window
+        if w is None:
+            self._window = dict(start=float(now), faults=[dict(at=float(now), reason=str(reason))], more=0)
+        elif len(w["faults"]) < self.MAX_FAULTS:
+            w["faults"].append(dict(at=float(now), reason=str(reason)))
+        else:
+            w["more"] += 1
+
+    def poll(self, now, **extra):
+        if self._window is not None and now >= self._window["start"] + self.post_s:
+            self._flush(complete=True, **extra)
+
+    def _flush(self, *, complete, **extra):
+        w, self._window = self._window, None
+        if self._busy is not None and not self._busy.done():
+            self.skipped += 1
+            print(f"[fault trace] {self.instance_id}: writer still busy; the trace of {w['faults'][0]['reason']!r} is "
+                  f"SKIPPED ({self.skipped} so far)", flush=True)
+            return
+        start = w["start"]
+        samples = [s for s in self._ring if s.get("pc_monotonic", start) >= start - self.pre_s]
+        now, stamp = _stamp()
+        header = dict(
+            schema="arm_control.supervisor_fault/v1", schema_version=1, observed_at_utc=now.isoformat(),
+            instance_id=self.instance_id, reason=w["faults"][0]["reason"], faults=w["faults"], more_faults=w["more"],
+            fault_at_pc_monotonic=start, pre_s=self.pre_s, post_s=self.post_s, post_window_complete=complete,
+            window_pc_monotonic=[samples[0]["pc_monotonic"], samples[-1]["pc_monotonic"]] if samples else None,
+            dropped_samples=0, skipped_traces_before=self.skipped, write_errors_before=self.errors,
+            timestamp_note=("pc_monotonic is this supervisor's tick time on the PC; state_t_mono_ns is the RT host's "
+                            "publication stamp (clock domain per the HELLO), not a physical capture time."),
+            retention=dict(keep_files=RETAIN_FILES, max_trace_bytes=MAX_TRACE_BYTES),
+            context=dict(self.context, **extra),
+        )
+        root = supervisor_fault_root(self.instance_id) if self.root is None else self.root
+        name = f"{stamp}-{self.instance_id or 'supervisor'}.json"
+        if self._writer is None:
+            self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fault-trace")
+        self._busy = self._writer.submit(self._write, root, name, header, samples)
+
+    def _write(self, root, name, header, samples):
         try:
-            with partial.open("xb") as stream:
-                created.append(partial)
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            with sidecar.open("x") as stream:  # exclusive: never replaces another trace's sidecar
-                created.append(sidecar)
-                stream.write(f"{digest}  {path.name}\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            if path.exists():
-                raise FileExistsError(str(path))  # never replace an existing trace
-            os.replace(partial, path)  # the trace appears whole or not at all
-            created.remove(partial)
-            _fsync_dir(root)
-        except BaseException:
-            for leftover in created:
-                try:
-                    leftover.unlink()
-                except OSError:
-                    pass
-            raise
-        warning = capacity_warning(root)
-        if warning:
-            print(f"[fault trace] WARNING: {warning}", flush=True)
+            path = write_trace(root, name, header, samples)
+        except Exception as exc:  # noqa: BLE001 -- a failed record is reported, never raised into the servo
+            self.errors += 1
+            print(f"[fault trace] {self.instance_id}: write failed ({exc!r}); {self.errors} so far", flush=True)
+            return None
+        self.written.append(path)
+        print(f"[fault trace] {self.instance_id}: {header['reason']} -> {path}", flush=True)
         return path
+
+    def close(self, timeout_s=5.0, **extra):
+        """Shutdown: a window still open is written with what it has (``post_window_complete`` false), waiting at most
+        ``timeout_s`` for the writer."""
+        if self._window is not None:
+            self._flush(complete=False, **extra)
+        if self._busy is not None:
+            try:
+                self._busy.result(timeout=timeout_s)
+            except Exception:  # noqa: BLE001 -- shutdown continues
+                pass
+        if self._writer is not None:
+            self._writer.shutdown(wait=False)
 
 
 

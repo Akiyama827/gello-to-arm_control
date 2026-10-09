@@ -294,6 +294,16 @@ def main():
             runtime.clients[a].trace_samples = real_trace
         runtime.step()
         assert not runtime.diagnostic_sample()['arms'][a]['trace_stale']
+        # A supervisor that answers but whose loop stopped ticking: no new rows; the held one ages visibly.
+        runtime.clients[a].trace_samples = lambda after=0: dict(real_trace(after), samples=[])
+        try:
+            time.sleep(.2)
+            runtime.step()
+            assert runtime.diagnostic_sample()['arms'][a]['trace_age_s'] >= .2, runtime.diagnostic_sample()['arms'][a]
+        finally:
+            runtime.clients[a].trace_samples = real_trace
+        runtime.step()
+        assert runtime.diagnostic_sample()['arms'][a]['trace_age_s'] < .1
         # a supervisor without trace/1 has no trace (nothing invented, nothing stale); the SDK and the service refuse the op
         bare = object.__new__(SupervisedHardware)
         bare.clients = {a: SimpleNamespace(extensions={})}

@@ -275,11 +275,22 @@ synchronized physical capture times. Preserve the report before clearing the
 cache; a planner pass alone does not qualify measured tracking or synchronization.
 Each report is written whole (atomic rename) with a SHA-256 sidecar, states how many
 ticks were evicted from the 500-tick window (`dropped_samples`), and carries the five
-closure quantities per tick (`closure_v1`). Nothing deletes reports automatically; over
-20 files or 256 MiB every save warns. Verify and export with
-`python -m arm_control.multi_arm.trace_export --verify` and `--dest DIR`; prune only
-after exporting: `--prune --yes --confirm-exported DIR` (dry run without `--yes`).
+closure quantities per tick (`closure_v1`). Every save keeps the newest 20 reports
+of its directory and deletes older ones; a report is at most 50 MB (the oldest ticks
+go first, counted in `truncated_samples`). Export what must be kept:
+`python -m arm_control.multi_arm.trace_export --verify` and `--dest DIR`; prune further
+only after exporting: `--prune --yes --confirm-exported DIR` (dry run without `--yes`).
 Reports written before sidecars existed show as `legacy` and export normally.
+
+Every arm's supervisor also writes its own fault trace, whatever console or client
+is attached: on a FAULTED execution, a latched RT fault or a controller stop, the
+supervisor's controller ticks (trace/1 rows) from 10 s before the fault to 2 s after,
+under `$ARM_CONTROL_ROOT/.cache/supervisor/<instance>/faults/` (schema
+`arm_control.supervisor_fault/v1`; faults inside the window join it). A background
+thread writes it, so the servo loop does not wait for the disk; a fault while the
+previous trace is still being written is skipped and counted, a failed write is
+printed and counted. Same retention (newest 20, 50 MB) and the same `trace_export`
+with `--root` pointing at that directory.
 
 For a setup with a shared object:
 

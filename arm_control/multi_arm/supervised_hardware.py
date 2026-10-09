@@ -322,15 +322,20 @@ class SupervisedHardware(HandControl):
     def diagnostic_sample(self):
         """The supervisor's newest controller tick per arm (trace/1: the controller diagnostic, with its own
         sequence), the measured joints, and the count of ticks that fell off the supervisor's ring before they were read
-        (``trace_dropped``). Without trace/1 only the measured joints are present, and nothing is filled in."""
+        (``trace_dropped``). ``trace_age_s``: how old the newest tick is (the supervisors run on this PC's monotonic clock),
+        so a supervisor that answers but whose loop stopped ticking shows as an ageing sample, not a current one. Without
+        trace/1 only the measured joints are present, and nothing is filled in."""
+        now = time.monotonic()
         arms = {a: dict(dict(source='supervisor', q_measured=self._sample[a][0].tolist(),
                              dq_measured=self._sample[a][1].tolist(), measurement_valid=self._sample[a][2],
                              fault_reason=self.handles[a].state().fault_reason),
                         **(self._trace_latest.get(a) or {}), trace_seq=self._trace_seq[a],
                         trace_dropped=self._trace_dropped[a], trace_errors=self._trace_errors[a],
-                        trace_stale=not self._trace_ok[a])
+                        trace_stale=not self._trace_ok[a],
+                        trace_age_s=(now - self._trace_latest[a]['pc_monotonic']
+                                     if (self._trace_latest.get(a) or {}).get('pc_monotonic') is not None else None))
                 for a in self.handles}
-        return dict(pc_monotonic=time.monotonic(), reference_time_pc=None, arms=arms, feedback_ready=self.feedback_ready,
+        return dict(pc_monotonic=now, reference_time_pc=None, arms=arms, feedback_ready=self.feedback_ready,
                     feedback_alignment=self._feedback_alignment if self.mode == 'shared' else None)
 
     # -- actions ----------------------------------------------------------------------------------------------

@@ -13,7 +13,10 @@ commander and cannot steal that commander's state stream.
 
 Usage (rung 1 has the service on the box, rung 0 a local server):
 
-    python tools/hw/rt_timing.py --host 172.16.1.2 --seconds 60
+    python tools/hw/rt_timing.py --host 172.16.1.2 --seconds 60 [--save]
+
+``--save`` also writes the raw samples and the summary to ``$ARM_CONTROL_EXPORT_ROOT/<date>/rt_timing-<time>/`` (CTRL-010:
+the operator's export root, outside the repository; the variable must be set).
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ if str(_ROOT) not in sys.path:
 
 
 import argparse
+import json
 import socket
 import time
 
@@ -79,7 +83,7 @@ def collect(host: str, port: int, seconds: float) -> list[tuple[int, int, int]]:
     return samples
 
 
-def report(samples: list[tuple[int, int, int]], label: str) -> None:
+def report(samples: list[tuple[int, int, int]], label: str) -> dict:
     n = len(samples)
     if n < 100:
         raise SystemExit(f"only {n} samples — not enough to report")
@@ -111,6 +115,9 @@ def report(samples: list[tuple[int, int, int]], label: str) -> None:
     print("stream cadence at receiver, us:")
     print(f"  median {med_gap / 1e3:.0f}   p99 {_pct(gaps, 99) / 1e3:.0f}   "
           f"max {gaps[-1] / 1e3:.0f}   gaps>2.5x-median {losses}")
+    return dict(label=label, samples=n, span_s=span_s, ticks=span_ticks,
+                jitter_ns={f"p{q}": _pct(jit, q) for q in (50, 90, 99, 99.9)} | {"max": jit[-1]},
+                cadence_us=dict(median=med_gap / 1e3, p99=_pct(gaps, 99) / 1e3, max=gaps[-1] / 1e3), losses=losses)
 
 
 def main() -> None:
@@ -119,9 +126,25 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=47800)
     ap.add_argument("--seconds", type=float, default=60.0)
     ap.add_argument("--label", default=None)
+    ap.add_argument("--save", action="store_true", help="write samples + summary under $ARM_CONTROL_EXPORT_ROOT")
     args = ap.parse_args()
     label = args.label or f"{args.host}:{args.port}"
-    report(collect(args.host, args.port, args.seconds), label)
+    dest = None
+    if args.save:
+        from arm_control.multi_arm.diagnostics import EXPORT_ROOT_ENV, export_dir
+
+        dest = export_dir("rt_timing")
+        if dest is None:
+            raise SystemExit(f"--save needs {EXPORT_ROOT_ENV} (the deployment's export root)")
+    samples = collect(args.host, args.port, args.seconds)
+    summary = report(samples, label)
+    if dest is not None:
+        dest.mkdir(parents=True, exist_ok=False)
+        with (dest / "rt_timing.json").open("x") as stream:
+            json.dump(dict(schema="arm_control.rt_timing/v1", host=args.host, port=args.port, seconds=args.seconds,
+                           summary=summary, columns=["state_seq", "t_server_ns", "t_arrival_pc_ns"],
+                           samples=samples), stream)
+        print(f"saved {dest / 'rt_timing.json'}")
 
 
 if __name__ == "__main__":

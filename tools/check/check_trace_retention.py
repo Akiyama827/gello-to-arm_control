@@ -39,19 +39,33 @@ def main():
             else:
                 raise AssertionError("a failed write was reported as saved")
         assert digest_tree(root) == before, "a failed write left a file behind"
-        # 3. Capacity: a save never deletes; over the policy it warns; pruning is an explicit, dry-run-by-default action.
-        for i in range(6):
-            small = diagnostics.PairFaultTrace(f"r{i}")
-            small.record(dict(index=i))
-            small.save(f"r{i}", {}, root=root)
-        assert len(list(root.glob("*.json"))) == 7, "a save deleted something"
+        # 3. Capacity: every save keeps the newest RETAIN_FILES (operator 2026-10-10), the new one always among them, sidecars
+        #    with their traces; pruning further is the operator's explicit, dry-run-by-default action.
+        with patch.object(diagnostics, "RETAIN_FILES", 4):
+            for i in range(6):
+                small = diagnostics.PairFaultTrace(f"r{i}")
+                small.record(dict(index=i))
+                last = small.save(f"r{i}", {}, root=root)
+        names = sorted(p.name for p in root.glob("*.json"))
+        assert len(names) == 4 and names[-1] == last.name and first.name not in names, names
+        assert sorted(p.name for p in root.glob("*.sha256")) == [n + ".sha256" for n in names]
         assert diagnostics.capacity_warning(root, keep_files=3) and not diagnostics.capacity_warning(root)
-        assert diagnostics.prune_traces(root, keep_files=3, dry_run=True) and len(list(root.glob("*.json"))) == 7
+        assert diagnostics.prune_traces(root, keep_files=3, dry_run=True) and len(list(root.glob("*.json"))) == 4
         assert trace_export.main(["--root", str(root), "--prune", "--keep-files", "3"]) == 0  # dry run
-        assert len(list(root.glob("*.json"))) == 7
+        assert len(list(root.glob("*.json"))) == 4
         removed = diagnostics.prune_traces(root, keep_files=3)
         names = sorted(p.name for p in root.glob("*.json"))
-        assert len(names) == 3 and len(removed) == 4 and all(n.endswith(".json") for n in removed), (names, removed)
+        assert len(names) == 3 and len(removed) == 1 and all(n.endswith(".json") for n in removed), (names, removed)
+        # Over MAX_TRACE_BYTES the OLDEST samples go, counted; the trace still verifies.
+        big = diagnostics.PairFaultTrace("big")
+        for i in range(400):
+            big.record(dict(index=i, pad="x" * 1000))
+        with patch.object(diagnostics, "MAX_TRACE_BYTES", 100_000):
+            capped = big.save("capped", {}, root=Path(tmp) / "capped")
+        report = json.loads(capped.read_text())
+        assert capped.stat().st_size <= 100_000 and report["truncated_samples"] > 0, capped.stat().st_size
+        assert report["samples"][-1]["index"] == 399 and report["samples_kept"] + report["truncated_samples"] == 400
+        assert trace_export.verify(capped)["ok"]
         assert sorted(p.name for p in root.glob("*.sha256")) == [n + ".sha256" for n in names]
         assert all(trace_export.verify(root / n)["ok"] for n in names)
         newest = root / names[-1]
@@ -83,6 +97,14 @@ def main():
             else:
                 raise AssertionError(f"export accepted {unsafe}")
         assert trace_export.main(["--root", str(root), "--verify"]) == 1  # one bad trace: non-zero
+        # CTRL-010: a bare --dest exports under the deployment's export root, never without one.
+        import os
+        with patch.dict(os.environ, {diagnostics.EXPORT_ROOT_ENV: ""}):
+            assert trace_export.main(["--root", str(root), "--dest"]) == 2
+        with patch.dict(os.environ, {diagnostics.EXPORT_ROOT_ENV: str(Path(tmp) / "exports")}):
+            assert trace_export.main(["--root", str(root), "--dest", "--include-unverified"]) == 0
+        auto = list((Path(tmp) / "exports").glob("*/faults-*/EXPORT_MANIFEST.json"))
+        assert len(auto) == 1 and auto[0].parent.name.startswith(f"faults-{root.parent.name}-"), auto
         # 4b. Round-1 review hardening.
         sub = Path(tmp) / "hard"
         t = diagnostics.PairFaultTrace("h")
