@@ -37,3 +37,13 @@ Project:
 Retired: the in-process FR3 sim motion graph (Dora `arm_controller` + `mujoco_interface` in it), the pilot graph, ScenePlant's
 own Hand hosting, `run_console --supervised`. Not retired: `mujoco_interface` and the in-process `arm_controller` serve the
 remaining graphs (sim_motion, dual_arm_sim, sim_view_arm, and the project's) until each moves.
+
+Console parity (the setpoint/1 review's open item, taken here because this graph is the first console on the supervisor):
+* `supervisor/runtime.py` + `service.py` + `sdk.py`: `hold(reason)` (controller/1 op `controller_hold`): cancels live executions,
+  drops a setpoint, and clears the controller's `frozen` hold after a failed settle, holding the measured pose, still ARMed (the
+  in-process controller's cancel/Stop). Before it, only DISARM then ARM recovered a failed settle on a supervised arm.
+* `supervisor/dora_arm.py`: an untargeted cancel/hold/stop from the console also calls `hold`.
+* `control/arm_controller.py`: the frozen refusal says what clears it.
+* `check_dora_arm`: a plan whose completion goal it never reaches freezes the controller (setpoint refused 'frozen'); the console's
+  Hold clears it, still ARMed. Mutant (bridge never calls hold) caught.
+* `franka_gripper` address check: `check_node_shutdown` states the fixture's address and asserts a config without one never starts.

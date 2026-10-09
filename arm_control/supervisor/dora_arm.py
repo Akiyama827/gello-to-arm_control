@@ -200,6 +200,11 @@ class DoraArmBridge:
         self.handle.cancel(reason, plan_id=plan_id)
         if running and plan_id in (None, running):
             self._event('leg_result', str(running), False, f'cancelled: {reason}')
+        if plan_id is None:  # an untargeted cancel/hold/stop also clears the hold a failed settle froze in (as in-process)
+            try:
+                self.arm.hold(reason)
+            except (SupervisorError, TimeoutError, OSError) as exc:
+                self._mode_event(ok=False, reason=f'hold: {exc}')
 
     # -- periodic: events, authority edge, measured state -----------------------------------------------------------
     def pump(self) -> None:

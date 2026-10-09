@@ -332,6 +332,21 @@ class RobotRuntime:
             raise Refused('controller did not confirm the requested law')
         return state
 
+    def hold(self, session, reason='hold'):
+        """Stop whatever runs and hold the MEASURED pose, still ARMed: live executions are cancelled, a setpoint is dropped, and
+        the controller's ``frozen`` hold after a failed settle is cleared (the in-process controller's cancel/Stop). Returns
+        the controller state. DISARM is the other way out of ``frozen``; this keeps the arm powered."""
+        return self._call(self._hold, session, str(reason))
+
+    def _hold(self, session, reason):
+        self._owns(session)
+        for ex in list(self._executions.values()):
+            if not ex.status.terminal and (ex.stream is not None or ex.completed_at is None):
+                self._cancel_execution(ex, reason)
+        self.controller.on_control(pack_control_update(cancel=True, reason=reason))
+        self._pump_controller()
+        return self._controller_state()
+
     def set_payload(self, session, payload):
         return self._call(self._set_payload, session, payload)
 
