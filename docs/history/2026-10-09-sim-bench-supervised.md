@@ -76,3 +76,10 @@ Named, not changed (owners):
   sequencing in the planner, or a bridge rule), with its end-to-end runs.
 * `check_dataflows` checks wiring, not that a node reads the input NAME it is given (a renamed `grasp_request` passes), nor
   qpos length against the perception twin's nq (19 = 19 measured in review).
+
+Review round 2: ACCEPT (live supervisor runs 600/30, preset `track`; interrupted and timed-out starts leave no supervisor and keep
+the log; cold-cache start measured 93 s; observe/1 at 125 Hz). NITs taken in the project: `check_bench_supervised` now allows the
+same 300 s as `run.py` (it used the 60 s default and failed on a cold cache), and both pass the mode config as
+`CONTROL_ROOT / scenario.mode_config` (it resolved against the cwd, so `run.py` from the repo root failed before any start).
+Accepted as is: two sub-millisecond orphan windows (between `Popen` and the guarded wait; between `run.py` restoring its signal
+handlers and Dora installing its own).
