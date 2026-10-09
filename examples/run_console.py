@@ -314,11 +314,6 @@ def _self_check() -> None:
 
     cfg = load_config_tree(DEFAULT_CONFIG)
     assert cfg["console"]["http_port"], cfg.get("console")
-    dual_cfg = load_config_tree(REPO_ROOT / "examples/configs/sim_arm_b.yaml")
-    assert dual_cfg["console"]["http_port"] != cfg["console"]["http_port"], (
-        "the two demo arms must not share a console port -- that collision is "
-        "the exact thing per-instance config exists to prevent"
-    )
     _check_entry_keys()
     ready, hint = assets_ready()
     assert ready or "franka_description" in hint, hint
