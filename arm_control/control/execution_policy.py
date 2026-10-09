@@ -82,10 +82,10 @@ class ExecutionPolicy:
         return 1.0 / self.command_rate_hz
 
     def envelope(self, measured=None):
-        """The admissible position band: the description's envelope, widened per joint to the MEASURED pose where that
-        already lies outside it (operator 2026-10-09: never further out). A joint gravity rested past its limit -- the DM
-        arm, disarmed, sits on its stops -- can be held where it is and brought back in, never driven further out: the
-        setpoint/1 escape rule, for every command and plan."""
+        """The admissible position band: the description's envelope, widened per joint to ``measured`` (a pose, or rows
+        of poses) where that already lies outside it (operator 2026-10-09: never further out). A joint gravity rested past
+        its limit -- the DM arm, disarmed, sits on its stops -- can be held where it is and brought back in, never driven
+        further out: the setpoint/1 escape rule, for every command and plan. The controller passes the pose it ARMed at."""
         if self.position_lower is None:
             return None
         if measured is None:
@@ -95,7 +95,9 @@ class ExecutionPolicy:
             return self.position_lower, self.position_upper
         return np.minimum(self.position_lower, q.min(axis=0)), np.maximum(self.position_upper, q.max(axis=0))
 
-    def plan_error(self, plan, measured, n_arm):
+    def plan_error(self, plan, measured, n_arm, *, been=None):
+        """Why ``plan`` may not run, or None. ``measured`` is the pose its start must be near; the position envelope widens
+        to ``been`` (default: ``measured``), the pose(s) a caller may hold the arm at -- the controller's pose at ARM."""
         q, v, t = plan["positions"], plan["velocities"], plan["times"]
         if q.ndim != 2 or q.shape[1] != n_arm:
             return f"trajectory must have {n_arm} joint columns"
@@ -106,7 +108,7 @@ class ExecutionPolicy:
                 return "trajectory contains non-finite values"
         if np.any(np.diff(t) <= 0):
             return "trajectory times must be strictly increasing"
-        band = self.envelope(measured)
+        band = self.envelope(measured if been is None else been)
         if band is not None:
             if (np.any(q < band[0] - ENVELOPE_TOL)
                     or np.any(q > band[1] + ENVELOPE_TOL)):

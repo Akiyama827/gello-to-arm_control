@@ -317,47 +317,71 @@ def check_goal_on_limit():
 
 
 def check_measured_outside():
-    """Never further out (operator 2026-10-09): an arm that gravity rested past a limit ARMs and holds where it is -- also as it
-    creeps back in under the hold, past the sample its hold was built from -- and nothing may go further out than it has been
-    since ARM. Re-ARM starts over."""
+    """Never further out (operator 2026-10-09): a joint gravity rested past a limit ARMs and is held where it rests -- as it
+    creeps back in under the hold (a command built from an older sample) or settles a little further out on its stop --
+    may be planned or jogged back in, and never driven beyond where it has been. A joint inside at ARM never widens (an
+    overshoot grants nothing); re-ARM starts over."""
     from arm_control.control.execution_policy import ExecutionPolicy
     from arm_control.motion import JointServoCommand
 
-    clock = [10.0]
-    policy = ExecutionPolicy(
-        command_rate_hz=100, state_timeout_sec=.25, health_timeout_sec=1,
-        start_pos_tol_rad=.1, abort_pos_err_rad=.35, hold_relatch_rad=.3,
-        torque_limits=np.array([87]*4+[12]*3), position_lower=np.full(7, -1.0), position_upper=np.full(7, 1.0))
-    c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), clock=lambda: clock[0],
-                      plant_reports_health=True, execution_policy=policy)
-    c._set_arm(True)
-    c.on_motor_health(pack_json_message("motor_health", dict(
-        armed=True, state_fresh=True, any_fault=False, supports_pose_hold=True)))
-    # ARMed where gravity rested it, 0.02 rad past the lower limit; then the hold pulls it back in, a sample behind
-    for q in (-1.02, -1.0199, -1.0198, -1.0197):
-        clock[0] += .01
-        c.on_motor_state(state(q))
-        c.tick()
-        assert not c.stopped, (q, "a hold where the arm is (or was, since ARM) faulted")
-    assert np.allclose(commands(c)[-1]["position"], -1.02, atol=1e-3)
-    # A jog (no hold anchor) built from a sample older than the latest, as the arm keeps creeping in: still where it has been.
-    assert c.on_jog(pack_jog(q=[-1.0197] * 7)) is None
-    for q in (-1.0196, -1.0195, -1.0194):
-        clock[0] += .01
-        c.on_motor_state(state(q))
-        c.tick()
-        assert not c.stopped and c._hold_anchor is None, (q, "a jog to where the arm has been since ARM faulted")
+    def controller():
+        clock = [10.0]
+        policy = ExecutionPolicy(
+            command_rate_hz=100, state_timeout_sec=.25, health_timeout_sec=1,
+            start_pos_tol_rad=.1, abort_pos_err_rad=.35, hold_relatch_rad=.3,
+            torque_limits=np.array([87]*4+[12]*3), position_lower=np.full(7, -1.0), position_upper=np.full(7, 1.0))
+        c = ArmController(_FakeNode(), _FakeExecutor(), gripper=dict(_GRIPPER), clock=lambda: clock[0],
+                          plant_reports_health=True, execution_policy=policy)
+        c._set_arm(True)
+        c.on_motor_health(pack_json_message("motor_health", dict(
+            armed=True, state_fresh=True, any_fault=False, supports_pose_hold=True)))
+        return c, clock, policy
+
+    def feed(c, clock, *qs):
+        for q in qs:
+            clock[0] += .01
+            c.on_motor_state(state(q))
+            c.tick()
+            assert not c.stopped, (q, "a command where the arm rested at ARM faulted")
 
     def hold(q):
         return JointServoCommand(np.full(7, q), np.zeros(7), np.zeros(7), np.full(7, 600.), np.full(7, 20.))
-    assert policy.command_valid(hold(-1.02), 7, c._where_been())        # where it has been since ARM
+
+    # ARMed where gravity rested it, 0.02 rad past the lower limit; then the hold pulls it back in, a sample behind
+    c, clock, policy = controller()
+    feed(c, clock, -1.02, -1.0199, -1.0198, -1.0197)
+    assert np.allclose(commands(c)[-1]["position"], -1.02, atol=1e-3)
+    # A jog (no hold anchor) built from a sample older than the latest, as the arm keeps creeping in.
+    assert c.on_jog(pack_jog(q=[-1.0197] * 7)) is None
+    feed(c, clock, -1.0196, -1.0195, -1.0194)
+    assert c._hold_anchor is None
+    assert policy.command_valid(hold(-1.02), 7, c._where_been())        # where it rested at ARM
     assert not policy.command_valid(hold(-1.021), 7, c._where_been())   # further out: never
+    # A plan out of the stop, its first knot where the arm rested (older than the latest sample): admitted.
+    c.on_control(pack_control_update(cancel=True))
+    feed(c, clock, -1.0193)
+    c.on_plan(plan("out", positions=np.array([[-1.0195] * 7, [-.95] * 7])))
+    assert c._plan is not None, "a plan out of the stop from where the arm rested was refused"
+    c.on_plan(plan("deeper", positions=np.array([[-1.0195] * 7, [-1.03] * 7])))
+    assert c._plan is None or c._plan.get("plan_id") != "deeper", "a plan further out was admitted"
+    # Resting on its stop, the joint settles a little further out under the hold: holding it where it now is is no fault.
+    feed(c, clock, -1.0205)
+    assert policy.command_valid(hold(-1.0205), 7, c._where_been())
+    assert not policy.command_valid(hold(-1.0206), 7, c._where_been())  # beyond anywhere it has been: never
     c._set_arm(False)
-    c.on_motor_state(state(-1.0))
+    c.on_motor_state(state(-1.01))     # re-ARMed resting outside again, but less far
     c._set_arm(True)
-    clock[0] += .01
-    c.on_motor_state(state(-1.0))
+    assert policy.command_valid(hold(-1.01), 7, c._where_been())
     assert not policy.command_valid(hold(-1.02), 7, c._where_been())    # a new ARM grants nothing from before it
+
+    # Inside at ARM: an overshoot past the limit while armed widens nothing (no ratchet).
+    c, clock, policy = controller()
+    feed(c, clock, -.99)
+    clock[0] += .01
+    c.on_motor_state(state(-1.003))
+    clock[0] += .01
+    c.on_motor_state(state(-.999))
+    assert not policy.command_valid(hold(-1.003), 7, c._where_been())
 
 
 def check_factory_envelope():

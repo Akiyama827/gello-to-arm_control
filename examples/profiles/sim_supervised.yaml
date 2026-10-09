@@ -15,6 +15,8 @@ sim_servo:
   hold_kp: 50                    # RT default: hold gains before any command of the epoch
   hold_kd: 5
 
-# The execution policy a supervisor requires is the FR3's own (robots/fr3/execution.yaml), included by the entry config: not restated here.
+# The execution policy a supervisor requires is the ARM's own, included by the entry config (the FR3's robots/fr3/execution.yaml;
+# a project arm's from its project): not restated here.
 # The Hand on its own protocol (the real hand_bridge wire), backed by the plant's fingers: franka_gripper drives it as on the bench.
+# A gripper other than the Franka Hand states its envelope (sim_hand.limits) and its finger map (the arm's joint_mimics).
 sim_hand: {port: 47812}

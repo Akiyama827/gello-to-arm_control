@@ -245,7 +245,7 @@ class SimHandBridge:
     # -- the plant thread ------------------------------------------------------------------------------------
     def on_sample(self, positions, efforts, now: float):
         """One measured finger sample after a plant step. Returns ``(targets, force_n)`` to apply, or None."""
-        width = float(sum(width_from_finger(float(p), self.mimic) for p in positions) / len(positions))
+        width = float(sum(width_from_finger(float(p), self.mimic) for p in positions) / max(len(positions), 1))
         with self._lock:
             adm = self._adm
             if adm.stopping:
