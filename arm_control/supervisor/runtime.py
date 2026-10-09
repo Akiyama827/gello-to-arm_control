@@ -21,6 +21,7 @@ from __future__ import annotations
 import collections
 import itertools
 import queue
+import re
 import socket
 import threading
 import time
@@ -195,9 +196,10 @@ class RobotRuntime:
         self.period = self.controller.execution_policy.period
         # CTRL-051: this supervisor's own fault record (the ticks 10 s before a fault to 2 s after), written off the loop
         self.fault_trace = SupervisorFaultTrace(self.instance_id, self.period, context=dict(
-            joints=list(self.joints), rt_host=getattr(self.link.config, 'host', None)))
-        self._latched_seen = False    # a latched fault was present last tick: only its rising edge opens a fault window (the
-                                      # text can carry an age that changes every tick, e.g. "rt state stream stale (0.42s)")
+            joints=list(self.joints), rt_host=getattr(self.link.config, 'host', None)),
+            sim=getattr(self.link, 'backend_name', '') == 'sim')  # a simulated plant's traces never prune the hardware's
+        self._latched_seen = ''       # the latched fault's kind last tick: a new kind opens a fault window, its changing
+                                      # age does not (e.g. "rt state stream stale (0.42s)")
         self._profile_gains = (self.controller.executor.kp.copy(),
                                self.controller.executor.kd.copy())
         self.identity: RobotIdentity | None = None
@@ -895,7 +897,10 @@ class RobotRuntime:
         self._stream_worker.shutdown(wait=False, cancel_futures=True)
         self._tracker.disarm_sent()
         if self._native is not None:
-            self._native.close()
+            try:
+                self._native.close()
+            except Exception as exc:  # noqa: BLE001 -- the DISARM below must still happen
+                print(f"[supervisor] native reference close: {exc!r}", flush=True)
         for fut, _, _ in self._pending:
             fut.cancel()  # queued ARM/DISARM work; link.close() disarms itself
         closing = self._rpc.submit(self.link.close)
@@ -1860,9 +1865,10 @@ class RobotRuntime:
         self._pump_controller(sent_for=rs["plan_id"] if rs["executing"] else None)
         self._record_trace(health)
         latched = str(health["latched_fault"] or "")
-        if latched and not self._latched_seen:
+        kind = re.sub(r'\s*\([^)]*\)', '', latched)  # the fault without its parenthesised age/detail
+        if kind and kind != self._latched_seen:
             self.fault_trace.trigger(f'latched fault: {latched}', time.monotonic())
-        self._latched_seen = bool(latched)
+        self._latched_seen = kind
         for ex in list(self._executions.values()):
             if (ex.first_seq is not None and not ex.status.terminal
                     and self._tracker.fault_seen(ex.epoch)):

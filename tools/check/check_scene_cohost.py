@@ -250,6 +250,7 @@ def stale_after_pause(host_path) -> None:
     cfg = load_robot_config(host_path)
     host = SimLink.from_config(cfg)
     runtime = RobotRuntime(cfg, link=host)
+    assert runtime.fault_trace.sim, "a simulated supervisor's fault traces would share (and prune) the hardware's directory"
     runtime.start()
     try:
         c = runtime.controller

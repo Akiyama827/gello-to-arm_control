@@ -57,11 +57,19 @@ FAULT_ROOT_ENV = "ARM_CONTROL_FAULT_ROOT"
 
 def _fault_base():
     override = os.environ.get(FAULT_ROOT_ENV)
+    if override and not Path(override).is_absolute():
+        raise ValueError(f"{FAULT_ROOT_ENV} must be an absolute path, not {override!r}")
     return Path(override) if override else CONTROL_ROOT / ".cache"
 
 
-def fault_root():
-    return _fault_base().joinpath(*FAULT_DIR)
+def _leaf(sim):
+    # A simulation's traces never share a directory, or its newest-20 retention, with the hardware's (the simulated bench
+    # pair runs under the real instance ids).
+    return "sim_faults" if sim else "faults"
+
+
+def fault_root(sim=False):
+    return _fault_base().joinpath(FAULT_DIR[0], _leaf(sim))
 
 
 #: An operator export's root (CTRL-010): set by the deployment, outside any repository (this project:
@@ -76,13 +84,13 @@ def export_dir(kind):
     if not root:
         return None
     if not Path(root).is_absolute():
-        raise ValueError(f"{EXPORT_ROOT_ENV} must be an absolute path outside any repository, not {root!r}")
+        raise ValueError(f"{EXPORT_ROOT_ENV} must be an absolute path (keep it outside any repository), not {root!r}")
     now = datetime.now()
     return Path(root) / f"{now:%Y-%m-%d}" / f"{kind}-{now:%H%M%S-%f}"
 
 
-def supervisor_fault_root(instance_id):
-    return _fault_base().joinpath("supervisor", str(instance_id) or "unnamed", "faults")
+def supervisor_fault_root(instance_id, sim=False):
+    return _fault_base().joinpath("supervisor", str(instance_id) or "unnamed", _leaf(sim))
 
 
 TRACE_GLOB = "2*.json"  # timestamped traces only: an EXPORT_MANIFEST.json in the directory is not a trace
@@ -215,7 +223,7 @@ class PairFaultTrace:
         self.samples.append(sample)
         self.recorded += 1
 
-    def save(self, reason, context, *, samples=None, root=None, recorded=None):
+    def save(self, reason, context, *, samples=None, root=None, recorded=None, sim=False):
         now, stamp = _stamp()
         kept = list(self.samples) if samples is None else samples
         seen = self.recorded if recorded is None else recorded
@@ -237,7 +245,7 @@ class PairFaultTrace:
             retention=dict(keep_files=RETAIN_FILES, keep_bytes=RETAIN_BYTES),
             context=context,
         )
-        return write_trace(fault_root() if root is None else root, f"{stamp}-{self.session}.json", header, kept)
+        return write_trace(fault_root(sim) if root is None else root, f"{stamp}-{self.session}.json", header, kept)
 
 
 class SupervisorFaultTrace:
@@ -253,8 +261,11 @@ class SupervisorFaultTrace:
 
     MAX_FAULTS = 50  # per window; more are counted, not listed
 
-    def __init__(self, instance_id, period, *, root=None, pre_s=FAULT_PRE_S, post_s=FAULT_POST_S, context=None):
-        self.instance_id, self.root = str(instance_id), root
+    def __init__(self, instance_id, period, *, root=None, pre_s=FAULT_PRE_S, post_s=FAULT_POST_S, context=None, sim=False):
+        self.instance_id, self.root, self.sim = str(instance_id), root, bool(sim)
+        if root is None and os.environ.get(FAULT_ROOT_ENV):
+            print(f"[fault trace] {self.instance_id}: traces go to {supervisor_fault_root(self.instance_id, self.sim)} "
+                  f"({FAULT_ROOT_ENV} is set)", flush=True)
         self.pre_s, self.post_s = float(pre_s), float(post_s)
         self.context = dict(context or {})
         self._ring = deque(maxlen=int(math.ceil((self.pre_s + self.post_s) / float(period))) + 2)
@@ -315,7 +326,7 @@ class SupervisorFaultTrace:
             retention=dict(keep_files=RETAIN_FILES, max_trace_bytes=MAX_TRACE_BYTES),
             context=dict(self.context, **extra),
         )
-        root = supervisor_fault_root(self.instance_id) if self.root is None else self.root
+        root = supervisor_fault_root(self.instance_id, self.sim) if self.root is None else self.root
         name = f"{stamp}-{self.instance_id or 'supervisor'}.json"
         if self._writer is None:
             self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fault-trace")
@@ -342,6 +353,7 @@ class SupervisorFaultTrace:
                 if flush:
                     self._flush(complete=False, **extra)
         except Exception as exc:  # noqa: BLE001 -- shutdown continues
+            self.errors += 1
             print(f"[fault trace] {self.instance_id}: close: {exc!r}", flush=True)
         if self._writer is not None:
             self._writer.shutdown(wait=False)

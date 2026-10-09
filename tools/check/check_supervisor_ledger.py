@@ -199,6 +199,16 @@ def check_fault_trace() -> None:
             time.sleep(.005)
         time.sleep(post + .2)
         assert len(rt.fault_trace.written) == before + 1, len(rt.fault_trace.written) - before
+        # A fault of another KIND replacing one still latched (no clear tick between) is a new fault: a new trace.
+        link.fault = ""
+        time.sleep(.05)
+        before = len(rt.fault_trace.written)
+        link.fault = "rt servo frozen (0.10s, link alive)"
+        time.sleep(post + .2)
+        link.fault = "rt fault 3: joint limit"
+        time.sleep(post + .2)
+        assert len(rt.fault_trace.written) == before + 2, len(rt.fault_trace.written) - before
+        assert not rt.fault_trace.sim, "a stub (non-sim) link's traces went to the simulation directory"
         # A trace that fails inside the loop is counted, never raised: the arm stays armed.
         link.fault = ""
         time.sleep(.05)
@@ -232,7 +242,7 @@ def check_fault_trace() -> None:
             rt.close()
     last = json.loads(rt.fault_trace.written[-1].read_text())
     assert last["reason"] == "latched fault: sixth" and last["post_window_complete"] is False, last["reason"]
-    assert len(list((tmp / "faults").glob("*.json"))) == 4, sorted((tmp / "faults").iterdir())
+    assert len(list((tmp / "faults").glob("*.json"))) == 6, sorted((tmp / "faults").iterdir())
     print(f"  supervisor fault trace: {len(stamps)} ticks [-{pre}, +{post}] s, faults joined, busy writer skipped, "
           f"write failure counted, a changing fault text traced once, a failing trace leaves the arm armed, "
           f"open window written on close after the DISARM")

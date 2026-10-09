@@ -371,12 +371,13 @@ def start_fakes(pair_path, binary, root):
 
 def main(pair_path, binary, refinement="none"):
     # the staged pair's instance ids are the real arms': its supervisors' fault traces go to a scratch root, never theirs
-    os.environ.setdefault(diagnostics.FAULT_ROOT_ENV, tempfile.mkdtemp(prefix="dual_hardware_faults_"))
+    if not os.environ.get(diagnostics.FAULT_ROOT_ENV):
+        os.environ[diagnostics.FAULT_ROOT_ENV] = tempfile.mkdtemp(prefix="dual_hardware_faults_")
     trace = diagnostics.PairFaultTrace("self-check")
     for i in range(510):
         trace.record(dict(index=i, value=float("nan")))
     assert len(trace.samples) == 500 and trace.samples[0]["index"] == 10
-    with tempfile.TemporaryDirectory() as trace_root, patch.object(diagnostics, "CONTROL_ROOT", Path(trace_root)):
+    with tempfile.TemporaryDirectory() as trace_root, patch.dict(os.environ, {diagnostics.FAULT_ROOT_ENV: trace_root}):
         report = json.loads(trace.save("test", {}).read_text())
         assert report["samples"][-1]["value"] is None
     config = load_pair_config(pair_path)
@@ -399,9 +400,7 @@ def main(pair_path, binary, refinement="none"):
         print("A shared object not stated virtual is refused at load: PASS", flush=True)
     app = None
     supervisors, servers, probe = [], [], {}
-    with tempfile.TemporaryDirectory(prefix="dual-hardware-check-") as root, patch.object(
-        diagnostics, "CONTROL_ROOT", Path(root)
-    ):
+    with tempfile.TemporaryDirectory(prefix="dual-hardware-check-") as root:
         logs = []
         try:
             pair, configs, servers, logs = start_fakes(pair_path, binary, root)

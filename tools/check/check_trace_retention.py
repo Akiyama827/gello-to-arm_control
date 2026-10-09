@@ -2,6 +2,7 @@
 import errno
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 import subprocess
@@ -96,8 +97,17 @@ def main():
             else:
                 raise AssertionError(f"export accepted {unsafe}")
         assert trace_export.main(["--root", str(root), "--verify"]) == 1  # one bad trace: non-zero
+        # Simulations never share a fault directory (or its retention) with the hardware, under the same instance id.
+        assert diagnostics.supervisor_fault_root("fr3_1", sim=True) != diagnostics.supervisor_fault_root("fr3_1")
+        assert diagnostics.fault_root(sim=True) != diagnostics.fault_root()
+        with patch.dict(os.environ, {diagnostics.FAULT_ROOT_ENV: "relative/faults"}):
+            try:
+                diagnostics.fault_root()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("a relative fault root was accepted")
         # CTRL-010: a bare --dest exports under the deployment's export root, never without one.
-        import os
         with patch.dict(os.environ, {diagnostics.EXPORT_ROOT_ENV: ""}):
             assert trace_export.main(["--root", str(root), "--dest"]) == 2
         with patch.dict(os.environ, {diagnostics.EXPORT_ROOT_ENV: str(Path(tmp) / "exports")}):

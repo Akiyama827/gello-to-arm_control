@@ -8,13 +8,14 @@ inside a repository (2026-10-09).
 New:
 * `multi_arm.diagnostics.SupervisorFaultTrace`, owned by every `RobotRuntime` (`runtime.fault_trace`): a ring of the
   supervisor's trace/1 rows sized for `FAULT_PRE_S` + `FAULT_POST_S` (10 + 2 s). A fault opens a window: a FAULTED receipt
-  (`_receipt`), the rising edge of a latched fault in the link health (the RT's, or the supervisor's own authority fault),
+  (`_receipt`), a new KIND of latched fault in the link health (the RT's, or the supervisor's own authority fault; the
+  kind is the text without its parenthesised age, so "rt state stream stale (0.42s)" is one fault however long it lasts),
   or a controller stop (with its reason). Faults inside the window join it (`faults`, at most 50 listed, the rest counted). 2 s after the first
   fault the window's rows go to ONE writer thread; the loop never encodes or touches the disk. A window that closes while the
   writer is still busy is SKIPPED and counted (`skipped`, and `skipped_traces_before` in the next trace), never queued
   without bound; a failed write (disk full) is printed and counted (`errors`). `close()` writes an open window with what it
   has (`post_window_complete: false`). Schema `arm_control.supervisor_fault/v1`, under
-  `$ARM_CONTROL_ROOT/.cache/supervisor/<instance>/faults/`. It needs no trace/1 reader: a console that died still leaves
+  `$ARM_CONTROL_ROOT/.cache/supervisor/<instance>/faults/` (a simulated plant's: `.../sim_faults/`). It needs no trace/1 reader: a console that died still leaves
   the supervisor's record.
 * `diagnostics.write_trace` (the console's atomic writer, factored out and shared): temporary file + fsync + rename, SHA-256
   sidecar, never replaces a trace; then keeps the newest `RETAIN_FILES` (20) of its directory (the new trace protected).
@@ -22,7 +23,9 @@ New:
   a time with a 1 ms yield after every ~2 ms of encoding, so a writer thread sharing the servo's interpreter does not hold
   the GIL for a whole trace. Measured (stub link, 1,202 rows, 1.2 MB): without the yield one servo tick came 21 ms after
   the previous one during the write; with it the largest gap in two writes was 11.9 ms. A 10 ms Python loop beside
-  synthetic traces: 3.8 MB 11.4 ms, 7.4 MB 12.6 ms, 19.4 MB 15.1 ms (the final join and write are not sliced).
+  synthetic traces: 3.8 MB 11.4 ms, 7.4 MB 12.6 ms, 19.4 MB 15.1 ms; the reviewer measured 17.5-22.2 ms (one gap per write)
+  for 19.4 MB inside a supervisor, realistic sizes (3.6-7 MB) within the 12.3-12.5 ms baseline (the final join and write are
+  not sliced).
 * `trace_export` verifies both schemas; `--root` reads a supervisor's directory; a bare `--dest` exports to
   `$ARM_CONTROL_EXPORT_ROOT/<date>/faults-<source>-<time>/` (CTRL-010; refused when the variable is unset).
   `tools/hw/rt_timing.py --save` writes the RT timing trial's raw samples and summary under the same root (`rt_timing-<time>/`).
@@ -71,3 +74,17 @@ Review round 1 (Opus xhigh, BLOCK: 2 MUST) and what changed:
   of the first fault's 2 s (documented). Left: an authority fault set and cleared within one drain never triggers; a single
   sample larger than the 50 MB budget leaves an empty trace; crash-leftover `.partial` files are listed by trace_export but
   never pruned.
+
+Review round 2 (Opus xhigh, PASS-WITH-FIXES; both MUSTs and all SHOULDs confirmed by running code: the SIGSTOP stale-link
+reproduction now writes one trace and keeps the onset; close -> DISARM 9-10 ms with a 3 s write):
+* SHOULD: the simulated bench pair runs its supervisors under the real instance ids (`fr3_1`/`fr3_2`), and the console's
+  directory was shared by sim and hardware, so simulation faults would prune unexported bench traces -> simulations write
+  to `sim_faults/` (supervisor: a `SimLink` plant; console: a non-`remote_rt` pair); check_scene_cohost asserts a simulated
+  supervisor's trace is marked sim, check_trace_retention that the directories differ.
+* NITs taken: a latched fault of another kind replacing one still latched gets its own trace (check: "rt servo frozen (...)"
+  then "rt fault 3: ..." without a clear tick -> two traces; a refused ARM against a still-faulted RT may trace each
+  attempt, operator-paced); `ARM_CONTROL_FAULT_ROOT` must be absolute and a supervisor prints where its traces go when it
+  is set; check_dual_hardware's dead `CONTROL_ROOT` patches replaced by the variable, no temporary directory when it is
+  already set; the export-root message no longer claims to check "outside any repository"; a failed fault-trace close is
+  counted; a raising native-reference close no longer skips the rest of `RobotRuntime.close` (including the DISARM: that
+  gap predated this slice). Left: the suites' scratch fault roots are not removed.

@@ -418,7 +418,8 @@ class DualArmConsole:
 
             def write():
                 try:
-                    self.fault_trace = str(self._trace.save(reason, context, samples=samples, recorded=recorded))
+                    self.fault_trace = str(self._trace.save(reason, context, samples=samples, recorded=recorded,
+                                                            sim=self.config.backend != "remote_rt"))
                     print(f"[dual_console] fault trace: {self.fault_trace}", flush=True)
                 except Exception as exc:
                     print(f"[dual_console] fault trace could not be saved: {exc}", flush=True)
