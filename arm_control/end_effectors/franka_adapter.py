@@ -215,6 +215,10 @@ class BridgeClient(threading.Thread):
                 self._failures.append(dict(request_id=str(request.get("request_id", "")),
                                            target_id=str(request.get("target_id", "")),
                                            ok=False, reason=reason))
+            else:
+                # A slider MOVE or a HOME has no requester to answer: say it on the graph log, or a failed move is
+                # silent on the PC (bench 2026-10-10, FR3 #2's Hand: the box logged "Command failed!", the PC nothing).
+                print(f"[franka_gripper] {self._inflight[1]} failed: {reason}", flush=True)
         self._command = self._inflight = None
         self.target = None
         self.want_home = False
@@ -561,7 +565,18 @@ def _demo() -> None:
     assert imm["ok"] and imm["reason"] == "released"
     assert fsm.poll({"is_grasped": False}, 2, False, 106.0) is None
 
-    print("[franka_gripper] demo OK — FSM verdicts + wire framing")
+    # a slider MOVE has no requester: its failure is printed, not dropped (bench 2026-10-10)
+    import contextlib
+    import io
+    client = BridgeClient("127.0.0.1", 0)
+    client._inflight = (3, "MOVE 0.04000 0.050", {})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        client._receive(b"DONE 3 0")
+    assert "MOVE 0.04000 0.050 failed: hand action failed" in out.getvalue(), out.getvalue()
+    assert client._inflight is None and not client.pop_failures() and not client.pop_move_results()
+
+    print("[franka_gripper] demo OK — FSM verdicts + wire framing + unrequested-move failure")
 
 
 def cli() -> None:

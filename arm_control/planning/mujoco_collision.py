@@ -58,6 +58,27 @@ class MuJoCoCollisionWorld:
         for name, value in query.items():
             getattr(self.data, name)[:] = value
 
+    def planning_delta(self) -> dict:
+        """What a plan reads that changes after construction, WITHOUT the model: the pickled state minus ``model``, plus
+        the model's contact masks (the only model fields this class toggles). The bench workcell's model pickles to ~370
+        MB, and pickling it per plan held the console's GIL ~0.5 s (Dora dropped its inputs, bench 2026-10-10). A world
+        replaced by a REBUILT object needs a full copy, never a delta."""
+        state = self.__getstate__()
+        state.pop("model")
+        state["_masks"] = (self.model.geom_contype.copy(), self.model.geom_conaffinity.copy())
+        return state
+
+    def apply_planning_delta(self, delta: dict) -> None:
+        """Bring a copy of this world (same model) to the state ``planning_delta`` captured."""
+        delta = dict(delta)
+        contype, conaffinity = delta.pop("_masks")
+        model = self.model
+        if contype.shape != model.geom_contype.shape:
+            raise ValueError("planning delta is for another model")
+        self.__setstate__(dict(delta, model=model))
+        model.geom_contype[:] = contype
+        model.geom_conaffinity[:] = conaffinity
+
     def __init__(
         self,
         urdf_path: str | Path,

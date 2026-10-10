@@ -822,8 +822,40 @@ def _close_planning_pool(pool):
     pool.join()
 
 
-def _plan_snapshot(world, planner_cfg, start, goal, vmax, amax, refinement):
-    """Solve against the serialized canonical world, never a rebuilt nominal URDF."""
+_PLAN_WORLD = None  # planning process: (key, world) last sent whole
+
+
+class PlanWorldMiss(RuntimeError):
+    """The planning process holds no copy of this world (a fresh or restarted worker): send it whole."""
+
+
+def _plan_world_key(world):
+    """A world object AND its model: replacing either (a scene rebuild) needs a whole copy."""
+    return id(world), id(getattr(world, "model", None))
+
+
+def _plan_world_cached(cached, world) -> bool:
+    return (hasattr(world, "planning_delta") and cached[0] is world
+            and cached[1] is getattr(world, "model", None))
+
+
+def _cache_plan_world(key, world):
+    global _PLAN_WORLD
+    _PLAN_WORLD = (key, world)
+
+
+def _plan_snapshot(world, planner_cfg, start, goal, vmax, amax, refinement, key=None, delta=None):
+    """Solve against the serialized canonical world, never a rebuilt nominal URDF.
+
+    ``world`` None: the copy this process cached under ``key``, brought up to date by ``delta`` (its planning_delta):
+    the model crosses the process boundary once per world object, not once per plan."""
+    if world is not None:
+        _cache_plan_world(key, world)
+    else:
+        if _PLAN_WORLD is None or _PLAN_WORLD[0] != key:
+            raise PlanWorldMiss(key)
+        world = _PLAN_WORLD[1]
+        world.apply_planning_delta(delta)
     _, planner = build_collision_stack(
         None, world.joint_names, planner_cfg, cache_dir=None, collision_world=world,
     )
@@ -1065,6 +1097,12 @@ def _run(
     # thread only waits for its result and runs project-specific path checks.
     plan_pool = _planning_pool()
     cleanup.callback(_close_planning_pool, plan_pool)
+    # The world crosses to the planning process now, before anything is ARMed, so a plan sends only its small delta.
+    warm = getattr(world, "world", world)
+    plan_cached = [None, None]  # [world, its model] the planning process holds: the refs keep their ids unique
+    if hasattr(warm, "planning_delta"):
+        plan_cached[:] = [warm, warm.model]
+        plan_pool.apply_async(_cache_plan_world, (_plan_world_key(warm), warm))
     plan_thread: threading.Thread | None = None
     plan_box: list = []  # worker appends ("ok", traj, goal_q) | ("err", msg)
     active_plan_id = ''
@@ -1341,11 +1379,19 @@ def _run(
 
                 def _plan_worker(m=m_snap, t=t_snap, t0=t_plan, rev=revision, refine=refinement):
                     try:
-                        traj = plan_pool.apply_async(
-                            _plan_snapshot,
-                            (getattr(world, "world", world), planner_cfg,
-                             m, t, vmax, amax, refine),
-                        ).get(timeout=180)
+                        w = getattr(world, "world", world)
+                        args = (planner_cfg, m, t, vmax, amax, refine)
+                        try:
+                            if not _plan_world_cached(plan_cached, w):
+                                raise PlanWorldMiss(_plan_world_key(w))
+                            traj = plan_pool.apply_async(
+                                _plan_snapshot, (None, *args, _plan_world_key(w), w.planning_delta()),
+                            ).get(timeout=180)
+                        except PlanWorldMiss:
+                            # Whole (a rebuilt world, a restarted worker): a GIL-heavy pickle, once per world.
+                            plan_cached[:] = [w, getattr(w, "model", None)]
+                            traj = plan_pool.apply_async(
+                                _plan_snapshot, (w, *args, _plan_world_key(w))).get(timeout=180)
                         if scene_actions is not None:
                             scene_actions.validate_path(traj, path_ik)
                         plan_box.append(("ok", traj, t, t0, rev))
@@ -1719,6 +1765,60 @@ def _check_planner_limits() -> None:
     print("arm_console: planner speed limits follow the execution policy")
 
 
+def _check_plan_world_cache() -> None:
+    """The planning process gets the world once, then per-plan deltas that carry every mutable query input."""
+    import pickle
+    import tempfile
+    from pathlib import Path
+
+    from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
+
+    cfg = load_robot_config(Path(__file__).resolve().parents[2] / "examples/configs/sim_arm.yaml")
+    joints = list(arm_joints(cfg))
+    box = dict(name="wall", pose=[.45, 0., .4, 0., 0., 0.], size=[.1, .8, .8])
+    with tempfile.TemporaryDirectory() as tmp:
+        w = MuJoCoCollisionWorld(cfg.urdf_path, joints, cache_dir=tmp, environment=[box])
+        child = pickle.loads(pickle.dumps(w))  # the copy the planning process caches
+        rng = np.random.default_rng(0)
+        qs = rng.uniform(w.lower, w.upper, (200, len(joints)))
+        hits = [w.in_collision(q) for q in qs]
+        assert any(hits) and not all(hits), "the samples must see the wall both ways, or this checks nothing"
+        wall = np.flatnonzero(w._env_geom)
+        w.model.geom_contype[wall] = w.model.geom_conaffinity[wall] = 0  # what enable_*_obstacles toggles
+        assert [w.in_collision(q) for q in qs] != hits
+        assert [child.in_collision(q) for q in qs] == hits, "stale before the delta"
+        child.apply_planning_delta(pickle.loads(pickle.dumps(w.planning_delta())))
+        assert [child.in_collision(q) for q in qs] == [w.in_collision(q) for q in qs]
+        fingers = list(gripper_joints(cfg))
+        assert fingers, "sim_arm must hold finger joints for the held-position case"
+        w.set_held_positions({fingers[0]: .013})
+        assert not np.array_equal(child._held_qpos, w._held_qpos)
+        child.apply_planning_delta(pickle.loads(pickle.dumps(w.planning_delta())))
+        assert np.array_equal(child._held_qpos, w._held_qpos)
+        assert len(pickle.dumps(w.planning_delta())) < len(pickle.dumps(w.model)) / 10
+        other = MuJoCoCollisionWorld(cfg.urdf_path, joints[:-1], cache_dir=tmp)
+        try:
+            other.apply_planning_delta(w.planning_delta())
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a delta applied to another model")
+        # the cache key: a replaced world or model is a miss; the process refuses a delta it holds no world for
+        cached = [w, w.model]
+        assert _plan_world_cached(cached, w) and not _plan_world_cached(cached, other)
+        cached[1] = other.model
+        assert not _plan_world_cached(cached, w)
+        _cache_plan_world(_plan_world_key(other), other)
+        try:
+            _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
+                           _plan_world_key(w), w.planning_delta())
+        except PlanWorldMiss:
+            pass
+        else:
+            raise AssertionError("planned against a world the process does not hold")
+    print("arm_console: planning world crosses once; deltas carry contact masks/held/qpos; misses refused OK")
+
+
 def _check_graphs() -> None:
     """Every console in every graph has exactly one authority feedback source (the controller's motor_health or its
     controller_arm), never an optimistic ARM badge, and every supervised_arm input has a handler. (The in-process arm_controller node this also checked is retired: every
@@ -1754,6 +1854,7 @@ def cli() -> None:
         _check_payload_declaration()
         _check_graphs()
         _check_planner_limits()
+        _check_plan_world_cache()
     else:
         main()
 
