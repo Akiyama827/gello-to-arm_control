@@ -97,6 +97,24 @@ def _answers(path: Path) -> bool:
         probe.close()
 
 
+def stop_supervisors(procs, *, keep_log: bool = False) -> None:
+    """Stop several supervisors (a pair): SIGTERM to EVERY one first, so an interrupt while waiting on one (a second Ctrl-C
+    during the bounded wait) has already told the rest to DISARM and exit; then each wait runs even if an earlier one raised.
+    Stopping them one by one left the second supervisor orphaned on the bench (2026-10-10)."""
+    procs = [p for p in procs if p is not None]
+    for proc in procs:
+        if proc.poll() is None:
+            proc.terminate()
+
+    def stop(rest):
+        if rest:
+            try:
+                stop_supervisor(rest[0], keep_log=keep_log)
+            finally:
+                stop(rest[1:])
+    stop(procs)
+
+
 def stop_supervisor(proc, *, keep_log: bool = False) -> None:
     """SIGTERM (the supervisor DISARMs the plant on the way out), then kill if it does not stop. Safe with None and twice. A clean
     stop removes its work directory unless ``keep_log`` (hardware runs keep it: the bench's evidence); a failure always keeps it,
@@ -121,3 +139,41 @@ def stop_supervisor(proc, *, keep_log: bool = False) -> None:
         shutil.rmtree(proc._workdir, ignore_errors=True)
     else:
         print(f"[supervisor] log kept: {proc._workdir / 'supervisor.log'}", flush=True)
+
+
+def _self_check() -> None:
+    """stop_supervisors: an interrupt while waiting on the first still stops (and reaps) the second."""
+    import tempfile
+    import threading
+
+    def proc():
+        p = subprocess.Popen(["sleep", "30"])
+        p._echo_stop, p._echo, p._workdir = threading.Event(), threading.Thread(target=lambda: None), Path(tempfile.mkdtemp())
+        p._echo.start()
+        p._log = open(p._workdir / "supervisor.log", "w")
+        return p
+    first, second = proc(), proc()
+    real_wait = first.wait
+
+    def interrupted(timeout=None):
+        # every supervisor was signalled before this first wait: the second exits on its own
+        assert second.wait(timeout=5) is not None, "the second supervisor was not signalled before the first wait"
+        raise KeyboardInterrupt
+    first.wait = interrupted
+    try:
+        stop_supervisors([first, None, second])
+        raise AssertionError("the interrupt was swallowed")
+    except KeyboardInterrupt:
+        pass
+    first.wait = real_wait
+    assert second.poll() is not None, "the second supervisor survived an interrupt during the first stop"
+    assert first.wait(timeout=5) is not None, "the first supervisor was not signalled before the wait"
+    import shutil
+    for p in (first, second):
+        p._log.close()
+        shutil.rmtree(p._workdir, ignore_errors=True)
+    print("stop_supervisors: every supervisor is signalled before any wait; an interrupted wait still stops the rest: OK")
+
+
+if __name__ == "__main__":
+    _self_check()

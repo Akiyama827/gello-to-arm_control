@@ -84,7 +84,7 @@ MODULE_CHECKS = (
     "arm_control.plants.franka.backend", "arm_control.plants.mujoco.backend --self-check", "arm_control.plants.mujoco.backend --demo",
     "arm_control.plants.mujoco.backend --scene-demo",
     "arm_control.plants.remote_rt.observation", "arm_control.plants.remote_rt.protocol",
-    "arm_control.scene", "arm_control.simulation.rerun_scene", "arm_control.supervisor.scene_observer", "arm_control.ui.hand_panel", "arm_control.ui.jog_panel",
+    "arm_control.scene", "arm_control.simulation.rerun_scene", "arm_control.supervisor.launch", "arm_control.supervisor.scene_observer", "arm_control.ui.hand_panel", "arm_control.ui.jog_panel",
     "arm_control.ui.operator_arm --self-check", "arm_control.viz.visualizer --self-check",
 )
 # Scripts outside tools/ with their own self-check.

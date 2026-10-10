@@ -80,7 +80,7 @@ def _write(path: Path, text: str) -> None:
 def start_pair(pair_path: Path, env: dict, *, plant: str, cwd: Path | None = None, timeout_s: float = 300.0):
     """Start the pair's supervisors; return ``(processes, staged pair config, env with ARM_CONTROL_PAIR_SOCKETS)``. A failure
     stops whatever had started."""
-    from arm_control.supervisor.launch import start_supervisor, stop_supervisor
+    from arm_control.supervisor.launch import start_supervisor, stop_supervisors
 
     staged, configs = stage_pair(pair_path, plant=plant)
     names = list(configs)
@@ -101,8 +101,7 @@ def start_pair(pair_path: Path, env: dict, *, plant: str, cwd: Path | None = Non
                 procs.append(proc)
                 sockets[name] = out["ARM_CONTROL_SOCKET"]
     except BaseException:
-        for proc in procs:
-            stop_supervisor(proc, keep_log=True)
+        stop_supervisors(procs, keep_log=True)
         raise
     return procs, staged, dict(env, **{SOCKETS_ENV: ",".join(f"{k}={v}" for k, v in sockets.items())})
 
@@ -110,14 +109,13 @@ def start_pair(pair_path: Path, env: dict, *, plant: str, cwd: Path | None = Non
 @contextmanager
 def running_pair(pair_path: Path, env: dict, *, plant: str, cwd: Path | None = None, timeout_s: float = 300.0):
     """``start_pair`` for a ``with`` block: yields ``(staged pair config, env)``; the supervisors stop on the way out."""
-    from arm_control.supervisor.launch import stop_supervisor
+    from arm_control.supervisor.launch import stop_supervisors
 
     procs, staged, env = start_pair(pair_path, env, plant=plant, cwd=cwd, timeout_s=timeout_s)
     try:
         yield staged, env
     finally:
-        for proc in procs:
-            stop_supervisor(proc, keep_log=plant == "rt")  # a hardware run keeps its supervisors' logs (the bench's evidence)
+        stop_supervisors(procs, keep_log=plant == "rt")  # a hardware run keeps its supervisors' logs (the bench's evidence)
 
 
 def pair_sockets(env) -> dict[str, str]:
