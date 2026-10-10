@@ -99,6 +99,7 @@ h1 {
 .authority { margin-top: .7rem; padding: .65rem; border: 1px solid var(--rule); background: #fff; }
 .button-pair { display: grid; grid-template-columns: 1fr 1fr; gap: .4rem; margin-top: .5rem; }
 .button-pair[hidden] { display: none; }
+#hand-home { grid-column: 1 / -1; }
 .arm { color: var(--blue-dark); font-weight: 700; }
 .danger { color: white; border-color: var(--red); background: var(--red); font-weight: 700; }
 .deadman {

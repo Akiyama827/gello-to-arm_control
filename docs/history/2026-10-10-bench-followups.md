@@ -33,3 +33,12 @@ packet, on the RT box clock both servers share) against that arm's own reference
 (anchor + d) difference. Saves the raw record (`--out`, re-run with `--analyze`). Checked: `--self-check` recovers a 4.1 ms
 skew either sign, common and separate anchors, from 250 Hz noisy packets; a smoke run against two fake-RT supervisors
 through the pair coordinator recorded 0 trace drops and gave anchor difference + d (fake-plant lag ~39 ms, equal on both).
+
+**Hand Home button in the manual console** (operator request, same day). `ControlPanel.request_home` (route
+`/hand_home`) asks for what touching the graph's `arm_gripper_home.<ARM_ID>` already did: the console loop touches that
+file (`franka_adapter.HOME_FILE`, the Hand node's own operator trigger; the console shares the graph's ARM_ID) and the
+node sends `HOME` to the bridge (libfranka `homing()`, a full open/close sweep). Gated as the slider is (confirmed ARM, no
+fault) plus: fresh feedback, idle, `is_grasped` known false, no carried scene object; one request per click. The node only
+honours the file in a graph without `hand_move_requires_arm` (the manual consoles); in a gated graph it is ignored, as the
+touch file always was. A failed home prints `[franka_gripper] HOME failed: ...` (above). Checked in
+`check_ui_scene_injection` (each refusal, one pending request, consumed once) and the console route check.

@@ -235,6 +235,7 @@ class ControlPanel:
         self._grip_lo, self._grip_hi = float(grip_range[0]), float(grip_range[1])
         self._grip = self._grip_hi               # start open
         self._grip_dirty = False
+        self._home_pending = False
         self.hand = HandPanel(
             gripper_cfg=gripper_cfg,
             payload_table=payload_table,
@@ -308,6 +309,8 @@ class ControlPanel:
             self.set_gripper(payload.get("value"), dirty=True)
         elif route == "hand":
             self.request_hand(payload)
+        elif route == "hand_home":
+            self.request_home()
         elif route == "scene_action":
             self.request_scene_action(payload)
         elif route == "jog":
@@ -614,6 +617,29 @@ class ControlPanel:
             if self._scene_state is not None:
                 self._invalidate_target_locked()
                 self.jog.release()
+
+    def request_home(self) -> None:
+        """Home the Hand (a full open/close sweep that re-measures its stroke): the same request as touching the graph's
+        ``arm_gripper_home.<ARM_ID>`` file, gated like the slider, plus: idle, fresh, holding nothing."""
+        with self._lock:
+            hand = self.hand.snapshot(armed=self._armed, fault=self._fault)
+            reason = ("Hand motion requires confirmed ARM and no fault" if self._armed is not True or self._fault
+                      else "Hand feedback unavailable or stale" if not hand["feedback_fresh"]
+                      else "Hand busy: wait for the current action" if self.hand.owns_jaws() or self._home_pending
+                      else "Homing sweeps the fingers: open the Hand and remove the object first"
+                      if hand["is_grasped"] is not False or (self._scene_state is not None
+                                                             and self._scene_state["status"] != "stored")
+                      else "")
+            if reason:
+                raise ValueError(reason)
+            self._home_pending = True
+            self._grip_dirty = False  # the sweep owns the jaws; a queued slider goal is dropped
+            self._log.append("Hand homing requested (keep fingers clear)")
+
+    def pop_home(self) -> bool:
+        with self._lock:
+            pending, self._home_pending = self._home_pending, False
+            return pending
 
     def set_scene_state(self, state, *, error=''):
         with self._lock:
@@ -1343,6 +1369,10 @@ def _run(
         hand_request = panel.pop_hand()
         if hand_request is not None:
             node.send_output("grasp_request", pack_grasp_request(**hand_request))
+        if panel.pop_home():
+            # The Hand node's own operator trigger (it owns the bridge link; this graph shares its ARM_ID).
+            from arm_control.end_effectors.franka_adapter import HOME_FILE
+            HOME_FILE.touch()
         declaration = panel.pop_payload()
         if declaration is not None and scene_actions is None:
             node.send_output("control", pack_control_update(payload=declaration))
