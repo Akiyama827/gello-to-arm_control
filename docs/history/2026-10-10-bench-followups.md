@@ -42,3 +42,23 @@ fault) plus: fresh feedback, idle, `is_grasped` known false, no carried scene ob
 honours the file in a graph without `hand_move_requires_arm` (the manual consoles); in a gated graph it is ignored, as the
 touch file always was. A failed home prints `[franka_gripper] HOME failed: ...` (above). Checked in
 `check_ui_scene_injection` (each refusal, one pending request, consumed once) and the console route check.
+
+Review round 1 (Opus xhigh, PASS-WITH-FIXES, no MUST; covered 11c53d8..a80d5b1, not the Home button). Verified
+empirically: on the real bench workcell, after every mutation the console, ManualCarry and WorkcellScene make (contact
+phases, scene obstacles with exclude/off, fingers, base state) the delta-applied copy, the parent and a fresh whole pickle
+give identical contacts on 400 q; a spawn-pool run (wall on/off/on, a killed worker -> `PlanWorldMiss` -> whole -> delta);
+only `geom_contype`/`conaffinity` are written on a collision world outside checks; the hold after a hand-judged leg goes
+through the relatch bound. Taken:
+* SHOULD: a future in-place geometry write would leave the planner on stale geometry silently -> the delta carries a
+  digest of the placement/shape fields (geom type/data/body/pos/quat/size/margin/gap, body parent/pos/quat, jnt_range,
+  qpos0); a copy whose digest differs refuses the delta and the console resends the world whole (`PlanWorldMiss`).
+  Bench world: still 0.04 s per plan, 2 ms worst gap. The apply also replaces the copy's attributes exactly (NIT).
+* SHOULD: settling progress and the timeout reason of a hand-judged leg reported the joint rule -> their joint fields are
+  None and progress carries `hand_error_m/_rad`, `hand_tolerance_m/_rad`; the console log and the project operator view
+  show the hand error and bound.
+* SHOULD: pair_skew's number includes tracking-lag differences (two arms started together with 10/25 ms lags read 15 ms
+  with a clean fit) -> renamed `motion_delay_difference_ms` and documented as such: start skew only for like legs.
+  NITs: one shared clock offset when both arms report one RT clock; `delay_at_search_edge` flags a delay at the search
+  bound; `same_pair` checks both arms' first legs belong to one pair; the JSON output is checked (a numpy bool broke it).
+* NIT: a configured ee frame missing from the URDF now fails at executor construction.
+Left: `id()` cache keys (the held references keep them unique); K_c = 0 legs take the hand bound (documented).

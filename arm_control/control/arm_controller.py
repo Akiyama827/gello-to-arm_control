@@ -956,22 +956,25 @@ class ArmController:
         if spec is not None:
             vel_tol = spec['vel_tol']
             goal, pos_tol = spec.get('goal_q'), spec.get('residual_max')
-        error = None if goal is None else np.abs(state.position - goal)
+        hand = spec is None and self._cartesian_now is not None  # judged on the hand: no joint criterion to report
+        error = None if goal is None or hand else np.abs(state.position - goal)
         joint = None if error is None else int(np.argmax(error)) + 1
         residual = None if error is None else float(np.max(error))
         speed = float(np.max(np.abs(state.velocity)))
         progress = dict(state=verdict.state, elapsed_s=verdict.elapsed_s,
                         remaining_s=verdict.remaining_s,
-                        joint=joint, error_rad=residual, position_tolerance_rad=pos_tol,
+                        joint=joint, error_rad=residual, position_tolerance_rad=None if hand else pos_tol,
                         speed_rad_s=speed, velocity_tolerance_rad_s=vel_tol)
+        if hand:
+            pos, rot = self.executor.hand_error(goal, state.position)
+            lim = self.executor.pose_tolerances
+            progress.update(hand_error_m=pos, hand_error_rad=rot, hand_tolerance_m=lim[0], hand_tolerance_rad=lim[1])
         if verdict.state == TIMED_OUT:
             detail = ('' if residual is None else
                       f'joint {joint} error {residual:.5f} rad (limit {pos_tol:.5f}); ')
-            if spec is None and self._cartesian_now is not None:
-                pos, rot = self.executor.hand_error(goal, state.position)
-                lim = self.executor.pose_tolerances
+            if hand:
                 detail = (f'hand error {pos * 1e3:.2f} mm / {np.degrees(rot):.2f} deg (limit {lim[0] * 1e3:g} mm / '
-                          f'{np.degrees(lim[1]):g} deg); {detail}')
+                          f'{np.degrees(lim[1]):g} deg); ')
             reason = (f'Completion timeout after {self._settling.timeout_s:g}s settling: '
                       f'{detail}speed {speed:.5f} rad/s (limit {vel_tol:.5f}). '
                       'Holding measured pose; completion criteria not met.')

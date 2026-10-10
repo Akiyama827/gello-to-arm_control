@@ -639,6 +639,13 @@ def check_cartesian_completion():
     cfg = load_robot_config(Path(__file__).resolve().parents[2] / "examples/configs/sim_arm.yaml")
     ex = build_executor(cfg)
     assert np.allclose(ex.pose_tolerances, (.02, np.radians(5.))), ex.pose_tolerances
+    from arm_control.control.trajectory_executor import JointTrajectoryExecutor
+    try:  # a configured ee frame the URDF lacks fails at startup, not at a Cartesian leg's end
+        JointTrajectoryExecutor("a", ex._joints, ex._dyn, ex.kp, ex.kd, np.ones(7), payload_frame="no_such_frame")
+    except ValueError as exc:
+        assert "no_such_frame" in str(exc), exc
+    else:
+        raise AssertionError("an executor with a missing ee frame was built")
     goal = np.array([0., -.785, 0., -2.356, 0., 1.571, .785])
     dyn = ex._dyn
     q_full = dyn._embed(goal, np.zeros(7), np.zeros(7))[0]
@@ -672,8 +679,12 @@ def check_cartesian_completion():
     c.on_control(pack_control_update(execute="p"))
     advance(c, clock, 2.)
     events = [unpack_json_message(v) for t, v in c.node.sent if t == "controller_event"]
-    assert c.frozen and any(e.get("kind") == "leg_result" and not e["ok"] and "hand error 30.00 mm" in e["reason"]
-                            for e in events), events
+    timeout = [e for e in events if e.get("kind") == "leg_result" and not e["ok"]]
+    assert c.frozen and timeout and "hand error 30.00 mm" in timeout[-1]["reason"], events
+    assert "joint" not in timeout[-1]["reason"], timeout[-1]["reason"]  # the joint rule is not this leg's criterion
+    done = timeout[-1]["completion"]
+    assert done["error_rad"] is None and done["position_tolerance_rad"] is None and done["hand_error_m"] == .03, done
+    assert any(e.get("kind") == "leg_progress" and e["completion"]["hand_tolerance_m"] == .002 for e in events), events
     # An arm with no hand frame (a body-list arm) refuses such a leg; one carrying its own completion rule loads.
     c, clock = setup()
     c.executor.pose_tolerances = None

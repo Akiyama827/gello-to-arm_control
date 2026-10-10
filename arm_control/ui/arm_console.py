@@ -881,7 +881,10 @@ def _plan_snapshot(world, planner_cfg, start, goal, vmax, amax, refinement, key=
         if _PLAN_WORLD is None or _PLAN_WORLD[0] != key:
             raise PlanWorldMiss(key)
         world = _PLAN_WORLD[1]
-        world.apply_planning_delta(delta)
+        try:
+            world.apply_planning_delta(delta)
+        except ValueError:  # its geometry changed in place: never plan against the stale copy
+            raise PlanWorldMiss(key) from None
     _, planner = build_collision_stack(
         None, world.joint_names, planner_cfg, cache_dir=None, collision_world=world,
     )
@@ -1217,8 +1220,11 @@ def _run(
                         panel.set_control_mode(control_mode)
                 if result['kind'] == 'leg_progress':
                     progress = result.get('completion') or {}
-                    panel.log(f"Settling: {progress.get('remaining_s', 0):.1f}s left; "
-                              f"joint error {progress.get('error_rad')} rad, "
+                    error = (f"hand {progress['hand_error_m'] * 1e3:.1f} mm / "
+                             f"{np.degrees(progress['hand_error_rad']):.1f} deg"
+                             if progress.get('hand_error_m') is not None
+                             else f"joint error {progress.get('error_rad')} rad")
+                    panel.log(f"Settling: {progress.get('remaining_s', 0):.1f}s left; {error}, "
                               f"speed {progress.get('speed_rad_s')} rad/s")
                 elif result['kind'] != 'mode' or not result['ok']:
                     panel.log(f"Controller {result['kind']}: {result.get('reason') or ''}")
@@ -1826,6 +1832,23 @@ def _check_plan_world_cache() -> None:
         child.apply_planning_delta(pickle.loads(pickle.dumps(w.planning_delta())))
         assert np.array_equal(child._held_qpos, w._held_qpos)
         assert len(pickle.dumps(w.planning_delta())) < len(pickle.dumps(w.model)) / 10
+        # geometry moved in place (no such writer today): the delta refuses, the process asks for the world whole
+        moved = pickle.loads(pickle.dumps(w))
+        moved.model.geom_pos[wall[0]] += .1
+        try:
+            child.apply_planning_delta(pickle.loads(pickle.dumps(moved.planning_delta())))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a delta from moved geometry applied")
+        _cache_plan_world(_plan_world_key(w), child)
+        try:
+            _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
+                           _plan_world_key(w), moved.planning_delta())
+        except PlanWorldMiss:
+            pass
+        else:
+            raise AssertionError("planned against stale geometry")
         other = MuJoCoCollisionWorld(cfg.urdf_path, joints[:-1], cache_dir=tmp)
         try:
             other.apply_planning_delta(w.planning_delta())
@@ -1846,7 +1869,8 @@ def _check_plan_world_cache() -> None:
             pass
         else:
             raise AssertionError("planned against a world the process does not hold")
-    print("arm_console: planning world crosses once; deltas carry contact masks/held/qpos; misses refused OK")
+    print("arm_console: planning world crosses once; deltas carry contact masks/held/qpos; moved geometry and "
+          "misses refused OK")
 
 
 def _check_graphs() -> None:

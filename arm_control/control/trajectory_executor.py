@@ -117,6 +117,7 @@ class JointTrajectoryExecutor:
                 raise ValueError("done_pose_tol must be (metres, radians), finite and positive")
             if not self._payload_frame or not hasattr(dynamics, "frame_pose"):
                 raise ValueError("done_pose_tol needs a URDF model and its ee frame (payload_frame)")
+            dynamics.frame_pose(np.zeros(n), self._payload_frame)  # a missing ee frame fails here, not at a leg's end
         self._done_pose_tol = done_pose_tol
 
     @property

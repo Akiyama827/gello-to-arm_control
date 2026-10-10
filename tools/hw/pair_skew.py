@@ -1,4 +1,4 @@
-"""Physical start skew of a released pair, observed read-only (bench 2026-10-10, open item: "no instrument").
+"""Motion-start skew of a released pair at the robots, observed read-only (bench 2026-10-10: "no instrument").
 
     python tools/hw/pair_skew.py --socket fr3_1=<sock> --socket fr3_2=<sock> [--seconds 15] [--out FILE]
     python tools/hw/pair_skew.py --analyze FILE        # re-run the estimate on a saved record
@@ -11,9 +11,14 @@ state_history/1 (every RT packet the PC received: measured q, stamped on the RT 
 Per arm it fits ONE delay d: the measured joints over the leg's first second against the arm's own reference, shifted by d
 from that leg's anchor (its reference time zero on the PC clock; a scheduled pair gives both the same one). d holds
 everything between the anchor and the arm actually moving -- the PC tick phase of its first command, the RT tick that
-applies it, the robot's tracking lag -- so each arm moves at anchor + d, and the PHYSICAL skew is the difference of those. Packets come at 250 Hz (4 ms); the fit uses every packet of the window, so it resolves
-well below that on a smooth leg, and the residual it prints says whether the fit holds. The box->PC clock mapping is each
-arm's minimum (PC receipt - RT stamp), i.e. one network latency, common to both arms to ~0.1 ms (printed per arm).
+applies it, the robot's tracking lag -- so each arm moves at anchor + d, and ``motion_delay_difference_ms`` is the
+difference of those: when the arms' motions line up, which is what a shared object feels. It is the START skew only when
+both arms track alike (same gains, similar motion and load): two arms started together with 10 ms and 25 ms tracking lags
+read 15 ms, and the fit residual cannot tell (review 2026-10-10). Compare like legs (the same joint move on both) to
+read it as start skew. Packets come at 250 Hz (4 ms); the fit uses every packet of the window, so it resolves
+well below that on a smooth leg; a large residual means no single delay explains the motion (a push, a leg that barely
+moves). The box->PC clock mapping is the minimum (PC receipt - RT stamp) over both arms when they report one RT clock (each
+arm's own minimum otherwise, printed), i.e. one network latency.
 It reports the PC-side skew of the first commanded tick too (the supervisors' "first sample" lines).
 """
 from __future__ import annotations
@@ -79,6 +84,9 @@ def _leg(rec: dict):
 
 def estimate(record_: dict) -> dict:
     result = {}
+    domains = {rec.get("clock_domain") for rec in record_.values()}
+    shared = len(domains) == 1 and None not in domains
+    shared_offset = min(p["rx_pc"] - p["t_rt"] for rec in record_.values() for p in rec["packets"]) if shared else None
     for arm, rec in record_.items():
         plan, anchor, first, e, q_ref = _leg(rec)
         packets = rec["packets"]
@@ -86,7 +94,8 @@ def estimate(record_: dict) -> dict:
             raise ValueError(f"{arm}: {len(packets)} RT packets recorded; polling fell behind")
         t_rt = np.array([p["t_rt"] for p in packets])
         q = np.array([p["q"] for p in packets])
-        offset = float(np.min([p["rx_pc"] - p["t_rt"] for p in packets]))  # box -> PC, one latency included
+        own = float(np.min([p["rx_pc"] - p["t_rt"] for p in packets]))  # box -> PC, one latency included
+        offset = own if shared_offset is None else float(shared_offset)
         phase = t_rt + offset - anchor                                      # each packet's reference phase at d = 0
         window = (e >= 0) & (e <= FIT_WINDOW_S)
         joints = np.flatnonzero(np.ptp(q_ref[window], axis=0) > MOVING_RAD) if window.any() else []
@@ -99,19 +108,22 @@ def estimate(record_: dict) -> dict:
             err = float(np.sqrt(np.mean((q[use][:, joints] - ref) ** 2)))
             if best is None or err < best[1]:
                 best = (float(d), err)
+        edge = bool(min(abs(best[0] - DELAYS_S[0]), abs(best[0] - DELAYS_S[-1])) < 1e-3)
         result[arm] = dict(plan_id=plan, delay_ms=best[0] * 1e3, fit_rms_mrad=best[1] * 1e3, joints=[int(j) + 1 for j in joints],
-                           packets=int(use.sum()), clock_offset_s=offset, first_command_pc=first, anchor_pc=anchor,
-                           trace_dropped=rec["trace_dropped"], clock_domain=rec.get("clock_domain"))
+                           packets=int(use.sum()), clock_offset_s=offset, own_clock_offset_s=own, first_command_pc=first,
+                           anchor_pc=anchor, trace_dropped=rec["trace_dropped"], clock_domain=rec.get("clock_domain"),
+                           delay_at_search_edge=edge)  # true delay may lie outside the search: not a measurement
     arms = list(result)
     if len(arms) == 2:
         a, b = arms
-        domains = {result[a]["clock_domain"], result[b]["clock_domain"]}
+        pair = {str(result[x]["plan_id"]).split(":", 1)[0] for x in arms}
         result["skew"] = dict(
-            physical_ms=(result[a]["anchor_pc"] - result[b]["anchor_pc"]) * 1e3 + result[a]["delay_ms"] - result[b]["delay_ms"],
+            same_pair=len(pair) == 1,  # plan ids "<pair>:<arm>"; False: the arms' first legs are not one pair
+            motion_delay_difference_ms=(result[a]["anchor_pc"] - result[b]["anchor_pc"]) * 1e3 + result[a]["delay_ms"] - result[b]["delay_ms"],
             pc_first_command_ms=(result[a]["first_command_pc"] - result[b]["first_command_pc"]) * 1e3,
             anchor_difference_ms=(result[a]["anchor_pc"] - result[b]["anchor_pc"]) * 1e3,
-            clock_offset_difference_ms=(result[a]["clock_offset_s"] - result[b]["clock_offset_s"]) * 1e3,
-            one_rt_clock=len(domains) == 1 and None not in domains)
+            own_clock_offset_difference_ms=(result[a]["own_clock_offset_s"] - result[b]["own_clock_offset_s"]) * 1e3,
+            one_rt_clock=shared)
     return result
 
 
@@ -140,13 +152,17 @@ def _synthetic(delays_s: dict, anchors=(100.0, 100.0), offset=-50.0, seed=0) -> 
 
 def _self_check() -> None:
     got = estimate(_synthetic({"fr3_1": 0.0062, "fr3_2": 0.0021}))
-    assert abs(got["skew"]["physical_ms"] - 4.1) < 0.4, got["skew"]
-    assert got["skew"]["one_rt_clock"] and all(got[a]["fit_rms_mrad"] < 0.5 for a in ("fr3_1", "fr3_2")), got
+    json.dumps(got)  # main prints it
+    assert abs(got["skew"]["motion_delay_difference_ms"] - 4.1) < 0.4, got["skew"]
+    assert got["skew"]["one_rt_clock"] and got["skew"]["same_pair"], got["skew"]
+    assert all(got[a]["fit_rms_mrad"] < 0.5 and not got[a]["delay_at_search_edge"] for a in ("fr3_1", "fr3_2")), got
+    far = estimate(_synthetic({"fr3_1": 0.2, "fr3_2": 0.0021}, seed=3))
+    assert far["fr3_1"]["delay_at_search_edge"], far["fr3_1"]
     swapped = estimate(_synthetic({"fr3_1": 0.0021, "fr3_2": 0.0062}, seed=1))
-    assert abs(swapped["skew"]["physical_ms"] + 4.1) < 0.4, swapped["skew"]
+    assert abs(swapped["skew"]["motion_delay_difference_ms"] + 4.1) < 0.4, swapped["skew"]
     # released apart (no common anchor): each arm moves at its own anchor + d
     apart = estimate(_synthetic({"fr3_1": 0.0062, "fr3_2": 0.0021}, anchors=(100.0, 100.003), seed=2))
-    assert abs(apart["skew"]["physical_ms"] - 1.1) < 0.4 and abs(apart["skew"]["anchor_difference_ms"] + 3) < .1, apart
+    assert abs(apart["skew"]["motion_delay_difference_ms"] - 1.1) < 0.4 and abs(apart["skew"]["anchor_difference_ms"] + 3) < .1, apart
     still = _synthetic({"fr3_1": 0.0, "fr3_2": 0.0})
     for s in still["fr3_2"]["trace"]:
         s["executing"] = False
@@ -156,8 +172,8 @@ def _self_check() -> None:
         assert "no executing tick" in str(exc)
     else:
         raise AssertionError("a record without a leg was estimated")
-    print("pair_skew: recovers a 4.1 ms physical skew (either sign, common or separate anchors) from 250 Hz packets "
-          "on one RT clock; no leg refused OK")
+    print("pair_skew: recovers a 4.1 ms motion-delay difference (either sign, common or separate anchors) from 250 Hz packets "
+          "on one RT clock; search-edge flagged; no leg refused OK")
 
 
 def main() -> None:
