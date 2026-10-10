@@ -120,6 +120,10 @@ def main() -> None:
         hand.set_armed(True, fault="latched")
         home_refused("no fault")
         hand.set_armed(True)
+        hand.set_scene_state({"status": "carrying"})  # a carried scene object, whatever the grasp bit says
+        home_refused("remove the object")
+        hand.set_scene_state(None)
+        hand.set_armed(True)
         hand._post("hand_home", {})
         try:  # a second click before the loop consumed the first
             hand._post("hand_home", {})

@@ -51,7 +51,7 @@ from arm_control.ui.hand_panel import HandPanel
 from arm_control.ui.jog_panel import JogPanel
 from arm_control.grasp_visual import VisualFK
 from arm_control.joint_motor_map import finger_from_width
-from arm_control.contracts import unpack_json_message
+from arm_control.contracts import pack_json_message, unpack_json_message
 from arm_control.contracts.motion import pack_control_update, pack_jog, pack_plan, unpack_controller_event
 from arm_control.contracts.motor import pack_motor_command, unpack_motor_state
 from arm_control.planning.planner import build_collision_stack
@@ -619,8 +619,8 @@ class ControlPanel:
                 self.jog.release()
 
     def request_home(self) -> None:
-        """Home the Hand (a full open/close sweep that re-measures its stroke): the same request as touching the graph's
-        ``arm_gripper_home.<ARM_ID>`` file, gated like the slider, plus: idle, fresh, holding nothing."""
+        """Home the Hand (a full open/close sweep that re-measures its stroke), sent to this graph's Hand node as
+        ``hand_home``; gated like the slider, plus: idle, fresh, holding nothing (the node checks those again)."""
         with self._lock:
             hand = self.hand.snapshot(armed=self._armed, fault=self._fault)
             reason = ("Hand motion requires confirmed ARM and no fault" if self._armed is not True or self._fault
@@ -875,6 +875,7 @@ def _plan_snapshot(world, planner_cfg, start, goal, vmax, amax, refinement, key=
 
     ``world`` None: the copy this process cached under ``key``, brought up to date by ``delta`` (its planning_delta):
     the model crosses the process boundary once per world object, not once per plan."""
+    global _PLAN_WORLD
     if world is not None:
         _cache_plan_world(key, world)
     else:
@@ -883,7 +884,8 @@ def _plan_snapshot(world, planner_cfg, start, goal, vmax, amax, refinement, key=
         world = _PLAN_WORLD[1]
         try:
             world.apply_planning_delta(delta)
-        except ValueError:  # its geometry changed in place: never plan against the stale copy
+        except Exception:  # its geometry changed in place, or the copy is unusable: never plan against it
+            _PLAN_WORLD = None
             raise PlanWorldMiss(key) from None
     _, planner = build_collision_stack(
         None, world.joint_names, planner_cfg, cache_dir=None, collision_world=world,
@@ -1220,11 +1222,8 @@ def _run(
                         panel.set_control_mode(control_mode)
                 if result['kind'] == 'leg_progress':
                     progress = result.get('completion') or {}
-                    error = (f"hand {progress['hand_error_m'] * 1e3:.1f} mm / "
-                             f"{np.degrees(progress['hand_error_rad']):.1f} deg"
-                             if progress.get('hand_error_m') is not None
-                             else f"joint error {progress.get('error_rad')} rad")
-                    panel.log(f"Settling: {progress.get('remaining_s', 0):.1f}s left; {error}, "
+                    panel.log(f"Settling: {progress.get('remaining_s', 0):.1f}s left; "
+                              f"joint error {progress.get('error_rad')} rad, "
                               f"speed {progress.get('speed_rad_s')} rad/s")
                 elif result['kind'] != 'mode' or not result['ok']:
                     panel.log(f"Controller {result['kind']}: {result.get('reason') or ''}")
@@ -1376,9 +1375,9 @@ def _run(
         if hand_request is not None:
             node.send_output("grasp_request", pack_grasp_request(**hand_request))
         if panel.pop_home():
-            # The Hand node's own operator trigger (it owns the bridge link; this graph shares its ARM_ID).
-            from arm_control.end_effectors.franka_adapter import HOME_FILE
-            HOME_FILE.touch()
+            # A graph topic, not the trigger file: that file is shared by every graph without an ARM_ID (review
+            # 2026-10-10: a sim page's Home would have homed a real Hand). The Hand node re-gates it (empty, idle).
+            node.send_output("hand_home", pack_json_message("hand_home", {}))
         declaration = panel.pop_payload()
         if declaration is not None and scene_actions is None:
             node.send_output("control", pack_control_update(payload=declaration))
@@ -1846,9 +1845,22 @@ def _check_plan_world_cache() -> None:
             _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
                            _plan_world_key(w), moved.planning_delta())
         except PlanWorldMiss:
-            pass
+            assert _PLAN_WORLD is None, "a refused delta must drop the cached copy"
         else:
             raise AssertionError("planned against stale geometry")
+        turned = pickle.loads(pickle.dumps(w))
+        turned.model.jnt_axis[0] = turned.model.jnt_axis[0][[1, 2, 0]]  # joint kinematics count as geometry
+        assert turned.planning_delta()["_geometry"] != w.planning_delta()["_geometry"]
+        _cache_plan_world(_plan_world_key(w), pickle.loads(pickle.dumps(w)))
+        broken = w.planning_delta()
+        broken.pop("_query_state")  # any failure to apply, not only ValueError, is a miss and drops the copy
+        try:
+            _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
+                           _plan_world_key(w), broken)
+        except PlanWorldMiss:
+            assert _PLAN_WORLD is None
+        else:
+            raise AssertionError("planned with a delta that did not apply")
         other = MuJoCoCollisionWorld(cfg.urdf_path, joints[:-1], cache_dir=tmp)
         try:
             other.apply_planning_delta(w.planning_delta())
@@ -1890,13 +1902,19 @@ def _check_graphs() -> None:
                     f"{graph.name}/{console['id']}: console needs exactly one "
                     "authority feedback source, never an optimistic ARM badge"
                 )
+                # Home is a graph topic to the node that serves the console's grasp_request (the same Hand)
+                hands = [n for n in spec["nodes"]
+                         if (n.get("inputs") or {}).get("grasp_request") == f"{console['id']}/grasp_request"]
+                assert "hand_home" in (console.get("outputs") or []) and len(hands) == 1 and (
+                    hands[0]["inputs"].get("hand_home") == f"{console['id']}/hand_home"), (
+                    f"{graph.name}/{console['id']}: hand_home must reach the Hand node its grasp_request does")
         assert not any(str(n.get("path", "")).endswith("arm_controller.py") for n in spec.get("nodes", [])), (
             f"{graph.name}: the retired in-process arm_controller node is wired")
         from arm_control.supervisor.dora_arm import unhandled_inputs
         unhandled = unhandled_inputs(graph)
         assert not unhandled, f"{graph.name}: supervised_arm is wired {unhandled}, which it has no handler for (dropped silently)"
     assert checked, "no console found in any graph -- did paths change?"
-    print(f"arm_console: {checked} console wirings have one authority feedback source")
+    print(f"arm_console: {checked} console wirings have one authority feedback source and their Home reaches their Hand")
 
 
 def cli() -> None:

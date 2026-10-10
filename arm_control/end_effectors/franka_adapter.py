@@ -93,6 +93,27 @@ def _open_line(fsm: HandGraspFsm) -> str:
     return _request_line(fsm.parameters, "release")
 
 
+def home_refusal(state: dict | None, require_authority: bool) -> str:
+    """Why the Hand may not home now, or "". Homing sweeps the fingers fully open and closed: never with an object."""
+    if require_authority:
+        return "homing is the manual consoles' (this graph gates Hand moves on the arm)"
+    state = state or {}
+    if not (state.get("available") and state.get("measured")) or state.get("busy"):
+        return "Hand unavailable, unmeasured or busy"
+    if state.get("is_grasped") is not False:
+        return "the Hand may be holding something: open it and remove the object first"
+    return ""
+
+
+def request_home(client, require_authority: bool) -> None:
+    reason = home_refusal(client.snapshot(), require_authority)
+    if reason:
+        print(f"[franka_gripper] HOME refused: {reason}", flush=True)
+        return
+    client.want_home = True
+    print("[franka_gripper] homing requested (keep fingers clear)", flush=True)
+
+
 def submit_grasp_request(client, fsm: HandGraspFsm, req: dict, now: float, *,
                          require_authority=False, authorized=False, position_pending=False) -> dict | None:
     """Validate/admit before touching the FSM so rejection preserves active IDs."""
@@ -360,7 +381,8 @@ class BridgeClient(threading.Thread):
                         self.send_line(f"MOVE {w:.5f} {min(MOVE_SPEED, self.limits.speed_max_mps):.3f}")
                     if self.want_home:
                         self.want_home = False
-                        self.send_line("HOME")
+                        if not self.send_line("HOME"):
+                            print("[franka_gripper] HOME refused: Hand busy, unmeasured or stopping", flush=True)
                     with self._lock:
                         cancel, self._cancel = self._cancel, False
                         command, self._command = self._command, None
@@ -458,6 +480,8 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
                                  and not health.get('any_fault') and not health.get('latched_fault'))
             elif event['type'] == 'INPUT' and event['id'] == 'arm':
                 operator_armed = unpack_json_message(event['value']).get('armed') is True
+            elif event['type'] == 'INPUT' and event['id'] == 'hand_home':
+                request_home(client, require_authority)  # the console's Home: this graph's Hand, nobody else's
             elif event['type'] == 'INPUT' and event['id'] == 'hand_move_request':
                 req = unpack_json_message(event['value'], expected_schema='hand_move_request')
                 try:
@@ -489,8 +513,7 @@ def _run(shutdown: ShutdownFlag, cleanup: ExitStack) -> None:
                     )
         if not require_authority and HOME_FILE.exists():
             HOME_FILE.unlink(missing_ok=True)
-            client.want_home = True
-            print("[franka_gripper] homing requested (keep fingers clear)", flush=True)
+            request_home(client, require_authority)
         now = time.monotonic()
         state = client.snapshot()
         state['effort_observed'] = False
@@ -576,7 +599,22 @@ def _demo() -> None:
     assert "MOVE 0.04000 0.050 failed: hand action failed" in out.getvalue(), out.getvalue()
     assert client._inflight is None and not client.pop_failures() and not client.pop_move_results()
 
-    print("[franka_gripper] demo OK — FSM verdicts + wire framing + unrequested-move failure")
+    # homing: the node's own gate (whatever asked), never with an object, never in a gated graph
+    idle = dict(available=True, measured=True, busy=False, is_grasped=False)
+    assert home_refusal(idle, False) == ""
+    for state, gated in ((dict(idle, is_grasped=True), False), (dict(idle, is_grasped=None), False),
+                         (dict(idle, busy=True), False), (dict(idle, measured=False), False), (None, False), (idle, True)):
+        assert home_refusal(state, gated), (state, gated)
+    client._inflight = None
+    client.state = dict(idle, is_grasped=True)
+    client._connected = True
+    client.want_home = False
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        request_home(client, False)
+    assert not client.want_home and "HOME refused" in out.getvalue(), out.getvalue()
+
+    print("[franka_gripper] demo OK — FSM verdicts + wire framing + unrequested-move failure + homing gate")
 
 
 def cli() -> None:

@@ -70,14 +70,16 @@ class MuJoCoCollisionWorld:
         return state
 
     def _geometry_digest(self) -> str:
-        """The model's placement and shape fields (not the masks a delta carries): a copy whose digest differs plans
+        """The model's placement, shape and joint-kinematics fields (not the masks a delta carries; not mesh data, which
+        nothing edits in place): a copy whose digest differs plans
         against other geometry, so a delta never applies to it (fail closed: the caller sends the world whole)."""
         import hashlib
 
         m = self.model
         h = hashlib.sha256()
         for field in ("geom_type", "geom_dataid", "geom_bodyid", "geom_pos", "geom_quat", "geom_size", "geom_margin",
-                      "geom_gap", "body_parentid", "body_pos", "body_quat", "jnt_range", "qpos0"):
+                      "geom_gap", "geom_rbound", "body_parentid", "body_pos", "body_quat", "jnt_pos", "jnt_axis",
+                      "jnt_range", "qpos0"):
             h.update(np.ascontiguousarray(getattr(m, field)).tobytes())
         return h.hexdigest()
 
