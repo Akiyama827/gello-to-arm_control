@@ -87,9 +87,10 @@ MODULE_CHECKS = (
     "arm_control.scene", "arm_control.simulation.rerun_scene", "arm_control.supervisor.launch", "arm_control.supervisor.scene_observer", "arm_control.ui.hand_panel", "arm_control.ui.jog_panel",
     "arm_control.ui.operator_arm --self-check", "arm_control.viz.visualizer --self-check",
 )
-# Scripts outside tools/ with their own self-check.
+# Scripts with their own device-free self-check (an hw/ tool's estimator runs here; the tool itself never does).
 SCRIPT_CHECKS = (
     "examples/run_console.py --self-check", "tools/assets/setup_fr3.py --self-check", "rt/bindings/pose_hold_check.py",
+    "tools/hw/pair_skew.py --self-check",
 )
 
 def git(*args: str) -> str:
