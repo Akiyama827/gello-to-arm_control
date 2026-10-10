@@ -176,6 +176,7 @@ def main():
     check_factory_envelope()
     check_modes_and_validation()
     check_cartesian_lifecycle()
+    check_cartesian_completion()
     check_completion_order()
     print("execution policy: start/release, tracking, outage, finite state, relatch, health, opt-out OK")
 
@@ -622,6 +623,70 @@ def check_cartesian_lifecycle():
     assert any(e.get("kind") == "leg_result" and not e["ok"] and "malformed plan" in e["reason"] for e in events), events
     c.on_plan(cartesian_plan())
     assert c._plan is not None, "a good plan after a malformed one must load"
+
+
+def check_cartesian_completion():
+    """A Cartesian leg with no completion rule settles on the HAND (operator 2026-10-10): at rest, the hand inside a sanity
+    bound (20 mm / 5 deg) of FK(planned end), wherever the joints rest in the null space (bench rung 6: j1 +32 / j3 -38 mrad
+    at 0.00 mm timed out under the joint rule). And the factory states ki at the profile kp (kp-scaled integral)."""
+    from pathlib import Path
+
+    import pinocchio as pin
+    from arm_control.config import load_robot_config
+    from arm_control.control.factory import build_arm_controller, build_executor
+    from arm_control.motion import JointState
+
+    cfg = load_robot_config(Path(__file__).resolve().parents[2] / "examples/configs/sim_arm.yaml")
+    ex = build_executor(cfg)
+    assert np.allclose(ex.pose_tolerances, (.02, np.radians(5.))), ex.pose_tolerances
+    goal = np.array([0., -.785, 0., -2.356, 0., 1.571, .785])
+    dyn = ex._dyn
+    q_full = dyn._embed(goal, np.zeros(7), np.zeros(7))[0]
+    J = pin.computeFrameJacobian(dyn._model, dyn._data, q_full, dyn._model.getFrameId(ex._payload_frame),
+                                 pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)[:, dyn._v_indices]
+    null = np.linalg.svd(J)[2][-1]
+    swivel = goal + .04 * null / np.max(np.abs(null))  # 40 mrad on some joint, the hand (to second order) still
+    rest = lambda q, v=0.: JointState(position=q, velocity=np.full(7, v))  # noqa: E731
+    assert not ex.at_goal(goal, rest(swivel)), "the swivel must fail the joint rule, or this checks nothing"
+    assert ex.hand_error(goal, swivel)[0] < 1e-3 and ex.hand_at_goal(goal, rest(swivel)), ex.hand_error(goal, swivel)
+    assert not ex.hand_at_goal(goal, rest(swivel, .1)), "moving is not settled"
+    far = goal + np.r_[0., .1, 0., 0., 0., 0., 0.]
+    assert ex.hand_error(goal, far)[0] > .02 and not ex.hand_at_goal(goal, rest(far)), ex.hand_error(goal, far)
+    tilted = goal + np.r_[0., 0., 0., 0., 0., 0., .1]  # j7 alone: rotation only, ~5.7 deg
+    assert ex.hand_error(goal, tilted)[1] > np.radians(5.) and not ex.hand_at_goal(goal, rest(tilted))
+
+    # The controller asks the hand rule for a Cartesian leg without a rule, the joint rule otherwise.
+    for cartesian in (True, False):
+        c, clock = setup(health=False, settle_dwell_s=0.)
+        c.executor.at_goal = lambda *a, **k: not cartesian
+        c.executor.hand_at_goal = lambda *a, **k: cartesian
+        c.on_plan(cartesian_plan() if cartesian else plan())
+        c.on_control(pack_control_update(execute="p"))
+        advance(c, clock, 1.3)
+        assert not c._running and not c.frozen, (cartesian, c.frozen)
+    # A Cartesian leg that settles outside the bound times out (frozen) and names the hand error.
+    c, clock = setup(health=False, settle_dwell_s=0., settle_timeout_s=.5)
+    c.executor.hand_at_goal = lambda *a, **k: False
+    c.executor.hand_error = lambda *a, **k: (.03, .01)
+    c.on_plan(cartesian_plan())
+    c.on_control(pack_control_update(execute="p"))
+    advance(c, clock, 2.)
+    events = [unpack_json_message(v) for t, v in c.node.sent if t == "controller_event"]
+    assert c.frozen and any(e.get("kind") == "leg_result" and not e["ok"] and "hand error 30.00 mm" in e["reason"]
+                            for e in events), events
+    # An arm with no hand frame (a body-list arm) refuses such a leg; one carrying its own completion rule loads.
+    c, clock = setup()
+    c.executor.pose_tolerances = None
+    c.on_plan(cartesian_plan())
+    assert c._plan is None
+    c.on_plan(cartesian_plan(completion=dict(vel_tol=.01, goal_q=None, residual_max=None)))
+    assert c._plan is not None
+
+    names = list(cfg.get("joint_names") or cfg.get("motor_names"))
+    mode = {"controller": {"kp_max": 1200., "kp": dict(zip(names, [600.] * 4 + [250., 150., 60.])), "kd": {j: 2. for j in names},
+                           "ki": {j: 1. for j in names}, "i_limit": {j: 1. for j in names}}}
+    c = build_arm_controller(cfg, _FakeNode(), arm_id="arm", mode_cfg=mode)
+    assert np.array_equal(c.integral.kp_ref, [600.] * 4 + [250., 150., 60.]), c.integral.kp_ref
 
 
 def check_completion_order():

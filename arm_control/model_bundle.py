@@ -290,7 +290,9 @@ def bind_gravity(bundle: ModelBundle, declaration: dict, *, installation_epoch: 
                     installation_epoch=installation_epoch)
     for key, value in expected.items():
         if binding["reviewed_against"].get(key) != value:
-            raise ValueError(f"gravity reviewed_against.{key} does not match selected model/installation")
+            # the expected value is printed: base_sha256 is a digest nobody computes by hand (bundle activation, RUNBOOK)
+            raise ValueError(f"gravity reviewed_against.{key} does not match selected model/installation: "
+                             f"the selected bundle gives {value!r}, the declaration {binding['reviewed_against'].get(key)!r}")
     if bundle.base.get("mount_epoch", installation_epoch) != installation_epoch:
         raise ValueError("gravity installation epoch differs from bundle mount_epoch")
     _check_gravity_model(binding, bundle.model_urdf)
