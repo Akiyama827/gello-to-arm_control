@@ -8,7 +8,8 @@
 //
 // COMMANDS NOTHING: a Robot, one readOnce(), loadModel() and model.pose() -- no control(), no writeOnce(), no setEE/setLoad.
 // PRECONDITION as flange_probe: the FCI allows ONE client, held by the RT server's Robot object for its whole lifetime, so
-// the RT server must be STOPPED (disarming is not enough). Runs from the PC (the robot IP through the box's NAT) or the box.
+// the RT server must be STOPPED (disarming is not enough). Run it ON THE RT BOX: libfranka's robot state is server-push UDP,
+// which cannot cross the box's NAT back to the PC (from the PC: "UDP receive: Timeout", bench 2026-10-10).
 //
 //   ./cartesian_probe [robot_ip] [samples]
 #include <algorithm>

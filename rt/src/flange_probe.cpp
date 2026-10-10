@@ -21,10 +21,11 @@
 //
 //   ssh ok@172.16.1.2 'sudo systemctl stop arm-rt-server.service'
 //
-// Runs fine from the PC: the default IP is the ROBOT on the FCI wire
-// (172.16.0.3), which the PC reaches through the box's NAT, and readOnce is
-// one non-realtime request. 172.16.1.2 is the RT BOX -- passing it here
-// connects to nothing.
+// Run it ON THE RT BOX (next to arm_rt_server_frk, whose lib/ it uses): the
+// default IP is the ROBOT on the FCI wire (172.16.0.3); readOnce waits for
+// the robot's server-push UDP state, which does not cross the box's NAT back
+// to the PC (from the PC it times out -- cartesian_probe, bench 2026-10-10).
+// 172.16.1.2 is the RT BOX -- passing it here connects to nothing.
 //
 //   ./flange_probe [robot_ip] >> samples.jsonl
 //
