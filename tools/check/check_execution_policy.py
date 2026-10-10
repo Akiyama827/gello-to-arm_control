@@ -582,6 +582,20 @@ def check_cartesian_lifecycle():
             later = commands(c)[sent:]
             assert later and all(m["cartesian"] is None for m in later), (strict, after, [m["cartesian"] for m in later])
 
+    # The joint integral during a leg: a joint leg integrates its tracking error; a Cartesian leg keeps the bias it entered
+    # with, unchanged (operator 2026-10-10: its stiffness is K_c's; no accumulation against a push, no step at the start).
+    from arm_control.control.integral import IntegralState
+    entered = np.full(7, .5)
+    for cartesian in (False, True):
+        c, clock = setup(integral_state=IntegralState(7, ki=[100.] * 7, i_limit=[3.] * 7))
+        c.integral._bias = entered.copy()
+        c.on_plan(cartesian_plan(positions=np.full((2, 7), .005)) if cartesian else plan(positions=np.full((2, 7), .005)))
+        c.on_control(pack_control_update(execute="p"))
+        advance(c, clock, .5, dt=.01)  # measured q = 0: a 5 mrad error, inside the integral's window
+        assert c._running and (commands(c)[-1]["cartesian"] is not None) == cartesian
+        bias = c.integral.bias
+        assert (np.array_equal(bias, entered) if cartesian else np.all(bias > entered + .1)), (cartesian, bias)
+
     # A jog while a gated Cartesian plan is staged (loaded, not released) is the joint law: the spec belongs to the leg.
     c, clock = setup()
     c.on_plan(cartesian_plan())
