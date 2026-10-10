@@ -733,9 +733,12 @@ class ArmController:
         self._stream_sent_at = None
         self._stream_sent_target = None
         self._running = True
+        # Stamped (the reference clock; a pair's supervisors share the PC's monotonic clock): `start` is when the trajectory
+        # begins, `taken` when this controller took the release -- a pair's start skew on the PC side is the difference of
+        # its two lines. Not the physical skew at the robots.
         print(
             f"[arm_controller] executing {self._plan['phase']} "
-            f"({plan_id}, {self._pending_traj.duration_sec:.2f}s)",
+            f"({plan_id}, {self._pending_traj.duration_sec:.2f}s) start={start:.6f} taken={self.exec_time:.6f}",
             flush=True,
         )
 
