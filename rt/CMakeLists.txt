@@ -56,6 +56,14 @@ if(WITH_FRANKA)
     INSTALL_RPATH "\$ORIGIN/lib")
   target_link_options(flange_probe PRIVATE -Wl,--disable-new-dtags)
 
+  # Read-only Cartesian-law probe (rungs 2/3): the box's FK call against O_T_EE, and its cost. Same layout as flange_probe.
+  add_executable(cartesian_probe src/cartesian_probe.cpp)
+  target_link_libraries(cartesian_probe PRIVATE Franka::Franka Eigen3::Eigen)
+  set_target_properties(cartesian_probe PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib"
+    INSTALL_RPATH "\$ORIGIN/lib")
+  target_link_options(cartesian_probe PRIVATE -Wl,--disable-new-dtags)
+
   add_executable(hand_bridge src/hand_bridge.cpp)
   add_executable(hand_bridge_selfcheck src/hand_bridge_selfcheck.cpp)
   target_link_libraries(hand_bridge_selfcheck PRIVATE Franka::Franka Threads::Threads)
