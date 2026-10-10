@@ -35,3 +35,12 @@ errors are 400s):
   POST is in flight and ignores a preset click while a pose POST is pending; `peer_parked --self-check` derives its expected
   error from the declared park instead of a third hard-coded copy. Left: re-clicking the preset discards a preview (by
   design, documented); a preset clicked before the first measured state is overwritten by the first-state sync (as any edit).
+
+Review round 2 (Opus xhigh, PASS-WITH-FIXES; three mutants of the new park check each fail it; the CSS change hides only the
+two preset rows): SHOULD: the bootstrap eye check said "clear of the previewed path", but the preview draws the peer AT its
+declared park, which the plan avoids by construction -> the RUNBOOK says to look at the other arm on the bench, not the drawn
+one, and "may not be" where the model puts it. NITs taken: the peer check needs the `dual_franka` profile (named); "move it
+clear in Desk" spelled out; the check imports `arm_joints` from `arm_control.config` and names a missing `park_q`. Left: the
+check validates against `arm_joints(cfg)` while the console honours a mode's `planner.joints` (no mode sets it); a preset
+click during a pose POST is ignored without a status line; whether one FR3 servoing while the other's server only streams
+state counts as unqualified dual-FCI timing (pre-existing, operator).
