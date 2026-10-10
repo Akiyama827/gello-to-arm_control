@@ -92,8 +92,8 @@ def main() -> None:
         assert empty._state()["pose_presets"] == [] and empty._state()["joint_presets"] == []
     finally:
         empty.close()
-    # Hand homing: the page's Home button requests what touching arm_gripper_home.<ARM_ID> does, gated like the slider,
-    # plus fresh, idle and empty (the sweep closes fully). One request per click, consumed once by the console loop.
+    # Hand homing: the page's Home button (sent to this graph's Hand node as hand_home), gated like the slider, plus
+    # fresh, idle and empty (the sweep closes fully). One request per click, consumed once by the console loop.
     hand = console.ControlPanel(["j"], [-1.0], [1.0], port=0, vfk=vfk)
     try:
         def home_refused(why):

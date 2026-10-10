@@ -79,3 +79,13 @@ across round trips and 9 mutations, so consecutive plans stay deltas: whole 2.19
 Not taken: exporting ARM_ID for `calibrate` (it would rename that graph's lock, recording and trigger files; Home no longer
 depends on it). Noted, not this bundle: `planner.py`'s timed_out -> hold path cannot fire in supervised real-add either
 (no `leg_progress` forwarding); owner decision.
+
+Review round 3 (Opus xhigh, PASS-WITH-FIXES; the round-2 diff only). Verified: all four console graphs wire `hand_home`
+to the Hand serving the console's `grasp_request` (16 wiring mutants killed by the two graph checks); a LIVE sim graph
+(library `sim_franka_motion` + sim supervisor): Home DISARMED -> 400, ARMed -> `[franka_gripper] homing requested`, a
+second Home mid-sweep -> 400, the trigger file mid-slider-close or mid-sweep -> `HOME refused: ... busy`; the bench-world
+digest is stable over round trips and 9 mutations (deltas 0.06-0.13 s after one 2.07 s whole send). Note: Dora 1.0.1 does
+NOT raise on an undeclared output, it drops it with a warning, so the graph checks are what keep a missing wire off the
+bench. Taken: the project's `check_calibration_contract` expected the calibrate Hand's exact inputs (MUST: red until
+`hand_home` was added); the project's graph check matches any `arm_console.py`; the adapter docstring, a check comment and
+the RUNBOOK ("not reporting a grasp", the trigger file skips the console's checks) corrected.

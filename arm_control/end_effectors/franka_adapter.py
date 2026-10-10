@@ -22,9 +22,10 @@ acknowledges receipt; idle, available, fresh measured state must follow.
 
 Input ``gripper``: motor_command_gripper format (finger metres, e.g. the
 teleop slider), latest-wins with a 2 mm width deadband. Output
-``gripper_state``: width + is_grasped. ``touch /tmp/arm_gripper_home``
-requests a homing cycle (physical open-close — needed once per Hand
-power-cycle; deliberately never automatic).
+``gripper_state``: width + is_grasped. Input ``hand_home`` (the manual
+console's Home, a graph topic) or touching ``$XDG_RUNTIME_DIR/arm_gripper_home[.<ARM_ID>]``
+requests a homing cycle (physical open-close; deliberately never automatic),
+both through ``home_refusal``: ungated graphs only, idle, measured, no grasp reported.
 
 Input ``grasp_request`` / output ``grasp_result`` (pick graphs): the
 orchestrator's grasp contract, served by the Hand itself — ``close`` maps to the bridge GRASP verb (the Hand's own
