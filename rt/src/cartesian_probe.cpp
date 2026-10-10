@@ -60,7 +60,10 @@ int main(int argc, char** argv) {
       const auto t0 = std::chrono::steady_clock::now();
       const auto T = model.pose(franka::Frame::kEndEffector, s.q, s.F_T_EE, s.EE_T_K);
       const auto t1 = std::chrono::steady_clock::now();
-      if (!std::isfinite(T[12])) return 1;
+      if (!std::isfinite(T[12])) {
+        std::fprintf(stderr, "cartesian_probe: model.pose returned a non-finite pose\n");
+        return 1;
+      }
       us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
     }
     std::sort(us.begin(), us.end());
