@@ -603,7 +603,11 @@ class ArmController:
                 self._cartesian_now = None
         if self._running and self._reference is not None:
             point = self._reference.sample(self.exec_time)
-            bias = self.integral.update(*cycle, point.position, arm.position, self.executor.kp)
+            # A Cartesian leg's stiffness is K_c's (operator 2026-10-10): its joint integral is FROZEN -- updated with zero
+            # error, so it neither accumulates against a push or a contact nor jumps; the bias it entered with (the hold's
+            # gravity residual) stays, so the leg starts without a torque step.
+            q_int = arm.position if self._cartesian_now is not None else point.position
+            bias = self.integral.update(*cycle, q_int, arm.position, self.executor.kp)
             command = self.executor.step(point, arm, integral_bias=bias)
             self._hold_anchor = None  # motion streams: next hold re-anchors
             if self._send(command, True) is False:
