@@ -317,6 +317,10 @@ class ArmController:
         # the execution_policy block on purpose — the graphs that configure no
         # policy are exactly the ones with no other admission check.
         reason = gain_error(plan["kp"], plan["kd"])
+        if not reason and plan.get("cartesian") is not None and plan.get("completion") is None \
+                and getattr(self.executor, "pose_tolerances", None) is None:
+            reason = ("a Cartesian leg without a completion rule completes on the hand pose: this arm configures no "
+                      "arm.done_pose_tol_m/done_pose_tol_rad")
         if reason:
             self._refuse_plan(plan, reason, report=True)
             return
@@ -905,6 +909,8 @@ class ArmController:
         if ref is None:
             return True
         spec = (self._plan or {}).get("completion")
+        if spec is None and self._cartesian_now is not None:
+            return self.executor.hand_at_goal(ref.end.position, state)  # its K_c holds the hand, not the joints
         if spec is None:
             return self.executor.at_goal(ref.end.position, state)
         if float(np.max(np.abs(np.asarray(state.velocity)))) > spec["vel_tol"]:
@@ -938,6 +944,10 @@ class ArmController:
         if verdict is None:
             return False
         if verdict.state == SETTLED:
+            if self._plan.get('completion') is None and self._cartesian_now is not None:
+                pos, rot = self.executor.hand_error(self._reference.end.position, state.position)
+                print(f'[arm_controller] cartesian leg {self._plan["phase"]} settled: hand {pos * 1e3:.2f} mm / '
+                      f'{np.degrees(rot):.2f} deg from FK(planned end)', flush=True)
             self._finish_leg(ok=True, reason='')
             return True
         spec = self._plan.get('completion')
@@ -946,17 +956,25 @@ class ArmController:
         if spec is not None:
             vel_tol = spec['vel_tol']
             goal, pos_tol = spec.get('goal_q'), spec.get('residual_max')
-        error = None if goal is None else np.abs(state.position - goal)
+        hand = spec is None and self._cartesian_now is not None  # judged on the hand: no joint criterion to report
+        error = None if goal is None or hand else np.abs(state.position - goal)
         joint = None if error is None else int(np.argmax(error)) + 1
         residual = None if error is None else float(np.max(error))
         speed = float(np.max(np.abs(state.velocity)))
         progress = dict(state=verdict.state, elapsed_s=verdict.elapsed_s,
                         remaining_s=verdict.remaining_s,
-                        joint=joint, error_rad=residual, position_tolerance_rad=pos_tol,
+                        joint=joint, error_rad=residual, position_tolerance_rad=None if hand else pos_tol,
                         speed_rad_s=speed, velocity_tolerance_rad_s=vel_tol)
+        if hand:
+            pos, rot = self.executor.hand_error(goal, state.position)
+            lim = self.executor.pose_tolerances
+            progress.update(hand_error_m=pos, hand_error_rad=rot, hand_tolerance_m=lim[0], hand_tolerance_rad=lim[1])
         if verdict.state == TIMED_OUT:
             detail = ('' if residual is None else
                       f'joint {joint} error {residual:.5f} rad (limit {pos_tol:.5f}); ')
+            if hand:
+                detail = (f'hand error {pos * 1e3:.2f} mm / {np.degrees(rot):.2f} deg (limit {lim[0] * 1e3:g} mm / '
+                          f'{np.degrees(lim[1]):g} deg); ')
             reason = (f'Completion timeout after {self._settling.timeout_s:g}s settling: '
                       f'{detail}speed {speed:.5f} rad/s (limit {vel_tol:.5f}). '
                       'Holding measured pose; completion criteria not met.')

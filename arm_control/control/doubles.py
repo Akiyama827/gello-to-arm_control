@@ -76,6 +76,14 @@ class _FakeExecutor:
     def at_goal(self, goal, state, pos_tol=None, vel_tol=None) -> bool:
         return True  # completion is the reference playing out
 
+    pose_tolerances = (0.002, 0.0087)
+
+    def hand_at_goal(self, goal, state) -> bool:
+        return True  # as at_goal
+
+    def hand_error(self, goal, q) -> tuple[float, float]:
+        return 0.0, 0.0
+
 
 def _controller(**kw) -> "ArmController":
     node = _FakeNode()

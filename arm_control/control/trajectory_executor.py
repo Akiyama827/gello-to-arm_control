@@ -64,6 +64,7 @@ class JointTrajectoryExecutor:
         gravity_comp: bool = False,
         *,
         payload_frame: str = "",
+        done_pose_tol: tuple[float, float] | None = None,
     ) -> None:
         n = len(list(joint_names))
         for arr, name in ((kp_default, "kp_default"), (kd_default, "kd_default")):
@@ -102,6 +103,22 @@ class JointTrajectoryExecutor:
         # joint) stalls at ~frictionloss/kp and completion would never fire.
         self._done_pos_tol = float(done_pos_tol)
         self._done_vel_tol = float(done_vel_tol)
+        # A Cartesian leg's completion (metres, radians at the hand): its K_c may leave the joints anywhere in the null space
+        # while the hand is on target (bench 2026-10-10, rung 6: j1 +32 / j3 -38 mrad at 0.00 mm), and with the joint
+        # integral frozen its static hand error is load/K_c (twin: 5.7 mm at 500 N/m). So it completes on SETTLING, at rest
+        # with the hand inside a SANITY bound -- precision is K_c's, not completion's (operator 2026-10-10). The hand is
+        # the payload frame, the config's ee_frame. Default 20 mm / 5 deg wherever the model has that frame; a body-list
+        # arm has none and judges no Cartesian leg (its controller refuses one without a rule).
+        if done_pose_tol is None and self._payload_frame and hasattr(dynamics, "frame_pose"):
+            done_pose_tol = (0.02, np.radians(5.0))
+        if done_pose_tol is not None:
+            done_pose_tol = tuple(float(v) for v in done_pose_tol)
+            if len(done_pose_tol) != 2 or not all(np.isfinite(v) and v > 0 for v in done_pose_tol):
+                raise ValueError("done_pose_tol must be (metres, radians), finite and positive")
+            if not self._payload_frame or not hasattr(dynamics, "frame_pose"):
+                raise ValueError("done_pose_tol needs a URDF model and its ee frame (payload_frame)")
+            dynamics.frame_pose(np.zeros(n), self._payload_frame)  # a missing ee frame fails here, not at a leg's end
+        self._done_pose_tol = done_pose_tol
 
     @property
     def n_joints(self) -> int:
@@ -253,6 +270,28 @@ class JointTrajectoryExecutor:
         pos_ok = bool(np.max(np.abs(state.position - goal)) <= pos_tol)
         vel_ok = bool(np.max(np.abs(state.velocity)) <= vel_tol)
         return pos_ok and vel_ok
+
+    @property
+    def pose_tolerances(self) -> tuple[float, float] | None:
+        """Hand position (m) and rotation (rad) sanity bound of a Cartesian leg's completion, or None (not configured)."""
+        return self._done_pose_tol
+
+    def hand_error(self, goal: np.ndarray, q: np.ndarray) -> tuple[float, float]:
+        """Hand position (m) and rotation (rad) distance between the joint poses ``q`` and ``goal``, on the construction
+        model (a load model has no ee frame). Both sides on one model, so a model offset common to both cancels."""
+        a = self._dyn.frame_pose(q, self._payload_frame)
+        b = self._dyn.frame_pose(goal, self._payload_frame)
+        cos = (np.trace(a[:3, :3].T @ b[:3, :3]) - 1.0) / 2.0
+        return float(np.linalg.norm(a[:3, 3] - b[:3, 3])), float(np.arccos(np.clip(cos, -1.0, 1.0)))
+
+    def hand_at_goal(self, goal: np.ndarray, state: JointState) -> bool:
+        """At rest with the hand within ``pose_tolerances`` of the hand at ``goal`` (a Cartesian leg's completion)."""
+        if self._done_pose_tol is None:
+            raise ValueError("this executor has no done_pose_tol")
+        if np.max(np.abs(state.velocity)) > self._done_vel_tol:
+            return False
+        pos, rot = self.hand_error(goal, state.position)
+        return pos <= self._done_pose_tol[0] and rot <= self._done_pose_tol[1]
 
     @property
     def completion_tolerances(self) -> tuple[float, float]:

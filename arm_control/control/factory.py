@@ -138,6 +138,11 @@ def build_executor(
     tolerances = {
         k: float(arm_blk[k]) for k in ("done_pos_tol", "done_vel_tol") if k in arm_blk
     }
+    pose_keys = [k for k in ("done_pose_tol_m", "done_pose_tol_rad") if k in arm_blk]
+    if pose_keys and len(pose_keys) != 2:
+        raise ValueError("arm.done_pose_tol_m and arm.done_pose_tol_rad come together")
+    if pose_keys:
+        tolerances["done_pose_tol"] = (float(arm_blk["done_pose_tol_m"]), float(arm_blk["done_pose_tol_rad"]))
     def _gain(key: str, arm_key: str) -> np.ndarray:
         if gains is None:
             return gain_vector(cfg, arm_key, n)
@@ -202,7 +207,7 @@ def build_arm_controller(
         key: validate_integral_vector(None if gains is None else gains.get(key),
                                       len(names) if names else n, where=key)[:n]
         for key in ("ki", "i_limit")
-    })
+    }, kp_ref=executor.kp)  # the profile kp the ki values are stated at
     policy_cfg = cfg.get("execution_policy")
     if policy_cfg is not None and gains is None:
         raise ValueError("execution_policy requires resolved per-joint torque limits")

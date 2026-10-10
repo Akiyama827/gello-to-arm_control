@@ -14,9 +14,19 @@ from arm_control.control.gains import validate_integral_vector
 class IntegralState:
     I_WINDOW_RAD = 0.02
 
-    def __init__(self, n: int, *, ki=None, i_limit=None):
+    def __init__(self, n: int, *, ki=None, i_limit=None, kp_ref=None):
         self.ki = validate_integral_vector(ki, n, where="ki")
         self.i_limit = validate_integral_vector(i_limit, n, where="i_limit")
+        # ki is stated at the profile kp (kp_ref). A leg or hold at a lower kp integrates at ki*kp/kp_ref, so the integral
+        # keeps the profile's ki/kp time constant instead of overpowering a soft spring (operator 2026-10-10: at the
+        # Cartesian floor kp 20 the profile ki 1200 pinned the bias at its clamp). Never above ki. None: unscaled.
+        if kp_ref is not None:
+            kp_ref = np.asarray(kp_ref, dtype=float)
+            if kp_ref.shape != (n,) or not np.isfinite(kp_ref).all() or np.any(kp_ref < 0):
+                raise ValueError("integral kp_ref must be n finite nonnegative values (the profile kp)")
+            kp_ref = kp_ref.copy()
+            kp_ref.flags.writeable = False
+        self.kp_ref = kp_ref
         self._bias = np.zeros(n)
         self._time: float | None = None
         self._cycle: int | None = None
@@ -53,7 +63,10 @@ class IntegralState:
         dt = 0.0 if self._time is None else min(max(now - self._time, 0.0), 0.05)
         err = q_des - q
         live = (kp > 0) & (np.abs(err) < self.I_WINDOW_RAD)
-        bias = np.where(live, self._bias + self.ki * err * dt, self._bias)
+        ki = self.ki
+        if self.kp_ref is not None:
+            ki = ki * np.clip(np.divide(kp, self.kp_ref, out=np.ones_like(kp), where=self.kp_ref > 0), 0.0, 1.0)
+        bias = np.where(live, self._bias + ki * err * dt, self._bias)
         bias = np.clip(bias, -self.i_limit, self.i_limit)
         bias[kp <= 0] = 0.0
         self._bias, self._time, self._cycle = bias, now, cycle_id
@@ -106,7 +119,17 @@ def _self_check():
         supplied[:] = 99.
         stored = getattr(admitted, name)
         assert np.array_equal(stored, [2., 3.]) and not stored.flags.writeable
-    print('integral: formula/window/clamp/reset, cycle idempotence, time cap and atomic inputs OK')
+    scaled = IntegralState(2, ki=[1200., 1200.], i_limit=[3., 3.], kp_ref=[600., 600.])
+    scaled.update(0, 0., target, q, np.array([20., 600.]))
+    assert np.allclose(scaled.update(1, .01, target, q, np.array([20., 900.])), [40. * .005 * .01, 1200. * .005 * .01])
+    for bad in ([600.], [np.nan, 1.], [-1., 1.]):
+        try:
+            IntegralState(2, ki=[1., 1.], kp_ref=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted kp_ref={bad!r}')
+    print('integral: kp-scaled ki (never above ki), formula/window/clamp/reset, cycle idempotence, time cap and atomic inputs OK')
 
 
 if __name__ == '__main__':

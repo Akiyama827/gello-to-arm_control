@@ -689,7 +689,7 @@ def main():
             if arm.status(cart.execution_id).phase.terminal:
                 break
             time.sleep(.1)
-        assert arm.status(cart.execution_id).phase is Phase.COMPLETED, [r.phase.value for r in arm.receipts(cart.execution_id)]
+        assert arm.status(cart.execution_id).phase is Phase.COMPLETED, [(r.phase.value, r.reason) for r in arm.receipts(cart.execution_id)]
         assert np.allclose(arm.state().q, q1 + [.1, .1, -.1], atol=.05), (arm.state().q, q1)
         time.sleep(.3)
         ticks += arm.trace_samples(cursor)['samples']

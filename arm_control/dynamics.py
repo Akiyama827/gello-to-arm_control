@@ -105,6 +105,17 @@ class PinocchioDynamics:
         n = self.n_joints
         return self.rnea(q, np.zeros(n), np.zeros(n))
 
+    def frame_pose(self, q: np.ndarray, frame_name: str) -> np.ndarray:
+        """``base_T_frame`` (4x4) at the arm joints ``q``, on this model."""
+        q = np.asarray(q, dtype=float)
+        if q.shape != (self.n_joints,):
+            raise ValueError(f"q must have shape ({self.n_joints},), got {q.shape}")
+        if not self._model.existFrame(frame_name):
+            raise ValueError(f"frame {frame_name!r} not found in URDF")
+        q_full, _, _ = self._embed(q, np.zeros(self.n_joints), np.zeros(self.n_joints))
+        pin.framesForwardKinematics(self._model, self._data, q_full)
+        return self._data.oMf[self._model.getFrameId(frame_name)].homogeneous.copy()
+
     def payload_gravity(
         self,
         q: np.ndarray,

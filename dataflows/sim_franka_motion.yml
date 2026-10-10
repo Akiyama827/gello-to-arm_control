@@ -31,6 +31,7 @@ nodes:
       - jog
       - gripper
       - grasp_request
+      - hand_home
 
   # The Franka Hand over its own protocol (the sim Hand here, the RT box's hand_bridge on the bench).
   - id: franka_gripper
@@ -38,6 +39,7 @@ nodes:
     inputs:
       gripper: arm_console/gripper
       grasp_request: arm_console/grasp_request
+      hand_home: arm_console/hand_home
     outputs:
       - gripper_state
       - grasp_result

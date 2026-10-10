@@ -256,6 +256,8 @@ const updateMode = (mode) => {
 
 const updateHand = (hand) => {
   for (const id of ["hand-grasp", "hand-open"]) $(id).disabled = handPosting || !hand?.enabled;
+  // Home needs no force grasp; the server re-checks ARM, freshness, idle and empty.
+  $("hand-home").disabled = handPosting || !hand?.feedback_fresh || Boolean(hand?.busy) || hand?.is_grasped !== false;
   if (gripperSlider) gripperSlider[0].disabled = handPosting || Boolean(hand?.busy);
   $("hand-status").textContent = handError || [hand?.status, hand?.reason].filter(Boolean).join(" · ");
   $("hand-feedback").textContent = hand?.measured_width_mm == null
@@ -289,6 +291,19 @@ const sendHand = async (mode) => {
 };
 $("hand-grasp").onclick = () => sendHand("close");
 $("hand-open").onclick = () => sendHand("release");
+$("hand-home").onclick = async () => {
+  if (handPosting) return;
+  handPosting = true;
+  handError = "";
+  try {
+    await post("/hand_home", {});
+  } catch (error) {
+    handError = error.message;
+    $("hand-status").textContent = handError;
+  } finally {
+    handPosting = false;
+  }
+};
 
 // -- gizmo: drag the target, one axis at a time ------------------------------
 gizmo.addEventListener("objectChange", () => {

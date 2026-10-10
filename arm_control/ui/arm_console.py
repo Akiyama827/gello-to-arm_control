@@ -51,7 +51,7 @@ from arm_control.ui.hand_panel import HandPanel
 from arm_control.ui.jog_panel import JogPanel
 from arm_control.grasp_visual import VisualFK
 from arm_control.joint_motor_map import finger_from_width
-from arm_control.contracts import unpack_json_message
+from arm_control.contracts import pack_json_message, unpack_json_message
 from arm_control.contracts.motion import pack_control_update, pack_jog, pack_plan, unpack_controller_event
 from arm_control.contracts.motor import pack_motor_command, unpack_motor_state
 from arm_control.planning.planner import build_collision_stack
@@ -235,6 +235,7 @@ class ControlPanel:
         self._grip_lo, self._grip_hi = float(grip_range[0]), float(grip_range[1])
         self._grip = self._grip_hi               # start open
         self._grip_dirty = False
+        self._home_pending = False
         self.hand = HandPanel(
             gripper_cfg=gripper_cfg,
             payload_table=payload_table,
@@ -308,6 +309,8 @@ class ControlPanel:
             self.set_gripper(payload.get("value"), dirty=True)
         elif route == "hand":
             self.request_hand(payload)
+        elif route == "hand_home":
+            self.request_home()
         elif route == "scene_action":
             self.request_scene_action(payload)
         elif route == "jog":
@@ -615,6 +618,29 @@ class ControlPanel:
                 self._invalidate_target_locked()
                 self.jog.release()
 
+    def request_home(self) -> None:
+        """Home the Hand (a full open/close sweep that re-measures its stroke), sent to this graph's Hand node as
+        ``hand_home``; gated like the slider, plus: idle, fresh, holding nothing (the node checks those again)."""
+        with self._lock:
+            hand = self.hand.snapshot(armed=self._armed, fault=self._fault)
+            reason = ("Hand motion requires confirmed ARM and no fault" if self._armed is not True or self._fault
+                      else "Hand feedback unavailable or stale" if not hand["feedback_fresh"]
+                      else "Hand busy: wait for the current action" if self.hand.owns_jaws() or self._home_pending
+                      else "Homing sweeps the fingers: open the Hand and remove the object first"
+                      if hand["is_grasped"] is not False or (self._scene_state is not None
+                                                             and self._scene_state["status"] != "stored")
+                      else "")
+            if reason:
+                raise ValueError(reason)
+            self._home_pending = True
+            self._grip_dirty = False  # the sweep owns the jaws; a queued slider goal is dropped
+            self._log.append("Hand homing requested (keep fingers clear)")
+
+    def pop_home(self) -> bool:
+        with self._lock:
+            pending, self._home_pending = self._home_pending, False
+            return pending
+
     def set_scene_state(self, state, *, error=''):
         with self._lock:
             self._scene_state = state
@@ -822,8 +848,45 @@ def _close_planning_pool(pool):
     pool.join()
 
 
-def _plan_snapshot(world, planner_cfg, start, goal, vmax, amax, refinement):
-    """Solve against the serialized canonical world, never a rebuilt nominal URDF."""
+_PLAN_WORLD = None  # planning process: (key, world) last sent whole
+
+
+class PlanWorldMiss(RuntimeError):
+    """The planning process holds no copy of this world (a fresh or restarted worker): send it whole."""
+
+
+def _plan_world_key(world):
+    """A world object AND its model: replacing either (a scene rebuild) needs a whole copy."""
+    return id(world), id(getattr(world, "model", None))
+
+
+def _plan_world_cached(cached, world) -> bool:
+    return (hasattr(world, "planning_delta") and cached[0] is world
+            and cached[1] is getattr(world, "model", None))
+
+
+def _cache_plan_world(key, world):
+    global _PLAN_WORLD
+    _PLAN_WORLD = (key, world)
+
+
+def _plan_snapshot(world, planner_cfg, start, goal, vmax, amax, refinement, key=None, delta=None):
+    """Solve against the serialized canonical world, never a rebuilt nominal URDF.
+
+    ``world`` None: the copy this process cached under ``key``, brought up to date by ``delta`` (its planning_delta):
+    the model crosses the process boundary once per world object, not once per plan."""
+    global _PLAN_WORLD
+    if world is not None:
+        _cache_plan_world(key, world)
+    else:
+        if _PLAN_WORLD is None or _PLAN_WORLD[0] != key:
+            raise PlanWorldMiss(key)
+        world = _PLAN_WORLD[1]
+        try:
+            world.apply_planning_delta(delta)
+        except Exception:  # its geometry changed in place, or the copy is unusable: never plan against it
+            _PLAN_WORLD = None
+            raise PlanWorldMiss(key) from None
     _, planner = build_collision_stack(
         None, world.joint_names, planner_cfg, cache_dir=None, collision_world=world,
     )
@@ -1065,6 +1128,12 @@ def _run(
     # thread only waits for its result and runs project-specific path checks.
     plan_pool = _planning_pool()
     cleanup.callback(_close_planning_pool, plan_pool)
+    # The world crosses to the planning process now, before anything is ARMed, so a plan sends only its small delta.
+    warm = getattr(world, "world", world)
+    plan_cached = [None, None]  # [world, its model] the planning process holds: the refs keep their ids unique
+    if hasattr(warm, "planning_delta"):
+        plan_cached[:] = [warm, warm.model]
+        plan_pool.apply_async(_cache_plan_world, (_plan_world_key(warm), warm))
     plan_thread: threading.Thread | None = None
     plan_box: list = []  # worker appends ("ok", traj, goal_q) | ("err", msg)
     active_plan_id = ''
@@ -1305,6 +1374,10 @@ def _run(
         hand_request = panel.pop_hand()
         if hand_request is not None:
             node.send_output("grasp_request", pack_grasp_request(**hand_request))
+        if panel.pop_home():
+            # A graph topic, not the trigger file: that file is shared by every graph without an ARM_ID (review
+            # 2026-10-10: a sim page's Home would have homed a real Hand). The Hand node re-gates it (empty, idle).
+            node.send_output("hand_home", pack_json_message("hand_home", {}))
         declaration = panel.pop_payload()
         if declaration is not None and scene_actions is None:
             node.send_output("control", pack_control_update(payload=declaration))
@@ -1341,11 +1414,19 @@ def _run(
 
                 def _plan_worker(m=m_snap, t=t_snap, t0=t_plan, rev=revision, refine=refinement):
                     try:
-                        traj = plan_pool.apply_async(
-                            _plan_snapshot,
-                            (getattr(world, "world", world), planner_cfg,
-                             m, t, vmax, amax, refine),
-                        ).get(timeout=180)
+                        w = getattr(world, "world", world)
+                        args = (planner_cfg, m, t, vmax, amax, refine)
+                        try:
+                            if not _plan_world_cached(plan_cached, w):
+                                raise PlanWorldMiss(_plan_world_key(w))
+                            traj = plan_pool.apply_async(
+                                _plan_snapshot, (None, *args, _plan_world_key(w), w.planning_delta()),
+                            ).get(timeout=180)
+                        except PlanWorldMiss:
+                            # Whole (a rebuilt world, a restarted worker): a GIL-heavy pickle, once per world.
+                            plan_cached[:] = [w, getattr(w, "model", None)]
+                            traj = plan_pool.apply_async(
+                                _plan_snapshot, (w, *args, _plan_world_key(w))).get(timeout=180)
                         if scene_actions is not None:
                             scene_actions.validate_path(traj, path_ik)
                         plan_box.append(("ok", traj, t, t0, rev))
@@ -1719,6 +1800,91 @@ def _check_planner_limits() -> None:
     print("arm_console: planner speed limits follow the execution policy")
 
 
+def _check_plan_world_cache() -> None:
+    """The planning process gets the world once, then per-plan deltas that carry every mutable query input."""
+    import pickle
+    import tempfile
+    from pathlib import Path
+
+    from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
+
+    cfg = load_robot_config(Path(__file__).resolve().parents[2] / "examples/configs/sim_arm.yaml")
+    joints = list(arm_joints(cfg))
+    box = dict(name="wall", pose=[.45, 0., .4, 0., 0., 0.], size=[.1, .8, .8])
+    with tempfile.TemporaryDirectory() as tmp:
+        w = MuJoCoCollisionWorld(cfg.urdf_path, joints, cache_dir=tmp, environment=[box])
+        child = pickle.loads(pickle.dumps(w))  # the copy the planning process caches
+        rng = np.random.default_rng(0)
+        qs = rng.uniform(w.lower, w.upper, (200, len(joints)))
+        hits = [w.in_collision(q) for q in qs]
+        assert any(hits) and not all(hits), "the samples must see the wall both ways, or this checks nothing"
+        wall = np.flatnonzero(w._env_geom)
+        w.model.geom_contype[wall] = w.model.geom_conaffinity[wall] = 0  # what enable_*_obstacles toggles
+        assert [w.in_collision(q) for q in qs] != hits
+        assert [child.in_collision(q) for q in qs] == hits, "stale before the delta"
+        child.apply_planning_delta(pickle.loads(pickle.dumps(w.planning_delta())))
+        assert [child.in_collision(q) for q in qs] == [w.in_collision(q) for q in qs]
+        fingers = list(gripper_joints(cfg))
+        assert fingers, "sim_arm must hold finger joints for the held-position case"
+        w.set_held_positions({fingers[0]: .013})
+        assert not np.array_equal(child._held_qpos, w._held_qpos)
+        child.apply_planning_delta(pickle.loads(pickle.dumps(w.planning_delta())))
+        assert np.array_equal(child._held_qpos, w._held_qpos)
+        assert len(pickle.dumps(w.planning_delta())) < len(pickle.dumps(w.model)) / 10
+        # geometry moved in place (no such writer today): the delta refuses, the process asks for the world whole
+        moved = pickle.loads(pickle.dumps(w))
+        moved.model.geom_pos[wall[0]] += .1
+        try:
+            child.apply_planning_delta(pickle.loads(pickle.dumps(moved.planning_delta())))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a delta from moved geometry applied")
+        _cache_plan_world(_plan_world_key(w), child)
+        try:
+            _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
+                           _plan_world_key(w), moved.planning_delta())
+        except PlanWorldMiss:
+            assert _PLAN_WORLD is None, "a refused delta must drop the cached copy"
+        else:
+            raise AssertionError("planned against stale geometry")
+        turned = pickle.loads(pickle.dumps(w))
+        turned.model.jnt_axis[0] = turned.model.jnt_axis[0][[1, 2, 0]]  # joint kinematics count as geometry
+        assert turned.planning_delta()["_geometry"] != w.planning_delta()["_geometry"]
+        _cache_plan_world(_plan_world_key(w), pickle.loads(pickle.dumps(w)))
+        broken = w.planning_delta()
+        broken.pop("_query_state")  # any failure to apply, not only ValueError, is a miss and drops the copy
+        try:
+            _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
+                           _plan_world_key(w), broken)
+        except PlanWorldMiss:
+            assert _PLAN_WORLD is None
+        else:
+            raise AssertionError("planned with a delta that did not apply")
+        other = MuJoCoCollisionWorld(cfg.urdf_path, joints[:-1], cache_dir=tmp)
+        try:
+            other.apply_planning_delta(w.planning_delta())
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a delta applied to another model")
+        # the cache key: a replaced world or model is a miss; the process refuses a delta it holds no world for
+        cached = [w, w.model]
+        assert _plan_world_cached(cached, w) and not _plan_world_cached(cached, other)
+        cached[1] = other.model
+        assert not _plan_world_cached(cached, w)
+        _cache_plan_world(_plan_world_key(other), other)
+        try:
+            _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
+                           _plan_world_key(w), w.planning_delta())
+        except PlanWorldMiss:
+            pass
+        else:
+            raise AssertionError("planned against a world the process does not hold")
+    print("arm_console: planning world crosses once; deltas carry contact masks/held/qpos; moved geometry and "
+          "misses refused OK")
+
+
 def _check_graphs() -> None:
     """Every console in every graph has exactly one authority feedback source (the controller's motor_health or its
     controller_arm), never an optimistic ARM badge, and every supervised_arm input has a handler. (The in-process arm_controller node this also checked is retired: every
@@ -1736,13 +1902,19 @@ def _check_graphs() -> None:
                     f"{graph.name}/{console['id']}: console needs exactly one "
                     "authority feedback source, never an optimistic ARM badge"
                 )
+                # Home is a graph topic to the node that serves the console's grasp_request (the same Hand)
+                hands = [n for n in spec["nodes"]
+                         if (n.get("inputs") or {}).get("grasp_request") == f"{console['id']}/grasp_request"]
+                assert "hand_home" in (console.get("outputs") or []) and len(hands) == 1 and (
+                    hands[0]["inputs"].get("hand_home") == f"{console['id']}/hand_home"), (
+                    f"{graph.name}/{console['id']}: hand_home must reach the Hand node its grasp_request does")
         assert not any(str(n.get("path", "")).endswith("arm_controller.py") for n in spec.get("nodes", [])), (
             f"{graph.name}: the retired in-process arm_controller node is wired")
         from arm_control.supervisor.dora_arm import unhandled_inputs
         unhandled = unhandled_inputs(graph)
         assert not unhandled, f"{graph.name}: supervised_arm is wired {unhandled}, which it has no handler for (dropped silently)"
     assert checked, "no console found in any graph -- did paths change?"
-    print(f"arm_console: {checked} console wirings have one authority feedback source")
+    print(f"arm_console: {checked} console wirings have one authority feedback source and their Home reaches their Hand")
 
 
 def cli() -> None:
@@ -1754,6 +1926,7 @@ def cli() -> None:
         _check_payload_declaration()
         _check_graphs()
         _check_planner_limits()
+        _check_plan_world_cache()
     else:
         main()
 

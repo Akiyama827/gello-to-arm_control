@@ -98,6 +98,9 @@ uint16_t parse_port(const char* flag, const char* value) {
 } // namespace
 
 int main(int argc, char** argv) {
+  // As hand_bridge: under systemd stdout is a pipe, fully buffered, so the startup and connect/disconnect lines sat in a
+  // 4K buffer until exit (bench 2026-10-10). No stdout write is on the RT loop (its journal has its own flushed stream).
+  setvbuf(stdout, nullptr, _IOLBF, 0);
   // MIT wire-format parity check (see backend_dm.cpp): golden frames the
   // Python pack_mit_control_frame/decode_mit_reply must reproduce exactly.
   if (argc > 1 && !std::strcmp(argv[1], "--mit-check"))

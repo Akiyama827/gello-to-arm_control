@@ -58,6 +58,45 @@ class MuJoCoCollisionWorld:
         for name, value in query.items():
             getattr(self.data, name)[:] = value
 
+    def planning_delta(self) -> dict:
+        """What a plan reads that changes after construction, WITHOUT the model: the pickled state minus ``model``, plus
+        the model's contact masks (the only model fields this class toggles). The bench workcell's model pickles to ~370
+        MB, and pickling it per plan held the console's GIL ~0.5 s (Dora dropped its inputs, bench 2026-10-10). A world
+        replaced by a REBUILT object needs a full copy, never a delta."""
+        state = self.__getstate__()
+        state.pop("model")
+        state["_masks"] = (self.model.geom_contype.copy(), self.model.geom_conaffinity.copy())
+        state["_geometry"] = self._geometry_digest()
+        return state
+
+    def _geometry_digest(self) -> str:
+        """The model's placement, shape and joint-kinematics fields (not the masks a delta carries; not mesh data, which
+        nothing edits in place): a copy whose digest differs plans
+        against other geometry, so a delta never applies to it (fail closed: the caller sends the world whole)."""
+        import hashlib
+
+        m = self.model
+        h = hashlib.sha256()
+        for field in ("geom_type", "geom_dataid", "geom_bodyid", "geom_pos", "geom_quat", "geom_size", "geom_margin",
+                      "geom_gap", "geom_rbound", "body_parentid", "body_pos", "body_quat", "jnt_pos", "jnt_axis",
+                      "jnt_range", "qpos0"):
+            h.update(np.ascontiguousarray(getattr(m, field)).tobytes())
+        return h.hexdigest()
+
+    def apply_planning_delta(self, delta: dict) -> None:
+        """Bring a copy of this world (same model) to the state ``planning_delta`` captured; ValueError if this copy's
+        geometry is not the one the delta was taken from."""
+        delta = dict(delta)
+        contype, conaffinity = delta.pop("_masks")
+        geometry = delta.pop("_geometry")
+        model = self.model
+        if contype.shape != model.geom_contype.shape or geometry != self._geometry_digest():
+            raise ValueError("planning delta is for another model or geometry")
+        self.__dict__.clear()  # exactly the parent's attributes, none left over from an earlier delta
+        self.__setstate__(dict(delta, model=model))
+        model.geom_contype[:] = contype
+        model.geom_conaffinity[:] = conaffinity
+
     def __init__(
         self,
         urdf_path: str | Path,

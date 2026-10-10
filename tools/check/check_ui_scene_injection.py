@@ -92,6 +92,49 @@ def main() -> None:
         assert empty._state()["pose_presets"] == [] and empty._state()["joint_presets"] == []
     finally:
         empty.close()
+    # Hand homing: the page's Home button (sent to this graph's Hand node as hand_home), gated like the slider, plus
+    # fresh, idle and empty (the sweep closes fully). One request per click, consumed once by the console loop.
+    hand = console.ControlPanel(["j"], [-1.0], [1.0], port=0, vfk=vfk)
+    try:
+        def home_refused(why):
+            try:
+                hand._post("hand_home", {})
+            except ValueError as exc:
+                assert why in str(exc), (why, exc)
+                assert not hand.pop_home()
+                return
+            raise AssertionError(f"homing accepted although {why!r}")
+
+        idle = dict(available=True, measured=True, busy=False, is_grasped=False, width=.08)
+        hand.set_hand_state(dict(idle, sample_seq=1))
+        home_refused("confirmed ARM")
+        hand.set_armed(True)
+        for seq, change, why in ((2, dict(is_grasped=True), "remove the object"),
+                                 (3, dict(busy=True), "busy"),
+                                 (4, dict(is_grasped=None), "remove the object")):
+            hand.set_hand_state(dict(idle, sample_seq=seq, **change))
+            home_refused(why)
+        hand.set_hand_state(dict(idle, available=False, sample_seq=5))
+        home_refused("unavailable or stale")
+        hand.set_hand_state(dict(idle, sample_seq=6))
+        hand.set_armed(True, fault="latched")
+        home_refused("no fault")
+        hand.set_armed(True)
+        hand.set_scene_state({"status": "carrying"})  # a carried scene object, whatever the grasp bit says
+        home_refused("remove the object")
+        hand.set_scene_state(None)
+        hand.set_armed(True)
+        hand._post("hand_home", {})
+        try:  # a second click before the loop consumed the first
+            hand._post("hand_home", {})
+        except ValueError as exc:
+            assert "busy" in str(exc), exc
+        else:
+            raise AssertionError("a second Home queued behind the first")
+        assert hand.pop_home() is True and hand.pop_home() is False
+        assert "Hand homing requested" in " ".join(hand._log)
+    finally:
+        hand.close()
     for bad in ([{"name": "x", "xyz_mm": [1, 2], "rpy_deg": [0, 0, 0]}],
                 [{"name": "", "xyz_mm": [1, 2, 3], "rpy_deg": [0, 0, 0]}],
                 [{"name": "d", "xyz_mm": [1, 2, 3], "rpy_deg": [0, 0, 0]}] * 2,
