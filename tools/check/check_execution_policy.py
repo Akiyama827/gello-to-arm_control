@@ -591,7 +591,14 @@ def check_cartesian_lifecycle():
         c.integral._bias = entered.copy()
         c.on_plan(cartesian_plan(positions=np.full((2, 7), .005)) if cartesian else plan(positions=np.full((2, 7), .005)))
         c.on_control(pack_control_update(execute="p"))
-        advance(c, clock, .5, dt=.01)  # measured q = 0: a 5 mrad error, inside the integral's window
+        # measured q = 0: a 5 mrad error, inside the integral's window; 1.1 s runs past the 1 s trajectory into settling
+        # (health refreshed: its 1 s timeout would otherwise pause the leg)
+        for _ in range(110):
+            clock[0] += .01
+            c.on_motor_health(pack_json_message("motor_health", dict(
+                armed=True, state_fresh=True, any_fault=False, supports_pose_hold=True)))
+            c.on_motor_state(state())
+            c.tick()
         assert c._running and (commands(c)[-1]["cartesian"] is not None) == cartesian
         bias = c.integral.bias
         assert (np.array_equal(bias, entered) if cartesian else np.all(bias > entered + .1)), (cartesian, bias)
