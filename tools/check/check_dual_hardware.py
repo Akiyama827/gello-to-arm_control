@@ -37,7 +37,7 @@ from arm_control.multi_arm.launch import SOCKETS_ENV, stage_pair
 from arm_control.multi_arm.supervised_hardware import SupervisedHardware
 from arm_control.sdk import ArmClient
 from arm_control.simulation import rerun_scene
-from arm_control.supervisor.launch import start_supervisor, stop_supervisor
+from arm_control.supervisor.launch import start_supervisor, stop_supervisors
 from arm_control.ui import dual_arm_console
 from arm_control.ui.dual_arm_console import DualArmConsole, _pose_matrix
 
@@ -685,8 +685,7 @@ def main(pair_path, binary, refinement="none"):
                 app.close()
             for p in probe.values():
                 p.close()
-            for proc in supervisors:
-                stop_supervisor(proc)
+            stop_supervisors(supervisors)
             for process in servers:
                 if process.poll() is None:
                     process.terminate()

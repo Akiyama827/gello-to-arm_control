@@ -156,6 +156,8 @@ def _self_check() -> None:
     real_wait = first.wait
 
     def interrupted(timeout=None):
+        # every supervisor was signalled before this first wait: the second exits on its own
+        assert second.wait(timeout=5) is not None, "the second supervisor was not signalled before the first wait"
         raise KeyboardInterrupt
     first.wait = interrupted
     try:
@@ -166,6 +168,10 @@ def _self_check() -> None:
     first.wait = real_wait
     assert second.poll() is not None, "the second supervisor survived an interrupt during the first stop"
     assert first.wait(timeout=5) is not None, "the first supervisor was not signalled before the wait"
+    import shutil
+    for p in (first, second):
+        p._log.close()
+        shutil.rmtree(p._workdir, ignore_errors=True)
     print("stop_supervisors: every supervisor is signalled before any wait; an interrupted wait still stops the rest: OK")
 
 

@@ -170,6 +170,7 @@ class ArmController:
         self._arm_pose_fixed = False
         self._been: np.ndarray | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
+        self._first_sample_pending: str | None = None  # a released leg whose first sample is not logged yet
         self.last_law: str | None = None           # the law of the last word sent
         self._pose_hold: dict | None = None
         self.supports_pose_hold = False
@@ -603,6 +604,14 @@ class ArmController:
                 self._cartesian_now = None
         if self._running and self._reference is not None:
             point = self._reference.sample(self.exec_time)
+            if self._first_sample_pending is not None and self._reference.elapsed(self.exec_time) >= 0:
+                # This controller's first tick at or after the anchor (before it, a scheduled leg holds its first point):
+                # when it starts commanding the motion, its tick phase included. On hardware both supervisors of
+                # a pair read the PC's monotonic clock, so the two arms' lines differ by the PC-side start skew; the
+                # physical skew at the robots is not measured here.
+                print(f"[arm_controller] first sample {self._first_sample_pending} at {self.exec_time:.6f} "
+                      f"(phase {self._reference.elapsed(self.exec_time):+.4f} s)", flush=True)
+                self._first_sample_pending = None
             # A Cartesian leg's stiffness is K_c's (operator 2026-10-10): its joint integral is FROZEN -- updated with zero
             # error, so it neither accumulates against a push or a contact nor jumps; the bias it entered with (the hold's
             # gravity residual) stays, so the leg starts without a torque step.
@@ -733,12 +742,12 @@ class ArmController:
         self._stream_sent_at = None
         self._stream_sent_target = None
         self._running = True
-        # Stamped (the reference clock; a pair's supervisors share the PC's monotonic clock): `start` is when the trajectory
-        # begins, `taken` when this controller took the release -- a pair's start skew on the PC side is the difference of
-        # its two lines. Not the physical skew at the robots.
+        self._first_sample_pending = plan_id
+        # `start` is the trajectory's anchor on the reference clock: a scheduled pair release gives both arms the SAME
+        # stamp by construction, so it shows the anchoring, not a skew. The skew is in the `first sample` line below.
         print(
             f"[arm_controller] executing {self._plan['phase']} "
-            f"({plan_id}, {self._pending_traj.duration_sec:.2f}s) start={start:.6f} taken={self.exec_time:.6f}",
+            f"({plan_id}, {self._pending_traj.duration_sec:.2f}s) start={start:.6f}",
             flush=True,
         )
 
