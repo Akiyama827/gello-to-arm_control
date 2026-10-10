@@ -133,6 +133,28 @@ def _pose_presets(raw) -> list:
     return out
 
 
+def _joint_presets(raw, names, lower, upper) -> dict[str, list[float]]:
+    """Validate caller-supplied named joint targets (e.g. a park posture).
+
+    Each names its joints so a reordered list is refused, not silently
+    permuted; a value outside the limits is refused, not clipped, because a
+    clipped park is not the posture the caller declared."""
+    out = {}
+    for entry in list(raw or []):
+        if not isinstance(entry, dict) or set(entry) != {"name", "joints", "q"}:
+            raise ValueError("joint preset needs name, joints and q only")
+        name = entry["name"]
+        if not isinstance(name, str) or not name.strip() or name in out:
+            raise ValueError("joint preset names must be unique non-empty strings")
+        if not isinstance(entry["joints"], (list, tuple)) or list(entry["joints"]) != list(names):
+            raise ValueError(f"joint preset {name!r} joints {entry['joints']!r} != console joints {list(names)}")
+        q = _finite_values(entry["q"], len(names))
+        if np.any(q < lower) or np.any(q > upper):
+            raise ValueError(f"joint preset {name!r} is outside the joint limits")
+        out[name] = q.tolist()
+    return out
+
+
 def pose_fields(ee):
     import pinocchio as pin
 
@@ -164,6 +186,7 @@ class ControlPanel:
         gain_presets: dict | None = None,
         payload_table: dict | None = None,
         pose_presets: list | None = None,
+        joint_presets: list | None = None,
         refinement: str = "none",
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
@@ -180,6 +203,9 @@ class ControlPanel:
         self._names = list(names)
         self._lower = [float(v) for v in lower]
         self._upper = [float(v) for v in upper]
+        # Named joint targets: SET the target server-side (the page sends only
+        # the name), then Plan/Execute gate the motion as for any target.
+        self._joint_presets = _joint_presets(joint_presets, self._names, self._lower, self._upper)
         self._values = [0.0] * len(names)
         self._measured: np.ndarray | None = None
         self._measured_at = float('-inf')
@@ -291,6 +317,8 @@ class ControlPanel:
         elif route == "pose":
             revision = self.request_pose(payload)
             return {'ok': True, 'revision': revision}
+        elif route == "joint_preset":
+            return {'ok': True, 'revision': self.apply_joint_preset(payload.get("name"))}
         elif route == "refinement":
             choice = refinement_choice(payload.get("refinement"))
             with self._lock:
@@ -343,6 +371,7 @@ class ControlPanel:
                 "pose": {'current': None, 'target': None, 'status': self._pose_status,
                          'revision': self._target_revision},
                 "pose_presets": self._pose_presets,
+                "joint_presets": list(self._joint_presets),
                 "scene_action": (None if self._scene_state is None else
                                  dict(self._scene_state, error=self._scene_error,
                                       pending=self._scene_pending is not None)),
@@ -418,6 +447,18 @@ class ControlPanel:
                 self._invalidate_target_locked()
                 self._pose_pending = self._cart_pending = None
             return True
+
+    def apply_joint_preset(self, name) -> int:
+        """Set the target to a named joint preset; the robot does not move."""
+        q = self._joint_presets.get(name) if isinstance(name, str) else None
+        if q is None:
+            raise ValueError(f"unknown joint preset {name!r}")
+        with self._lock:
+            self._values = list(q)
+            self._invalidate_target_locked()
+            self._pose_pending = self._cart_pending = None
+            self._pose_status = f"Target set to {name}; Plan + preview before Execute"
+            return self._target_revision
 
     @property
     def target_revision(self):
@@ -792,19 +833,21 @@ def _plan_snapshot(world, planner_cfg, start, goal, vmax, amax, refinement):
 
 
 def main(*, cfg=None, collision_world=None, static_geoms=None, pose_presets=None,
-         scene_actions=None) -> None:
+         joint_presets=None, scene_actions=None) -> None:
     shutdown = ShutdownFlag()
     install_signal_handlers(shutdown)
     with ExitStack() as cleanup:
         _run(
             shutdown, cleanup, cfg=cfg, collision_world=collision_world,
-            static_geoms=static_geoms, pose_presets=pose_presets, scene_actions=scene_actions,
+            static_geoms=static_geoms, pose_presets=pose_presets, joint_presets=joint_presets,
+            scene_actions=scene_actions,
         )
 
 
 def _run(
     shutdown: ShutdownFlag, cleanup: ExitStack, *,
-    cfg=None, collision_world=None, static_geoms=None, pose_presets=None, scene_actions=None,
+    cfg=None, collision_world=None, static_geoms=None, pose_presets=None, joint_presets=None,
+    scene_actions=None,
 ) -> None:
     import pinocchio as pin
     import rerun as rr
@@ -967,6 +1010,7 @@ def _run(
         gain_presets={name: gains for name, gains in gain_presets.items() if name not in pose_hold_presets},
         payload_table={} if scene_actions is not None else dict(cfg.get("module_grasps") or {}),
         pose_presets=pose_presets,
+        joint_presets=joint_presets,
         refinement=planner_cfg.get("refinement", "none"),
     )
     cleanup.callback(panel.close)
