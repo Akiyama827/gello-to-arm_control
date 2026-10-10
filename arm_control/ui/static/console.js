@@ -115,6 +115,31 @@ const buildPresets = (presets) => {
     updateMoveButtons();
   };
 };
+// Joint presets SET the target on the server (the page sends only the name);
+// Plan/Execute still gate the motion. A Desired draft is superseded.
+const buildJointPresets = (names) => {
+  const row = $("joint-preset-row");
+  row.replaceChildren();
+  row.hidden = !(names || []).length;
+  for (const name of names || []) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `Target: ${name}`;
+    button.onclick = async () => {
+      try {
+        await post("/joint_preset", { name });
+        poseDirty = false;
+        posePending = null;
+        poseError = "";
+      } catch (error) {
+        poseError = error.message;
+        $("pose-status").textContent = poseError;
+      }
+      updateMoveButtons();
+    };
+    row.append(button);
+  }
+};
 
 $("apply-pose").onclick = async () => {
   if (posePosting || posePending) return;
@@ -461,6 +486,7 @@ const build = async (state) => {
   }
   if (state.jog) buildJogPad(state.jog);
   buildPresets(state.pose_presets);
+  buildJointPresets(state.joint_presets);
 
   const strip = $("buttons");
   const gains = $("gains");

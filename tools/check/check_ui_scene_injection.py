@@ -89,7 +89,7 @@ def main() -> None:
         panel.close()
     empty = console.ControlPanel(["j"], [-1.0], [1.0], port=0, vfk=vfk)
     try:
-        assert empty._state()["pose_presets"] == []
+        assert empty._state()["pose_presets"] == [] and empty._state()["joint_presets"] == []
     finally:
         empty.close()
     for bad in ([{"name": "x", "xyz_mm": [1, 2], "rpy_deg": [0, 0, 0]}],
@@ -102,11 +102,45 @@ def main() -> None:
         except ValueError:
             continue
         raise AssertionError(f"console accepted a malformed pose preset: {bad}")
+    # Named joint presets (a park posture): only NAMES are served, the page
+    # posts a name, and the server sets the target -- the robot does not move.
+    # A reordered/foreign joint list or an out-of-limit value is refused, not
+    # permuted or clipped (a clipped park is not the declared posture).
+    park = [{"name": "park", "joints": ["j"], "q": [0.5]}]
+    panel = console.ControlPanel(["j"], [-1.0], [1.0], port=0, vfk=vfk, joint_presets=park)
+    try:
+        assert panel._state()["joint_presets"] == ["park"]
+        before = panel.target_revision
+        reply = panel._post("joint_preset", {"name": "park"})
+        assert reply["revision"] == panel.target_revision > before
+        assert panel.sliders().tolist() == [0.5]
+        assert panel._state()["pose"]["status"].startswith("Target set to park")
+        for name in ("missing", None, 3):
+            try:
+                panel._post("joint_preset", {"name": name})
+            except ValueError:
+                continue
+            raise AssertionError(f"console accepted an unknown joint preset {name!r}")
+        assert panel.sliders().tolist() == [0.5]
+    finally:
+        panel.close()
+    for bad in ([{"name": "p", "joints": ["k"], "q": [0.0]}],
+                [{"name": "p", "joints": ["j"], "q": [1.5]}],
+                [{"name": "p", "joints": ["j"], "q": [float("nan")]}],
+                [{"name": "p", "joints": ["j"], "q": [0.0, 0.0]}],
+                [{"name": "p", "joints": ["j"], "q": [0.0]}] * 2,
+                [{"name": "p", "q": [0.0]}]):
+        try:
+            console._joint_presets(bad, ["j"], [-1.0], [1.0])
+        except ValueError:
+            continue
+        raise AssertionError(f"console accepted a malformed joint preset: {bad}")
     # The page must actually render them, or the list is served into nothing.
     page = (Path(console.__file__).parent / "static" / "console.js").read_text()
     assert "buildPresets(state.pose_presets)" in page
+    assert "buildJointPresets(state.joint_presets)" in page and '"/joint_preset"' in page
     markup = (Path(console.__file__).parent / "static" / "console.html").read_text()
-    for element in ('id="preset-select"', 'id="fill-preset"', 'id="preset-row"'):
+    for element in ('id="preset-select"', 'id="fill-preset"', 'id="preset-row"', 'id="joint-preset-row"'):
         assert element in markup, element
     with patch.object(console, "_run") as run, patch.object(
         console, "install_signal_handlers",
@@ -117,8 +151,10 @@ def main() -> None:
                      pose_presets=presets)
         assert run.call_args.kwargs == {
             "cfg": cfg, "collision_world": world, "static_geoms": geoms,
-            "pose_presets": presets, "scene_actions": None,
+            "pose_presets": presets, "joint_presets": None, "scene_actions": None,
         }
+        console.main(cfg=cfg, collision_world=world, static_geoms=geoms, joint_presets=park)
+        assert run.call_args.kwargs["joint_presets"] == park
         console.main()
         assert run.call_args.kwargs["pose_presets"] is None
         # The project composition's scene/load actions ride the same seam.
