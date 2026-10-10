@@ -19,3 +19,19 @@ The project supplies the preset from its scene (`scene.park_q`, see the project 
 Check: `check_ui_scene_injection` serves names only, applies a preset (target set, revision advanced, status), refuses an
 unknown/None/non-string name without touching the target, refuses foreign joints, out-of-limit, NaN, wrong-length,
 duplicate and incomplete entries, the page builds the row and posts `/joint_preset`, and `main` passes the list through.
+
+Review round 1 (Opus xhigh, PASS-WITH-FIXES, no MUST; verified the gate empirically: a queued Execute is consumed, an old
+revision is refused by can_execute/execute_if_current/set_plan, a late IK or cart write cannot land after the preset, HTTP
+errors are 400s):
+* SHOULD: the project's "peer without q" refusal passed for the wrong reason (no path either) -> it asserts the message names
+  `q`; the reviewer's mutant (old zero default restored) now fails the check.
+* SHOULD: RUNBOOK parking order -> parking is a motion planned around the OTHER arm's declared park: confirm that arm first
+  (`peer_parked.py --scene` of the arm about to move), one arm at a time, and the bootstrap rule when neither is confirmed.
+* SHOULD: no offline check saw the preset as the hardware console does -> project `check_dual_bench.check_park_presets`
+  stages both FR3 entries for hardware, runs the console's own validation and asserts each park collision-free with the
+  peer parked.
+* NITs taken: a joint list must be a list (a string or None is refused with a ValueError, the message no longer raises);
+  `.button-pair[hidden]` now hides (both preset rows showed when empty); the page keeps a Desired draft typed while a preset
+  POST is in flight and ignores a preset click while a pose POST is pending; `peer_parked --self-check` derives its expected
+  error from the declared park instead of a third hard-coded copy. Left: re-clicking the preset discards a preview (by
+  design, documented); a preset clicked before the first measured state is overwritten by the first-state sync (as any edit).

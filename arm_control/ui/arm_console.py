@@ -146,8 +146,8 @@ def _joint_presets(raw, names, lower, upper) -> dict[str, list[float]]:
         name = entry["name"]
         if not isinstance(name, str) or not name.strip() or name in out:
             raise ValueError("joint preset names must be unique non-empty strings")
-        if list(entry["joints"]) != list(names):
-            raise ValueError(f"joint preset {name!r} joints {list(entry['joints'])} != console joints {list(names)}")
+        if not isinstance(entry["joints"], (list, tuple)) or list(entry["joints"]) != list(names):
+            raise ValueError(f"joint preset {name!r} joints {entry['joints']!r} != console joints {list(names)}")
         q = _finite_values(entry["q"], len(names))
         if np.any(q < lower) or np.any(q > upper):
             raise ValueError(f"joint preset {name!r} is outside the joint limits")

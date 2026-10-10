@@ -129,7 +129,9 @@ def main() -> None:
                 [{"name": "p", "joints": ["j"], "q": [float("nan")]}],
                 [{"name": "p", "joints": ["j"], "q": [0.0, 0.0]}],
                 [{"name": "p", "joints": ["j"], "q": [0.0]}] * 2,
-                [{"name": "p", "q": [0.0]}]):
+                [{"name": "p", "q": [0.0]}],
+                [{"name": "p", "joints": "j", "q": [0.0]}],
+                [{"name": "p", "joints": None, "q": [0.0]}]):
         try:
             console._joint_presets(bad, ["j"], [-1.0], [1.0])
         except ValueError:

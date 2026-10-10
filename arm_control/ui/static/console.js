@@ -126,9 +126,12 @@ const buildJointPresets = (names) => {
     button.type = "button";
     button.textContent = `Target: ${name}`;
     button.onclick = async () => {
+      if (posePosting) return;
+      const edits = poseEdits;
       try {
         await post("/joint_preset", { name });
-        poseDirty = false;
+        // A Desired draft typed while this was in flight stays a draft.
+        if (poseEdits === edits) poseDirty = false;
         posePending = null;
         poseError = "";
       } catch (error) {
