@@ -1,6 +1,6 @@
 """leader-follower 离线自检：不接硬件，验证换算/安全/碰撞/整条假回路。
 
-    PYTHONPATH=. python -B tools/bench/check_leader_follower.py
+    PYTHONPATH=. python -B tools/check/check_leader_follower.py
 """
 from __future__ import annotations
 
@@ -152,12 +152,12 @@ def check_s288_ex_pos() -> None:
 def check_dora_follower_messages() -> None:
     """校验 DoraJogFollower 产出 jog/control/gripper 的格式（FR3 主路径）。"""
     from arm_control.leader_follower.follower import DoraJogFollower
-    from arm_control.messages import (
+    from arm_control.contracts.motion import (
         pack_control_update,
         unpack_control_update,
         unpack_jog,
-        unpack_motor_command,
     )
+    from arm_control.contracts.motor import unpack_motor_command
 
     class FakeNode:
         def __init__(self) -> None:
@@ -197,11 +197,9 @@ def check_dora_feedback() -> None:
     """校验 FR3 回读：motor_state/health/event/gripper_state -> 安全层。"""
     from arm_control.leader_follower.dora_feedback import DoraFollowerFeedback
     from arm_control.leader_follower.follower import DoraJogFollower
-    from arm_control.messages import (
-        pack_controller_event,
-        pack_json_message,
-        pack_motor_state,
-    )
+    from arm_control.contracts import pack_json_message
+    from arm_control.contracts.motion import pack_controller_event
+    from arm_control.contracts.motor import pack_motor_state
 
     class FakeNode:
         def __init__(self, events):

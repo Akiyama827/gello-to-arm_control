@@ -6,7 +6,7 @@
 # 必须先激活 venv（dora CLI 靠 VIRTUAL_ENV 找节点用的 Python）：
 #     source <repo>/.venv/bin/activate.fish     # fish
 #     source <repo>/.venv/bin/activate          # bash/zsh
-#     dora run tools/bench/dora_smoke/smoke.yml --log-level info
+#     dora run tools/check/dora_smoke/smoke.yml --log-level info
 #
 # 或直接跑同目录的 run_smoke.sh。
 nodes:

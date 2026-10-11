@@ -8,7 +8,9 @@ import time
 import numpy as np
 from dora import Node
 
-from arm_control.messages import pack_json_message, pack_motor_state, unpack_jog
+from arm_control.contracts import pack_json_message
+from arm_control.contracts.motion import unpack_jog
+from arm_control.contracts.motor import pack_motor_state
 
 N = 7
 

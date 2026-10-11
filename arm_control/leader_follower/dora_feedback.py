@@ -3,9 +3,9 @@
 小臂→大臂的 `jog` 是**单向下发**通道，默认不回读。安全层要判"大臂没按预期
 运行"，就必须另接一组反馈：
 
-* ``plant_interface/motor_state``      实测关节位置/速度（跟踪误差、速度异常）
-* ``plant_interface/motor_health``      `armed` / `latched_fault`（失能/故障位）
-* ``arm_controller/controller_event``   控制器 `fault`（控制器停了）
+* ``supervised_arm/motor_state``      实测关节位置/速度（跟踪误差、速度异常）
+* ``supervised_arm/motor_health``     `armed` / `latched_fault`（失能/故障位）
+* ``supervised_arm/controller_event``   控制器 `fault`（控制器停了）
 * ``franka_gripper/gripper_state``      夹爪开度（仅记录，安全层暂不判）
 
 同一个 Dora `Node` 既发 `jog`/`control`/`gripper` 又收上面这些 topic，所以本类
@@ -105,7 +105,7 @@ class DoraFollowerFeedback:
             self._parse_controller_event(value)
 
     def _parse_motor_state(self, value) -> None:
-        from arm_control.messages import unpack_motor_state
+        from arm_control.contracts.motor import unpack_motor_state
 
         n = self._n
         try:
@@ -120,7 +120,7 @@ class DoraFollowerFeedback:
         self._t = time.monotonic()
 
     def _parse_gripper_state(self, value) -> None:
-        from arm_control.messages import unpack_json_message
+        from arm_control.contracts import unpack_json_message
 
         msg = unpack_json_message(value, expected_schema="gripper_state")
         width = msg.get("width")
@@ -128,7 +128,7 @@ class DoraFollowerFeedback:
         self._width_m = None if width is None else float(width)
 
     def _parse_health(self, value) -> None:
-        from arm_control.messages import unpack_json_message
+        from arm_control.contracts import unpack_json_message
 
         msg = unpack_json_message(value)
         if "armed" in msg:
@@ -137,7 +137,7 @@ class DoraFollowerFeedback:
         self._health_fault = str(latched) if latched else ""
 
     def _parse_controller_event(self, value) -> None:
-        from arm_control.messages import unpack_controller_event
+        from arm_control.contracts.motion import unpack_controller_event
 
         result = unpack_controller_event(value)
         if result.get("kind") == "fault":
@@ -211,5 +211,5 @@ class DoraFollowerFeedback:
         if self._q is None and not got_stop:
             raise RuntimeError(
                 f"启动超时：{timeout_s:.1f}s 内未收到大臂 motor_state；"
-                "确认 plant_interface 已启动、motor_state 已接线。"
+                "确认 supervised_arm 已启动、motor_state 已接线。"
             )

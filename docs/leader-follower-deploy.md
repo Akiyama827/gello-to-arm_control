@@ -24,7 +24,7 @@ Franka Hand）。
 | `arm_control/leader_follower/node.py` | Dora 节点入口：单 `Node` 同时下发 + 收回读，启动 `prime` | 否 |
 | `arm_control/leader_follower/config.py` | YAML 解析与装配（新增 `follower.auto_arm`） | 否 |
 | `nodes/leader_teleop.py` | 上述节点的 Dora 可执行薄壳 | 否 |
-| `dataflows/leader_teleop_franka.yml` | 真机 Dora 图：遥操作节点作唯一运动源接 `arm_controller`/`franka_gripper` | 否（env 走部署侧） |
+| `dataflows/leader_teleop_franka.yml` | 真机 Dora 图：遥操作节点作唯一运动源接 `supervised_arm`/`franka_gripper` | 否（env 走部署侧） |
 | `examples/configs/leader_follower.yaml` | 全仿真示例配置（fake/fake） | 否 |
 | `examples/configs/leader_follower_real.example.yaml` | **真机配置模板**，复制后按现场标定 | **是** |
 | `examples/leader_follower_teleop.py` | 单机可运行示例（默认全仿真） | 否 |
@@ -33,7 +33,7 @@ Franka Hand）。
 | `examples/leader_follower_interactive.py` | MuJoCo 交互可视化（鼠标拖拽小臂 -> 真实 FR3 跟随） | **是** |
 | `examples/s288_calibrate.py` | **S288 小臂标定 CLI**（读数 / 找零 / 定方向 / 标夹爪，可写回 YAML） | **是**（标定用） |
 | `tools/assets/fetch_fr3_description.py` | 自动获取并 staging FR3 描述到 `franka/` | 否 |
-| `tools/bench/check_leader_follower.py` | 离线自检（无硬件） | 否 |
+| `tools/check/check_leader_follower.py` | 离线自检（无硬件） | 否 |
 | `docs/leader-follower.md` | 设计与原理 | 否 |
 | `docs/leader-follower-usage.md` | 使用说明书（怎么跑/看可视化/FAQ） | 否 |
 | `docs/leader-follower-deploy.md` | 本文档 | 否 |
@@ -79,7 +79,7 @@ ls -l /dev/ttyUSB0
 python -c "import serial; print(serial.__version__)"
 
 # 3) 离线自检全绿（不接硬件）
-PYTHONPATH=. python -B tools/bench/check_leader_follower.py
+PYTHONPATH=. python -B tools/check/check_leader_follower.py
 ```
 
 第 2 步失败就 `pip install pyserial`。若接的是旧配置里的 `bus: unitree_sdk`，会明确
@@ -185,21 +185,38 @@ build/arm_rt_server --backend franka --franka-ip <FR3-IP> --n 7 \
 
 服务器起来时是 **DISARMED**。
 
-### 6.2 再起 Dora 图（控制 PC）
+### 6.2 再起 supervisor 服务 + Dora 图（控制 PC）
+
+本图起在 **supervisor 架构**上（上游 CTRL-053）：控制器在一个独立进程
+`arm_control.supervisor.service` 里，通过 SDK socket 被 `supervised_arm` 节点代理。
+**supervisor 服务必须由部署启动器先于本图拉起**（图本身不起它），例如：
+
+```bash
+# 1) 先起 supervisor 服务（RT 机器上的 arm_rt_server 已在 6.1 起好并连上）
+python -m arm_control.supervisor.service --config <real_franka.yaml> --plant rt
+#    <real_franka.yaml> 需含 rt: 块（instance_id 等）；launcher 会写合并配置并暴露
+#    ARM_CONTROL_CONFIG / ARM_CONTROL_SOCKET 给后续每个节点。
+```
 
 在部署根（含 `configs/` 和 `libs/arm_control`）执行：
 
 ```bash
 export ARM_CONTROL_ROOT=$PWD
-export ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml
+export ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml   # supervisored 的合并配置
+export ARM_CONTROL_SOCKET=<supervisor socket 路径>                 # 或用实例默认
 export LEADER_FOLLOWER_CONFIG=$PWD/configs/entries/leader_follower.yaml
 
 dora run libs/arm_control/dataflows/leader_teleop_franka.yml
 ```
 
-> 注意：图里每个节点的 `env:` 会**覆盖**启动器环境，所以 `LEADER_FOLLOWER_CONFIG`
-> 故意不写进 `leader_teleop` 的 `env:`，让它从启动器继承。若省略该变量，节点会
-> 回退到 fake/fake 示例并**拒绝启动**（报错提示），不会静默空跑。
+> 注意：
+> * 本图里 `supervised_arm`/`trace_logger` 经 SDK 访问 supervisor，因此
+>   `ARM_CONTROL_CONFIG`、`ARM_CONTROL_SOCKET` 必须指向同一个 supervisor。
+> * 每个节点的 `env:` 会**覆盖**启动器环境，所以 `LEADER_FOLLOWER_CONFIG` 故意不写进
+>   `leader_teleop` 的 `env:`，让它从启动器继承。若省略该变量，节点会回退到
+>   fake/fake 示例并**拒绝启动**（报错提示），不会静默空跑。
+> * 若想保留操作台的 ARM/DISARM 门，请跑 `real_franka_motion.yml` 并把
+>   `follower.auto_arm` 设为 `false`；本图 `auto_arm: true`（停节点即 DISARM）。
 
 本地只有本仓库、没有部署根时，可直接：
 
@@ -208,6 +225,7 @@ ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=<你的 real_franka 配置> \
 LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
   dora run dataflows/leader_teleop_franka.yml
 ```
+（仍需先起 supervisor 服务并把 `ARM_CONTROL_SOCKET` 指到它。）
 
 ### 6.3 启动时观察
 
@@ -243,7 +261,7 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 
 处理流程：本 tick 起停止下发 `jog`（RT 服务器 0.2s 后 HOLD），节点发
 `control(cancel)`，并 `arm=False` 退出。恢复：排除原因（线缆/使能/碰撞风险/限位）
-→ 重新起 RT 服务器会话（若有故障锁存需 DISARM→ARM）→ 重跑第 6 节。
+→ 若有故障锁存，在 supervisor/操作台 DISARM→ARM → 重跑第 6 节。
 
 ### 7.3 各安全门含义（配置在 `safety.limits`）
 
@@ -264,7 +282,7 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 
 ## 8. 验证顺序（强烈建议逐级）
 
-1. **离线自检**：`PYTHONPATH=. python -B tools/bench/check_leader_follower.py` 全绿。
+1. **离线自检**：`PYTHONPATH=. python -B tools/check/check_leader_follower.py` 全绿。
 2. **单机仿真**：`PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10`，
    观察 mapping 方向与周期。想直观看动作就开
    `PYTHONPATH=. python -B examples/leader_follower_viewer.py --duration 20`（MuJoCo 3D
@@ -280,7 +298,8 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
    日志；确认无跳变后再在操作台 ARM。
 5. **真机低速**：把 `mapping.alpha` 调小（如 0.6）、`max_rate` 调小，小臂缓慢
    动作，确认跟踪正常后再恢复。
-6. **接入 `motor_state_logger`**：图中已包含，产出 CSV，用 `qdes - pos` 复核跟踪误差。
+6. **接入 `trace_logger` 跟踪日志**：图中已包含（读 supervisor trace/1），产出 CSV，
+   用 `qdes - pos` 复核跟踪误差。
 
 ---
 
@@ -290,14 +309,14 @@ LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_real.example.yaml \
 |---|---|---|
 | 节点报「找不到配置文件」 | 未设 `LEADER_FOLLOWER_CONFIG` | 指向真机配置（见 6.2） |
 | 节点报「follower.kind 不是 dora」 | 用了 fake/fake 示例 | 改配置或换 `LEADER_FOLLOWER_CONFIG` |
-| 启动超时未收到 `motor_state` | `plant_interface` 未起 / RT 服务器没连上 / 图接线错 | 先看 RT 服务器日志，再确认 Dora 图里 `plant_interface` 节点起来了 |
+| 启动超时未收到 `motor_state` | supervisor 服务未起 / RT 服务器没连上 / 图接线错 | 先看 supervisor 服务与 RT 服务器日志，再确认 Dora 图里 `supervised_arm` 节点起来了 |
 | 报错「unitree_actuator_sdk 不支持 S288」 | 配置里是旧的 `bus: unitree_sdk` | 改成 `bus: serial`（官方 digital_servo 协议） |
 | 反馈超时/CRC 失败 | 波特率非 6M / TX-RX 接反 / 未共地 / 适配器不是半双工一体 | 核对 6 Mbps、TTL 单线接法、共地；换收发一体适配器 |
 | 打开串口失败 | 端口错 / 权限不足 | 查 `ls -l /dev/ttyUSB0`、加入 `dialout` |
 | 一启动就安全停机（越限） | `fr3_joint4` 零位越限 / 初始位形非法 | 确保 `auto_align: true` 且 FR3 处于合法位形；核对限位 |
-| 一启动就安全停机（跟踪误差） | 大臂没使能 / 增益 0 / `jog` 未接上 | 检查 `arm_controller` 的 `jog` 输入与 ARM 状态 |
-| 运行中报「反馈陈旧」 | `motor_state` 断流 | 查 `plant_interface` 与 RT 链路 |
-| 小臂动、大臂不动 | `jog` 未接线 / 目标被限幅掉 / DISARMED | 看 `arm_controller` 日志的 IGNORING 与 armed 状态 |
+| 一启动就安全停机（跟踪误差） | 大臂没使能 / 增益 0 / `jog` 未接上 | 检查 `supervised_arm` 的 `jog` 输入与 ARM 状态 |
+| 运行中报「反馈陈旧」 | `motor_state` 断流 | 查 `supervised_arm` 与 RT 链路 / supervisor 服务 |
+| 小臂动、大臂不动 | `jog` 未接线 / 目标被限幅掉 / DISARMED | 看 `supervised_arm` 日志的 IGNORING 与 armed 状态 / supervisor 服务 |
 | 方向相反 | `joint_signs` 标定错 | 按第 5 节重标 |
 | 夹爪不动 | `gripper` 未接 `franka_gripper` / 单指米超 `[0,0.04]` | 查图接线与 `open_finger_m` |
 | 单个电机反馈冻结 / `err` 非 0 且重上电不消失 | 看是哪一路反馈坏：`q_out`（转子多圈）冻结、但 `ExPos`（输出端绝对单圈）仍随手动扳动变化 → 多为**转子多圈计数坏**；两路都不动才是电机彻底坏 | 用单电机探针 `examples/s288_gripper_probe.py` 分辨；若只是 `q_out` 坏，见 §9.1，把该关节（夹爪）角度源切到 ExPos |

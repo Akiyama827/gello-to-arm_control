@@ -1,46 +1,73 @@
 # REAL FR3 teleoperation — the leader arm (8x Unitree S288: 7 joints + 1
 # gripper, official digital_servo protocol over serial via pyserial) drives the
-# FR3 through the same RT bridge as real_franka_motion.yml.
+# FR3 through the SUPERVISOR architecture (CTRL-053) and the RT machine.
 #
-# One node is the SOLE motion source. `leader_teleop` produces the exact
-# jog/control/gripper contract `arm_console` produces, so arm_controller and
-# franka_gripper wire to it unchanged. It also consumes the feedback topics
-# (motor_state / motor_health / controller_event / gripper_state) and feeds
-# them through its safety layer — tracking error, stale feedback, latched
-# fault, disarm — and stops the arm on any of them.
+# This graph mirrors the supervisor wiring of real_franka_motion.yml but with
+# the teleop node as the SOLE motion source: `leader_teleop` produces the exact
+# jog/control contract `supervised_arm` serves. The Franka Hand stays a
+# separate graph node (the arm supervisor serves no gripper), fed by the
+# teleop `gripper` message.
 #
 # SAFETY MODEL — differs from real_franka_motion.yml on purpose. There is no
 # on-page ARM/DISARM gate here: the teleop node sends control(arm=True) when
 # it opens (follower.auto_arm) and control(cancel, arm=False) when it exits or
-# safety-stops, and the RT server keeps its normal deadman, so losing the node
+# safety-stops; the RT server keeps its normal deadman, so losing the node
 # parks the arm. STOPPING THIS NODE IS THE DISARM. To keep the console's
 # ARM/DISARM gate instead, run real_franka_motion.yml and set
 # follower.auto_arm:false in the teleop config.
 #
-# REQUIREMENT — this graph needs a deployment config with
-#   leader:   {kind: s288, bus: serial, port: ..., motor_ids: [...]}
-#   follower: {kind: dora, auto_arm: true}
-# exported as LEADER_FOLLOWER_CONFIG (a bare run would fall back to the
-# fake/fake example and the node refuses to start).
+# REQUIREMENTS — this graph needs:
+#   1. the arm's SUPERVISOR service already up on the control PC (started by
+#      the deployment launcher, NOT this graph):
+#        python -m arm_control.supervisor.service --config <robot.yaml> --plant rt
+#      where <robot.yaml> has an `rt:` block; the RT server (arm_rt_server
+#      --backend franka, normal deadman) must be running on the RT box.
+#   2. env for every node to reach the supervisor and pick the right config:
+#        ARM_CONTROL_CONFIG=<merged real_franka config>
+#        ARM_CONTROL_SOCKET=<supervisor socket>   (or default per-instance)
+#   3. the teleop config (exported as LEADER_FOLLOWER_CONFIG) with
+#      leader:   {kind: s288, bus: serial, port: ..., motor_ids: [...]}
+#      follower: {kind: dora, auto_arm: true}
+#      (a bare run would fall back to the fake/fake example and the node
+#      refuses to start).
 #
 #   LEADER_FOLLOWER_CONFIG=$PWD/configs/entries/leader_follower.yaml \
-#     ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
+#     ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
+#     ARM_CONTROL_SOCKET=$XDG_RUNTIME_DIR/arm_control_demo.sock \
 #     dora run libs/arm_control/dataflows/leader_teleop_franka.yml
 nodes:
+  # The teleop node: sole motion source. Produces jog/control/gripper and
+  # consumes the feedback topics from the supervised arm + Hand for its safety
+  # layer (tracking error, stale feedback, latched fault, disarm).
   - id: leader_teleop
     path: ../nodes/leader_teleop.py
-    env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
     inputs:
-      # Feedback for the safety layer; the jog channel itself does not read back.
-      motor_state: plant_interface/motor_state
-      motor_health: plant_interface/motor_health
-      controller_event: arm_controller/controller_event
-      gripper_state: franka_gripper/gripper_state
+      motor_state:      supervised_arm/motor_state
+      motor_health:     supervised_arm/motor_health
+      controller_event: supervised_arm/controller_event
+      gripper_state:    franka_gripper/gripper_state
     outputs:
       - jog
       - control
       - gripper
+
+  # The arm_controller contract served by the arm's supervisor (the one and
+  # only control authority). It talks to the supervisor through the SDK; the
+  # supervisor owns no authority of its own here — authority comes from the
+  # teleop control messages (auto_arm).
+  - id: supervised_arm
+    path: ../nodes/supervised_arm.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
+    inputs:
+      control: leader_teleop/control
+      jog:     leader_teleop/jog
+    outputs:
+      - motor_state
+      - arm
+      - controller_event
+      - motor_health
+      - model_revision
 
   # The Franka Hand — gripper-ONLY bridge, unchanged from real_franka_motion.yml.
   # The teleop `gripper` message is a 2-finger motor_command whose position[0]
@@ -53,43 +80,15 @@ nodes:
       - gripper_state
       - grasp_result
 
-  - id: arm_controller
-    path: ../nodes/arm_controller.py
-    env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
-    inputs:
-      motor_state: plant_interface/motor_state
-      motor_health: plant_interface/motor_health
-      control: leader_teleop/control
-      jog:     leader_teleop/jog
-    outputs:
-      - motor_command     # the ONLY producer of this topic
-      - arm
-      - controller_event  # ready / leg_result / fault
-
-  - id: plant_interface
-    path: ../nodes/rt_interface.py
-    env:
-      ARM_CONTROL_MODE_CONFIG: configs/modes/franka_rt.yaml
-    inputs:
-      motor_command: arm_controller/motor_command
-      arm:           arm_controller/arm
-    outputs:
-      - motor_state
-      - motor_state_viz
-      - motor_health
-      - model_revision
-
   - id: visualizer
     path: ../nodes/visualizer.py
     inputs:
-      motor_state: plant_interface/motor_state_viz
+      motor_state: supervised_arm/motor_state
       gripper_state: franka_gripper/gripper_state
 
-  # Tracking log: measured pos/vel/torque + commanded q_des per motor_state
-  # tick -> CSV. Tracking error = qdes - pos.
+  # Tracking log from the supervisor's trace/1: measured pos/vel/torque, the
+  # PC's q_des, the RT's servoed command -> CSV. Tracking error = qdes - pos.
   - id: motor_state_logger
-    path: ../nodes/motor_state_logger.py
+    path: ../nodes/trace_logger.py
     inputs:
-      motor_state:   plant_interface/motor_state
-      motor_command: arm_controller/motor_command
+      tick: dora/timer/millis/100

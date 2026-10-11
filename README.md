@@ -20,7 +20,7 @@ git clone https://github.com/Akiyama827/gello-to-arm_control.git arm_control   #
 cd arm_control
 python3 -m venv .venv && source .venv/bin/activate            # fish: source .venv/bin/activate.fish
 pip install -e '.[sim,viz,assets]'                            # 想锁版本：pip install -r requirements.txt
-PYTHONPATH=. python -B tools/bench/check_leader_follower.py   # 离线自检，应打印“全部通过”
+PYTHONPATH=. python -B tools/check/check_leader_follower.py   # 离线自检，应打印“全部通过”
 PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 缩小孪生小臂 + 曲线
 ```
 

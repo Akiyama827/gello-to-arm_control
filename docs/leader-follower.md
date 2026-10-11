@@ -8,7 +8,8 @@
 - **小臂（leader）**：**8 个宇树 S288** = 7 个臂关节 + 1 个夹爪；串口通信走
   **官方 `digital_servo` 协议**（20B/26B + CRC32，pyserial 直连）。
 - **大臂（follower）**：**FR3** = `fr3_joint1..7` + Franka Hand。臂关节走
-  `arm_controller` 的 `jog`/`control`，夹爪走 `franka_gripper` 的 `gripper`。
+  `supervised_arm`（旧 `arm_controller` 的 supervisor 代理）的 `jog`/`control`，
+  夹爪走 `franka_gripper` 的 `gripper`。
 
 小臂 7 个臂关节与 FR3 的 7 个关节**天然一一对应**，关节空间直连即可。
 
@@ -55,7 +56,7 @@ DryRunFollower / DoraJogFollower / RtFollower / FakeFollower （下发 FR3）
 | `tools/assets/setup_fr3.py` | 把 FR3 描述 staging 到 `franka/` |
 | `tools/assets/fetch_fr3_description.py` | 自动 clone franka_description + xacro 生成 URDF + staging |
 | `examples/configs/leader_follower.yaml` | 示例配置 |
-| `tools/bench/check_leader_follower.py` | 离线自检 |
+| `tools/check/check_leader_follower.py` | 离线自检 |
 
 ## 串口通信：官方 digital_servo 协议
 
@@ -87,26 +88,29 @@ S288/J288 的官方通信协议**不在** `unitree_actuator_sdk` 里（该 SDK �
 
 ## FR3 下发通道（Dora）
 
-FR3 在 `real_franka_motion.yml` 里由 `arm_console` 产出三个 topic，我们的遥操作
-节点就按同样格式产出来替代/并行这个运动源：
+FR3 在 `real_franka_motion.yml` 里由 `supervised_arm`（旧的 `arm_controller` 节点已被上游
+**supervisor 架构**替代）消费 `plan`/`control`/`jog` 三个 topic，我们的遥操作节点就按
+同样格式产出来替代/并行这个运动源：
 
 | topic | 消费者 | 内容 |
 |---|---|---|
-| `jog` | `arm_controller` | `pack_jog(q=[7 关节], reason=...)`；单帧设定点，0.2s 不刷新自动停 |
-| `control` | `arm_controller` | `pack_control_update(arm=True)` 使能；`cancel=True`/`arm=False` 撤销 |
+| `jog` | `supervised_arm` | `pack_jog(q=[7 关节], reason=...)`；单帧设定点，0.2s 不刷新自动停 |
+| `control` | `supervised_arm` | `pack_control_update(arm=True)` 使能；`cancel=True`/`arm=False` 撤销 |
 | `gripper` | `franka_gripper` | `pack_motor_command([finger, finger], 0,0,0,0)`，**单指位移（米）** |
 
 要点：
 
-- FR3 的 `arm_controller` **不**消费 `gripper`（`num_motors: 7`，臂上无夹爪电机）；
+- FR3 臂的 `supervised_arm` **不**消费 `gripper`（`num_motors: 7`，臂上无夹爪电机）；
   夹爪由独立的 `franka_gripper` 节点经它自己的 TCP 服务驱动。
 - `franka_gripper` 取 `gripper` 消息的 `position[0]` 作为**单指位移**，内部
   `width = 2 * finger`；FR3 行程是 `gripper_range_m: [0.0, 0.04]`（单指）。
   所以 `GripperMapping.open_finger_m` 用 **0.04**，不是整手 0.075/0.08。
-- 部署时把 `real_franka_motion.yml` 里 `arm_controller`/`franka_gripper` 的
+- 部署时把 `real_franka_motion.yml` 里 `supervised_arm`/`franka_gripper` 的
   `jog`/`control`/`gripper` 输入从 `arm_console/*` 改接到遥操作节点。已经落成
   `dataflows/leader_teleop_franka.yml`：`leader_teleop` 作**唯一运动源**，
   产出的三个 topic 与 `arm_console` 完全同格式；`arm_console` 不再入图。
+  注意新架构下控制器在 supervisor 服务进程里，`supervised_arm` 只是该服务的
+  Dora 代理（见部署文档 §6.2）。
 - RT 直连后端（`RtFollower`）只发 7 个臂关节，**不驱动 Franka Hand**；要连夹爪
   一起遥操作必须走 Dora 的 `DoraJogFollower`。
 
@@ -117,9 +121,9 @@ Dora `Node` 上收反馈，喂给安全层：
 
 | topic | 用途 |
 |---|---|
-| `plant_interface/motor_state` | 实测关节位置/速度 -> 跟踪误差、速度异常、启动对齐基准 |
-| `plant_interface/motor_health` | `armed` / `latched_fault` -> 失能/故障位停机 |
-| `arm_controller/controller_event` | `kind=fault` -> 控制器停止，粘住不自动清除 |
+| `supervised_arm/motor_state` | 实测关节位置/速度 -> 跟踪误差、速度异常、启动对齐基准 |
+| `supervised_arm/motor_health` | `armed` / `latched_fault` -> 失能/故障位停机 |
+| `supervised_arm/controller_event` | `kind=fault` -> 控制器停止，粘住不自动清除 |
 | `franka_gripper/gripper_state` | 夹爪开度（仅记录；`width` 为整手，单指 = `width/2`） |
 
 要点：
@@ -162,8 +166,8 @@ Dora `Node` 上收反馈，喂给安全层：
 - `SphereCollisionGuard`：纯 numpy 两臂球体近似，开箱可用
 
 > 注意：`DoraJogFollower` 的 `jog` 通道本身不回读，但 Dora 节点用
-> `DoraFollowerFeedback` 另接 `plant_interface/motor_state` +
-> `plant_interface/motor_health` + `arm_controller/controller_event`，跟踪误差、
+> `DoraFollowerFeedback` 另接 `supervised_arm/motor_state` +
+> `supervised_arm/motor_health` + `supervised_arm/controller_event`，跟踪误差、
 > 反馈陈旧、故障位、失能都能判。若确实没有回读，必须设 `feedback_required: false`
 > 并明确接受该保护缺失。
 
@@ -171,7 +175,7 @@ Dora `Node` 上收反馈，喂给安全层：
 
 ```bash
 # 离线自检（无需硬件）
-PYTHONPATH=. python -B tools/bench/check_leader_follower.py
+PYTHONPATH=. python -B tools/check/check_leader_follower.py
 # 全仿真跑 10s
 PYTHONPATH=. python -B examples/leader_follower_teleop.py --duration 10
 # 带玩具碰撞守卫，演示两臂碰撞停机

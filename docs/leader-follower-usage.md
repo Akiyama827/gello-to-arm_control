@@ -22,7 +22,7 @@
 | 安全 | `arm_control/simulation/mj_collision_guard.py` | 同场景真实几何的两臂碰撞守卫 |
 | 配置 | `examples/configs/leader_follower.yaml` | 仿真配置（fake/fake） |
 | 配置 | `examples/configs/leader_follower_real.example.yaml` | 真机配置模板 |
-| 自检 | `tools/bench/check_leader_follower.py` | 无硬件离线自检 |
+| 自检 | `tools/check/check_leader_follower.py` | 无硬件离线自检 |
 | 资产 | `tools/assets/fetch_fr3_description.py` | 获取并 staging FR3 描述到 `franka/` |
 | 真机 | `dataflows/leader_teleop_franka.yml` | 真机 Dora 图 |
 
@@ -76,7 +76,7 @@ source .venv/bin/activate # fish: source .venv/bin/activate.fish
 **第 1 步 · 自检**（不碰硬件，应打印"全部通过"）
 
 ```fish
-PYTHONPATH=. python -B tools/bench/check_leader_follower.py
+PYTHONPATH=. python -B tools/check/check_leader_follower.py
 ```
 
 **第 2 步 · 纯仿真跑一遍**（默认 FakeLeader + FakeFollower）
@@ -315,15 +315,20 @@ PYTHONPATH=. python -B examples/gello_leader_preview.py --appearance gello
 ## 7. 真机运行（简述）
 
 前提：部署侧已按 [leader-follower-deploy.md](leader-follower-deploy.md) 配好
-`arm_controller` / `franka_gripper` 与真机配置。
+`supervised_arm` / `franka_gripper` 与真机配置；并且**supervisor 服务进程已先由
+部署启动器拉起**（`python -m arm_control.supervisor.service --config <robot.yaml>
+--plant rt`，详见部署文档 §6.2），节点经 SDK socket 连它。
 
 ```bash
 LEADER_FOLLOWER_CONFIG=$PWD/configs/entries/leader_follower.yaml \
 ARM_CONTROL_ROOT=$PWD ARM_CONTROL_CONFIG=$PWD/configs/entries/real_franka.yaml \
+ARM_CONTROL_SOCKET=<supervisor socket 路径>   # 或用实例默认
   dora run libs/arm_control/dataflows/leader_teleop_franka.yml
 ```
 
 - `dora run` 必须在**已激活 venv** 的 shell 里跑（否则节点用系统 python）。
+- `ARM_CONTROL_CONFIG`、`ARM_CONTROL_SOCKET` 必须指向**同一个 supervisor**（图中的
+  `supervised_arm`/`trace_logger` 都经 SDK 访问它）。
 - 首次接真机建议 `follower.auto_arm: false`，只观察回读与 `auto_align`，确认无跳变后再 ARM。
 
 ### 7.1 小臂标定（接上真 S288 后）
@@ -420,7 +425,7 @@ fish 要用 `source .venv/bin/activate.fish`。
 source .venv/bin/activate.fish
 
 # 自检
-PYTHONPATH=. python -B tools/bench/check_leader_follower.py
+PYTHONPATH=. python -B tools/check/check_leader_follower.py
 
 # S288 小臂标定（真机；--bus fake 可无硬件演练）
 PYTHONPATH=. python -B examples/s288_calibrate.py --config $CFG read --watch

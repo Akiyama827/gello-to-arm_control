@@ -242,7 +242,7 @@ class DoraJogFollower:
     def open(self) -> None:
         node = self._ensure_node()
         if self.auto_arm:
-            from arm_control.messages import pack_control_update
+            from arm_control.contracts.motion import pack_control_update
 
             node.send_output("control", pack_control_update(arm=True))
             print("[follower:dora] 已发送 control(arm=True)")
@@ -250,7 +250,7 @@ class DoraJogFollower:
 
     def read_state(self) -> tuple[np.ndarray, float]:
         # `jog` 通道本身不回读；若节点注入了 `state_provider`（订阅
-        # `plant_interface/motor_state` + `franka_gripper/gripper_state`），
+        # `supervised_arm/motor_state` + `franka_gripper/gripper_state`），
         # 就用实测位形做启动对齐基准；否则回退零点，由部署侧自行对齐。
         if self.state_provider is not None:
             arm, finger = self.state_provider()
@@ -258,7 +258,8 @@ class DoraJogFollower:
         return np.zeros(self.num_arm_joints), 0.0
 
     def send(self, arm_q: Sequence[float], gripper_finger_m: float) -> None:
-        from arm_control.messages import pack_jog, pack_motor_command
+        from arm_control.contracts.motion import pack_jog
+        from arm_control.contracts.motor import pack_motor_command
 
         node = self._ensure_node()
         q = np.asarray(arm_q, dtype=float)
@@ -286,7 +287,7 @@ class DoraJogFollower:
         if not self._opened:
             return
         try:
-            from arm_control.messages import pack_control_update
+            from arm_control.contracts.motion import pack_control_update
 
             self._ensure_node().send_output(
                 "control", pack_control_update(cancel=True, reason="leader-stale")
@@ -298,7 +299,7 @@ class DoraJogFollower:
         if not self._opened:
             return
         try:
-            from arm_control.messages import pack_control_update
+            from arm_control.contracts.motion import pack_control_update
 
             self._ensure_node().send_output(
                 "control", pack_control_update(cancel=True, arm=False, reason="leader-follower-exit")
