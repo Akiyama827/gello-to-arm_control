@@ -8,26 +8,26 @@ version = "0.1.0"
 description = "Reusable robot control, planning, plant backends and Dora adapters"
 requires-python = ">=3.10"
 
-# HARD deps = imported at module top level by code any consumer hits.
-#   numpy    — every module
-#   pyarrow  — contracts/ (wire codecs; messages.py remains an API alias)
-#   pyyaml   — config.py, node_utils.py (top-level)
-#   dora-rs  — the repository ships Dora process adapters.
+# HARD deps = what the minimal SDK imports: arm_control.sdk, .execution and
+# .motion need numpy and nothing else (tools/check/check_sdk_supervisor.py
+# asserts it). Everything that runs a controller or a Dora process is an extra.
 dependencies = [
     "numpy",
-    "pyarrow",
-    "pyyaml",
-    "dora-rs",
 ]
 
 [project.optional-dependencies]
+# The headless supervisor (arm_control.supervisor): ArmController's wire
+# codecs (contracts/, pyarrow) and robot configs (config.py, pyyaml).
+supervisor = ["pyarrow", "pyyaml"]
+# Dora process adapters (nodes/, dataflows/: supervised_arm, scene_observer, the consoles).
+dora = ["pyarrow", "pyyaml", "dora-rs"]
 # --- pip-installable extras -------------------------------------------------
 # simulation/ + planning/mujoco_collision.py import mujoco at MODULE top level,
 # so `pip install arm_control[sim]` is required before importing those.
 sim = ["mujoco"]
 # Shared joint-path retiming; imported only by planning processes.
 planning = ["toppra==0.6.10", "scipy"]
-# nodes/visualizer.py, planning/preview_rerun.py, simulation/rerun_scene.py.
+# nodes/visualizer.py, viz/preview.py, simulation/rerun_scene.py.
 # visualizer is in every dataflow, so in practice this is not optional at
 # RUNTIME — it is an extra only because the library imports it lazily.
 viz = ["rerun-sdk"]
@@ -48,7 +48,6 @@ hardware = ["pyserial"]
 #   pinocchio / hpp-fcl — dynamics, FK/IK, geometry and preview.
 #   ompl — optional planning bindings.
 #   pylibfranka — direct Franka backend bindings, provisioned with libfranka.
-#   dmcan — vendor USB2FDCAN SDK and its shared library when that transport is selected.
 # See docs/RUNBOOK.md; installing extras does not provision vendor toolchains.
 # Perception implementation and camera dependencies belong to consumers.
 

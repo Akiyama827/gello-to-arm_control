@@ -1,0 +1,883 @@
+"""High-level facade exposing plan_cartesian / plan_joint for orchestrator nodes."""
+from __future__ import annotations
+
+from time import perf_counter
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from arm_control.frames import T_to_pose_xyzquat, pose_xyzquat_to_T
+from arm_control.planning.ik import PinocchioIK
+from arm_control.motion import JointTrajectory
+from arm_control.planning import PLANNER_DEFAULTS
+from arm_control.planning.retiming import (
+    BLEND_TOLERANCE_RAD, COLLISION_STEP_RAD, RETIMING_STEPS_RAD, ROUTE_ATTEMPTS, RouteCollides,
+    bound_trajectory, collision_checked_retiming, time_parameterize_blended,
+)
+
+def ompl_settings(planner_cfg) -> dict:
+    """``solve_time_sec``/``simplify_time_sec``/``resolution_frac`` for an OMPLPlanner: the config's, else the defaults."""
+    return {k: float(planner_cfg.get(k, PLANNER_DEFAULTS[k])) for k in ("solve_time_sec", "simplify_time_sec", "resolution_frac")}
+
+if TYPE_CHECKING:
+    from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
+    from arm_control.planning.ompl_planner import OMPLPlanner
+
+
+def _quat_of(T: np.ndarray) -> np.ndarray:
+    """[w,x,y,z] of a homogeneous transform, via the wire pose convention."""
+    return np.asarray(T_to_pose_xyzquat(T), dtype=float)[3:]
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, s: float) -> np.ndarray:
+    dot = float(np.clip(q0 @ q1, -1.0, 1.0))
+    if dot > 0.9995:  # nearly parallel: lerp is exact enough and slerp blows up
+        out = q0 + s * (q1 - q0)
+        return out / np.linalg.norm(out)
+    theta = np.arccos(dot) * s
+    basis = q1 - q0 * dot
+    basis = basis / np.linalg.norm(basis)
+    return q0 * np.cos(theta) + basis * np.sin(theta)
+
+
+def _curve_length_upper(trajectory: JointTrajectory) -> float:
+    """Joint-space arc length, conservatively within 1e-4 joint units.
+
+    Hermite knots alone underestimate travel. Convert the flown cubics to
+    Bezier segments: chord sums bound length below, control polygons above.
+    De Casteljau subdivision tightens those bounds without time sampling.
+    The upper bound is safe for pruning alternative IK endpoints. This is
+    the unweighted Euclidean metric used by our OMPL real-vector space;
+    for the FR3 all coordinates are revolute and the unit is radians.
+    """
+    q = trajectory.positions
+    if not np.isfinite(q).all() or not np.isfinite(trajectory.times).all():
+        raise ValueError('path selection requires a finite trajectory')
+    if trajectory.velocities is None:
+        length = float(np.linalg.norm(np.diff(q, axis=0), axis=1).sum())
+        return length + 1e-10 * max(1., length)
+    v = trajectory.velocities
+    if not np.isfinite(v).all():
+        raise ValueError('path selection requires finite velocities')
+    h = np.diff(trajectory.times)[:, None]
+    polygons = np.stack((q[:-1], q[:-1] + h * v[:-1] / 3,
+                         q[1:] - h * v[1:] / 3, q[1:]), axis=1)
+    for _ in range(20):
+        upper = float(np.linalg.norm(np.diff(polygons, axis=1), axis=2).sum())
+        lower = float(np.linalg.norm(polygons[:, -1] - polygons[:, 0], axis=1).sum())
+        if upper - lower <= 1e-4:
+            # Numerical allowance, not an interval-arithmetic certificate.
+            return upper + 1e-10 * max(1., upper)
+        # Only subdivide segments whose gap exceeds their share of the budget.
+        gaps = (np.linalg.norm(np.diff(polygons, axis=1), axis=2).sum(axis=1)
+                - np.linalg.norm(polygons[:, -1] - polygons[:, 0], axis=1))
+        split = gaps > 1e-4 / len(polygons)
+        p = polygons[split]
+        a = (p[:, :-1] + p[:, 1:]) / 2
+        b = (a[:, :-1] + a[:, 1:]) / 2
+        middle = (b[:, 0] + b[:, 1]) / 2
+        polygons = np.concatenate((polygons[~split],
+            np.stack((p[:, 0], a[:, 0], b[:, 0], middle), axis=1),
+            np.stack((middle, b[:, 1], a[:, 2], p[:, 3]), axis=1)))
+    raise ValueError('path length bounds did not converge')
+
+
+def build_collision_stack(
+    urdf_path,
+    planned_joints: list[str],
+    planner_cfg: dict,
+    *,
+    cache_dir,
+    environment: list[dict] | None = None,
+    collision_world=None,
+) -> tuple["MuJoCoCollisionWorld", "OMPLPlanner"]:
+    """Construct the shared collision world + OMPL planner pair.
+
+    Single construction site for teleop and orchestrator nodes so both plan
+    against the same environment. Imports mujoco/ompl lazily — this module
+    stays importable on hosts without them (the executor path).
+    """
+    from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
+    from arm_control.planning.ompl_planner import OMPLPlanner
+
+    world = collision_world if collision_world is not None else MuJoCoCollisionWorld(
+        urdf_path,
+        list(planned_joints),
+        cache_dir=cache_dir,
+        self_collision_padding_m=float(
+            planner_cfg.get("self_collision_padding_m", PLANNER_DEFAULTS["self_collision_padding_m"])
+        ),
+        environment=environment,
+        held_positions={
+            str(k): float(v)
+            for k, v in (planner_cfg.get("held_joints") or {}).items()
+        },
+        ignore_bodies=[str(b) for b in (planner_cfg.get("ignore_bodies") or [])],
+        cloud_obstacles=planner_cfg.get("cloud_obstacles"),
+    )
+    ompl = OMPLPlanner(
+        list(zip(world.lower, world.upper)),
+        world.in_collision,
+        **ompl_settings(planner_cfg),
+    )
+    return world, ompl
+
+
+class _CertifyFailed(Exception):
+    """No retiming rung of one route certified; carries the last certification error."""
+
+    def __init__(self, error: ValueError):
+        super().__init__(str(error))
+        self.error = error
+
+
+class ArmPlanner:
+    """Compose IK + (optionally OMPL) + blended time-parameterization.
+
+    Orchestrator nodes call ``plan_cartesian(target_pose, q_start)`` to get a
+    fully-timed ``JointTrajectory`` ready for execution by
+    ``JointTrajectoryExecutor``.
+    """
+
+    def __init__(
+        self,
+        arm_id: str,
+        ik: PinocchioIK,
+        ompl: OMPLPlanner | None,
+        max_vel: np.ndarray,
+        max_acc: np.ndarray,
+        world=None,
+        trajectory_refiner=None,
+        *,
+        ik_candidate_attempts: int = 0,
+        ik_limit_margin_fraction: float = 0.05,
+    ) -> None:
+        self.arm_id = str(arm_id)
+        self._ik = ik
+        self._ompl = ompl
+        # MuJoCoCollisionWorld | None: with a world, IK restarts are filtered
+        # to collision-free branches — bare DLS happily converges into a
+        # self-colliding posture and OMPL then rejects the goal outright.
+        self._world = world
+        self._trajectory_refiner = trajectory_refiner
+        self._max_vel = np.asarray(max_vel, dtype=float).ravel()
+        self._max_acc = np.asarray(max_acc, dtype=float).ravel()
+        if self._max_vel.shape != self._max_acc.shape:
+            raise ValueError("max_vel and max_acc must have matching shape")
+        if isinstance(ik_candidate_attempts, bool) \
+                or not isinstance(ik_candidate_attempts, (int, np.integer)) \
+                or not 0 <= ik_candidate_attempts <= 128:
+            raise ValueError('ik_candidate_attempts must be an integer in [0, 128]')
+        margin = float(ik_limit_margin_fraction)
+        if not np.isfinite(margin) or not 0 <= margin <= 0.5:
+            raise ValueError('ik_limit_margin_fraction must be finite and in [0, 0.5]')
+        self._ik_candidate_attempts = ik_candidate_attempts
+        self._ik_limit_margin_fraction = margin
+        if ik_candidate_attempts:
+            lo, hi = ik.hard_limits
+            span = hi - lo
+            if lo.shape != self._max_vel.shape or hi.shape != lo.shape \
+                    or not lo.size or not np.isfinite(lo).all() \
+                    or not np.isfinite(hi).all() or not np.isfinite(span).all() \
+                    or not (span > 0).all():
+                raise ValueError('IK ranking requires finite positive joint spans')
+
+    @property
+    def ik(self) -> PinocchioIK:
+        return self._ik
+
+    def plan_cartesian(
+        self,
+        target_T: np.ndarray,
+        q_start: np.ndarray,
+        *,
+        collision_check: bool = True,
+        speed_scale: float = 1.0,
+    ) -> JointTrajectory | None:
+        started = perf_counter()
+        target_T = np.asarray(target_T, dtype=float)
+        q_start = np.asarray(q_start, dtype=float).ravel()
+        validate = None
+        if collision_check and self._world is not None:
+            validate = lambda q: not self._world.in_collision(q)  # noqa: E731
+            if self._world.in_collision(q_start):
+                print(
+                    f"[planner:{self.arm_id}] start pose is in collision per the "
+                    f"plan world: q={np.round(q_start, 3).tolist()}",
+                    flush=True,
+                )
+        stage_started = perf_counter()
+        if self._ik_candidate_attempts:
+            candidates = self._ik.solve_candidates(
+                target_T, q_start, validate=validate, attempts=self._ik_candidate_attempts
+            )
+            lo, hi = self._ik.hard_limits
+            span = hi - lo
+            planned_start = np.clip(q_start, lo, hi)
+
+            def score(q):
+                margin = float(np.min(np.minimum(q - lo, hi - q) / span))
+                # Same start and trivial-hold rule as plan_joint. Endpoint
+                # distance is an admissible length lower bound, not a route
+                # quality score. Bounded joints must never wrap here.
+                travel = (0. if np.allclose(planned_start, q) else
+                          float(np.linalg.norm(q - planned_start)))
+                return max(0., self._ik_limit_margin_fraction - margin), travel
+
+            candidates.sort(key=score)
+        else:
+            q_goal = self._ik.solve(target_T, q_start, validate=validate)
+            candidates = [] if q_goal is None else [q_goal]
+        print(f'[planner:{self.arm_id}] stage=IK elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
+        if not candidates:
+            print(
+                f"[planner:{self.arm_id}] IK found no"
+                f"{' collision-free' if validate else ''} goal branch for "
+                f"target p={np.round(target_T[:3, 3], 3).tolist()}",
+                flush=True,
+            )
+            return None
+        best = None
+        best_score = (np.inf, np.inf)
+        best_rank = planned = pruned = unsolved = 0
+        for rank, q_goal in enumerate(candidates, 1):
+            if self._ik_candidate_attempts and score(q_goal) >= best_score:
+                # Sorted lower bounds: no remaining endpoint can improve the
+                # incumbent under the same margin preference and length metric.
+                pruned = len(candidates) - rank + 1
+                break
+            planned += 1
+            trajectory = self.plan_joint(
+                q_goal, q_start, collision_check=collision_check, speed_scale=speed_scale
+            )
+            if trajectory is None:
+                unsolved += 1
+            if trajectory is not None:
+                if self._ik_candidate_attempts:
+                    expected_goal = (planned_start if np.allclose(planned_start, q_goal)
+                                     else q_goal)
+                    if not np.array_equal(trajectory.positions[0], planned_start) \
+                            or not np.array_equal(trajectory.positions[-1], expected_goal):
+                        raise ValueError('path selection requires fixed trajectory endpoints')
+                    margin = float(np.min(np.minimum(q_goal - lo, hi - q_goal) / span))
+                    shortfall, travel = score(q_goal)
+                    length = _curve_length_upper(trajectory)
+                    print(
+                        f'[planner:{self.arm_id}] IK candidate rank={rank}/{len(candidates)} '
+                        f'endpoint_lower={travel:.6f} path_length_upper={length:.6f} '
+                        f'margin={margin:.6f} shortfall={shortfall:.6f} '
+                        f'q_start={np.round(q_start, 6).tolist()} '
+                        f'q_goal={np.round(q_goal, 6).tolist()}',
+                        flush=True,
+                    )
+                    if (shortfall, length) < best_score:
+                        best, best_score, best_rank = trajectory, (shortfall, length), rank
+                    continue
+                print(f'[planner:{self.arm_id}] stage=cartesian_total elapsed_s={perf_counter() - started:.6f}', flush=True)
+                return trajectory
+        if best is not None:
+            print(f'[planner:{self.arm_id}] route_selection=joint_path_length '
+                  f'candidates={len(candidates)} planned={planned} '
+                  f'unsolved={unsolved} pruned={pruned} '
+                  f'selected_rank={best_rank} path_length_upper={best_score[1]:.6f} '
+                  f'duration_s={best.duration_sec:.6f}', flush=True)
+        print(f'[planner:{self.arm_id}] stage=cartesian_total elapsed_s={perf_counter() - started:.6f}', flush=True)
+        return best
+
+    def plan_linear(
+        self,
+        target_T: np.ndarray,
+        q_start: np.ndarray,
+        *,
+        collision_check: bool = True,
+        speed_scale: float = 1.0,
+        max_step_m: float = 0.005,
+    ) -> JointTrajectory | None:
+        """A STRAIGHT line in Cartesian space, not just a Cartesian goal.
+
+        ``plan_cartesian`` solves IK for the goal and then interpolates in
+        JOINT space, so the tool traces whatever curve the joints happen to
+        sweep -- measured 0.34 mm of lateral bow over a 40 mm insertion, a
+        third of the seat gate, and unbounded because it depends on posture.
+        A connector being pushed into its socket has to travel down its own
+        axis, so this samples the line itself and solves IK per sample.
+
+        Returns None if any sample is unreachable (the caller can fall back
+        to a joint-space plan) -- a partially-straight path is not a thing
+        worth shipping.
+        """
+        target_T = np.asarray(target_T, dtype=float)
+        lo, hi = self._ik.hard_limits
+        q_start = np.clip(np.asarray(q_start, dtype=float).ravel(), lo, hi)
+        if not 0.0 < speed_scale <= 1.0:
+            raise ValueError("speed_scale must be in (0, 1]")
+        start_T = self._ik.fk(q_start)
+        p0, p1 = start_T[:3, 3], target_T[:3, 3]
+        span = float(np.linalg.norm(p1 - p0))
+        if span < 1e-9:
+            return self.plan_joint(
+                q_start, q_start, collision_check=collision_check,
+                speed_scale=speed_scale,
+            )
+        steps = max(2, int(np.ceil(span / float(max_step_m))) + 1)
+        q0 = _quat_of(start_T)
+        q1 = _quat_of(target_T)
+        if float(q0 @ q1) < 0.0:
+            q1 = -q1  # shortest arc: quaternions double-cover rotations
+        validate = None
+        if collision_check and self._world is not None:
+            validate = lambda q: not self._world.in_collision(q)  # noqa: E731
+        waypoints = [q_start]
+        seed = q_start
+        for step in range(1, steps):
+            s = step / (steps - 1)
+            pose = np.empty(7)
+            pose[:3] = p0 + s * (p1 - p0)
+            pose[3:] = _slerp(q0, q1, s)
+            q = self._ik.solve(pose_xyzquat_to_T(pose), seed, validate=validate)
+            if q is None:
+                print(
+                    f"[planner:{self.arm_id}] straight-line insertion is not "
+                    f"reachable at {s * span * 1e3:.0f} mm of {span * 1e3:.0f} mm",
+                    flush=True,
+                )
+                return None
+            waypoints.append(q)
+            seed = q
+        if collision_check and self._world is not None:
+            return collision_checked_retiming(
+                np.vstack(waypoints), self._max_vel * speed_scale,
+                self._max_acc * speed_scale, self._world.in_collision)
+        return time_parameterize_blended(
+            np.vstack(waypoints), self._max_vel * speed_scale,
+            self._max_acc * speed_scale)
+
+    def plan_joint(
+        self,
+        q_goal: np.ndarray,
+        q_start: np.ndarray,
+        *,
+        collision_check: bool = True,
+        speed_scale: float = 1.0,
+    ) -> JointTrajectory | None:
+        started = perf_counter()
+        # A parked/sagged arm can measure marginally OUTSIDE the joint limits
+        # (gravity sag in sim, calibration offset on hardware); OMPL then
+        # rejects the start state outright. Plan from the nearest in-bounds
+        # configuration — sub-degree from where the arm actually is.
+        lo, hi = self._ik.hard_limits
+        q_start = np.clip(np.asarray(q_start, dtype=float).ravel(), lo, hi)
+        if not 0.0 < speed_scale <= 1.0:
+            raise ValueError("speed_scale must be in (0, 1]")
+        q_start = np.asarray(q_start, dtype=float).ravel()
+        q_goal = np.asarray(q_goal, dtype=float).ravel()
+        if q_start.shape != q_goal.shape:
+            raise ValueError("q_start and q_goal must have the same shape")
+        if self._trajectory_refiner is not None and (self._ompl is None or not collision_check):
+            raise ValueError('trajectory refinement requires collision-checked OMPL planning')
+        if np.allclose(q_start, q_goal):
+            # Trivial hold: 2-point traj over 0.1 s with zero velocity.
+            times = np.array([0.0, 0.1])
+            positions = np.vstack([q_start, q_start])
+            velocities = np.zeros_like(positions)
+            print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
+            return JointTrajectory(times=times, positions=positions, velocities=velocities)
+
+        # Certify only where a path was actually CLEARED. Without OMPL the
+        # waypoints are a bare start->goal line nothing collision-checked, so
+        # a complaint would report the absence of planning rather than a curve
+        # that left its corridor. NOTE this is deliberately narrower than the
+        # `self._world is not None` guards above, which gate collision-aware
+        # IK CANDIDATE selection and must stay on with or without OMPL --
+        # widening this condition to those cost a self-check ("colliding
+        # candidate was selected") while writing it.
+        certify = collision_check and self._world is not None and self._ompl is not None
+        failure = None
+        for attempt in range(self.ROUTE_ATTEMPTS if certify else 1):
+            if self._ompl is not None and collision_check:
+                stage_started = perf_counter()
+                waypoints = self._ompl.plan(q_start, q_goal)
+                print(f'[planner:{self.arm_id}] stage=OMPL elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
+                if waypoints is None:
+                    return None
+            else:
+                waypoints = np.vstack([q_start, q_goal])
+            stage_started = perf_counter()
+            if certify and self._trajectory_refiner is None:
+                # OMPL validates each segment only every resolution_frac x the joint space's extent (~65 mrad on the
+                # FR3) and shortcutting makes long segments, so a route can graze an obstacle between its checks.
+                # Measured 2026-10-08: both failed sim-add legs had a colliding POLYLINE (12 and 78 samples at the
+                # certify step), so no retiming rung could pass. Such a route is not retimed: a fresh one is planned.
+                # Not with a refiner: TrajOpt's collision terms can push a grazing seed clear, and a route it cannot
+                # fix fails the ladder below, which re-plans as well.
+                straight = JointTrajectory(np.arange(len(waypoints), dtype=float), np.asarray(waypoints, float),
+                                           np.zeros_like(np.asarray(waypoints, float)))
+                try:
+                    self._certify_curve(straight)
+                except ValueError as exc:
+                    failure = exc
+                    print(f'[planner:{self.arm_id}] route {attempt + 1}/{self.ROUTE_ATTEMPTS} grazes an obstacle '
+                          'between OMPL\'s checks; re-planning', flush=True)
+                    continue
+            try:
+                seed = self._retime(waypoints, speed_scale, certify)
+            except _CertifyFailed as exc:
+                failure = exc.error
+                print(f'[planner:{self.arm_id}] route {attempt + 1}/{self.ROUTE_ATTEMPTS}: no certified timing; '
+                      're-planning', flush=True)
+                continue
+            failure = None
+            break
+        if failure is not None:
+            # Every attempt was rejected. This does not prove that no collision-free trajectory exists.
+            raise failure
+        print(f'[planner:{self.arm_id}] stage=seed_retiming '
+              f'elapsed_s={perf_counter() - stage_started:.6f} '
+              f'samples={len(seed.times)}', flush=True)
+        print(f'[planner:{self.arm_id}] stage=joint_total elapsed_s={perf_counter() - started:.6f}', flush=True)
+        return seed
+
+    def _retime(self, waypoints, speed_scale, certify):
+        """Time one route, tightening blends and timing on contact; raises _CertifyFailed when no rung certifies."""
+        failure = None
+        for ds in self.RETIMER_STEPS_RAD:
+            seed = time_parameterize_blended(
+                waypoints, self._max_vel * speed_scale,
+                self._max_acc * speed_scale, ds=ds,
+                blend_tolerance_rad=BLEND_TOLERANCE_RAD * ds / self.RETIMER_STEPS_RAD[0],
+            )
+            if self._trajectory_refiner is not None:
+                # Refine the seed's positions, then replace its timing with
+                # the refiner's native spline timing. Both positions and
+                # velocities may change, so check the returned curve on
+                # every attempt. Exceptions propagate to the planner's hold.
+                try:
+                    seed = self._trajectory_refiner(
+                        seed.positions, self._max_vel * speed_scale,
+                        self._max_acc * speed_scale,
+                    )
+                except RouteCollides as exc:
+                    # Its collision validation failed. A finer rung only re-densifies the same route's seed, so the ROUTE
+                    # fails: re-planned, at most ROUTE_ATTEMPTS refinements (other refiner errors propagate).
+                    raise _CertifyFailed(exc) from exc
+            seed = bound_trajectory(seed, self._max_vel * speed_scale,
+                                    self._max_acc * speed_scale)
+            if not certify:
+                return seed
+            try:
+                self._certify_curve(seed)
+            except ValueError as exc:
+                # Retry the same route with finer samples: a corner's cubic
+                # can depart from the cleared polyline. Refinement may also
+                # change the curve, so every attempt needs its own check.
+                failure = exc
+                continue
+            return seed
+        raise _CertifyFailed(failure)
+
+    # A route that cannot be certified is re-planned (a fresh OMPL route) at most this many times in all.
+    ROUTE_ATTEMPTS = ROUTE_ATTEMPTS
+    # Tighten both geometric blending and timing resolution on contact.
+    RETIMER_STEPS_RAD = RETIMING_STEPS_RAD
+    CURVE_COLLISION_STEP_RAD = COLLISION_STEP_RAD
+
+    def _certify_curve(self, trajectory) -> None:
+        """Collision-check what will actually be FLOWN, not its waypoints.
+
+        OMPL clears a polyline; the retimer blends its corners and exports
+        samples for the executor's cubic. Those changes need a final check.
+        Equal-time curve/chord differences are not geometric deviations:
+        a straight leg can change timing while staying on the same segment.
+        This is a sampled collision check, not continuous collision proof.
+
+        Raises rather than returning a flag: a trajectory that cannot be
+        certified is not a slower trajectory, it is not a trajectory, and
+        plan_joint's callers already treat an exception as the hold path.
+        """
+        for q in trajectory.densify(self.CURVE_COLLISION_STEP_RAD):
+            if self._world.in_collision(q):
+                raise ValueError(
+                    f'[planner:{self.arm_id}] interpolated trajectory collides '
+                    'between waypoints — the flown cubic leaves the cleared '
+                    'path; re-plan or tighten the retimer step')
+
+
+def _self_check() -> None:
+    """plan_linear really is straight, and _slerp really interpolates.
+
+    Uses a fake arm whose joints ARE the tool position, so the correct path
+    is exactly the straight line and any bow is the sampler's own error --
+    no URDF, no solver tolerance to hide behind.
+
+    Run: python -m arm_control.planning.planner
+    """
+    q0 = np.array([1.0, 0.0, 0.0, 0.0])
+    q1 = np.array([0.0, 1.0, 0.0, 0.0])
+    assert np.allclose(_slerp(q0, q1, 0.0), q0), "slerp must start at q0"
+    assert np.allclose(_slerp(q0, q1, 1.0), q1), "slerp must end at q1"
+    mid = _slerp(q0, q1, 0.5)
+    assert abs(np.linalg.norm(mid) - 1.0) < 1e-12, "slerp must stay on the unit sphere"
+    assert abs(float(mid @ q0) - float(mid @ q1)) < 1e-12, "half-way must be equidistant"
+    near = _slerp(q0, q0 + 1e-9, 0.5)  # the lerp branch must not divide by zero
+    assert np.isfinite(near).all(), "slerp degenerates on nearly-parallel inputs"
+
+    class _FakeIK:
+        """Tool position == first three joints; orientation ignored."""
+
+        hard_limits = (np.full(3, -10.0), np.full(3, 10.0))
+
+        def fk(self, q):
+            T = np.eye(4)
+            T[:3, 3] = np.asarray(q, dtype=float)[:3]
+            return T
+
+        def solve(self, T, seed, validate=None):
+            return np.asarray(T, dtype=float)[:3, 3].copy()
+
+    planner = ArmPlanner("fake", _FakeIK(), None, np.full(3, 1.0), np.full(3, 2.0))
+    goal = np.eye(4)
+    goal[:3, 3] = [0.3, 0.4, 0.0]  # 0.5 m, not axis-aligned
+    traj = planner.plan_linear(goal, np.zeros(3), collision_check=False)
+    assert traj is not None, "straight-line plan failed on a trivially reachable goal"
+    start, end = traj.positions[0], traj.positions[-1]
+    axis = (end - start) / np.linalg.norm(end - start)
+    bow = max(
+        float(np.linalg.norm((p - start) - np.dot(p - start, axis) * axis))
+        for p in traj.positions
+    )
+    assert bow < 1e-9, f"plan_linear bowed {bow * 1e3:.4f} mm off its own line"
+    assert np.allclose(end, [0.3, 0.4, 0.0]), "plan_linear did not reach the goal"
+
+    # The optional refiner is planner-only and must not reshape linear legs.
+    import inspect
+    assert 'trajectory_refiner' in inspect.signature(ArmPlanner).parameters
+    calls = []
+
+    class _FakeOMPL:
+        def plan(self, start, end):
+            return np.vstack([start, end])
+
+    def refine(seed, vmax, amax):
+        calls.append((seed.copy(), vmax.copy(), amax.copy()))
+        return traj
+
+    hybrid = ArmPlanner('fake', _FakeIK(), _FakeOMPL(), np.ones(3),
+                        np.full(3, 2.), trajectory_refiner=refine)
+    from contextlib import redirect_stdout
+    from io import StringIO
+
+    output = StringIO()
+    with redirect_stdout(output):
+        refined = hybrid.plan_cartesian(goal, np.zeros(3), speed_scale=.5)
+    assert np.array_equal(refined.positions, traj.positions)
+    assert np.all(refined.bounds()['qd_abs_max'] <= .5 + 1e-8)
+    assert np.all(refined.bounds()['qdd_abs_max'] <= 1. + 1e-8)
+    for stage in ('IK', 'OMPL', 'seed_retiming', 'joint_total', 'cartesian_total'):
+        assert f'[planner:fake] stage={stage} elapsed_s=' in output.getvalue(), stage
+    assert len(calls) == 1 and np.all(calls[0][1] == .5) and np.all(calls[0][2] == 1.)
+    hybrid.plan_linear(goal, np.zeros(3))
+    assert len(calls) == 1, 'Cartesian line entered free-space refinement'
+    try:
+        hybrid.plan_joint(np.ones(3), np.zeros(3), collision_check=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('hybrid accepted collision checking disabled')
+
+    def reject(*args):
+        raise ValueError('refinement rejected')
+
+    hybrid._trajectory_refiner = reject
+    try:
+        hybrid.plan_joint(np.ones(3), np.zeros(3))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('refinement failure silently fell back to seed')
+
+    assert 'ik_candidate_attempts' in inspect.signature(ArmPlanner).parameters, \
+        'missing opt-in candidate ranking'
+
+    class _CandidateIK(_FakeIK):
+        hard_limits = (np.full(3, -np.pi), np.full(3, np.pi))
+        candidates = [np.array([3.1, 0., 0.]), np.array([2.5, 0., 0.]), np.zeros(3)]
+        enumerations = 0
+        solves = 0
+
+        def solve_candidates(self, T, seed, validate=None, *, attempts=64):
+            self.enumerations += 1
+            assert attempts == 64
+            return [q for q in self.candidates if validate is None or validate(q)]
+
+        def solve(self, T, seed, validate=None):
+            self.solves += 1
+            return super().solve(T, seed, validate)
+
+    candidate_ik = _CandidateIK()
+    ranked = ArmPlanner('ranked', candidate_ik, None, np.ones(3), np.full(3, 2.),
+                        ik_candidate_attempts=64)
+    start = np.array([3., 0., 0.])
+    chosen = ranked.plan_cartesian(goal, start, collision_check=False)
+    assert np.allclose(chosen.positions[-1], [2.5, 0., 0.]), \
+        'ranking must clear the margin, then prefer shorter whole-arm travel'
+    candidate_ik.candidates = [np.array([-3.1, 0., 0.]), np.zeros(3)]
+    ranked._ik_limit_margin_fraction = 0.
+    chosen = ranked.plan_cartesian(goal, start, collision_check=False)
+    assert np.allclose(chosen.positions[-1], 0), 'bounded joints must not wrap'
+    candidate_ik.hard_limits = (np.array([-10., -1., -1.]), np.array([10., 1., 1.]))
+    candidate_ik.candidates = [np.array([1., 0., 0.]), np.array([0., .2, 0.])]
+    chosen = ranked.plan_cartesian(goal, np.zeros(3), collision_check=False)
+    assert np.allclose(chosen.positions[-1], [0., .2, 0.]), \
+        'joint range normalization must not hide a longer route'
+    candidate_ik.candidates = [np.array([1., .5, 0.]), np.array([1.5, 0., 0.])]
+    chosen = ranked.plan_cartesian(goal, np.zeros(3), collision_check=False)
+    assert np.allclose(chosen.positions[-1], [1., .5, 0.]), 'travel must use every joint'
+    candidate_ik.hard_limits = _CandidateIK.hard_limits
+
+    class _World:
+        def in_collision(self, q):
+            return q[0] > 1.
+
+    ranked._world = _World()
+    candidate_ik.candidates = [np.array([2.5, 0., 0.]), np.zeros(3)]
+    chosen = ranked.plan_cartesian(goal, start)
+    assert np.allclose(chosen.positions[-1], 0), 'colliding candidate was selected'
+    ranked._world = None
+    route_goals = []
+
+    class _RetryOMPL:
+        def plan(self, start, end):
+            route_goals.append(end.copy())
+            return None if len(route_goals) == 1 else np.vstack([start, end])
+
+    ranked._ompl = _RetryOMPL()
+    chosen = ranked.plan_cartesian(goal, start)
+    assert len(route_goals) == 2 and np.allclose(chosen.positions[-1], 0), \
+        'route search failure did not retry the next ranked goal'
+    ranked._trajectory_refiner = reject
+    route_goals.clear()
+    route_goals.append(start)  # route exists immediately; refinement must stop retries
+    try:
+        ranked.plan_cartesian(goal, start)
+    except ValueError as exc:
+        assert str(exc) == 'refinement rejected'
+    else:
+        raise AssertionError('candidate ranking swallowed refinement rejection')
+    assert len(route_goals) == 2, 'refinement failure retried another candidate'
+    enumerations = candidate_ik.enumerations
+    ranked.plan_linear(goal, np.zeros(3))
+    assert candidate_ik.enumerations == enumerations and candidate_ik.solves > 0
+    legacy = ArmPlanner('legacy', candidate_ik, None, np.ones(3), np.full(3, 2.))
+    legacy.plan_cartesian(goal, np.zeros(3), collision_check=False)
+    assert candidate_ik.enumerations == enumerations, 'default planner enumerates IK'
+    for kwargs in ([{'ik_candidate_attempts': v} for v in (True, -1, 129, 1.5, '64')]
+                   + [{'ik_limit_margin_fraction': v} for v in (-.1, .51, np.nan, np.inf)]):
+        try:
+            ArmPlanner('invalid', candidate_ik, None, np.ones(3), np.ones(3), **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted invalid ranking config: {kwargs}')
+    for upper in (np.zeros(3), np.full(3, np.inf), np.full(3, np.nan)):
+        candidate_ik.hard_limits = (np.zeros(3), upper)
+        try:
+            ArmPlanner('invalid', candidate_ik, None, np.ones(3), np.ones(3),
+                       ik_candidate_attempts=64)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('ranking accepted invalid joint bounds')
+    print(f"planner self-check OK: {len(traj.positions)} samples, bow {bow:.2e} m")
+
+
+def _check_route_selection() -> None:
+    """A nearer endpoint can require a longer route; compare flown curves."""
+    class IK:
+        hard_limits = (np.full(2, -10.), np.full(2, 10.))
+
+        def solve_candidates(self, *args, **kwargs):
+            return [np.array([x, 0.]) for x in (.2, .4, .8)]
+
+    planner = ArmPlanner('selection-check', IK(), None, np.ones(2), np.ones(2),
+                         ik_candidate_attempts=64)
+    visited = []
+
+    def route(goal, start, **kwargs):
+        visited.append(float(goal[0]))
+        if goal[0] == .2:
+            # Even its knot chord is short, but the flown cubic bows away.
+            return JointTrajectory([0., 1.], [start, goal], [[0., 3.], [0., -3.]])
+        return JointTrajectory([0., 1.], [start, goal])
+
+    planner.plan_joint = route
+    chosen = planner.plan_cartesian(np.eye(4), np.zeros(2))
+    assert visited == [.2, .4], 'must evaluate the detour, improve it, then prune .8'
+    assert np.array_equal(chosen.positions[-1], [.4, 0.])
+    bulge = route(np.array([.2, 0.]), np.zeros(2))
+    upper = _curve_length_upper(bulge)
+    samples = np.array([bulge.sample_at(t).position for t in np.linspace(0, 1, 10001)])
+    sampled = np.linalg.norm(np.diff(samples, axis=0), axis=1).sum()
+    assert sampled <= upper <= sampled + 1.01e-4, (sampled, upper)
+    assert abs(_curve_length_upper(JointTrajectory(
+        bulge.times * 7, bulge.positions, bulge.velocities / 7)) - upper) < 1e-12, \
+        'geometric objective changed under uniform time scaling'
+    hold = JointTrajectory([0, 1], [[0.], [0.]], [[.6], [-.6]])
+    assert abs(_curve_length_upper(hold) - .3) < 1e-4, 'missed cubic reversal'
+    print('route selection: completed curve cost, admissible pruning, length bounds OK')
+
+
+
+def _check_curve_certificate() -> None:
+    """The certificate must catch a collision the WAYPOINTS do not contain.
+
+    A cubic between two collision-free knots can bulge into an obstacle. The
+    planted world here is collision-free at every knot and blocked only in the
+    band the curve bulges through, so a waypoint-only check passes it and the
+    flown-curve check must not.
+    """
+    from arm_control.motion import JointTrajectory
+
+    # Both ends at rest at 0.0, velocities pushing out and back: the knots sit
+    # at 0.0 and the curve peaks near 0.087 (see types.py's own self-check).
+    traj = JointTrajectory(np.array([0.0, 1.0]), np.array([[0.0], [0.0]]),
+                           np.array([[0.6], [-0.6]]))
+
+    class _BandWorld:
+        """Blocked strictly between the knots' value and the curve's peak."""
+
+        lower, upper = np.array([-10.0]), np.array([10.0])
+
+        def __init__(self):
+            self.calls = 0
+
+        def in_collision(self, q):
+            self.calls += 1
+            return bool(0.05 < float(q[0]) < 0.09)
+
+    world = _BandWorld()
+    assert not world.in_collision(traj.positions[0]), "knots must be clear"
+    assert not world.in_collision(traj.positions[1]), "knots must be clear"
+
+    planner = ArmPlanner.__new__(ArmPlanner)
+    planner.arm_id = "curve-check"
+    planner._world = world
+    try:
+        planner._certify_curve(traj)
+    except ValueError as exc:
+        assert "between waypoints" in str(exc), exc
+    else:
+        raise AssertionError(
+            "certificate passed a curve that leaves the cleared path")
+    assert world.calls > 2, "certificate checked only the endpoints"
+
+    # A clear world must still pass, and must actually sample the interior.
+    class _Clear(_BandWorld):
+        def in_collision(self, q):
+            self.calls += 1
+            return False
+
+    clear = _Clear()
+    planner._world = clear
+    planner._certify_curve(traj)
+    assert clear.calls >= 60, f"too coarse to certify anything ({clear.calls})"
+    print("curve collision certificate: catches between-waypoint contact OK")
+
+
+def _check_replan() -> None:
+    """A route that grazes an obstacle between OMPL's checks is re-planned, never flown; attempts are bounded."""
+
+    class IK:
+        hard_limits = (np.full(2, -5.), np.full(2, 5.))
+
+    class World:  # a wall at x in (0.4, 0.6) below y = 0.5
+        def in_collision(self, q):
+            return bool(0.4 < q[0] < 0.6 and q[1] < 0.5)
+
+    start, goal = np.zeros(2), np.array([1., 0.])
+    grazing = np.vstack([start, goal])                          # straight through the wall: both knots clear
+    around = np.vstack([start, [0., 1.], [1., 1.], goal])       # over it
+
+    class OMPL:
+        def __init__(self, routes):
+            self.routes, self.calls = list(routes), 0
+
+        def plan(self, q_start, q_goal):
+            self.calls += 1
+            return self.routes[min(self.calls, len(self.routes)) - 1]
+
+    ompl = OMPL([grazing, around])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World())
+    timed_routes, plain_retime = [], planner._retime
+    planner._retime = lambda waypoints, *a: timed_routes.append(waypoints) or plain_retime(waypoints, *a)
+    flown = planner.plan_joint(goal, start)
+    assert ompl.calls == 2, ompl.calls
+    assert len(timed_routes) == 1 and timed_routes[0] is around, 'a grazing polyline reached the timing ladder'
+    assert np.allclose(flown.positions[-1], goal)
+    assert not any(World().in_collision(q) for q in flown.densify(1e-3)), 'a re-planned route was not certified'
+    ompl = OMPL([grazing])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World())
+    try:
+        planner.plan_joint(goal, start)
+    except ValueError as exc:
+        assert 'between waypoints' in str(exc), exc
+    else:
+        raise AssertionError('a route through the wall was flown')
+    assert ompl.calls == ArmPlanner.ROUTE_ATTEMPTS, ompl.calls
+    # A clear polyline whose timing ladder runs out (a blended corner that bulges into an obstacle) is re-planned too.
+    ompl = OMPL([around, around])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World())
+    retime, ladders = planner._retime, []
+
+    def ladder_out_once(waypoints, speed_scale, certify):
+        ladders.append(len(waypoints))
+        if len(ladders) == 1:
+            raise _CertifyFailed(ValueError('interpolated trajectory collides between waypoints'))
+        return retime(waypoints, speed_scale, certify)
+
+    planner._retime = ladder_out_once
+    planner.plan_joint(goal, start)
+    assert ompl.calls == 2 and len(ladders) == 2, (ompl.calls, ladders)
+    # With a refiner the polyline pre-check is skipped: the refiner sees the grazing seed and may clear it.
+    ompl, timed = OMPL([grazing, around]), []
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World(), trajectory_refiner=object())
+    planner._retime = lambda waypoints, *_: timed.append(waypoints) or flown
+    planner.plan_joint(goal, start)
+    assert ompl.calls == 1 and timed[0] is grazing, (ompl.calls, timed)
+    # ... and a refiner that finds the grazing seed in collision (RouteCollides) fails each rung, so the route is re-planned.
+    refined = []
+
+    def refiner(positions, vmax, amax):
+        refined.append(1)
+        if any(World().in_collision(q) for q in positions):
+            raise RouteCollides('trajectory fails canonical MuJoCo collision validation')
+        return time_parameterize_blended(positions, vmax, amax)
+
+    ompl = OMPL([grazing, around])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World(), trajectory_refiner=refiner)
+    flown = planner.plan_joint(goal, start)
+    assert ompl.calls == 2 and not any(World().in_collision(q) for q in flown.densify(1e-3)), ompl.calls
+    assert len(refined) == 2, f'a refiner collision must fail the route, not one rung: {len(refined)} refinements'
+
+    # Any other refiner failure is not a collision: it propagates at once, no re-plan.
+    def broken(positions, vmax, amax):
+        raise ValueError('TrajOpt optimization failed')
+
+    ompl = OMPL([around])
+    planner = ArmPlanner('replan', IK(), ompl, np.ones(2), np.full(2, 2.), World(), trajectory_refiner=broken)
+    try:
+        planner.plan_joint(goal, start)
+    except RouteCollides:
+        raise AssertionError('a refiner optimization failure was reported as a collision')
+    except ValueError as exc:
+        assert 'optimization failed' in str(exc) and ompl.calls == 1, (exc, ompl.calls)
+    else:
+        raise AssertionError('a failed refinement was flown')
+    print(f"re-plan: a grazing route or an exhausted timing ladder gets a fresh route; {ArmPlanner.ROUTE_ATTEMPTS} "
+          "attempts at most; a refiner sees the grazing seed OK")
+
+
+if __name__ == "__main__":
+    _check_curve_certificate()
+    _check_replan()
+    _self_check()
+    _check_route_selection()

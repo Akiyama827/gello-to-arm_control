@@ -5,13 +5,17 @@ the consuming project's workcell-add or hardware deployment workflow.
 
 ## Environment
 
-The local `pyproject.toml` declares Python >=3.10, core dependencies, and the
-`sim`, `viz`, and `mesh` extras. To install this checkout into your selected
-environment:
+The local `pyproject.toml` declares Python >=3.10 and numpy as the only core
+dependency: that is the minimal SDK (`arm_control.sdk`, `.execution`,
+`.motion`). Running controllers or Dora processes needs the `supervisor` or
+`dora` extra. To install this checkout for the Dora stack and console:
 
 ```bash
-python -m pip install -e ".[sim,viz,mesh]"
+python -m pip install -e ".[dora,sim,viz,mesh]"
 ```
+
+An application that only talks to a supervisor needs `python -m pip install .`
+(numpy only); the supervisor host needs `".[supervisor]"` plus Pinocchio.
 
 Installation can download packages and is separate from the offline checks
 below. Provision Pinocchio/collision/planning and vendor hardware bindings as
@@ -20,15 +24,15 @@ Do not assume every optional module imports without its dependency installed.
 
 ## Offline checks
 
-These commands use existing assert-based checks and do not arm hardware:
+`python tools/check/suite.py` builds the RT tree and runs every device-free check below, and every other one in
+`tools/` (a device-free check no suite runs is deleted). Individually, these use assert-based checks and do not arm hardware:
 
 ```bash
 PYTHONPATH=. python -B -m arm_control.config
 PYTHONPATH=. python -B -m arm_control.frames
 PYTHONPATH=. python -B -m arm_control.scene
-PYTHONPATH=. python -B -m arm_control.messages
+PYTHONPATH=. python -B -m arm_control.contracts
 PYTHONPATH=. python -B -m arm_control.planning.jog
-PYTHONPATH=. python -B -m arm_control.control.arm_controller
 PYTHONPATH=. python -B -m arm_control.plants.base
 PYTHONPATH=. python -B -m arm_control.plants.franka.backend
 PYTHONPATH=. python -B -m arm_control.plants.remote_rt.protocol
@@ -37,7 +41,26 @@ PYTHONPATH=. python -B nodes/arm_console.py --self-check
 PYTHONPATH=. python -B examples/run_console.py --self-check
 PYTHONPATH=. python -B examples/run_console.py --check
 PYTHONPATH=. python -B tools/assets/setup_fr3.py --check
+PYTHONPATH=. python -B -m arm_control.model_bundle
+PYTHONPATH=. python -B -m arm_control.mukca
+PYTHONPATH=. python -B -m arm_control.kinematic_fit --self-check
+PYTHONPATH=. python -B tools/check/check_rt_telemetry.py
+PYTHONPATH=. python -B tools/check/check_arm_controller.py
 ```
+
+With a built `arm_rt_server` (fake backend, no hardware):
+
+```bash
+PYTHONPATH=. python -B -m arm_control.plants.remote_rt.client   # loopback rung
+PYTHONPATH=. python -B tools/check/rt/check_two_instances.py <build>/arm_rt_server
+PYTHONPATH=. python -B tools/check/rt/torque_cap.py <build>/arm_rt_server
+```
+
+`check_two_instances.py` runs two fake instances at once: simultaneous
+tracking, refusal of a config aimed at the other instance's ports, an
+identity-filtered observer, and per-instance fault latch and stop epoch.
+`arm_control.mukca_casadi` is NOT exercised here: it needs the offline solver
+environment (CasADi + forwardkinematics) that control deliberately lacks.
 
 Asset-status checks can report missing staged files without failing their
 process. Read the output; exit zero is not evidence that a simulation launched.
@@ -46,8 +69,8 @@ module self-checks. They do not replace a consuming project's full gated run.
 
 ## Standalone simulated console
 
-The examples use `examples/configs/sim_arm.yaml` and a second instance in
-`sim_arm_b.yaml`, with profiles under `examples/profiles/`. They are generic
+The example uses `examples/configs/sim_arm.yaml`, with profiles under
+`examples/profiles/`. These are generic
 samples, not calibrated workcell scenes. First inspect asset status using the
 offline commands above. If assets must be staged, explicitly select the local
 source; this writes the chosen staging destination:
@@ -61,11 +84,14 @@ With dependencies and assets ready, these commands launch simulation and UI:
 
 ```bash
 PYTHONPATH=. python -B examples/run_console.py
-PYTHONPATH=. python -B examples/run_console.py --dual
 ```
 
-Use one launch command at a time. The console defaults to loopback port 7500;
-the dual example adds 7510. For a reviewed move, sync the target, plan, inspect
+The single-arm console defaults to loopback port 7500. The launcher starts the
+arm's supervisor over a simulated plant first (the control authority, as on
+the bench) and the graph reaches it through `supervised_arm`; jog is a
+supervisor setpoint, and the Hand runs on its own protocol against the sim
+Hand at 127.0.0.1:47812.
+For a reviewed move, sync the target, plan, inspect
 the preview, press ARM, wait for the armed indication, then click Execute once.
 The arm console uses this policy for both sim and hardware: there is no separate
 hold-to-enable button or Spacebar deadman. A reviewed trajectory runs until it
@@ -85,6 +111,8 @@ It shows Unknown when feedback is unavailable or stale, and distinguishes pendin
 requests from applied modes. Track is the default in the supplied motion profile;
 the badge reflects actual controller gains, not an assumed startup preset. This
 is controller feedback, not a separate acknowledgement from the remote RT plant.
+Float is selected here; the standalone `real_float.yml` graph and `float.yaml`
+profile are retired. Tracking and floating share this command owner and gate.
 
 Move shows Current as an FK estimate from fresh measured joints, not an external
 pose measurement. Current and Desired use the robot base frame: XYZ in mm and
@@ -92,6 +120,16 @@ fixed-axis roll/pitch/yaw in degrees, R = Rz(yaw) Ry(pitch) Rx(roll). Copy curre
 fills Desired only. Apply target solves all six fields together without moving;
 failed IK leaves the previous target intact. Then Plan + preview, ARM and Execute.
 Edits invalidate older previews. Polling preserves unfinished input drafts.
+
+**Refine trajectory with TrajOpt** enables the library's existing native refiner
+for the next plan. It optimizes the OMPL seed, uses native spline timing, then
+checks the returned curve against joint/dynamic limits and the current collision
+world. Changing the checkbox invalidates the old preview; plan and review again.
+Missing native dependencies, solver failure or failed validation refuse the plan
+without falling back to the seed. Install the `trajopt` extra on the planning host.
+The solve runs in a child process so native optimization cannot monopolize the
+console's Python thread. Stop and Disarm invalidate the pending result; closing
+the single-arm console terminates its planner child.
 
 Stop (hold) cancels motion but leaves authority enabled; DISARM cancels the
 plan and drops authority. Plant command watchdogs, fault handling, and any
@@ -112,19 +150,19 @@ standalone executor node is no longer a supported process surface; its class
 remains available under `arm_control.control.trajectory_executor`.
 
 ```bash
-PYTHONPATH=. python tools/bench/check_execution_policy.py
-PYTHONPATH=. python tools/bench/check_node_shutdown.py
+PYTHONPATH=. python tools/check/check_execution_policy.py
+PYTHONPATH=. python tools/check/check_node_shutdown.py
 ```
 
 Console policy checks (no hardware):
 
 ```bash
-PYTHONPATH=. python tools/bench/check_console_authority.py
-PYTHONPATH=. python tools/inspect/check_console_controls.py
-PYTHONPATH=. python tools/inspect/check_console_page.py
-PYTHONPATH=. python tools/inspect/check_controller_mode_feedback.py
-PYTHONPATH=. python tools/bench/check_console_grasp.py
-PYTHONPATH=. python tools/bench/check_hand_grasp.py
+PYTHONPATH=. python tools/check/check_console_authority.py
+PYTHONPATH=. python tools/check/check_console_controls.py
+PYTHONPATH=. python tools/check/check_console_page.py
+PYTHONPATH=. python tools/check/check_controller_mode_feedback.py
+PYTHONPATH=. python tools/check/check_console_grasp.py
+PYTHONPATH=. python tools/check/check_hand_grasp.py
 PYTHONPATH=. python -m arm_control.console_server
 PYTHONPATH=. python nodes/arm_console.py --self-check
 PYTHONPATH=. python -m arm_control.control.arm_controller
@@ -135,6 +173,181 @@ node --input-type=module --check < arm_control/ui/static/console.js
 Concrete deployments should use their own launcher and asset-root composition.
 The older manuals are retained in [history](history/README.md) for engineering
 context, not as instructions to run retired commands.
+
+### Dual-arm simulation
+
+```bash
+PYTHONPATH=. python -B examples/run_console.py --dual --check
+PYTHONPATH=. python -B examples/run_console.py --dual          # http://127.0.0.1:7520
+```
+
+This starts the pair's two arm supervisors (the first hosts one MuJoCo world, the
+second co-hosts it; each serves its own simulated Hand) and one browser console;
+it opens no hardware connection. `examples/configs/dual_arm.yaml` references the
+existing `sim_arm.yaml` twice and supplies only layout and pair motion limits.
+For another composition use `--dual --pair-config /absolute/path/pair.yaml`;
+set `ARM_CONTROL_ROOT` before launch if its profiles use deployment-relative
+asset paths. An optional `scene:` loads existing `SceneSpec` static scenery.
+Both actors must be configured, with matching controller joint order. The
+optional `shared_object` composition below describes a virtual object and its
+nominal grasps. Startup always preserves the configured arm joints and opens in
+independent mode. Hand closure alone never establishes object ownership.
+
+Arm both controllers. Select one or both moving arms, enter joint angles or
+TCP pose (mm and fixed-axis RPY degrees, shared world or arm base). Select a
+**Drag target** above the scene, or **Drag this TCP** in an arm panel, then
+use **Translate / Rotate**. Drag axes are in the shared world; numeric fields
+reflect the chosen coordinate frame. Dragging edits only that target. Then
+**Plan + preview → review both paths → Stage pair → Execute pair**. The
+unselected arm holds its measured joints on the same trajectory timeline.
+Stage requires both arms armed/ready; Execute requires both staging ACKs.
+Hand opening is measured separately from its command and requires ARM.
+
+Target edits and Hand changes invalidate preview use. After reload/reconnect,
+stop any staged pair and re-plan. Stop both cancels the pair and leaves the
+controllers armed in hold; disarming either cancels the pair. If no browser
+poll/action arrives for three seconds, an active pair and any Hand motion are
+cancelled. This browser lease is additional to each hardware link's RT deadman.
+Configuration/model changes require a console restart. The default example
+uses nominal geometry, not the project's calibrated bench models.
+For the consuming Control deployment, run `python tools/run.py sim dual` from
+Control; it resolves the actual bench descriptions and approved model bindings.
+Its configured object is available through the runtime **Control mode** selector.
+No deployed bench values are copied into this library's example configs.
+
+For hardware, the consumer supplies `backend: remote_rt`, two real robot
+profiles with model bindings, 100 Hz execution policies and real-mode gains;
+its launcher starts one supervisor per arm over its RT server
+(`multi_arm.launch.running_pair(..., plant="rt")`). The console loads
+collision/display models and exports meshes before `SupervisedHardware.connect()`
+claims both arms. Fresh arm and Hand measurements are required before the
+console appears; staged model poses are replaced with those measurements. It
+starts disarmed. Hand moves require the bridge's active-stop capability; a Hand
+is unmeasured while it moves or while a stop is unconfirmed, and the console
+refuses actions until it settles. Pending authority acknowledgements block
+re-ARM; disarm, faults and shutdown supersede queued enables. A `shared_object`
+must be marked `virtual: true`: empty-Hand coordination without welds or payload.
+The consuming Control command is
+`python tools/run.py real dual` (port 7521), after its experimental RT deployment.
+`--check` validates configuration without connecting. Both members of a pair leg
+start at one scheduled PC stamp (scheduled_release/1). Both releases are sent
+together and must be accepted before the stamp less 10 ms; otherwise the accepted
+member is cancelled before it moves and the pair faults. Physical start skew and
+concurrent FCI timing remain unqualified.
+
+For a virtual object, choose **Virtual object**, ARM both controllers, then
+**Plan to virtual grasps** → review → Stage → Execute. Keep both Hands empty
+and open. Once both TCPs are within 10 mm / 2° of the nominal edge poses and
+settle, confirm **Both Hands are empty; capture these TCP offsets**, then
+**Enable virtual coupling**. The panel shows each residual. Entry records the
+actual object-to-TCP transforms without moving either arm or the virtual plate;
+these transforms stay fixed until leaving shared mode. They are included in
+preview identity and passed unchanged to the planning worker. Translate/rotate
+the plate and use the usual preview/stage/execute
+workflow. In shared mode, the displayed pose and closure check use joint
+positions interpolated to one RT publication timestamp, with fresh bracketing
+samples from the same host and authority epoch. No extrapolation is allowed.
+Receipt age above 50 ms, invalid feedback, or a spacing gap above 20 ms during
+motion stops the pair. A settled joint hold can wait up to 50 ms from the last
+aligned observation's receipt for a spacing gap to recover. It retains its hold
+target, cancels pending plans and blocks execution until fresh alignment returns.
+Then **Plan → review → Stage → Execute** again; the cancelled plan cannot resume.
+A prolonged gap still stops both arms. Controllers retain raw measured feedback.
+The object pose is inferred from the first TCP, with agreement checked against
+the second; it is not an object sensor measurement. Divergence
+above 3 mm / 2° faults the console and disarms both arms. Hand commands stay
+locked during coupling. Returning to **Independent arms** freezes the virtual
+plate at its current pose and invalidates previews; it needs no physical support.
+The next approach uses the nominal edge poses again. Capture handles a virtual
+attachment only; it is not a correction for robot tracking or calibration.
+Ordinary joint-goal completion retains the planned endpoint with zero desired
+velocity. Cancelling an unreleased joint plan while stationary preserves that
+hold. Active-motion cancellation, timeout and task-specific completion hold at
+the measured pose.
+
+A shared-object runtime fault prints the measured disagreement and requests
+both arms to stop. Runtime faults save the last 500 PC ticks under
+`$ARM_CONTROL_ROOT/.cache/dual_arm/faults/` and print the JSON path. The report
+includes measured joints, PC/RT references, packet timestamps, common reference
+times, interpolation brackets, captured grasps and the planned trajectories.
+Receipt and RT publication times are not
+synchronized physical capture times. Preserve the report before clearing the
+cache; a planner pass alone does not qualify measured tracking or synchronization.
+Each report is written whole (atomic rename) with a SHA-256 sidecar, states how many
+ticks were evicted from the 500-tick window (`dropped_samples`), and carries the five
+closure quantities per tick (`closure_v1`). Every save keeps the newest 20 reports
+of its directory and deletes older ones; a report is at most 50 MB (the oldest ticks
+go first, counted in `truncated_samples`). Export what must be kept:
+`python -m arm_control.multi_arm.trace_export --verify` and `--dest DIR`; prune further
+only after exporting: `--prune --yes --confirm-exported DIR` (dry run without `--yes`).
+Reports written before sidecars existed show as `legacy` and export normally.
+
+Every arm's supervisor also writes its own fault trace, whatever console or client
+is attached: on a FAULTED execution, a latched RT fault or a controller stop, the
+supervisor's controller ticks (trace/1 rows) from 10 s before the fault to 2 s after,
+under `$ARM_CONTROL_ROOT/.cache/supervisor/<instance>/faults/` (a simulated plant's under `.../sim_faults/`, and a
+simulated pair console's under `.cache/dual_arm/sim_faults/`, so simulations never prune hardware traces; schema
+`arm_control.supervisor_fault/v1`; faults inside the window join it). A background
+thread writes it, so the servo loop does not wait for the disk; a fault while the
+previous trace is still being written is skipped and counted, a failed write is
+printed and counted. Same retention (newest 20, 50 MB) and the same `trace_export`
+with `--root` pointing at that directory.
+
+For a setup with a shared object:
+
+```bash
+PYTHONPATH=. python -B examples/run_console.py --dual \
+  --pair-config examples/configs/dual_arm_object.yaml
+```
+
+This preset includes `dual_arm.yaml` and overrides only the facing layout and
+the virtual plate's nominal grasps; robot descriptions, gains and limits remain
+in the existing arm profiles. The workflow is the virtual one above, in
+simulation as on hardware (operator 2026-10-09): nothing is welded, no Hand
+closes and no payload is added.
+
+The same **Refine trajectory with TrajOpt** checkbox applies to independent
+moves, grasp preparation and shared-object moves. Independent refinement optimizes
+both moving arms together; an unselected peer is held exactly. Shared-object
+refinement constrains both TCP poses at every interior knot of the prescribed
+object path, with fixed joint endpoints. The payload follows the first grasp in
+the optimization collision model. Both grasps, the object path, boundary and
+collisions are checked again on the returned Hermite curve. It does not search
+for object detours or control internal grasp force. Refinement is off initially;
+changing it clears the preview and is refused during active pair operations.
+
+Object moves follow a straight translation and shortest rotation, with a
+500 mm / 90° request limit. Unreachable, discontinuous, colliding or
+closure-breaking paths fail instead of detouring in joint space. The preview
+checks grasp and object-path errors against 1 mm / 0.5° on the retimed curve.
+The running console faults (and disarms both arms) when the two TCP-inferred
+plate poses disagree by more than 3 mm / 2°.
+
+Supported here: joint/TCP and virtual-object targets, translate/rotate
+gizmos, common retiming, shared collision checking, preview, pair staging and
+scheduled release, guided grasp approach, explicit mode confirmation, per-arm
+ARM/DISARM and independent-mode Hand position. Continuous jog, Soft mode,
+automatic pickup and physical coupled carrying are not exposed.
+
+Device-free regression commands (planning/simulation checks need staged assets):
+
+```bash
+PYTHONPATH=. python -B tools/check/check_bimanual_contract.py
+PYTHONPATH=. python -B tools/check/check_bimanual_sync.py
+PYTHONPATH=. python -B tools/check/check_pair_planning.py
+PYTHONPATH=. python -B tools/check/check_dual_console.py
+PYTHONPATH=. python -B tools/check/check_cooperative.py
+PYTHONPATH=. python -B tools/check/check_refinement.py
+# the console over two supervisors and two fake RT servers (a staged remote_rt pair; the project suite stages its bench)
+PYTHONPATH=. python -B tools/check/check_dual_hardware.py <pair.yaml> <rt build>/arm_rt_server [--refine]
+```
+
+`--dual` selects the simulated pair above. (The older two-independent-
+worlds graph `dual_arm_sim.yml` was deleted 2026-10-09, operator decision. It
+exercised the retired in-process controller path; on hardware each arm runs on its
+own supervisor, a separate process. In simulation both arms' supervisors share
+one process (host and co-host of one world), so sim process isolation is not
+exercised.)
 
 ### Hand Grasp / Open
 
@@ -188,10 +401,17 @@ Soft requires the updated compiled binding in the same environment as Dora:
 ```bash
 python -m pip install --no-deps -e rt/bindings
 PYTHONPATH=. python rt/bindings/pose_hold_check.py
-PYTHONPATH=. python tools/bench/check_pose_hold_contract.py
-PYTHONPATH=. python tools/bench/check_pose_hold_controller.py
-PYTHONPATH=. python tools/bench/check_pose_hold_sim.py
+PYTHONPATH=. python tools/check/check_pose_hold.py
+PYTHONPATH=. python tools/check/check_pose_hold_sim.py [/path/to/arm_rt_servo.so] [--config <entry.yaml>]
 ```
+
+The simulation regression builds the plant with the sim's own builder from a
+robot entry config (default `examples/configs/sim_arm.yaml`, the staged generic
+FR3), so it carries that robot's description, step and `sim_armature`; a
+deployment passes `--config` for each deployed arm. Its limits are behavioural:
+a 1 N*m elbow push moves the elbow, the EE stays within 2 cm / 0.15 rad and
+recovers within 5 mm / 0.03 rad. The offline suite runs it. It is a simulation
+check of the compiled law, not hardware qualification.
 
 The single-model simulator advertises support only with an explicit EE body and
 the updated binding. Composed workcells do not advertise Soft. Remote Franka

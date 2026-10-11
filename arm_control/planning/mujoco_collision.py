@@ -18,13 +18,9 @@ import mujoco
 import numpy as np
 
 from arm_control import frames
-# URDF->MuJoCo staging is neither planning nor plant: both load the same staged
-# file. Re-exported so this module's own users keep working after the move.
-from arm_control.simulation.mujoco_model import (  # noqa: F401
-    _explicit_geom_names,
-    build_mujoco_model,
-    build_planning_model,
-)
+from arm_control.planning import PLANNER_DEFAULTS
+# URDF->MuJoCo staging is neither planning nor plant: both load the same staged file.
+from arm_control.simulation.mujoco_model import _explicit_geom_names, build_planning_model
 
 
 # The transform itself lives in arm_control.frames; this name is local use.
@@ -43,13 +39,71 @@ class MuJoCoCollisionWorld:
     model. ``in_collision`` matches the ``OMPLPlanner`` collision_fn contract.
     """
 
+    def __getstate__(self):
+        # MjData pickles another copy of its model. Collision queries rebuild
+        # FK, so retain only its configuration and externally positioned mocaps.
+        state = dict(self.__dict__)
+        data = state.pop("data")
+        state["_query_state"] = {
+            name: getattr(data, name).copy()
+            for name in ("qpos", "mocap_pos", "mocap_quat")
+        }
+        return state
+
+    def __setstate__(self, state):
+        state = dict(state)
+        query = state.pop("_query_state")
+        self.__dict__.update(state)
+        self.data = mujoco.MjData(self.model)
+        for name, value in query.items():
+            getattr(self.data, name)[:] = value
+
+    def planning_delta(self) -> dict:
+        """What a plan reads that changes after construction, WITHOUT the model: the pickled state minus ``model``, plus
+        the model's contact masks (the only model fields this class toggles). The bench workcell's model pickles to ~370
+        MB, and pickling it per plan held the console's GIL ~0.5 s (Dora dropped its inputs, bench 2026-10-10). A world
+        replaced by a REBUILT object needs a full copy, never a delta."""
+        state = self.__getstate__()
+        state.pop("model")
+        state["_masks"] = (self.model.geom_contype.copy(), self.model.geom_conaffinity.copy())
+        state["_geometry"] = self._geometry_digest()
+        return state
+
+    def _geometry_digest(self) -> str:
+        """The model's placement, shape and joint-kinematics fields (not the masks a delta carries; not mesh data, which
+        nothing edits in place): a copy whose digest differs plans
+        against other geometry, so a delta never applies to it (fail closed: the caller sends the world whole)."""
+        import hashlib
+
+        m = self.model
+        h = hashlib.sha256()
+        for field in ("geom_type", "geom_dataid", "geom_bodyid", "geom_pos", "geom_quat", "geom_size", "geom_margin",
+                      "geom_gap", "geom_rbound", "body_parentid", "body_pos", "body_quat", "jnt_pos", "jnt_axis",
+                      "jnt_range", "qpos0"):
+            h.update(np.ascontiguousarray(getattr(m, field)).tobytes())
+        return h.hexdigest()
+
+    def apply_planning_delta(self, delta: dict) -> None:
+        """Bring a copy of this world (same model) to the state ``planning_delta`` captured; ValueError if this copy's
+        geometry is not the one the delta was taken from."""
+        delta = dict(delta)
+        contype, conaffinity = delta.pop("_masks")
+        geometry = delta.pop("_geometry")
+        model = self.model
+        if contype.shape != model.geom_contype.shape or geometry != self._geometry_digest():
+            raise ValueError("planning delta is for another model or geometry")
+        self.__dict__.clear()  # exactly the parent's attributes, none left over from an earlier delta
+        self.__setstate__(dict(delta, model=model))
+        model.geom_contype[:] = contype
+        model.geom_conaffinity[:] = conaffinity
+
     def __init__(
         self,
         urdf_path: str | Path,
         planned_joints: list[str],
         *,
         cache_dir: str | Path,
-        self_collision_padding_m: float = -0.002,
+        self_collision_padding_m: float = PLANNER_DEFAULTS["self_collision_padding_m"],
         environment: list[dict] | None = None,
         cloud_obstacles: dict | None = None,
         held_positions: dict[str, float] | None = None,
@@ -222,9 +276,9 @@ class MuJoCoCollisionWorld:
         cls,
         scene,
         state,
-        planned_actor: str,
+        planned_actor: str | tuple[str, ...],
         *,
-        self_collision_padding_m: float = -0.002,
+        self_collision_padding_m: float = PLANNER_DEFAULTS["self_collision_padding_m"],
         held_positions: dict[str, float] | None = None,
         ground_z: float | None = 0.0,
         body_sites: dict[str, str] | None = None,
@@ -233,9 +287,12 @@ class MuJoCoCollisionWorld:
         """Build collision truth from the same generic composed workcell."""
         if self_collision_padding_m > 0.0:
             raise ValueError("positive self_collision_padding_m is unsupported")
-        actor = next((item for item in scene.actors if item.name == planned_actor), None)
-        if actor is None:
-            raise KeyError(f"unknown planned actor: {planned_actor}")
+        names = (planned_actor,) if isinstance(planned_actor, str) else tuple(planned_actor)
+        if not names or len(set(names)) != len(names):
+            raise ValueError("planned actors must be distinct and nonempty")
+        by_name = {item.name: item for item in scene.actors}
+        actors = [by_name[name] for name in names]
+
         # Local import avoids the composer/collision helper import cycle.
         from arm_control.plants.mujoco.backend import compose_workcell_scene
 
@@ -248,7 +305,7 @@ class MuJoCoCollisionWorld:
         )
         if workspace_xy is not None:
             from types import SimpleNamespace
-            from arm_control.planning.projection import _workspace_bound
+            from arm_control.planning.trajopt import _workspace_bound
 
             bounds = np.asarray(workspace_xy, dtype=float)
             if bounds.shape != (2, 2) or not np.isfinite(bounds).all() or not np.all(bounds[0] < bounds[1]):
@@ -285,7 +342,7 @@ class MuJoCoCollisionWorld:
         for item in scene.actors:
             for joint, value in zip(item.joints, state.actor_q[item.name]):
                 self.data.qpos[self.model.joint(f"{item.name}__{joint}").qposadr[0]] = value
-        self.joint_names = [f"{actor.name}__{name}" for name in actor.joints]
+        self.joint_names = [f"{actor.name}__{name}" for actor in actors for name in actor.joints]
         self._qadr = np.asarray(
             [int(self.model.joint(name).qposadr[0]) for name in self.joint_names], dtype=int
         )
@@ -314,7 +371,7 @@ class MuJoCoCollisionWorld:
             ],
             dtype=bool,
         )
-        actor_prefix = f"{actor.name}__"
+        actor_prefix = tuple(f"{actor.name}__" for actor in actors)
         self._planned_body = np.asarray(
             [
                 (self.model.body(i).name or "").startswith(actor_prefix)
@@ -326,6 +383,17 @@ class MuJoCoCollisionWorld:
         # the kinematic tree, so their contacts also constrain the planned arm.
         for body in range(1, self.model.nbody):
             self._planned_body[body] |= self._planned_body[self.model.body_parentid[body]]
+        # Inter-actor contacts use zero penetration tolerance. The existing
+        # per-arm self padding remains unchanged. Payloads inherit ownership.
+        self._multi_actor_query = len(actors) > 1
+        self._actor_owner = np.zeros(self.model.nbody, dtype=int)
+        for i, item in enumerate(scene.actors, 1):
+            for body in range(1, self.model.nbody):
+                if (self.model.body(body).name or "").startswith(f"{item.name}__"):
+                    self._actor_owner[body] = i
+        for body in range(1, self.model.nbody):
+            if not self._actor_owner[body]:
+                self._actor_owner[body] = self._actor_owner[self.model.body_parentid[body]]
         self._allowed_body_pairs = set()
         self._scene_gids = np.asarray(
             [
@@ -364,29 +432,113 @@ class MuJoCoCollisionWorld:
         out[self._qadr] = np.asarray(q, dtype=float)
         return out
 
+    def set_free_body_pose(self, name: str, T: np.ndarray) -> None:
+        """Move a planned free rigid body; include its environment/arm contacts.
+
+        Call before a query on this worker's scratch world. Geometry and exact
+        contact exclusions remain those of the composed scene.
+        """
+        from arm_control.frames import T_to_pose_xyzquat
+
+        T = np.asarray(T, dtype=float)
+        if (T.shape != (4, 4) or not np.isfinite(T).all()
+                or not np.allclose(T[3], [0, 0, 0, 1])
+                or not np.allclose(T[:3, :3].T @ T[:3, :3], np.eye(3), atol=1e-7)
+                or np.linalg.det(T[:3, :3]) < 0):
+            raise ValueError("free body pose must be a rigid transform")
+        body = self.model.body(name).id
+        if not hasattr(self, "_planned_body") or self._actor_owner[body] > 0:
+            raise ValueError("free object poses require a scene world and a non-actor body")
+        joint = int(self.model.body_jntadr[body])
+        if joint < 0 or self.model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_FREE:
+            raise ValueError(f"{name}: expected a free rigid body")
+        address = int(self.model.jnt_qposadr[joint])
+        self._held_qpos[address:address + 7] = T_to_pose_xyzquat(T)
+        for child in range(body, self.model.nbody):
+            parent = self.model.body_parentid[child]
+            if child == body or self._actor_owner[parent] == -body:
+                self._planned_body[child] = True
+                self._actor_owner[child] = -body
+        self._multi_actor_query = True
+
+    def bind_free_body(self, name, parent, parent_T_body):
+        """Make a free payload follow one arm in this planning snapshot.
+
+        A closed chain still requires explicit constraints for its other grasp.
+        Projection consumes the same relation; physics is not modified here.
+        """
+        body, parent_id = self.model.body(name).id, self.model.body(parent).id
+        if parent_id == body or self.model.body_jntnum[body] != 1:
+            raise ValueError("expected a separate free payload body")
+        self._fk(np.zeros(len(self.joint_names)))
+        T = np.eye(4)
+        T[:3, :3] = self.data.xmat[parent_id].reshape(3, 3)
+        T[:3, 3] = self.data.xpos[parent_id]
+        self.set_free_body_pose(name, T @ parent_T_body)
+        self._rigid_bodies = dict(getattr(self, '_rigid_bodies', {}))
+        self._rigid_bodies[body] = (parent_id, np.asarray(parent_T_body).copy())
+
     def _fk(self, q: np.ndarray) -> None:
         self.data.qpos[:] = self._full_q(q)
         mujoco.mj_kinematics(self.model, self.data)
+        for body, (parent, offset) in getattr(self, '_rigid_bodies', {}).items():
+            from arm_control.frames import T_to_pose_xyzquat
+
+            T = np.eye(4)
+            T[:3, :3] = self.data.xmat[parent].reshape(3, 3)
+            T[:3, 3] = self.data.xpos[parent]
+            address = self.model.jnt_qposadr[self.model.body_jntadr[body]]
+            self.data.qpos[address:address + 7] = T_to_pose_xyzquat(T @ offset)
+            mujoco.mj_kinematics(self.model, self.data)
 
     def in_collision(self, q: np.ndarray) -> bool:
         """True when the configuration collides — self OR environment (OMPL fn)."""
         self._fk(q)
         mujoco.mj_collision(self.model, self.data)
         for i in range(self.data.ncon):
-            contact = self.data.contact[i]
-            body1 = self.model.geom_bodyid[contact.geom1]
-            body2 = self.model.geom_bodyid[contact.geom2]
-            if tuple(sorted((int(body1), int(body2)))) in getattr(self, '_allowed_body_pairs', ()):
-                continue
-            if hasattr(self, "_planned_body") and not (
-                self._planned_body[body1] or self._planned_body[body2]
-            ):
-                continue
-            if self._env_geom[contact.geom1] or self._env_geom[contact.geom2]:
-                return True  # environment: zero padding, any contact counts
-            if contact.dist <= self._pad:
-                return True  # self: deeper than the tolerated hull overlap
+            if self._contact_blocks(self.data.contact[i]):
+                return True
         return False
+
+    def _contact_blocks(self, contact) -> bool:
+        """Shared predicate for validity and its diagnostics; no policy change."""
+        body1 = self.model.geom_bodyid[contact.geom1]
+        body2 = self.model.geom_bodyid[contact.geom2]
+        if tuple(sorted((int(body1), int(body2)))) in getattr(self, '_allowed_body_pairs', ()):
+            return False
+        if hasattr(self, "_planned_body") and not (
+            self._planned_body[body1] or self._planned_body[body2]
+        ):
+            return False
+        owners = getattr(self, '_actor_owner', None)
+        if getattr(self, '_multi_actor_query', False) and owners is not None and owners[body1] and owners[body2] and owners[body1] != owners[body2]:
+            return True
+        if self._env_geom[contact.geom1] or self._env_geom[contact.geom2]:
+            return True  # environment: zero padding, any contact counts
+        return bool(contact.dist <= self._pad)
+
+    def collision_contacts(self, q: np.ndarray) -> list[dict]:
+        """Blocking body pairs with their minimum signed distance in metres.
+
+        Uses the same permissions and padding as ``in_collision``. Multiple
+        mesh contacts between a pair are collapsed for operator diagnostics.
+        Like other queries, this mutates scratch FK data; call on the planner
+        thread, never concurrently with another collision query.
+        """
+        self._fk(q)
+        mujoco.mj_collision(self.model, self.data)
+        pairs = {}
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            if not self._contact_blocks(contact):
+                continue
+            names = tuple(sorted(
+                self.model.body(self.model.geom_bodyid[g]).name or 'world'
+                for g in (contact.geom1, contact.geom2)
+            ))
+            pairs[names] = min(pairs.get(names, float('inf')), float(contact.dist))
+        return [{'bodies': names, 'distance_m': distance}
+                for names, distance in sorted(pairs.items())]
 
     def set_allowed_contacts(self, pairs) -> None:
         """Replace exact body-pair contact permissions; geometry stays enabled."""

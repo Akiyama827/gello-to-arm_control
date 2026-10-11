@@ -67,9 +67,12 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 缩
 |---|---|
 | `arm_control/motion/` | Shared joint-state, command, and trajectory values |
 | `arm_control/control/` | Execution, controller state, safety, gain validation |
+| `arm_control/execution/` | Transport-independent execution contract and its JSON codec |
+| `arm_control/supervisor/`, `arm_control/sdk.py` | Headless per-robot supervisor process; the minimal application SDK (`ArmClient`) |
+| `arm_control/multi_arm/` | Pair lifecycle, transport handles, shared-world and fixed-grasp object planning, simulation |
 | `arm_control/planning/` | IK, collision checking, planning, retiming, preview builders |
 | `arm_control/contracts/` | Central Dora/Arrow wire contracts |
-| `arm_control/plants/` | Plant protocol; DM, Franka, remote RT, MuJoCo adapters |
+| `arm_control/plants/` | Plant protocol; Franka, remote RT, MuJoCo adapters; the DM motor wire codec (the base's RT server) |
 | `arm_control/end_effectors/` | Generic grasp and Hand behavior |
 | `arm_control/ui/`, `arm_control/viz/` | Operator adapters, packaged web assets, telemetry |
 | `arm_control/simulation/` | Compatibility imports, generic convex decomposition and scene mirroring |
@@ -85,7 +88,7 @@ Planning requires `pip install -e '.[planning]'`, which pins TOPPRA 0.6.10.
 The shared retimer blends corners locally, solves per-joint velocity and
 acceleration constraints, and bounds the returned Hermite curve. Planning
 callers validate the blended geometry for collisions. Jerk limits are not
-provided. `PYTHONPATH=. python tools/bench/check_retiming.py` exercises the
+provided. `PYTHONPATH=. python tools/check/check_retiming.py` exercises the
 corner regression, short moves, reversals, collision retries and replay caps.
 
 From this repository, in an environment containing the required dependencies:
@@ -93,7 +96,7 @@ From this repository, in an environment containing the required dependencies:
 ```bash
 PYTHONPATH=. python -B -m arm_control.config
 PYTHONPATH=. python -B -m arm_control.frames
-PYTHONPATH=. python -B -m arm_control.messages
+PYTHONPATH=. python -B -m arm_control.contracts
 PYTHONPATH=. python -B examples/run_console.py --check
 ```
 

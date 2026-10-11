@@ -16,7 +16,6 @@ from typing import Mapping
 import time
 
 import numpy as np
-import yaml
 
 from arm_control import CONTROL_ROOT, REPO_ROOT
 
@@ -27,6 +26,17 @@ class ShutdownFlag:
 
     def request_stop(self) -> None:
         self.stop_requested = True
+
+
+def instance_scoped(path: Path) -> Path:
+    """``path`` suffixed with ``.<ARM_ID>`` when the graph names its instance.
+
+    Operator trigger files are motion authority. Two arm graphs on one host
+    must not both act on one ``touch``; a graph without ARM_ID keeps the
+    unsuffixed name it always had.
+    """
+    arm = os.environ.get("ARM_ID", "").strip()
+    return path.with_name(f"{path.name}.{arm}") if arm else path
 
 
 def install_signal_handlers(flag: ShutdownFlag):
@@ -81,7 +91,11 @@ def _load_mode_config() -> dict:
     raw = os.environ.get("ARM_CONTROL_MODE_CONFIG")
     if not raw:
         return {}
-    return yaml.safe_load(resolve_mode_config_path(raw).read_text()) or {}
+    # The config-tree loader, so a mode profile can include a shared one and state only what it changes.
+    from arm_control.config import load_config_tree
+
+    tree = load_config_tree(resolve_mode_config_path(raw))
+    return tree
 
 
 def resolve_mode_config_path(raw: str | Path) -> Path:
@@ -146,9 +160,8 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | N
 
     Without the arm-table fallback a mode config keyed by ANOTHER arm's joint
     names expands to all-zeros -- a limp arm on the bench, silently. The arm
-    table (``arm.<key>``) is arm-length and says nothing about non-arm motor
-    slots such as the DM gripper, so it is zero-padded up to the full motor
-    list; those trailing slots are only ever set by an explicit mode entry.
+    table (``arm.<key>``) is arm-length, so it is zero-padded up to the full
+    motor list; any trailing slots are only ever set by an explicit mode entry.
 
     Gain CEILINGS are per-arm hardware facts, not policy: 500/5 are the DM MIT
     wire-format limits (``pack_mit_control_frame`` clips above them), while the
@@ -158,6 +171,7 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | N
     import numpy as np
 
     from arm_control.config import _arm_block
+    from arm_control.control.gains import validate_integral_vector
 
     if not names:
         # No motor-name vector at the top level of this config. That is a
@@ -191,6 +205,13 @@ def resolve_gains(cfg, mode_cfg: dict, names: list[str], n_arm: int) -> dict | N
         out[key] = expand_named_values(
             spec, names=names, default=0.0, clamp_min=0.0, clamp_max=clamp_max
         )
+    # Integral law (PC controller state, rides in tau_ff): mode config only, absent
+    # = zero = off. No arm-table fallback -- it is a tuning of one plant's
+    # servo, not a fact about the arm.
+    for key in ("ki", "i_limit"):
+        out[key] = validate_integral_vector(expand_named_values(
+            controller_cfg.get(key), names=names, default=0.0
+        ), len(names), where=f"controller.{key}")
 
     if not float(np.max(np.abs(out["kp"][:n_arm]))) > 0.0:
         # All-zero arm stiffness is never intentional -- it is a limp arm that
@@ -246,7 +267,7 @@ def scene_injections() -> dict:
 def _check_resolve_gains() -> None:
     """The three config shapes that reach resolve_gains, including the empty one.
 
-    The last case is a regression guard. Wiring ``nodes/arm_controller.py`` to
+    The last case is a regression guard. Wiring the controller factory to
     this function assumed every arm config names its motors at the top level.
     A composed-SCENE config does not -- its joints live under
     ``scene.arm.joint_names`` and the plant prefixes them -- so ``names`` came
@@ -263,6 +284,9 @@ def _check_resolve_gains() -> None:
     out = resolve_gains(cfg, mode, names, 2)
     assert np.allclose(out["kp"], [20.0, 21.0]), out["kp"]
     assert np.allclose(out["kd"], [1.0, 1.1]), out["kd"]   # falls back
+    assert np.allclose(out["ki"], 0.0) and np.allclose(out["i_limit"], 0.0)  # off
+    out = resolve_gains(cfg, {"controller": {"ki": {"j1": 5.0}, "i_limit": 2.0}}, names, 2)
+    assert np.allclose(out["ki"], [5.0, 0.0]) and np.allclose(out["i_limit"], 2.0), out
 
     # 2. No mode config at all: the arm table, exactly as before this existed.
     out = resolve_gains(cfg, {}, names, 2)
@@ -280,7 +304,49 @@ def _check_resolve_gains() -> None:
         assert "all zeros" in str(exc), exc
     else:
         raise AssertionError("all-zero kp resolved silently")
-    print("node_utils: resolve_gains OK")
+    for key in ("ki", "i_limit"):
+        for bad in (-1., float("nan"), float("inf"), [1.], [1., 2., 3.],
+                    [[1., 2.]], {"j1": -1.}, {"j2": float("nan")}):
+            try:
+                resolve_gains(cfg, {"controller": {key: bad}}, names, 2)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"resolved invalid {key}={bad!r}")
+        vector = [2., 3.]
+        out = resolve_gains(cfg, {"controller": {key: vector}}, names, 2)
+        vector[:] = [99., 99.]
+        assert np.array_equal(out[key], [2., 3.]) and not out[key].flags.writeable
+    print("node_utils: resolve_gains and integral admission OK")
+
+
+def planner_speed_limits(planner_cfg, policy, planned):
+    """``(vmax, amax)`` the planner times plans with. The execution policy is the SINGLE statement of an arm's speed limits (the
+    controller refuses a plan above it at admission): without a planner statement the planner uses it; a planner may state LOWER
+    limits (plan slower), never higher -- refused here, at load, rather than every plan refused at Execute. A config with no policy
+    keeps the planner's own statement, else the historical 0.5 rad/s / 1.0 rad/s^2."""
+    names = list(planned)
+    limits = []
+    for plan_key, policy_key, fallback in (("vel_limits", "velocity_limits", 0.5), ("acc_limits", "acceleration_limits", 1.0)):
+        bound = None if not policy or policy.get(policy_key) is None else np.asarray(policy[policy_key], dtype=float).ravel()
+        if plan_key in planner_cfg:
+            stated = planner_cfg[plan_key]
+            if isinstance(stated, Mapping) and bound is not None:   # per joint by name; joints it does not name take the policy
+                unknown = set(stated) - set(names)
+                if unknown:   # a misspelt joint would silently lose the slower limit it states
+                    raise ValueError(f"planner.{plan_key} names no such joint: {sorted(unknown)} (joints: {names})")
+                value = np.array([float(stated.get(name, bound[i])) for i, name in enumerate(names)], dtype=float)
+            else:
+                value = expand_named_values(stated, names=names, default=fallback)
+            if bound is not None and np.any(value > bound[: len(value)] + 1e-12):
+                raise ValueError(f"planner.{plan_key} {value.tolist()} exceeds execution_policy.{policy_key} "
+                                 f"{bound[: len(value)].tolist()}: the planner may plan slower than the policy, never faster")
+        elif bound is not None:
+            value = bound[: len(names)].copy()
+        else:
+            value = expand_named_values(fallback, names=names, default=fallback)
+        limits.append(value)
+    return limits[0], limits[1]
 
 
 if __name__ == "__main__":

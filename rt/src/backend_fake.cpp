@@ -1,12 +1,13 @@
 // Loopback plant: a damped double integrator per joint, paced at 1 kHz by an
 // absolute-deadline sleep. PERMANENT test double, not bring-up scaffolding —
-// it is what lets the whole server (threads, sockets, seqlocks, deadman,
+// it is what lets the whole server (threads, sockets, mailboxes, deadman,
 // fault latching) be exercised on any machine, and what failure-injection
 // tests run against. Keep it DUMB: realistic closed-loop behaviour is the
 // MuJoCo twin's job on the PC, never this file's.
 #include <cmath>
 #include <ctime>
 #include <string>
+#include <vector>
 
 #include "arm_rt/backend.hpp"
 
@@ -19,8 +20,9 @@ constexpr double DAMPING = 0.8;  // N m s/rad, viscous
 
 class FakeBackend final : public Backend {
 public:
-  explicit FakeBackend(int n) : n_(n) {
+  FakeBackend(int n, const std::vector<double>& q0) : n_(n) {
     for (int j = 0; j < MAX_JOINTS; ++j) tau_limit_[j] = 50.0;
+    for (size_t j = 0; j < q0.size() && j < size_t(n); ++j) q_[j] = q0[j];
     clock_gettime(CLOCK_MONOTONIC, &next_);
   }
 
@@ -81,8 +83,9 @@ public:
     return true;
   }
 
-  void stop() override {
+  bool stop() override {
     for (int j = 0; j < n_; ++j) tau_[j] = 0.0;
+    return true;
   }
 
   const std::string& fault_text() const override { return fault_; }
@@ -100,8 +103,8 @@ private:
 
 } // namespace
 
-std::unique_ptr<Backend> make_fake_backend(int n) {
-  return std::make_unique<FakeBackend>(n);
+std::unique_ptr<Backend> make_fake_backend(int n, const std::vector<double>& q0) {
+  return std::make_unique<FakeBackend>(n, q0);
 }
 
 } // namespace arm_rt

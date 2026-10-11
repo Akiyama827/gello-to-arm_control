@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(arm_rt LANGUAGES CXX)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,6 +56,14 @@ if(WITH_FRANKA)
     INSTALL_RPATH "\$ORIGIN/lib")
   target_link_options(flange_probe PRIVATE -Wl,--disable-new-dtags)
 
+  # Read-only Cartesian-law probe (rungs 2/3): the box's FK call against O_T_EE, and its cost. Same layout as flange_probe.
+  add_executable(cartesian_probe src/cartesian_probe.cpp)
+  target_link_libraries(cartesian_probe PRIVATE Franka::Franka Eigen3::Eigen)
+  set_target_properties(cartesian_probe PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib"
+    INSTALL_RPATH "\$ORIGIN/lib")
+  target_link_options(cartesian_probe PRIVATE -Wl,--disable-new-dtags)
+
   add_executable(hand_bridge src/hand_bridge.cpp)
   add_executable(hand_bridge_selfcheck src/hand_bridge_selfcheck.cpp)
   target_link_libraries(hand_bridge_selfcheck PRIVATE Franka::Franka Threads::Threads)
@@ -82,10 +91,44 @@ target_include_directories(torque_cap_selfcheck PRIVATE include)
 target_link_libraries(torque_cap_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
 target_compile_options(torque_cap_selfcheck PRIVATE -UNDEBUG)
 
+add_executable(cartesian_loop_selfcheck src/cartesian_loop_selfcheck.cpp src/rt_loop.cpp)
+target_include_directories(cartesian_loop_selfcheck PRIVATE include)
+target_link_libraries(cartesian_loop_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
+target_compile_options(cartesian_loop_selfcheck PRIVATE -UNDEBUG)
+
 add_executable(dm_command_selfcheck src/dm_command_selfcheck.cpp src/rt_loop.cpp)
 target_include_directories(dm_command_selfcheck PRIVATE include)
 target_link_libraries(dm_command_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
 target_compile_options(dm_command_selfcheck PRIVATE -UNDEBUG)
+
+# FR3 backend + rt_loop against a scripted franka:: surface: builds and runs
+# without libfranka or a robot (exception containment, fault attribution).
+add_executable(franka_backend_selfcheck src/franka_backend_selfcheck.cpp src/rt_loop.cpp
+  src/udp_link.cpp)
+target_include_directories(franka_backend_selfcheck PRIVATE include)
+target_link_libraries(franka_backend_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
+target_compile_options(franka_backend_selfcheck PRIVATE -UNDEBUG)
+
+# Fault journal ring: causes, truncation, full ring, concurrent producers.
+add_executable(fault_journal_selfcheck src/fault_journal_selfcheck.cpp)
+target_include_directories(fault_journal_selfcheck PRIVATE include)
+target_link_libraries(fault_journal_selfcheck PRIVATE Threads::Threads)
+target_compile_options(fault_journal_selfcheck PRIVATE -UNDEBUG)
+
+# CTRL-010 loop-gap diagnostics: forced gap, fixture sequence association,
+# full ring, stalled consumer, law raw-export behavior neutrality.
+add_executable(gap_diagnostic_selfcheck src/gap_diagnostic_selfcheck.cpp
+  src/rt_loop.cpp)
+target_include_directories(gap_diagnostic_selfcheck PRIVATE include)
+target_link_libraries(gap_diagnostic_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
+target_compile_options(gap_diagnostic_selfcheck PRIVATE -UNDEBUG)
+
+# RT <-> non-RT transport: mailbox, command admission, envelope freshness.
+# Build it with -fsanitize=thread as well (see README); no sockets are opened.
+add_executable(ipc_selfcheck src/ipc_selfcheck.cpp src/udp_link.cpp)
+target_include_directories(ipc_selfcheck PRIVATE include)
+target_link_libraries(ipc_selfcheck PRIVATE Threads::Threads)
+target_compile_options(ipc_selfcheck PRIVATE -UNDEBUG)
 
 add_executable(dm_backend_selfcheck src/dm_backend_selfcheck.cpp src/backend_dm.cpp)
 target_include_directories(dm_backend_selfcheck PRIVATE include)
@@ -93,3 +136,89 @@ target_compile_options(dm_backend_selfcheck PRIVATE -UNDEBUG)
 foreach(call socket setsockopt ioctl bind close write recv ppoll)
   target_link_options(dm_backend_selfcheck PRIVATE "-Wl,--wrap=${call}")
 endforeach()
+
+add_executable(reference_protocol_selfcheck src/reference_protocol_selfcheck.cpp)
+target_include_directories(reference_protocol_selfcheck PRIVATE include)
+target_compile_options(reference_protocol_selfcheck PRIVATE -UNDEBUG)
+
+# Numerical parity wrapper delegates to the same pure evaluator as RT.
+add_library(reference_probe SHARED src/reference_probe.cpp)
+set_target_properties(reference_probe PROPERTIES PREFIX "")
+target_include_directories(reference_probe PRIVATE include)
+target_compile_options(reference_probe PRIVATE -ffp-contract=off)
+
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+target_link_libraries(arm_rt_server PRIVATE OpenSSL::Crypto)
+add_executable(clock_domain_selfcheck src/clock_domain_selfcheck.cpp)
+target_include_directories(clock_domain_selfcheck PRIVATE include)
+target_link_libraries(clock_domain_selfcheck PRIVATE OpenSSL::Crypto)
+target_compile_options(clock_domain_selfcheck PRIVATE -UNDEBUG)
+add_executable(group_record_selfcheck src/group_record_selfcheck.cpp)
+target_include_directories(group_record_selfcheck PRIVATE include)
+target_link_libraries(group_record_selfcheck PRIVATE Threads::Threads)
+target_compile_options(group_record_selfcheck PRIVATE -UNDEBUG)
+add_executable(reference_upload_selfcheck src/reference_upload_selfcheck.cpp)
+target_include_directories(reference_upload_selfcheck PRIVATE include)
+target_link_libraries(reference_upload_selfcheck PRIVATE OpenSSL::Crypto)
+target_compile_options(reference_upload_selfcheck PRIVATE -UNDEBUG -ffp-contract=off)
+
+add_executable(reference_session_selfcheck src/reference_session_selfcheck.cpp)
+target_include_directories(reference_session_selfcheck PRIVATE include)
+target_link_libraries(reference_session_selfcheck PRIVATE OpenSSL::Crypto Threads::Threads)
+
+add_executable(reference_selection_selfcheck src/reference_selection_selfcheck.cpp)
+target_include_directories(reference_selection_selfcheck PRIVATE include)
+target_compile_options(reference_selection_selfcheck PRIVATE -UNDEBUG -ffp-contract=off)
+
+add_executable(mode_select_selfcheck src/mode_select_selfcheck.cpp)
+target_include_directories(mode_select_selfcheck PRIVATE include)
+target_compile_options(mode_select_selfcheck PRIVATE -UNDEBUG)
+
+add_executable(mode_select_session_selfcheck src/mode_select_session_selfcheck.cpp)
+target_include_directories(mode_select_session_selfcheck PRIVATE include)
+target_link_libraries(mode_select_session_selfcheck PRIVATE OpenSSL::Crypto Threads::Threads)
+target_compile_options(mode_select_session_selfcheck PRIVATE -UNDEBUG)
+
+add_executable(reference_runtime_selfcheck src/reference_runtime_selfcheck.cpp
+  src/rt_loop.cpp src/udp_link.cpp src/control_session.cpp src/backend_fake.cpp)
+target_include_directories(reference_runtime_selfcheck PRIVATE include)
+target_link_libraries(reference_runtime_selfcheck PRIVATE OpenSSL::Crypto Threads::Threads Eigen3::Eigen)
+
+add_executable(stale_envelope_scope_selfcheck src/stale_envelope_scope_selfcheck.cpp
+  src/rt_loop.cpp)
+target_include_directories(stale_envelope_scope_selfcheck PRIVATE include)
+target_link_libraries(stale_envelope_scope_selfcheck PRIVATE Threads::Threads Eigen3::Eigen)
+target_compile_options(stale_envelope_scope_selfcheck PRIVATE -UNDEBUG)
+
+add_executable(controller_selfcheck src/controller_selfcheck.cpp)
+target_include_directories(controller_selfcheck PRIVATE include)
+target_link_libraries(controller_selfcheck PRIVATE Eigen3::Eigen)
+target_compile_options(controller_selfcheck PRIVATE -UNDEBUG)
+
+if(BUILD_TESTING)
+  foreach(selfcheck IN ITEMS
+      protocol_selfcheck hand_admission_selfcheck pose_hold_selfcheck
+      torque_cap_selfcheck dm_command_selfcheck franka_backend_selfcheck
+      fault_journal_selfcheck gap_diagnostic_selfcheck ipc_selfcheck
+      dm_backend_selfcheck reference_protocol_selfcheck reference_upload_selfcheck
+      reference_selection_selfcheck clock_domain_selfcheck group_record_selfcheck
+      mode_select_selfcheck mode_select_session_selfcheck
+      stale_envelope_scope_selfcheck
+      controller_selfcheck cartesian_loop_selfcheck)
+    add_test(NAME ${selfcheck} COMMAND $<TARGET_FILE:${selfcheck}>)
+  endforeach()
+  # These two self-check binaries are harnesses: one needs a socketpair FD,
+  # the other free UDP/TCP ports. Their existing Python probes supply them.
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME reference_session_selfcheck COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/../tools/check/rt/reference_upload.py
+    $<TARGET_FILE:reference_session_selfcheck>)
+  add_test(NAME reference_runtime_selfcheck COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/../tools/check/rt/native_reference.py
+    $<TARGET_FILE:reference_runtime_selfcheck>)
+  set_tests_properties(reference_session_selfcheck reference_runtime_selfcheck
+    PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/..")
+  if(TARGET hand_bridge_selfcheck)
+    add_test(NAME hand_bridge_selfcheck COMMAND $<TARGET_FILE:hand_bridge_selfcheck>)
+  endif()
+endif()

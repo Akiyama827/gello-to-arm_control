@@ -19,9 +19,10 @@ import time
 import uuid
 
 from arm_control.end_effectors.franka_hand import (
+    FRANKA_HAND,
     GRASP_TIMEOUT_S,
-    MAX_FORCE_N,
-    MIN_FORCE_N,
+    HandLimits,
+    require_force_grasp,
     resolve_grasp_parameters,
 )
 
@@ -67,6 +68,12 @@ class HandPanel:
         self._disarm_requested = False
 
     # -- plant observations ---------------------------------------------------
+    @property
+    def limits(self) -> HandLimits:
+        """The connected gripper's stated envelope (``gripper_state.limits``; none stated: the Franka Hand)."""
+        stated = self._state.get("limits")
+        return HandLimits(**stated) if stated else FRANKA_HAND
+
     def set_state(self, state: dict) -> None:
         if not state.get("available"):
             self._pending = None
@@ -138,12 +145,14 @@ class HandPanel:
                 and abs(float(width) - self.defaults["open_width_m"]) <= .002):
             self._status = "Open"
         return {
+            "feedback_fresh": fresh and bool(self._state.get("measured")),
+            "is_grasped": self._state.get("is_grasped") if fresh else None,
             "enabled": not reason,
             "reason": reason,
             "status": self._status,
             "busy": self.busy(),
             "defaults": self.defaults,
-            "force_min_n": MIN_FORCE_N, "force_max_n": MAX_FORCE_N,
+            "force_min_n": self.limits.force_min_n, "force_max_n": self.limits.force_max_n,
             "width_max_mm": self._width_max_m * 2000,
             "measured_width_mm": (
                 float(width) * 1000
@@ -173,7 +182,8 @@ class HandPanel:
         if reason:
             raise ValueError(reason)
         mode = payload.get("mode", "close")
-        params = resolve_grasp_parameters(self._cfg, payload)
+        require_force_grasp(self.limits, mode)
+        params = resolve_grasp_parameters(self._cfg, payload, self.limits)
         self._request_id = uuid.uuid4().hex
         self._pending = {
             "request_id": self._request_id, "target_id": "hand", "mode": mode,

@@ -1,14 +1,6 @@
-// Shared machinery for both console pages: the 3D scene, mesh loading, robot
-// building, the gizmo, sliders, the deadman, and the fetch helpers.
-//
-// Two pages import this: console.js (drive an arm) and editor.js (edit grasp
-// profiles). They used to be ONE file serving one page, switched at runtime on
-// whether `state.module` existed -- which is why the operator console showed a
-// Calibration rack whose every control 404'd, and why the tab was titled
-// "Workcell calibration console" while you were driving a robot.
-//
-// Nothing here knows which page it is on. Anything that does belongs in the
-// page module.
+// Shared browser scene, mesh loading, optional gizmo, and request helpers.
+// Single-arm, dual-arm and consumer pages import these components. Page-specific
+// controls and behavior stay in their own modules.
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/OrbitControls.js";
 import { TransformControls } from "three/addons/TransformControls.js";
@@ -116,6 +108,7 @@ export const buildRobot = async (geometries, tint, opacity) => {
 };
 
 export const buildStatic = async (items) => {
+  const group = new THREE.Group();
   for (const item of items) {
     const mesh = new THREE.Mesh(
       await loadGeometry(item.mesh),
@@ -124,8 +117,10 @@ export const buildStatic = async (items) => {
     mesh.scale.set(...item.scale);
     mesh.position.set(...item.p);
     mesh.quaternion.set(...item.q);
-    scene.add(mesh);
+    group.add(mesh);
   }
+  scene.add(group);
+  return group;
 };
 
 export const setPoses = (robot, poses) => {

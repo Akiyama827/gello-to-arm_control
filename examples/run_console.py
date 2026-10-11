@@ -7,7 +7,7 @@ it is. All this does is the three things a bare `dora run` cannot do for you:
 check the assets are staged, export the two roots, and pick the graph.
 
     python examples/run_console.py                 # one arm, console on :7500
-    python examples/run_console.py --dual          # two arms, :7500 and :7510
+    python examples/run_console.py --dual          # the simulated pair (two supervisors, one world), :7520
     python examples/run_console.py --config <path> # your own entry config
 
 Meshes are not vendored here (this repo owns the code; a project owns its CAD),
@@ -30,8 +30,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from arm_control.supervisor.launch import start_supervisor, stop_supervisor  # noqa: E402  (after the path bootstrap)
+
+# One arm: the FR3 through its SUPERVISOR over a simulated plant (CTRL-053; the in-process controller graph is retired).
 SINGLE = REPO_ROOT / "dataflows" / "sim_franka_motion.yml"
-DUAL = REPO_ROOT / "dataflows" / "dual_arm_sim.yml"
+SUPERVISED_PROFILE = REPO_ROOT / "examples" / "profiles" / "sim_supervised.yaml"
+MODE_PROFILE = REPO_ROOT / "examples" / "profiles" / "motion_franka.yaml"
+PAIR_CONFIG = REPO_ROOT / "examples" / "configs" / "dual_arm.yaml"
+OBJECT_CONFIG = REPO_ROOT / "examples" / "configs" / "dual_arm_object.yaml"
 DEFAULT_CONFIG = REPO_ROOT / "examples" / "configs" / "sim_arm.yaml"
 
 
@@ -107,14 +113,41 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                         help=f"entry config (default: {DEFAULT_CONFIG.name})")
     parser.add_argument("--dual", action="store_true",
-                        help="two arms in one graph, on two console ports")
+                        help="the simulated pair's console on :7520 (two supervisors, one world)")
+    parser.add_argument("--pair-config", type=Path, default=PAIR_CONFIG,
+                        help="dual-arm composition (used with --dual)")
+    parser.add_argument("--port", type=int, default=7520, help="dual console loopback port")
     parser.add_argument("--check", action="store_true",
                         help="report readiness and exit, launching nothing")
+    parser.add_argument("--no-viewer", action="store_true", help="do not start a Rerun viewer (headless runs)")
     args = parser.parse_args()
+
+    if args.dual:
+        if args.config != DEFAULT_CONFIG:
+            parser.error("--config is single-arm; use --pair-config with --dual")
+        if args.pair_config.resolve() in (PAIR_CONFIG, OBJECT_CONFIG):
+            os.environ["ARM_CONTROL_ROOT"] = str(REPO_ROOT)
+        from arm_control.multi_arm.config import load_pair_config
+        config_path = args.pair_config.resolve()
+        if args.check:
+            pair = load_pair_config(config_path)
+            print(f"{pair.backend} configuration: {config_path}, arms={pair.scene.actor_names}; no transports opened")
+            return 0
+        if load_pair_config(config_path).backend != "shared_sim":
+            parser.error("--dual runs the simulated pair; a hardware pair is the project's launcher (two RT supervisors)")
+        from arm_control.multi_arm.launch import SOCKETS_ENV, running_pair
+        from arm_control.ui.dual_arm_console import main as dual_main
+        env = dict(os.environ, ARM_CONTROL_ROOT=str(REPO_ROOT),
+                   PYTHONPATH=os.pathsep.join([str(REPO_ROOT), os.environ.get("PYTHONPATH", "")]).strip(os.pathsep))
+        # every arm on its supervisor (CTRL-053): the first hosts the pair's world, the second co-hosts it
+        with running_pair(config_path, env, plant="sim", cwd=REPO_ROOT) as (staged, env):
+            os.environ[SOCKETS_ENV] = env[SOCKETS_ENV]
+            dual_main(staged, port=args.port)
+        return 0
 
     ready, hint = assets_ready()
     config = args.config if args.config.is_absolute() else REPO_ROOT / args.config
-    graph = DUAL if args.dual else SINGLE
+    graph = SINGLE
 
     if args.check or not ready:
         print(f"config: {config}  {'ok' if config.is_file() else 'MISSING'}")
@@ -149,12 +182,38 @@ def main() -> int:
         [str(REPO_ROOT), env.get("PYTHONPATH", "")]
     ).strip(os.pathsep)
 
-    ensure_rerun_viewer()
+    supervisor = None
+    live: dict = {"graph": None}
+    stopped_by: list[int] = []
+
+    def _stop(signum, _frame):
+        # Signal only; never wait here. The handler runs on the main thread, which may be blocked in a wait holding Popen's
+        # _waitpid_lock, so a handler that waits re-enters that lock on the same thread and hangs. Signalling dora is enough --
+        # it reaps its nodes, the wait returns, and the real teardown runs in `finally`, off the handler. Installed BEFORE
+        # anything is started: a signal during the supervisor's start-up or the viewer's must not orphan either.
+        stopped_by.append(int(signum))
+        graph_proc = live["graph"]
+        if graph_proc is not None:
+            try:
+                os.killpg(os.getpgid(graph_proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _stop)
+    try:
+        supervisor, env = start_supervisor(config, env, overlays=(SUPERVISED_PROFILE,), control_mode=MODE_PROFILE,
+                                           cwd=REPO_ROOT, stopped=lambda: bool(stopped_by))
+    except RuntimeError as exc:
+        print(f"[run_console] {exc}", file=sys.stderr)
+        return 128 + stopped_by[0] if stopped_by else 1
+    if stopped_by:
+        stop_supervisor(supervisor)
+        return 128 + stopped_by[0]
+    if not args.no_viewer:
+        ensure_rerun_viewer()
     print(f"[run_console] {config.name} -> {graph.name}", flush=True)
-    if args.dual:
-        print("[run_console] consoles on http://127.0.0.1:7500 and :7510", flush=True)
-    else:
-        print("[run_console] console on http://127.0.0.1:7500", flush=True)
+    print("[run_console] console on http://127.0.0.1:7500", flush=True)
     print("[run_console] the arm comes up DISARMED — press ARM on the page", flush=True)
     try:
         # start_new_session: the graph gets its OWN session, so teardown can
@@ -170,28 +229,26 @@ def main() -> int:
     except FileNotFoundError:
         print("`dora` is not on PATH — is the dora-rs CLI installed?",
               file=sys.stderr)
+        stop_supervisor(supervisor)
         return 1
 
-    stopped_by: list[int] = []
-
-    def _stop(signum, _frame):
-        # Signal only; never wait here. The handler runs on the main thread,
-        # which is blocked in proc.wait() holding Popen's _waitpid_lock, so a
-        # handler that waits re-enters that lock on the same thread and hangs.
-        # Signalling dora is enough -- it reaps its nodes, wait() returns, and
-        # the real teardown runs in `finally`, off the handler.
-        stopped_by.append(int(signum))
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _stop)
+    live["graph"] = proc
+    if stopped_by:  # a signal arrived between the graph's start and now
+        _terminate_graph(proc)
     try:
-        return proc.wait()
+        if supervisor is None:
+            return proc.wait()
+        # With a supervisor the graph is only as alive as the thing that owns control: watch both.
+        while proc.poll() is None:
+            if supervisor.poll() is not None:
+                print(f"[run_console] the supervisor exited ({supervisor.returncode}): stopping the graph", file=sys.stderr, flush=True)
+                _terminate_graph(proc)
+                return 1
+            time.sleep(0.5)
+        return proc.returncode
     finally:
         _terminate_graph(proc)
+        stop_supervisor(supervisor)  # after the graph: its SIGTERM DISARMs the plant through the link
         if stopped_by:
             raise SystemExit(128 + stopped_by[0])
 
@@ -255,8 +312,9 @@ def _terminate_graph(proc, grace_s: float = 8.0) -> None:
 
 def _self_check() -> None:
     """The launcher's own claims: the files it points at have to exist."""
-    assert SINGLE.is_file(), SINGLE
-    assert DUAL.is_file(), DUAL
+    assert SINGLE.is_file() and SUPERVISED_PROFILE.is_file() and MODE_PROFILE.is_file(), SINGLE
+    assert PAIR_CONFIG.is_file(), PAIR_CONFIG
+    assert OBJECT_CONFIG.is_file(), OBJECT_CONFIG
     assert DEFAULT_CONFIG.is_file(), DEFAULT_CONFIG
     # The entry config must actually load through the include machinery, and
     # name a console port -- the whole reason it lives with the robot.
@@ -264,11 +322,6 @@ def _self_check() -> None:
 
     cfg = load_config_tree(DEFAULT_CONFIG)
     assert cfg["console"]["http_port"], cfg.get("console")
-    dual_cfg = load_config_tree(REPO_ROOT / "examples/configs/sim_arm_b.yaml")
-    assert dual_cfg["console"]["http_port"] != cfg["console"]["http_port"], (
-        "the two demo arms must not share a console port -- that collision is "
-        "the exact thing per-instance config exists to prevent"
-    )
     _check_entry_keys()
     ready, hint = assets_ready()
     assert ready or "franka_description" in hint, hint

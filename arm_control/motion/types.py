@@ -59,9 +59,10 @@ class JointTrajectory:
         consistent; the retimer and execution policy separately bound its
         extrema. Legal waypoint velocities alone do not bound a cubic.
 
-        This is the ONLY reference evaluator in the stack -- sim and hardware
-        both come through here, and the RT server holds the last command
-        rather than interpolating -- so there is nothing to keep in sync.
+        This is the Python evaluator for simulation and legacy streamed
+        execution. Negotiated native references delegate evaluation to the
+        byte-parity-checked RT implementation; the PC consumes its selected
+        sample and does not run this evaluator for that execution.
         """
         t = float(time_sec)
         if t <= self.times[0]:
@@ -79,20 +80,21 @@ class JointTrajectory:
             # already self-consistent -- the chord slope is its derivative.
             return TrajectoryPoint(
                 time=t,
-                position=(1.0 - s) * q0 + s * q1,
+                position=q0 + s * (q1 - q0),
                 velocity=(q1 - q0) / h,
                 acceleration=np.zeros(self.num_joints, dtype=float),
             )
         v0, v1 = self.velocities[lower], self.velocities[upper]
         s2, s3 = s * s, s * s * s
+        # Offset form, q0 + dq*h01 + h*(v0*h10 + v1*h11): a segment held still (dq = 0, v = 0) returns its knot EXACTLY. The
+        # weighted-sum form (h00*q0 + h01*q1) rounds h00 + h01 to 1 +- ulp, so a joint held on its limit sampled one ulp past it.
+        # Same polynomial; rt/include/arm_rt/reference.hpp evaluates it identically.
+        dq = q1 - q0
         return TrajectoryPoint(
             time=t,
-            position=((2 * s3 - 3 * s2 + 1) * q0 + (s3 - 2 * s2 + s) * h * v0
-                      + (-2 * s3 + 3 * s2) * q1 + (s3 - s2) * h * v1),
-            velocity=((6 * s2 - 6 * s) * q0 / h + (3 * s2 - 4 * s + 1) * v0
-                      + (-6 * s2 + 6 * s) * q1 / h + (3 * s2 - 2 * s) * v1),
-            acceleration=((12 * s - 6) * q0 / (h * h) + (6 * s - 4) * v0 / h
-                          + (-12 * s + 6) * q1 / (h * h) + (6 * s - 2) * v1 / h),
+            position=q0 + (3 * s2 - 2 * s3) * dq + h * ((s3 - 2 * s2 + s) * v0 + (s3 - s2) * v1),
+            velocity=(6 * s - 6 * s2) * dq / h + (3 * s2 - 4 * s + 1) * v0 + (3 * s2 - 2 * s) * v1,
+            acceleration=(6 - 12 * s) * dq / (h * h) + ((6 * s - 4) * v0 + (6 * s - 2) * v1) / h,
         )
 
     def bounds(self) -> dict[str, np.ndarray]:

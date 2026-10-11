@@ -28,8 +28,8 @@ from pathlib import Path
 from dora import Node
 
 
-from arm_control.messages import pack_json_message
-from arm_control.node_utils import next_event_gil_friendly
+from arm_control.contracts import pack_json_message
+from arm_control.node_utils import instance_scoped, next_event_gil_friendly
 
 _PANEL_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>operator gate</title><style>
@@ -220,7 +220,8 @@ class OperatorPanel:
 
 
 def _trigger_file() -> Path:
-    return Path(os.environ.get("ARM_OPERATOR_ARM_FILE", "/tmp/arm_operator_arm"))
+    explicit = os.environ.get("ARM_OPERATOR_ARM_FILE")
+    return Path(explicit) if explicit else instance_scoped(Path("/tmp/arm_operator_arm"))
 
 
 def _file_mtime(path: Path) -> float | None:
@@ -264,7 +265,7 @@ def main() -> None:
             and event["id"] == "status"
             and panel is not None
         ):
-            from arm_control.messages import unpack_json_message
+            from arm_control.contracts import unpack_json_message
 
             panel.set_status(unpack_json_message(event["value"]))
         if panel is not None and panel.evicted:
@@ -286,10 +287,8 @@ def main() -> None:
             triggered = True
         if panel is not None and panel.take_replay():
             # View-only channel, sent ONLY while orchestrator status shows a
-            # held plan. In graphs where this node feeds the real bridge's
-            # `arm` input directly (real_motion) there is never a status feed,
-            # so a replay can never reach a consumer that would read the
-            # non-armed message as a DISARM.
+            # held plan, so a replay can never reach a consumer that would
+            # read the non-armed message as a DISARM.
             if panel.status_holding():
                 node.send_output("arm", pack_json_message("arm", {"replay": True}))
                 panel.log("PLAY — flying the plan preview")

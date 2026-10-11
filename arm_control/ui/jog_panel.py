@@ -43,10 +43,6 @@ class JogPanel:
         # continued one -- a re-press must re-latch, not resume mid-stroke.
         self._epoch = 0
 
-    @property
-    def max_speeds(self) -> tuple[float, float]:
-        return self._max
-
     def set_speeds(self, payload) -> None:
         if not isinstance(payload, dict) or set(payload) != {"speed_m_s", "joint_speed_rad_s"}:
             raise ValueError("provide Cartesian and joint jog speeds only")

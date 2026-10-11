@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <thread>
 
 #include "server.hpp"
@@ -31,22 +32,57 @@ void on_signal(int) {
   if (g_ctx) g_ctx->shutdown.store(true);
 }
 
+// Thread boundary: an exception escaping a server thread was std::terminate
+// (no unwinding, no diagnosable cause). Report it and shut the whole process
+// down nonzero instead -- never resume a thread whose invariants are unknown.
+template <class Fn>
+void guarded(const char* thread, arm_rt::ServerCtx& ctx, Fn fn) {
+  try {
+    fn(ctx);
+  } catch (const std::exception& exc) {
+    std::fprintf(stderr, "[rt] %s thread exception: %s — shutting down\n", thread,
+                 exc.what());
+    ctx.failed.store(true);
+    ctx.shutdown.store(true);
+  } catch (...) {
+    std::fprintf(stderr, "[rt] %s thread: unknown exception — shutting down\n",
+                 thread);
+    ctx.failed.store(true);
+    ctx.shutdown.store(true);
+  }
+}
+
 void usage(const char* argv0) {
   std::printf(
-      "usage: %s [--backend fake|franka|dm] [--n N] [--udp-port P] [--tcp-port P]\n"
+      "usage: %s [--backend fake|franka|dm] [--instance-id ID] [--joint-names A,B,..]\n"
+      "          [--n N] [--fake-q0 Q1,Q2,..] [--udp-port P] [--tcp-port P]\n"
       "          [--state-hz HZ] [--hold-ms MS] [--fault-ms MS] [--slew NM]\n"
       "          [--hold-kp V] [--hold-kd V] [--franka-ip IP] [--can-if IF]\n"
       "          [--ee-mass KG] [--ee-com X,Y,Z] [--tau-max NM]\n"
       "          [--dm-spec IF;ID:TYPE[:MST[:PMAX:VMAX:TMAX]],...] [--rt-priority N]\n"
       "          [--active-mask MASK] [--rt-cpu CPU] [--bind IP] [--mit-check]\n"
+      "          [--require-rt-setup] [--enable-reference]\n"
+      "          [--machine-id-file PATH] [--boot-id-file PATH]\n"
+      "          [--group-shm NAME --group-member K --group-members N\n"
+      "           --group-peer-max-age-ms MS --group-min-lead-ms MS]\n"
       "\n"
+      "  --instance-id  provisioned arm instance id ([A-Za-z0-9_.-], <32 chars);\n"
+      "             required for franka/dm. Commanders CLAIM it before ARM.\n"
+      "  --joint-names  comma-separated joint order the backend's slots mean;\n"
+      "             required for franka/dm, count must equal the backend's.\n"
       "  --ee-mass  payload past the flange (wrist camera + mount, carried\n"
       "             module) in kg, ADDED to Desk's end-effector config.\n"
       "  --ee-com   that payload's centre of mass in the FLANGE frame, metres.\n"
       "  --dm-spec DM host MIT maps; optional symmetric PMAX/VMAX/TMAX must\n"
       "             match firmware (rad, rad/s, N.m). Omit for type defaults.\n"
       "  --tau-max  positive operating torque cap per joint (N.m), never above\n"
-      "             backend limits; omitted keeps the backend defaults.\n",
+      "             backend limits; omitted keeps the backend defaults.\n"
+      "  --require-rt-setup  refuse ARM if mlockall, SCHED_FIFO or --rt-cpu fails\n"
+      "             (always on for franka/dm; the fake backend runs degraded).\n"
+      "  --enable-reference  advertise and accept the v7 native-reference\n"
+      "             contract. OFF by default: the native path is not qualified\n"
+      "             for any deployment, so it must be opted into per instance\n"
+      "             (the deployment registry renders this flag).\n",
       argv0);
 }
 
@@ -62,6 +98,9 @@ uint16_t parse_port(const char* flag, const char* value) {
 } // namespace
 
 int main(int argc, char** argv) {
+  // As hand_bridge: under systemd stdout is a pipe, fully buffered, so the startup and connect/disconnect lines sat in a
+  // 4K buffer until exit (bench 2026-10-10). No stdout write is on the RT loop (its journal has its own flushed stream).
+  setvbuf(stdout, nullptr, _IOLBF, 0);
   // MIT wire-format parity check (see backend_dm.cpp): golden frames the
   // Python pack_mit_control_frame/decode_mit_reply must reproduce exactly.
   if (argc > 1 && !std::strcmp(argv[1], "--mit-check"))
@@ -78,7 +117,44 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     if (!std::strcmp(argv[i], "--backend")) cfg.backend = next("--backend");
+    else if (!std::strcmp(argv[i], "--instance-id")) cfg.instance_id = next("--instance-id");
+    else if (!std::strcmp(argv[i], "--joint-names")) {
+      std::string list = next("--joint-names");
+      cfg.joint_names.clear();
+      size_t start = 0;
+      while (start <= list.size()) {
+        const size_t comma = list.find(',', start);
+        const std::string name = list.substr(start, comma == std::string::npos
+                                                        ? std::string::npos
+                                                        : comma - start);
+        if (name.empty()) {
+          std::fprintf(stderr, "--joint-names has an empty entry\n");
+          return 2;
+        }
+        cfg.joint_names.push_back(name);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
+    }
     else if (!std::strcmp(argv[i], "--n")) cfg.n = std::atoi(next("--n"));
+    else if (!std::strcmp(argv[i], "--fake-q0")) {
+      // test double only: the fake plant's start pose, so a client whose envelope excludes zero can ARM it
+      std::string list = next("--fake-q0");
+      cfg.fake_q0.clear();
+      for (size_t start = 0; start <= list.size();) {
+        const size_t comma = list.find(',', start);
+        const std::string item = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        char* end = nullptr;
+        const double v = std::strtod(item.c_str(), &end);
+        if (item.empty() || *end || !std::isfinite(v)) {
+          std::fprintf(stderr, "--fake-q0 needs comma-separated radians (got %s)\n", list.c_str());
+          return 2;
+        }
+        cfg.fake_q0.push_back(v);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
+    }
     else if (!std::strcmp(argv[i], "--udp-port")) cfg.udp_port = parse_port("--udp-port", next("--udp-port"));
     else if (!std::strcmp(argv[i], "--tcp-port")) cfg.tcp_port = parse_port("--tcp-port", next("--tcp-port"));
     else if (!std::strcmp(argv[i], "--bind")) {
@@ -90,6 +166,13 @@ int main(int argc, char** argv) {
       cfg.bind_addr = a.s_addr;
     }
     else if (!std::strcmp(argv[i], "--state-hz")) cfg.state_hz = std::atof(next("--state-hz"));
+    else if (!std::strcmp(argv[i], "--machine-id-file")) cfg.machine_id_file = next("--machine-id-file");
+    else if (!std::strcmp(argv[i], "--boot-id-file")) cfg.boot_id_file = next("--boot-id-file");
+    else if (!std::strcmp(argv[i], "--group-shm")) cfg.group_shm = next("--group-shm");
+    else if (!std::strcmp(argv[i], "--group-member")) cfg.group_member = std::atoi(next("--group-member"));
+    else if (!std::strcmp(argv[i], "--group-members")) cfg.group_members = uint32_t(std::atoi(next("--group-members")));
+    else if (!std::strcmp(argv[i], "--group-peer-max-age-ms")) cfg.group_peer_max_age_ms = std::atof(next("--group-peer-max-age-ms"));
+    else if (!std::strcmp(argv[i], "--group-min-lead-ms")) cfg.group_min_lead_ms = std::atof(next("--group-min-lead-ms"));
     else if (!std::strcmp(argv[i], "--hold-ms")) cfg.hold_ms = std::atof(next("--hold-ms"));
     else if (!std::strcmp(argv[i], "--fault-ms")) cfg.fault_ms = std::atof(next("--fault-ms"));
     else if (!std::strcmp(argv[i], "--slew")) cfg.slew = std::atof(next("--slew"));
@@ -132,13 +215,40 @@ int main(int argc, char** argv) {
     }
     else if (!std::strcmp(argv[i], "--rt-priority")) cfg.rt_priority = std::atoi(next("--rt-priority"));
     else if (!std::strcmp(argv[i], "--rt-cpu")) cfg.rt_cpu = std::atoi(next("--rt-cpu"));
+    else if (!std::strcmp(argv[i], "--require-rt-setup")) cfg.require_rt_setup = true;
+    else if (!std::strcmp(argv[i], "--enable-reference")) cfg.enable_reference = true;
     else {
       usage(argv[0]);
       return 2;
     }
   }
+  // Identity is provisioned deployment data. A hardware server without it
+  // would accept any commander's claim -- refuse to start instead.
+  if (cfg.backend != "fake" && (cfg.instance_id.empty() || cfg.joint_names.empty())) {
+    std::fprintf(stderr, "--instance-id and --joint-names are required for --backend %s\n",
+                 cfg.backend.c_str());
+    return 2;
+  }
+  if (cfg.backend == "fake" && cfg.instance_id.empty()) cfg.instance_id = "fake";
+  {
+    char probe[arm_rt::ID_CHARS] = {};
+    if (cfg.instance_id.size() >= sizeof(probe)) {
+      std::fprintf(stderr, "--instance-id must be shorter than %d chars\n", arm_rt::ID_CHARS);
+      return 2;
+    }
+    std::memcpy(probe, cfg.instance_id.data(), cfg.instance_id.size());
+    if (!arm_rt::valid_id(probe)) {
+      std::fprintf(stderr, "--instance-id must be 1..31 of [A-Za-z0-9_.-] (got '%s')\n",
+                   cfg.instance_id.c_str());
+      return 2;
+    }
+  }
   if (cfg.n < 1 || cfg.n > arm_rt::MAX_JOINTS) {
     std::fprintf(stderr, "--n must be 1..%d\n", arm_rt::MAX_JOINTS);
+    return 2;
+  }
+  if (!cfg.fake_q0.empty() && (cfg.backend != "fake" || int(cfg.fake_q0.size()) != cfg.n)) {
+    std::fprintf(stderr, "--fake-q0 is for the fake backend and needs exactly --n values\n");
     return 2;
   }
   // A misconfigured safety flag must refuse to start, not silently disable a
@@ -163,23 +273,55 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // Group execution is all-or-nothing and has no default timing constants.
+  const bool any_group = !cfg.group_shm.empty() || cfg.group_member >= 0 || cfg.group_members ||
+                         cfg.group_peer_max_age_ms > 0 || cfg.group_min_lead_ms > 0;
+  if (any_group) {
+    if (cfg.group_shm.empty() || cfg.group_shm[0] != '/' || cfg.group_members < 2 ||
+        cfg.group_members > arm_rt::GROUP_MAX_MEMBERS || cfg.group_member < 0 ||
+        uint32_t(cfg.group_member) >= cfg.group_members || cfg.group_peer_max_age_ms <= 0 ||
+        cfg.group_min_lead_ms <= 0 || !cfg.enable_reference) {
+      std::fprintf(stderr, "group execution needs --enable-reference and ALL of --group-shm /NAME, "
+                           "--group-member K < --group-members N (2..%u), "
+                           "--group-peer-max-age-ms > 0, --group-min-lead-ms > 0\n",
+                   arm_rt::GROUP_MAX_MEMBERS);
+      return 2;
+    }
+    if (!ctx.group.open(cfg.group_shm, cfg.group_members)) {
+      std::fprintf(stderr, "cannot open group segment %s\n", cfg.group_shm.c_str());
+      return 2;
+    }
+    ctx.group.reset_slot(uint32_t(cfg.group_member));  // a killed predecessor may have left it mid-write
+    ctx.group_enabled.store(true);
+  }
+
   g_ctx = &ctx;
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
-  std::printf("[rt] arm_rt_server: backend=%s udp=%u tcp=%u state=%.0fHz "
-              "hold=%.0fms fault=%.0fms\n",
-              cfg.backend.c_str(), cfg.udp_port, cfg.tcp_port, cfg.state_hz,
-              cfg.hold_ms, cfg.fault_ms);
+  // Off unless this launch opted in: the capability word and the v7 mode
+  // gate both read this, so a bare start cannot expose the native path.
+  ctx.supports_reference.store(cfg.enable_reference);
 
-  std::thread udp(arm_rt::udp_rx_thread, std::ref(ctx));
-  std::thread tx(arm_rt::state_tx_thread, std::ref(ctx));
-  std::thread ctl(arm_rt::control_thread, std::ref(ctx));
-  arm_rt::rt_loop(ctx);  // RT thread = main thread; backend constructed here
+  std::printf("[rt] arm_rt_server: backend=%s udp=%u tcp=%u state=%.0fHz "
+              "hold=%.0fms fault=%.0fms reference=%s\n",
+              cfg.backend.c_str(), cfg.udp_port, cfg.tcp_port, cfg.state_hz,
+              cfg.hold_ms, cfg.fault_ms, cfg.enable_reference ? "on" : "off");
+
+  std::thread udp(guarded<void (*)(arm_rt::ServerCtx&)>, "udp_rx", std::ref(ctx),
+                  arm_rt::udp_rx_thread);
+  std::thread tx(guarded<void (*)(arm_rt::ServerCtx&)>, "state_tx", std::ref(ctx),
+                 arm_rt::state_tx_thread);
+  std::thread ctl(guarded<void (*)(arm_rt::ServerCtx&)>, "control", std::ref(ctx),
+                  arm_rt::control_thread);
+  // RT thread = main thread; backend constructed here
+  guarded("rt_loop", ctx, arm_rt::rt_loop);
   ctx.shutdown.store(true);
   udp.join();
   tx.join();
   ctl.join();
+  arm_rt::close_udp_socket(ctx);      // no thread can still use it
+  arm_rt::finish_fault_journal(ctx);  // every producer and consumer is joined
   std::printf("[rt] down\n");
   return ctx.failed.load() ? 1 : 0;
 }

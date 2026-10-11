@@ -8,7 +8,7 @@ through the same resolver and choose with ``strict``.
 
 These two functions turn the ``scene:`` block into geometry: the same bodies a
 viewer draws are the ones the planner must not hit, so they are derived once
-here rather than duplicated. They lived in ``preview_rerun`` until 2026-09-10,
+here rather than duplicated. They lived in the Rerun preview (now ``viz.preview``) until 2026-09-10,
 which imports ``rerun`` at module level -- so ``planning.stack`` could not be
 imported at all without the optional [viz] extra, for two functions that log
 nothing. Neither uses rerun; keep it that way.
@@ -102,7 +102,7 @@ def static_scene_geoms(cfg, *, strict: bool = False) -> list:
             data = mujoco.MjData(model)
             # Pose the body's own joints exactly as the sim holds them, so a
             # rotated dock socket renders rotated here too.
-            hold = spec.get("hold_q") or cfg.get("sim_base_hold_q") or []
+            hold = spec.get("hold_q") or []
             for j, value in enumerate(hold[: model.nq]):
                 data.qpos[j] = float(value)
             mujoco.mj_forward(model, data)
@@ -248,7 +248,7 @@ def _self_check() -> None:
     """A controller host with no [viz] extra must still import the planner.
 
     This module exists for exactly this: `planning.stack` used to reach
-    `scene_obstacle_geoms` through `preview_rerun`, which imports `rerun` at
+    `scene_obstacle_geoms` through `viz.preview`, which imports `rerun` at
     module level, so a headless servo host could not import the planning stack
     at all. Blocking `rerun` is the only honest way to check that, and it runs
     in a SUBPROCESS -- unloading half of sys.modules in-process leaves
@@ -266,11 +266,11 @@ def _self_check() -> None:
         "sys.meta_path.insert(0, NoRerun())\n"
         "import arm_control.planning.stack\n"
         "try:\n"
-        "    import arm_control.planning.preview_rerun\n"
+        "    import arm_control.viz.preview\n"
         "except ImportError:\n"
         "    pass\n"
         "else:\n"
-        "    raise SystemExit('preview_rerun imported with rerun blocked')\n"
+        "    raise SystemExit('viz.preview imported with rerun blocked')\n"
     )
     done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     assert done.returncode == 0, (
@@ -293,9 +293,10 @@ def _self_check() -> None:
             continue
         raise AssertionError("planning geometry failed open on a missing body")
 
-    from arm_control.planning import preview_rerun, scene_geoms
-    assert preview_rerun.scene_obstacle_geoms is scene_geoms.scene_obstacle_geoms
-    assert preview_rerun.static_scene_geoms is scene_geoms.static_scene_geoms
+    from arm_control.planning import scene_geoms
+    from arm_control.viz import preview
+    assert preview.scene_obstacle_geoms is scene_geoms.scene_obstacle_geoms
+    assert preview.static_scene_geoms is scene_geoms.static_scene_geoms
     assert scene_obstacle_geoms({}) == [] and static_scene_geoms({}) == []
     print("scene_geoms: planning imports without rerun; preview re-export intact")
 

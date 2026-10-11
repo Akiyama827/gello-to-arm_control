@@ -1,0 +1,14 @@
+# Generic simulation layout. Each arm inherits the existing single-arm profile.
+# No measured bench transforms, robot addresses, or project-specific CAD.
+version: 1
+backend: shared_sim
+arms:
+  left:
+    config: sim_arm.yaml
+    world_origin: [0.0, -0.45, 0.0]
+  right:
+    config: sim_arm.yaml
+    world_origin: [0.0, 0.45, 0.0]
+ground_z: 0.0
+max_velocity: 0.4
+max_acceleration: 0.8

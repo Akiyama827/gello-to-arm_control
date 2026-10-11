@@ -1,4 +1,4 @@
-"""Local parabolic corner blends and TOPPRA constrained path timing.
+"""Local parabolic corner blends, TOPPRA constrained path timing, and path finishing.
 
 TOPPRA: Pham & Pham, IEEE T-RO 2018, doi:10.1109/TRO.2018.2819195.
 The geometric path is C1 (linear segments joined by quadratic Bezier blends).
@@ -6,6 +6,8 @@ Both terms of qdd = q_s * sdd + q_ss * sd**2 enter its acceleration constraints.
 The returned Hermite curve is independently bounded, as it is what we execute.
 """
 from __future__ import annotations
+
+import copy
 
 import numpy as np
 
@@ -17,6 +19,12 @@ BLEND_TOLERANCE_RAD = 0.002
 INTERPOLATION_TOLERANCE_RAD = 1e-6
 COLLISION_STEP_RAD = 0.001
 RETIMING_STEPS_RAD = (0.02, 0.01, 0.005, 0.0025)
+# An OMPL route whose finished curve collides is re-planned (a fresh route) at most this many times in all.
+ROUTE_ATTEMPTS = 3
+
+
+class RouteCollides(ValueError):
+    """The finished curve of this route collides: a fresh route may not. Other failures are not re-planned."""
 
 
 class _BlendedPath:
@@ -177,7 +185,147 @@ def collision_checked_retiming(waypoints, max_vel, max_acc, in_collision):
             blend_tolerance_rad=BLEND_TOLERANCE_RAD * ds / RETIMING_STEPS_RAD[0])
         if not any(in_collision(q) for q in trajectory.densify(COLLISION_STEP_RAD)):
             return trajectory
-    raise ValueError("blended trajectory collides; no checked blend in the retry ladder")
+    raise RouteCollides("blended trajectory collides; no checked blend in the retry ladder")
+
+
+# Common path finishing for manual and coordinated motion planners.
+def plan_and_finish(plan_route, world, vmax, amax, *, label="arm", **finish):
+    """Plan a route with `plan_route()` and finish it; re-plan when the finished curve collides.
+
+    OMPL validates segments only at its resolution, so a route can graze an obstacle between its checks
+    and no finishing rung then certifies it (2026-10-08-plan-replan.md). Returns None when OMPL finds no
+    route at all; raises the last RouteCollides after ROUTE_ATTEMPTS routes (or when a re-plan finds none),
+    and any other failure at once.
+    """
+    failure = None
+    for attempt in range(1, ROUTE_ATTEMPTS + 1):
+        route = plan_route()
+        if route is None:
+            if failure is not None:
+                raise failure
+            return None
+        try:
+            return finish_path(world, route, vmax, amax, label=label, **finish)
+        except RouteCollides as exc:
+            failure = exc
+            if attempt == ROUTE_ATTEMPTS:
+                raise
+            print(f"[{label}] route {attempt}/{ROUTE_ATTEMPTS} collides once finished; re-planning", flush=True)
+
+
+def refinement_choice(value):
+    if value not in (None, "none", "trajopt"):
+        raise ValueError("refinement must be none or trajopt")
+    return "none" if value is None else value
+
+
+def finish_path(
+    world,
+    path,
+    vmax,
+    amax,
+    *,
+    refinement="none",
+    active_indices=None,
+    collides=None,
+    cartesian_targets=None,
+    label="arm",
+):
+    """Refine and time a path, retaining the caller's canonical validation.
+
+    Frozen joints are removed from optimization and restored exactly, including
+    zero velocity. A scene adapter supplies its current raw world via .world.
+    Cartesian targets map body names to one world pose per seed knot.
+    """
+    refinement = refinement_choice(refinement)
+    collides = world.in_collision if collides is None else collides
+    if refinement == "none":
+        return collision_checked_retiming(path, vmax, amax, collides)
+    from arm_control.planning.trajopt import refine_trajectory
+
+    raw = getattr(world, "world", world)
+    path = np.asarray(path, dtype=float)
+    indices = (
+        np.arange(path.shape[1])
+        if active_indices is None
+        else np.asarray(active_indices)
+    )
+    frozen = np.setdiff1d(np.arange(path.shape[1]), indices)
+    if not np.all(path[:, frozen] == path[0, frozen]):
+        raise ValueError("held joints moved in refinement seed")
+    view = copy.copy(raw)
+    view._held_qpos = raw._full_q(path[0])
+    view.joint_names = [raw.joint_names[i] for i in indices]
+    view._qadr = raw._qadr[indices]
+    view.lower, view.upper = raw.lower[indices], raw.upper[indices]
+
+    def expand(q):
+        full = path[0].copy()
+        full[indices] = q
+        return full
+
+    trajectory = refine_trajectory(
+        view,
+        path[:, indices],
+        np.asarray(vmax)[indices],
+        np.asarray(amax)[indices],
+        arm_id=label,
+        cartesian_targets=cartesian_targets,
+        collision_fn=lambda q: collides(expand(q)),
+    )
+    positions = np.tile(path[0], (len(trajectory.times), 1))
+    velocities = np.zeros_like(positions)
+    positions[:, indices], velocities[:, indices] = (
+        trajectory.positions,
+        trajectory.velocities,
+    )
+    return JointTrajectory(trajectory.times, positions, velocities)
+
+
+def _check_plan_and_finish():
+    """A route whose finished curve collides is re-planned; other failures are not; attempts are bounded."""
+
+    class World:  # a wall at x in (0.4, 0.6) below y = 0.5
+        def in_collision(self, q):
+            return bool(0.4 < q[0] < 0.6 and q[1] < 0.5)
+
+    start, goal = np.zeros(2), np.array([1., 0.])
+    grazing = np.vstack([start, goal])
+    around = np.vstack([start, [0., 1.], [1., 1.], goal])
+
+    def routes(*seq):
+        calls = []
+        return calls, lambda: (calls.append(1), seq[min(len(calls), len(seq)) - 1])[1]
+
+    limits = np.ones(2), np.full(2, 2.)
+    calls, plan = routes(grazing, around)
+    flown = plan_and_finish(plan, World(), *limits)
+    assert len(calls) == 2 and np.allclose(flown.positions[-1], goal)
+    assert not any(World().in_collision(q) for q in flown.densify(COLLISION_STEP_RAD))
+    calls, plan = routes(grazing)
+    try:
+        plan_and_finish(plan, World(), *limits)
+    except RouteCollides:
+        assert len(calls) == ROUTE_ATTEMPTS
+    else:
+        raise AssertionError("a route through the wall was flown")
+    calls, plan = routes(grazing, None)  # the re-plan finds nothing: the collision is the reason, not "no path"
+    try:
+        plan_and_finish(plan, World(), *limits)
+    except RouteCollides:
+        assert len(calls) == 2
+    else:
+        raise AssertionError("a failed re-plan hid the collision")
+    calls, plan = routes(None)
+    assert plan_and_finish(plan, World(), *limits) is None and len(calls) == 1
+    calls, plan = routes(around)
+    try:
+        plan_and_finish(plan, World(), *limits, refinement="bogus")
+    except RouteCollides:
+        raise AssertionError("a non-collision failure was treated as one")
+    except ValueError:
+        assert len(calls) == 1, "a non-collision failure was re-planned"
+    print(f"plan_and_finish: a colliding route is re-planned, {ROUTE_ATTEMPTS} at most; other failures are not OK")
 
 
 def _self_check():
@@ -193,3 +341,4 @@ def _self_check():
 
 if __name__ == "__main__":
     _self_check()
+    _check_plan_and_finish()

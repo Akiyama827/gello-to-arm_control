@@ -58,6 +58,7 @@
 #include <vector>
 
 #include "arm_rt/backend.hpp"
+#include "dm_mit.hpp"
 
 namespace arm_rt {
 namespace {
@@ -65,81 +66,12 @@ namespace {
 constexpr double TICK_S = 0.002;  // 500 Hz
 constexpr int64_t TICK_NS = 2'000'000;
 constexpr int64_t SILENCE_NS = 50'000'000;  // per-motor feedback deadman
-
-constexpr uint8_t DM_ENABLE_FRAME[8] = {0xFF, 0xFF, 0xFF, 0xFF,
-                                        0xFF, 0xFF, 0xFF, 0xFC};
-constexpr uint8_t DM_DISABLE_FRAME[8] = {0xFF, 0xFF, 0xFF, 0xFF,
-                                         0xFF, 0xFF, 0xFF, 0xFD};
-
-// Default per-type MIT limits, matching dm_backend.py DEFAULT_LIMITS_BY_TYPE.
-// A per-motor spec override changes the host's encoding and feedback decoding.
-struct DmLimits {
-  double p_lo, p_hi, v_lo, v_hi, kp_lo, kp_hi, kd_lo, kd_hi, t_lo, t_hi;
-};
-constexpr DmLimits LIM_4310 = {-12.5, 12.5, -30, 30, 0, 500, 0, 5, -10, 10};
-constexpr DmLimits LIM_4310P = {-12.5, 12.5, -50, 50, 0, 500, 0, 5, -10, 10};
-constexpr DmLimits LIM_4340 = {-12.5, 12.5, -10, 10, 0, 500, 0, 5, -28, 28};
-// 4340P: same electrical specs as 4340 (cross-roller bearing variant)
-
-bool limits_for(const std::string& type, DmLimits& out) {
-  if (type == "4310") out = LIM_4310;
-  else if (type == "4310p") out = LIM_4310P;
-  else if (type == "4340" || type == "4340p") out = LIM_4340;
-  else return false;
-  return true;
-}
-
-// float<->uint scaling, bit-for-bit with the Python _float_to_uint /
-// _uint_to_float (same operand order, same truncation toward zero).
-uint32_t f2u(double v, double lo, double hi, int bits) {
-  if (v < lo) v = lo;
-  if (v > hi) v = hi;
-  return uint32_t((v - lo) * double((1u << bits) - 1) / (hi - lo));
-}
-double u2f(uint32_t raw, double lo, double hi, int bits) {
-  return double(raw) * (hi - lo) / double((1u << bits) - 1) + lo;
-}
-
-// MIT control frame: pos16 | vel12 | kp12 | kd12 | tau12 (dm_backend.py
-// pack_mit_control_frame). Authorized commands are validated by pack_native_mit
-// BEFORE reaching this raw codec. Zero-gain lifecycle frames use it directly.
-void pack_mit(double pos, double vel, double kp, double kd, double tau,
-              const DmLimits& L, uint8_t out[8]) {
-  const uint32_t p = f2u(pos, L.p_lo, L.p_hi, 16);
-  const uint32_t v = f2u(vel, L.v_lo, L.v_hi, 12);
-  const uint32_t s = f2u(kp, L.kp_lo, L.kp_hi, 12);
-  const uint32_t d = f2u(kd, L.kd_lo, L.kd_hi, 12);
-  const uint32_t t = f2u(tau, L.t_lo, L.t_hi, 12);
-  out[0] = uint8_t((p >> 8) & 0xFF);
-  out[1] = uint8_t(p & 0xFF);
-  out[2] = uint8_t((v >> 4) & 0xFF);
-  out[3] = uint8_t(((v & 0x0F) << 4) | ((s >> 8) & 0x0F));
-  out[4] = uint8_t(s & 0xFF);
-  out[5] = uint8_t((d >> 4) & 0xFF);
-  out[6] = uint8_t(((d & 0x0F) << 4) | ((t >> 8) & 0x0F));
-  out[7] = uint8_t(t & 0xFF);
-}
-
-// MIT reply: [err<<4|id, pos16, vel12, tau12, T_mos, T_rotor]
-// (dm_backend.py decode_mit_reply).
-struct MitReply {
-  int id, err;
-  double q, dq, tau, t_mos, t_rotor;
-};
-bool decode_mit(const uint8_t* d, int len, const DmLimits& L, MitReply& r) {
-  if (len < 8) return false;
-  r.id = d[0] & 0x0F;
-  r.err = (d[0] >> 4) & 0x0F;
-  const uint32_t pos_u = uint32_t(d[1] << 8) | d[2];
-  const uint32_t vel_u = uint32_t(d[3] << 4) | uint32_t(d[4] >> 4);
-  const uint32_t tau_u = (uint32_t(d[4] & 0x0F) << 8) | d[5];
-  r.q = u2f(pos_u, L.p_lo, L.p_hi, 16);
-  r.dq = u2f(vel_u, L.v_lo, L.v_hi, 12);
-  r.tau = u2f(tau_u, L.t_lo, L.t_hi, 12);
-  r.t_mos = double(d[6]);   // surfaced by the Python motor_health(); no
-  r.t_rotor = double(d[7]); // PlantState slot — dropped here for now
-  return true;
-}
+// A shared bus (operator 2026-10-09: the base and the DM arm on ONE can0, their motor ids colliding, ONE robot powered at a
+// time) is checked on an unfiltered probe socket: a passive listen before the first frame, then the first moments of
+// operation. DM motors speak only when spoken to, so a command to one of our ids before we sent anything is another
+// driver, and our id answering on a Master ID that is not ours is another robot's motor, powered.
+constexpr int64_t LISTEN_NS = 100'000'000;
+constexpr int64_t PROBE_NS = 100'000'000;
 
 struct Motor {
   int id = 0;
@@ -401,12 +333,32 @@ public:
       fail("bind(%s): %s", iface_.c_str(), std::strerror(errno));
       return;
     }
+    probe_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (probe_ < 0 ||
+        setsockopt(probe_, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &on, sizeof on) != 0 ||
+        ::bind(probe_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      fail("probe socket on %s: %s", iface_.c_str(), std::strerror(errno));
+      return;
+    }
+    timespec now, end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ts_add(end, LISTEN_NS);
+    for (;;) {  // before our first frame: nobody may be commanding our ids
+      if (!probe_drain(false)) return;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (ts_ns(now) >= ts_ns(end)) break;
+      const uint64_t left_ns = ts_ns(end) - ts_ns(now);
+      timespec left{time_t(left_ns / 1'000'000'000ull), long(left_ns % 1'000'000'000ull)};
+      pollfd pf{probe_, POLLIN, 0};
+      ppoll(&pf, 1, &left, nullptr);
+    }
     clock_gettime(CLOCK_MONOTONIC, &next_);
     ok_ = true;
   }
 
   ~DmBackend() override {
     if (fd_ >= 0) ::close(fd_);
+    if (probe_ >= 0) ::close(probe_);
   }
 
   bool ok() const { return ok_; }
@@ -466,6 +418,14 @@ public:
       started_ = true;
       const uint64_t t0 = ts_ns(now);
       for (Motor& m : motors_) m.last_rx_ns = t0;  // silence grace from here
+      probe_until_ns_ = t0 + uint64_t(PROBE_NS);
+    }
+    if (probe_ >= 0) {  // the first moments: another robot's motor with one of our ids must not be powered
+      if (!probe_drain(true)) return false;
+      if (ts_ns(now) >= probe_until_ns_) {
+        ::close(probe_);
+        probe_ = -1;
+      }
     }
     if (!wrote_ && !elicit_all()) return false;  // keepalive: solicit replies
     wrote_ = false;
@@ -575,19 +535,22 @@ public:
     return true;
   }
 
-  void stop() override {
+  bool stop() override {
     // Zero-gain hold then DISABLE per motor — the Python
-    // _zero_torque_and_disable sequence. Errors ignored: never throws, and
-    // the disarmed elicit keeps state flowing afterwards.
-    if (fd_ < 0) return;
+    // _zero_torque_and_disable sequence. Every frame is still attempted
+    // after a failure (never throws; the disarmed elicit keeps state
+    // flowing); the result only reports whether all of them went out.
+    if (fd_ < 0) return true;
     uint8_t zt[8];
+    bool ok = true;
     for (const Motor& m : motors_) {
       pack_mit(0, 0, 0, 0, 0, m.lim, zt);
-      send8(m.id, zt);
-      send8(m.id, DM_DISABLE_FRAME);
+      ok = send8(m.id, zt) && ok;
+      ok = send8(m.id, DM_DISABLE_FRAME) && ok;
     }
     for (size_t j = 0; j < motors_.size(); ++j) last_tau_[j] = 0.0;
     enabled_mask_ = 0;
+    return ok;
   }
 
   const std::string& fault_text() const override { return fault_; }
@@ -669,6 +632,45 @@ private:
     }
   }
 
+  bool ours(uint32_t id) const {
+    for (const Motor& m : motors_)
+      if (uint32_t(m.id) == id) return true;
+    return false;
+  }
+
+  // Every frame on the bus since the last call (the probe sees them all, our own included). False (latched fault) on a
+  // command to one of our ids before we sent anything, or on one of our ids answering on a Master ID that is not ours.
+  bool probe_drain(bool sent) {
+    for (;;) {
+      canfd_frame f;
+      const ssize_t got = ::recv(probe_, &f, sizeof f, MSG_DONTWAIT);
+      if (got < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+        if (errno == EINTR) continue;
+        fail("probe recv on %s: %s", iface_.c_str(), std::strerror(errno));
+        return false;
+      }
+      if (got != ssize_t(CAN_MTU) && got != ssize_t(CANFD_MTU)) continue;
+      if (f.can_id & (CAN_ERR_FLAG | CAN_EFF_FLAG | CAN_RTR_FLAG)) continue;
+      const uint32_t id = f.can_id & CAN_SFF_MASK;
+      if (ours(id)) {
+        if (sent) continue;  // our own frames, looped back to this socket
+        fail("another driver commands motor %u on %s before this server sent anything (one robot powered, one server "
+             "running, per bus)", id, iface_.c_str());
+        return false;
+      }
+      if (f.len < 8) continue;
+      bool master = false;
+      for (const Motor& m : motors_) master |= uint32_t(m.mst) == id;
+      const uint32_t nib = f.data[0] & 0x0F;
+      if (!master && ours(nib)) {
+        fail("motor id %u answers on Master ID 0x%03X, not this arm's: another robot is powered on %s (operator: one "
+             "robot powered at a time on a shared bus)", nib, id, iface_.c_str());
+        return false;
+      }
+    }
+  }
+
   void fail(const char* fmt, ...) __attribute__((format(printf, 2, 3))) {
     char buf[224];
     va_list ap;
@@ -688,6 +690,8 @@ private:
   uint32_t enabled_mask_ = 0;  // motors enabled since the last stop()
   bool wrote_ = false;     // a write() happened since the last read()
   bool all_seen_ = false;  // every motor has replied at least once
+  int probe_ = -1;         // unfiltered: the shared-bus checks (closed once they are over)
+  uint64_t probe_until_ns_ = 0;
   uint32_t active_mask_ = 0;
   timespec next_ = {};
   std::string fault_;

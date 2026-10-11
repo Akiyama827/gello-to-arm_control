@@ -1,0 +1,22 @@
+# The FR3's control-mode basics, shared by every FR3 mode profile (the library's sim motion mode and a deployment's real mode):
+# the controller's stiffness ceilings and the console's gain presets. A mode includes this and states its own tracking gains.
+controller:
+  # Joint stiffnesses in N*m/rad, not the DM arm's MIT wire-format kp (ceiling 500).
+  kp_max: 3000.0           # Franka's own default tops out at 3000 N*m/rad
+  kd_max: 200.0
+  torque_limit_max: 90.0   # FR3 joint torque limits are 87 / 12 N*m
+
+# Buttons on the console, named at runtime. Applying one CANCELS a running leg (a plan reviewed at one stiffness must not finish at
+# another). On the real arm the RT box's servo law consumes them (sim: the MuJoCo plant's PD).
+gain_presets:
+  float:
+    kp: 0.0            # gravity + payload feedforward only, which IS float
+    kd: 5.0            # not 0: some damping (in sim, MuJoCo's PD is the only damping)
+  soft:
+    # NOT hardware-certified: values tuned in simulation; verify on the arm before first use (hardware track list).
+    pose_hold:
+      kc: [300, 300, 300, 30, 30, 30]  # N/m, Nm/rad
+      dc: [35, 35, 35, 8, 8, 8]       # Ns/m, Nms/rad
+      nullspace_kp: 0.5               # weak posture spring, Nm/rad
+      nullspace_kd: 2.0               # independent damping, Nms/rad
+  track: {}            # empty = the mode's controller.kp/kd

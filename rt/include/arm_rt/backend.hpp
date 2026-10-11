@@ -38,6 +38,11 @@ struct PlantState {
   double pose[7] = {};  // measured EE pose: xyz,wxyz, base frame
   double coriolis[MAX_JOINTS] = {};  // robot supplies gravity internally
   bool pose_valid = false;
+  // Robot-side clock of the returned sample (franka: RobotState::time) and
+  // the robot's view of our command delivery. 0 / -1 when the plant has none.
+  // Diagnostics only (loop-gap log); never on the wire.
+  uint64_t robot_time_ms = 0;
+  double cmd_success_rate = -1.0;
 };
 
 class Backend {
@@ -60,6 +65,16 @@ public:
   }
 
   virtual bool supports_pose_hold() const { return false; }
+
+  // The v8 Cartesian law's target: this backend's EE pose (xyz, wxyz, base frame) at a COMMANDED q, with the same
+  // model read() measures with. Called on the RT thread after read(). False = no geometry: the law fails closed.
+  virtual bool supports_cartesian() const { return false; }
+  virtual bool ee_pose_at(const double* q, double* pose) { (void)q; (void)pose; return false; }
+
+  // The kinematic model the RT side evaluates for task-space feedback (pose
+  // hold's pose/Jacobian). "none" when the backend has no geometry. This is
+  // reported, never a claim of calibration (see CAP_CALIBRATED_TASK_SPACE).
+  virtual const char* task_model() const { return "none"; }
 
   // Fixed slots are configured once. A backend may report a subset online
   // and activate a subset for torque; conventional arms keep all slots live.
@@ -86,8 +101,10 @@ public:
     return write(tau_out, command.n);
   }
 
-  // Drop to zero authority safely (disarm path). Idempotent.
-  virtual void stop() = 0;
+  // Drop to zero authority safely (disarm path). Idempotent. False = the
+  // stop itself failed (reason via fault_text()); the RT loop journals it as
+  // a secondary event, separate from the latched first cause.
+  virtual bool stop() = 0;
 
   virtual const std::string& fault_text() const = 0;
 };

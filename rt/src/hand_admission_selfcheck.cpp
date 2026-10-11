@@ -14,6 +14,13 @@ int main() {
     assert(!parse_hand_command(bad, action));
   }
   assert(parse_hand_command("CMD 1 HOME", action));
+  // A stated envelope replaces the Franka Hand's; force_max 0 admits no GRASP.
+  const HandLimits wide{.0878, .2, 0, 0};
+  assert(parse_hand_command("CMD 1 MOVE 0.085 0.15", action, wide) && action.w == .085);
+  assert(!parse_hand_command("CMD 1 MOVE 0.085 0.05", action));
+  assert(!parse_hand_command("CMD 1 MOVE 0.04 0.21", action, wide));
+  assert(!parse_hand_command("CMD 1 GRASP 0.04 0.05 0 0.02 0.02", action, wide));
+  assert(parse_hand_command("CMD 1 HOME", action, wide));
   action.token = gate.epoch;
   assert(gate.admit(action, true) != nullptr); // offline
   gate.client = gate.connected = true;
@@ -56,9 +63,53 @@ int main() {
   assert(gate.admit(action, true) != nullptr);
   gate.request_stop(); // Explicit retry; no automatic motion on recovery.
   gate.finish_stop(gate.stop_serial, false, true);
-  assert(!gate.stopping && !gate.stop_fault);
+  assert(!gate.stopping && gate.stop_fault); // Stop alone is not a measurement.
+  action.token = gate.epoch;
+  assert(gate.admit(action, true) != nullptr);
+  gate.sampled();
+  assert(!gate.stop_fault);
   action.token = gate.epoch;
   assert(gate.admit(action, false) != nullptr);
   assert(gate.admit(action, true) == nullptr);
-  std::cout << "PASS hand TCP parsing, admission, cancellation and stale generation\n";
+
+  // Failed stop, then the device session drops and a new one opens.
+  gate = {};
+  gate.client = gate.connected = true;
+  gate.request_stop();
+  gate.finish_stop(gate.stop_serial, false, false);
+  assert(gate.stop_fault);
+  gate.connected = false;
+  gate.cancel();              // robot loss
+  gate.client = false;        // PC client reconnects...
+  gate.cancel();
+  gate.client = true;
+  gate.sampled();             // ...and samples arrive: none of it clears.
+  assert(gate.stop_fault);
+  const auto before_session = gate.epoch;
+  gate.session_opened();      // new device session retries the stop
+  assert(gate.connected && gate.stopping && gate.stop_fault);
+  assert(gate.epoch > before_session);
+  action.token = before_session;
+  assert(gate.admit(action, true) != nullptr); // old action discarded
+  gate.sampled();             // pre-completion samples do not count
+  assert(gate.stop_fault);
+  gate.finish_stop(gate.stop_serial, false, false); // refused retry:
+  gate.sampled();
+  assert(!gate.stopping && gate.stop_fault);        // latch kept, no loop
+  gate.session_opened();      // next session retries once more
+  assert(gate.stopping);
+  gate.finish_stop(gate.stop_serial, false, true);
+  action.token = gate.epoch;
+  assert(gate.stop_fault && gate.admit(action, true) != nullptr);
+  HandAction taken;
+  assert(!gate.take(taken));
+  gate.sampled();
+  assert(!gate.stop_fault && !gate.pending.kind);   // nothing replayed
+  action.token = gate.epoch;
+  assert(gate.admit(action, true) == nullptr);
+  gate = {};
+  gate.connected = gate.client = true;
+  gate.session_opened();      // healthy session: no stop is sent
+  assert(!gate.stopping && !gate.stop_fault);
+  std::cout << "PASS hand TCP parsing, admission, cancellation, stale generation, failed-stop recovery\n";
 }

@@ -14,6 +14,8 @@ from time import perf_counter
 
 import numpy as np
 
+from arm_control.planning.retiming import RouteCollides
+
 
 def _program(world, positions, *, state=False):
     from tesseract_robotics import tesseract_command_language as command
@@ -151,6 +153,69 @@ def _native_timing(env, world, positions, vmax, amax):
                  for getter in ('getTime', 'getPosition', 'getVelocity', 'getAcceleration'))
 
 
+def _optimize_constrained(env, world, seed, targets):
+    """Native TrajOpt SQP with simultaneous Cartesian constraints on both arms.
+
+    Use the low-level constraint API because the waypoint profile exposes only
+    one TCP per knot. Projection, collision profiles, timing and final validation
+    are shared with the existing unconstrained refiner.
+    """
+    from tesseract_robotics import trajopt_ifopt as ti, trajopt_sqp as sqp
+    from tesseract_robotics.tesseract_common import Isometry3d
+
+    variables = ti.createNodesVariables(
+        'trajectory', world.joint_names, list(seed), ti.toBounds(world.lower, world.upper))
+    positions = [node.getVar('joints') for node in variables.getNodes()]
+    nlp = sqp.IfoptProblem(variables)
+    group = env.getJointGroup('manipulator')
+    terms = []  # Native constraint references must outlive the solve.
+    for index in (0, len(seed) - 1):
+        terms.append(ti.JointPosConstraint(seed[index], positions[index],
+                                          np.ones(seed.shape[1]), f'endpoint_{index}'))
+    for name, poses in targets.items():
+        body = world.model.body(name).id
+        if np.shape(poses) != (len(seed), 4, 4) or not np.isfinite(poses).all():
+            raise ValueError('Cartesian constraints must provide one finite pose per knot')
+        for index in range(1, len(seed) - 1):
+            terms.append(ti.CartPosConstraint(
+                positions[index], group, f'body_{body}', 'body_0',
+                Isometry3d.Identity(), Isometry3d(poses[index]), f'{name}_{index}'))
+    for term in terms:
+        nlp.addConstraintSet(term)
+    problem = sqp.IfoptQPProblem(nlp)
+    costs = [
+        ti.JointVelConstraint(np.zeros(seed.shape[1]), positions, np.ones(seed.shape[1]), 'velocity'),
+        ti.JointAccelConstraint(np.zeros(seed.shape[1]), positions, np.full(seed.shape[1], 10.), 'acceleration'),
+    ]
+    for cost in costs:
+        problem.addCostSet(cost, sqp.CostPenaltyType.SQUARED)
+    profile = _collision_profile(env, world)
+    evaluators = []
+    for index in range(1, len(seed)):
+        evaluator = ti.LVSDiscreteCollisionEvaluator(group, env, profile.collision_constraint_config)
+        evaluators.append(evaluator)
+        term = ti.ContinuousCollisionConstraint(
+            evaluator, positions[index - 1], positions[index], index == 1,
+            index == len(seed) - 1, 20, False, f'collision_{index}')
+        terms.append(term)
+        problem.addConstraintSet(term)
+    problem.setup()
+    qp = sqp.OSQPEigenSolver()
+    solver = sqp.TrustRegionSQPSolver(qp)
+    solver.verbose = False
+    solver.params.max_iterations = 100
+    solver.params.max_time = 120.
+    solver.params.cnt_tolerance = 1e-6
+    solver.solve(problem)
+    if solver.getStatus() != sqp.SQPStatus.NLP_CONVERGED:
+        raise ValueError(f'constrained TrajOpt failed: {solver.getStatus()}')
+    result = np.asarray(solver.getResults().best_var_vals).reshape(seed.shape)
+    if not np.isfinite(result).all() or not np.allclose(result[[0, -1]], seed[[0, -1]], atol=1e-6, rtol=0):
+        raise ValueError('constrained TrajOpt changed fixed endpoints')
+    result[[0, -1]] = seed[[0, -1]]
+    return result
+
+
 def _spline_extrema(spline):
     """Exact per-joint cubic extrema, including either side of every knot."""
     extrema = []
@@ -171,13 +236,13 @@ def _check_positions(world, positions):
         raise ValueError('trajectory exceeds finite joint position limits')
 
 
-def _check_collision(world, positions):
+def _check_collision(world, positions, collision_fn=None):
     for q in positions:
-        if world.in_collision(q):
-            raise ValueError('trajectory fails canonical MuJoCo collision validation')
+        if world.in_collision(q) or (collision_fn is not None and collision_fn(q)):
+            raise RouteCollides('trajectory fails canonical MuJoCo collision validation')
 
 
-def _validate_timing(world, positions, t, q, v, a, vmax, amax):
+def _validate_timing(world, positions, t, q, v, a, vmax, amax, *, collision_fn=None):
     from scipy.interpolate import CubicHermiteSpline
     from arm_control.motion import JointTrajectory
 
@@ -218,16 +283,17 @@ def _validate_timing(world, positions, t, q, v, a, vmax, amax):
     max_speed = float(np.max(np.abs(extrema[1])))
     for index, (start, end) in enumerate(zip(q[:-1], q[1:])):
         intervals = max(1, int(np.ceil(np.max(np.abs(end - start)) / .001)))
-        _check_collision(world, start + np.linspace(0, 1, intervals + 1)[:, None] * (end - start))
+        _check_collision(world, start + np.linspace(0, 1, intervals + 1)[:, None] * (end - start), collision_fn)
         intervals = max(1, int(np.ceil((t[index + 1] - t[index]) * max_speed / .001)))
         samples = spline(np.linspace(t[index], t[index + 1], intervals + 1))
         _check_positions(world, samples)
-        _check_collision(world, samples)
+        _check_collision(world, samples, collision_fn)
     return JointTrajectory(t, q, v)
 
 
 def refine_trajectory(world, seed_positions, vmax, amax, *,
-                      soft_clearance_exempt_pairs=None, arm_id='arm'):
+                      soft_clearance_exempt_pairs=None, arm_id='arm',
+                      cartesian_targets=None, collision_fn=None):
     """Refine >=2 finite seed knots against a fresh canonical collision world.
 
     ``world`` is the raw MuJoCoCollisionWorld snapshot, not a callback/cache.
@@ -248,23 +314,29 @@ def refine_trajectory(world, seed_positions, vmax, amax, *,
     if any(np.shape(values) != (joints,) or not np.isfinite(values).all() for values in (world.lower, world.upper)) or np.any(world.lower >= world.upper):
         raise ValueError('TrajOpt requires finite ordered joint bounds')
     _check_positions(world, seed)
+    if cartesian_targets is not None and collision_fn is None:
+        raise ValueError('constrained refinement requires a task-path validation callback')
+    if cartesian_targets is not None and len(seed) < 4:
+        raise ValueError('constrained refinement requires at least four seed knots')
     while len(seed) < 4:
         index = int(np.argmax(np.linalg.norm(np.diff(seed, axis=0), axis=1)))
         seed = np.insert(seed, index + 1, (seed[index] + seed[index + 1]) / 2, axis=0)
-    from arm_control.planning.projection import project_world
 
     stage_started = perf_counter()
     env = project_world(world)
     print(f'[trajopt:{arm_id}] stage=projection elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
     stage_started = perf_counter()
-    positions = _optimize(env, world, seed, soft_clearance_exempt_pairs=soft_clearance_exempt_pairs)
+    if cartesian_targets is None:
+        positions = _optimize(env, world, seed, soft_clearance_exempt_pairs=soft_clearance_exempt_pairs)
+    else:
+        positions = _optimize_constrained(env, world, seed, cartesian_targets)
     print(f'[trajopt:{arm_id}] stage=optimization elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
     _check_positions(world, positions)
     stage_started = perf_counter()
     timing = _native_timing(env, world, positions, vmax, amax)
     print(f'[trajopt:{arm_id}] stage=native_timing elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
     stage_started = perf_counter()
-    trajectory = _validate_timing(world, positions, *timing, vmax, amax)
+    trajectory = _validate_timing(world, positions, *timing, vmax, amax, collision_fn=collision_fn)
     print(f'[trajopt:{arm_id}] stage=validation elapsed_s={perf_counter() - stage_started:.6f}', flush=True)
     print(f'[trajopt:{arm_id}] stage=total elapsed_s={perf_counter() - started:.6f}', flush=True)
     lengths = [float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()) for path in (seed, positions)]
@@ -273,6 +345,181 @@ def refine_trajectory(world, seed_positions, vmax, amax, *,
           'cubic_limits=PASS command_segment_limits=PASS canonical_collision_0.001rad=PASS', flush=True)
     return trajectory
 
+
+# Projection: Project one current MuJoCo collision snapshot into a Tesseract environment.
+#
+# Only limited scalar hinges at body origins are supported. Other joints are
+# frozen at the canonical world's held positions. Meshes use MuJoCo's convex
+# envelope semantics. The ground replacement bounds all reachable robot geometry.
+
+def _transform(position, rotation):
+    result = np.eye(4)
+    result[:3, :3] = rotation.reshape(3, 3)
+    result[:3, 3] = position
+    return result
+
+
+def _workspace_bound(world):
+    import mujoco
+
+    model, data = world.model, world.data
+    offsets = np.zeros(model.nbody)
+    for body in range(1, model.nbody):
+        parent = model.body_parentid[body]
+        offsets[body] = offsets[parent] + np.linalg.norm(data.xpos[body] - data.xpos[parent])
+    bound = 0.0
+    for geom in range(model.ngeom):
+        if not (model.geom_contype[geom] or model.geom_conaffinity[geom]):
+            continue
+        kind, size = model.geom_type[geom], model.geom_size[geom]
+        if kind == mujoco.mjtGeom.mjGEOM_PLANE:
+            continue
+        radius = np.linalg.norm(size)
+        if kind == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh = model.geom_dataid[geom]
+            start, count = model.mesh_vertadr[mesh], model.mesh_vertnum[mesh]
+            radius = np.max(np.linalg.norm(model.mesh_vert[start:start + count], axis=1))
+        elif kind == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            radius = sum(size[:2])
+        bound = max(bound, offsets[model.geom_bodyid[geom]] + np.linalg.norm(model.geom_pos[geom]) + radius)
+    if not np.isfinite(bound):
+        raise ValueError('nonfinite projected workspace bound')
+    return float(bound)
+
+
+def project_world(world):
+    """Rebuild geometry and filters from the supplied snapshot; fail closed."""
+    import mujoco
+    from scipy.spatial import ConvexHull
+    from tesseract_robotics import ensure_configured
+    from tesseract_robotics import tesseract_geometry as geometry
+    from tesseract_robotics.tesseract_common import Isometry3d, GeneralResourceLocator
+    from tesseract_robotics.tesseract_environment import Environment
+    from tesseract_robotics.tesseract_scene_graph import SceneGraph, Link, Joint, JointType, JointLimits, Collision
+    from tesseract_robotics.tesseract_srdf import SRDFModel, KinematicsInformation
+
+    ensure_configured()
+    model, data = world.model, world.data
+    if (model.npair or model.opt.disableflags or model.nflex
+            or np.any(model.geom_margin != 0) or np.any(model.geom_gap != 0)):
+        raise ValueError('unsupported explicit pairs, collision flags, flex, margins or gaps')
+    if not np.isfinite(world._pad) or world._pad > 0:
+        raise ValueError('self collision padding must be finite and nonpositive')
+    if np.shape(world._env_geom) != (model.ngeom,):
+        raise ValueError('invalid environment geometry mask')
+    planned_body = getattr(world, '_planned_body', np.ones(model.nbody, dtype=bool))
+    if np.shape(planned_body) != (model.nbody,):
+        raise ValueError('invalid planned body mask')
+    active_ids = {model.joint(name).id for name in world.joint_names}
+    if len(active_ids) != len(world.joint_names):
+        raise ValueError('duplicate planned joints')
+    for joint in active_ids:
+        body = model.jnt_bodyid[joint]
+        if (model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_HINGE
+                or model.body_jntnum[body] != 1 or not model.jnt_limited[joint]
+                or np.max(np.abs(model.jnt_pos[joint])) > 1e-12):
+            raise ValueError('projection requires limited single hinges at body origins')
+    world._fk(np.zeros(len(world.joint_names)))
+    if not np.isfinite(data.xpos).all() or not np.isfinite(data.xmat).all():
+        raise ValueError('nonfinite canonical forward kinematics')
+    graph = SceneGraph('planning_snapshot')
+    # Generated names prevent collisions with user bodies named geom_0 etc.
+    body_names = [f'body_{body}' for body in range(model.nbody)]
+    body_transforms = [_transform(data.xpos[body], data.xmat[body]) for body in range(model.nbody)]
+    radius = _workspace_bound(world) + 1.0
+    for body, name in enumerate(body_names):
+        link = Link(name)
+        if body == 0:
+            added = graph.addLink(link)
+            graph.setRoot(name)
+        else:
+            joint_id = int(model.body_jntadr[body])
+            active = joint_id in active_ids
+            joint = Joint(model.joint(joint_id).name if active else f'fixed_body_{body}')
+            joint.type = JointType.REVOLUTE if active else JointType.FIXED
+            parent = model.body_parentid[body]
+            if body in getattr(world, '_rigid_bodies', {}):
+                parent = world._rigid_bodies[body][0]
+            joint.parent_link_name, joint.child_link_name = body_names[parent], name
+            joint.parent_to_joint_origin_transform = Isometry3d(np.linalg.inv(body_transforms[parent]) @ body_transforms[body])
+            if active:
+                joint.axis = model.jnt_axis[joint_id].copy()
+                lo, hi = model.jnt_range[joint_id]
+                joint.limits = JointLimits(float(lo), float(hi), 100., 3., 10., 100.)
+            added = graph.addLink(link, joint)
+        if not added:
+            raise ValueError(f'cannot project body {body}')
+    live = [geom for geom in range(model.ngeom) if model.geom_contype[geom] or model.geom_conaffinity[geom]]
+    for geom in live:
+        kind, size = int(model.geom_type[geom]), model.geom_size[geom]
+        if kind == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh = model.geom_dataid[geom]
+            start, count = model.mesh_vertadr[mesh], model.mesh_vertnum[mesh]
+            vertices = model.mesh_vert[start:start + count].astype(float)
+            hull = ConvexHull(vertices)
+            vertices = vertices[hull.vertices]
+            hull = ConvexHull(vertices)
+            faces = np.column_stack((np.full(len(hull.simplices), 3), hull.simplices)).astype(np.int32).ravel()
+            shape = geometry.ConvexMesh(list(vertices), faces)
+        elif kind == mujoco.mjtGeom.mjGEOM_BOX:
+            shape = geometry.Box(*map(float, 2 * size))
+        elif kind == mujoco.mjtGeom.mjGEOM_PLANE:
+            if (model.geom_bodyid[geom] != 0 or not np.array_equal(model.geom_pos[geom], [0, 0, 0])
+                    or not np.array_equal(model.geom_quat[geom], [1, 0, 0, 0])):
+                raise ValueError('only a world z=0 ground plane is supported')
+            shape = geometry.Box(8 * radius, 8 * radius, 4 * radius)
+        elif kind == mujoco.mjtGeom.mjGEOM_SPHERE:
+            shape = geometry.Sphere(float(size[0]))
+        elif kind in (mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_CYLINDER):
+            constructor = geometry.Capsule if kind == mujoco.mjtGeom.mjGEOM_CAPSULE else geometry.Cylinder
+            shape = constructor(float(size[0]), float(size[1] * 2))
+        else:
+            raise ValueError(f'unsupported collision geometry {geom}: type {kind}')
+        link = Link(f'geom_{geom}')
+        collision = Collision()
+        collision.name, collision.geometry = f'geom_{geom}', shape
+        collision.origin = Isometry3d.Identity()
+        if kind == mujoco.mjtGeom.mjGEOM_PLANE:
+            collision.origin = Isometry3d(_transform(np.array([0., 0., -2 * radius]), np.eye(3)))
+        link.addCollision(collision)
+        joint = Joint(f'fixed_geom_{geom}')
+        joint.type = JointType.FIXED
+        joint.parent_link_name = body_names[model.geom_bodyid[geom]]
+        joint.child_link_name = link.getName()
+        rotation = np.empty(9)
+        mujoco.mju_quat2Mat(rotation, model.geom_quat[geom])
+        joint.parent_to_joint_origin_transform = Isometry3d(_transform(model.geom_pos[geom], rotation))
+        if not graph.addLink(link, joint):
+            raise ValueError(f'cannot project geometry {geom}')
+    excluded = set(map(int, model.exclude_signature))
+    for index, a in enumerate(live):
+        for b in live[index + 1:]:
+            ba, bb = map(int, model.geom_bodyid[[a, b]])
+            wa, wb = map(int, model.body_weldid[[ba, bb]])
+            parent = wa != 0 and wb != 0 and (model.body_weldid[model.body_parentid[wa]] == wb or model.body_weldid[model.body_parentid[wb]] == wa)
+            masks = (model.geom_contype[a] & model.geom_conaffinity[b]) or (model.geom_contype[b] & model.geom_conaffinity[a])
+            signature = (min(ba, bb) << 16) + max(ba, bb)
+            allowed_contact = tuple(sorted((ba, bb))) in getattr(world, '_allowed_body_pairs', ())
+            if wa == wb or parent or not masks or signature in excluded or allowed_contact or not (planned_body[ba] or planned_body[bb]):
+                graph.addAllowedCollision(f'geom_{a}', f'geom_{b}', 'canonical MuJoCo filter')
+    srdf = SRDFModel()
+    srdf.initString(graph, '<robot name="planning_snapshot"><contact_managers_plugin_config filename="package://tesseract/support/urdf/contact_manager_plugins.yaml"/></robot>', GeneralResourceLocator())
+    kin = KinematicsInformation()
+    kin.addJointGroup('manipulator', world.joint_names)
+    srdf.kinematics_information = kin
+    env = Environment()
+    if not env.init(graph, srdf):
+        raise ValueError('Tesseract environment initialization failed')
+    # Verify every projected body at held state and two nonzero planned poses.
+    for q in (np.zeros(len(world.joint_names)), world.lower * .25 + world.upper * .75,
+              world.lower * .75 + world.upper * .25):
+        world._fk(q)
+        env.setState(world.joint_names, q)
+        transforms = env.getState().link_transforms
+        for body, name in enumerate(body_names):
+            if not np.allclose(transforms[name].matrix, _transform(data.xpos[body], data.xmat[body]), atol=1e-9, rtol=0):
+                raise ValueError(f'projected kinematics disagree for body {body}')
+    return env
 
 def _self_check(native=False):
     import inspect
@@ -288,6 +535,8 @@ def _self_check(native=False):
                            (q * np.nan, [1, 1])):
         try:
             refine_trajectory(world, seed, velocity, [1, 1])
+        except RouteCollides:
+            raise AssertionError('invalid input reported as a collision (it would be re-planned)')
         except ValueError:
             pass
         else:
@@ -308,14 +557,13 @@ def _self_check(native=False):
     try:
         _validate_timing(world, q, t, q.copy(), v, spline(t, 2),
                          np.ones(2), np.ones(2))
-    except ValueError:
+    except RouteCollides:  # a collision, so the caller may re-plan the route
         pass
     else:
         raise AssertionError('interior collision accepted')
     if native:
         import mujoco
         from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
-        from arm_control.planning.projection import project_world
 
         world = MuJoCoCollisionWorld.__new__(MuJoCoCollisionWorld)
         xml = (

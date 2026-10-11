@@ -135,27 +135,13 @@ def config_key_provenance(path: str | Path, key: str) -> tuple[dict, list[dict]]
 
 @dataclass(frozen=True)
 class RobotConfig:
-    serial_port: str = "/dev/ttyACM0"
-    baud_rate: int = 2000000
     num_motors: int = 7
-    update_rate_hz: float = 100.0
     motor_ids: list[int] = field(default_factory=list)
     motor_names: list[str] = field(default_factory=list)
     joint_names: list[str] = field(default_factory=list)
-    listen_mode: bool = False
-    rx_timeout_ms: float = 200.0
-    debug_tx: bool = False
-    debug_rx: bool = False
-    debug_tx_throttle_hz: float = 0.0
-    debug_rx_throttle_hz: float = 0.0
     urdf_path: str = ""
     state_timeout_sec: float = 0.5
-    torque_scale: float = 1.0
     torque_limits: list[float] = field(default_factory=list)
-    gui_publish_rate_hz: float = 20.0
-    gc_alpha: float = 1.0
-    torque_ramp_sec: float = 0.5
-    rerun_app_id: str = "arm_control"
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -166,27 +152,13 @@ class RobotConfig:
     def from_mapping(cls, raw: Mapping[str, Any]) -> "RobotConfig":
         data = dict(raw)
         config = cls(
-            serial_port=str(data.get("serial_port", "/dev/ttyACM0")),
-            baud_rate=int(data.get("baud_rate", 2000000)),
             num_motors=int(data.get("num_motors", 7)),
-            update_rate_hz=float(data.get("update_rate_hz", 100.0)),
             motor_ids=[int(v) for v in _as_list(data, "motor_ids")],
             motor_names=[str(v) for v in _as_list(data, "motor_names")],
             joint_names=[str(v) for v in _as_list(data, "joint_names")],
-            listen_mode=bool(data.get("listen_mode", False)),
-            rx_timeout_ms=float(data.get("rx_timeout_ms", 200.0)),
-            debug_tx=bool(data.get("debug_tx", False)),
-            debug_rx=bool(data.get("debug_rx", False)),
-            debug_tx_throttle_hz=float(data.get("debug_tx_throttle_hz", 0.0)),
-            debug_rx_throttle_hz=float(data.get("debug_rx_throttle_hz", 0.0)),
             urdf_path=_resolve_control_path(data.get("urdf_path")),
             state_timeout_sec=float(data.get("state_timeout_sec", 0.5)),
-            torque_scale=float(data.get("torque_scale", 1.0)),
             torque_limits=[float(v) for v in _as_list(data, "torque_limits")],
-            gui_publish_rate_hz=float(data.get("gui_publish_rate_hz", 20.0)),
-            gc_alpha=float(data.get("gc_alpha", 1.0)),
-            torque_ramp_sec=float(data.get("torque_ramp_sec", 0.5)),
-            rerun_app_id=str(data.get("rerun_app_id", "arm_control")),
             raw=data,
         )
         config.validate()
@@ -195,22 +167,8 @@ class RobotConfig:
     def validate(self) -> None:
         if self.num_motors <= 0:
             raise ValueError("num_motors must be > 0")
-        if self.baud_rate <= 0:
-            raise ValueError("baud_rate must be > 0")
-        if self.update_rate_hz <= 0:
-            raise ValueError("update_rate_hz must be > 0")
-        if self.gui_publish_rate_hz <= 0:
-            raise ValueError("gui_publish_rate_hz must be > 0")
-        if self.rx_timeout_ms < 0:
-            raise ValueError("rx_timeout_ms must be >= 0")
         if self.state_timeout_sec <= 0:
             raise ValueError("state_timeout_sec must be > 0")
-        if self.torque_ramp_sec < 0:
-            raise ValueError("torque_ramp_sec must be >= 0")
-        if self.torque_scale < 0:
-            raise ValueError("torque_scale must be >= 0")
-        if self.gc_alpha < 0:
-            raise ValueError("gc_alpha must be >= 0")
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.raw.get(key, default)

@@ -32,14 +32,6 @@ class ActorSpec:
     urdf: str | None = None
     ee_frame: str | None = None
 
-    @property
-    def command_port(self) -> str:
-        return f"{self.name}_command"
-
-    @property
-    def arm_port(self) -> str:
-        return f"{self.name}_arm"
-
     def supports(self, capability: str) -> bool:
         return capability in self.capabilities
 
@@ -102,68 +94,6 @@ class ActorCatalog:
         return tuple(self._actors)
 
 
-@dataclass
-class ConsoleAuthority:
-    actor_names: tuple[str, ...]
-    deadman_timeout_s: float
-    selected: str | None = None
-    deadman_actor: str | None = None
-    deadman_seen_s: float = 0.0
-
-    def __post_init__(self) -> None:
-        if not self.actor_names or len(set(self.actor_names)) != len(self.actor_names):
-            raise ValueError("actor_names must be non-empty and unique")
-        if self.deadman_timeout_s <= 0.0:
-            raise ValueError("deadman_timeout_s must be positive")
-
-    @staticmethod
-    def _stop(actor: str | None) -> list[tuple[str, str]]:
-        return [] if actor is None else [("hold", actor), ("disarm", actor)]
-
-    def select(self, actor: str, *, now: float) -> list[tuple[str, str]]:
-        del now
-        if actor not in self.actor_names:
-            raise KeyError(f"unknown actor: {actor}")
-        actions = self._stop(self.selected) if self.selected != actor else []
-        self.selected = actor
-        self.deadman_actor = None
-        return actions
-
-    def set_deadman(self, held: bool, *, now: float) -> list[tuple[str, str]]:
-        if held:
-            if self.selected is None:
-                raise ValueError("select an actor before holding the deadman")
-            self.deadman_actor = self.selected
-            self.deadman_seen_s = float(now)
-            return []
-        actor = self.deadman_actor
-        self.deadman_actor = None
-        return self._stop(actor)
-
-    def may_move(self, actor: str, *, now: float) -> bool:
-        return (
-            actor == self.selected == self.deadman_actor
-            and float(now) - self.deadman_seen_s <= self.deadman_timeout_s
-        )
-
-    def expire(self, *, now: float) -> list[tuple[str, str]]:
-        if self.deadman_actor is None or self.may_move(
-            self.deadman_actor, now=now
-        ):
-            return []
-        actor = self.deadman_actor
-        self.deadman_actor = None
-        return self._stop(actor)
-
-
-#: How many timestamped backups of one profile to keep. Every save writes one,
-#: and nothing ever removed them: six copies of a single 30-line YAML had
-#: accumulated in configs/modules/, which grep hits before the real file.
-#:
-#: They are NOT junk -- each is a distinct earlier calibration, and they are
-#: gitignored, so git holds no copy and a delete is the only copy gone. That is
-#: why this keeps several rather than one, and why it says out loud what it
-#: removes instead of tidying up silently.
 KEEP_BACKUPS = 5
 
 
@@ -308,7 +238,12 @@ def validate_grasp_profile(
     if ancestor != tool_root_link:
         raise ValueError("grasp.tool_root_link must be an ancestor of ee_frame")
     tool_source_sha256 = grasp.get("tool_source_sha256")
-    if tool_source_sha256 != asset_fingerprint(tool):
+    scope = grasp.get("tool_fingerprint_scope", "urdf")
+    if scope not in {"urdf", "subtree"}:
+        raise ValueError("grasp.tool_fingerprint_scope must be urdf or subtree")
+    if tool_source_sha256 != asset_fingerprint(
+        tool, root_link=tool_root_link if scope == "subtree" else None
+    ):
         raise ValueError("tool fingerprint does not match tool asset")
 
     if not finger_joints or len(set(finger_joints)) != len(finger_joints):

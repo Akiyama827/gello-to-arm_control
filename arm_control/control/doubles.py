@@ -16,12 +16,12 @@ from __future__ import annotations
 import numpy as np
 
 from arm_control.control.arm_controller import ArmController
-from arm_control.messages import pack_plan
+from arm_control.contracts.motion import pack_plan
 from arm_control.motion import JointServoCommand
 
 
 class _FakeNode:
-    """Collects outputs; iterating it ends the run loop immediately."""
+    """Collects outputs."""
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, object]] = []
@@ -40,15 +40,13 @@ class _FakeExecutor:
 
     def __init__(self, n: int = 7) -> None:
         self.n_joints = n
-        self._traj = None
-        self._t_start = 0.0
         self.kp = np.full(n, 1200.0)
         self.kd = np.full(n, 30.0)
         self.payload = (0.0, None)
         self.steps = 0
         # The real executor reads these off the URDF it loaded; a double with
         # no model states an honest, permissive envelope rather than omitting
-        # the property, so control/adapter.py can keep requiring it.
+        # the property, so the controller factory can keep requiring it.
         self.joint_limits = (np.full(n, -np.pi), np.full(n, np.pi))
 
     def set_gains(self, kp=None, kd=None) -> None:
@@ -57,42 +55,34 @@ class _FakeExecutor:
         if kd is not None:
             self.kd = np.asarray(kd, dtype=float)
 
-    def set_payload(self, mass_kg, frame_name="", com_offset=None) -> None:
-        self.payload = (float(mass_kg), com_offset)
+    def set_payload(self, mass_kg, *, com_offset=None) -> None:
+        self.payload = (float(mass_kg), None if mass_kg == 0 else com_offset)
 
-    @property
-    def has_trajectory(self) -> bool:
-        return self._traj is not None
-
-    def load_trajectory(self, traj, t_start: float) -> None:
-        self._traj, self._t_start = traj, float(t_start)
-
-    def elapsed(self, t_now: float) -> float:
-        return float(t_now) - self._t_start
-
-    def clear_trajectory(self) -> None:
-        self._traj = None
-
-    def step(self, t_now, state) -> JointServoCommand:
+    def step(self, point, state, *, integral_bias=0.0) -> JointServoCommand:
         self.steps += 1
         n = self.n_joints
         return JointServoCommand(
-            q_des=np.zeros(n), qd_des=np.zeros(n), tau_ff=np.zeros(n),
+            q_des=np.zeros(n), qd_des=np.zeros(n), tau_ff=np.zeros(n) + integral_bias,
             kp=self.kp, kd=self.kd,
         )
 
-    def hold_command(self, state, q_des=None) -> JointServoCommand:
+    def hold_command(self, state, q_des=None, *, integral_bias=0.0) -> JointServoCommand:
         n = self.n_joints
         q = np.asarray(state.position, dtype=float) if q_des is None else np.asarray(q_des)
         return JointServoCommand(
-            q_des=q, qd_des=np.zeros(n), tau_ff=np.zeros(n), kp=self.kp, kd=self.kd
+            q_des=q, qd_des=np.zeros(n), tau_ff=np.zeros(n) + integral_bias, kp=self.kp, kd=self.kd
         )
 
-    def done(self, t_now, state, pos_tol=None, vel_tol=None) -> bool:
-        return self._traj is not None and t_now - self._t_start >= self._traj.duration_sec
+    def at_goal(self, goal, state, pos_tol=None, vel_tol=None) -> bool:
+        return True  # completion is the reference playing out
 
+    pose_tolerances = (0.002, 0.0087)
 
-_GRIPPER = {"n_motors": 7, "mimic": None, "open_finger_m": 0.04, "gains": (100.0, 1.0)}
+    def hand_at_goal(self, goal, state) -> bool:
+        return True  # as at_goal
+
+    def hand_error(self, goal, q) -> tuple[float, float]:
+        return 0.0, 0.0
 
 
 def _controller(**kw) -> "ArmController":
@@ -102,7 +92,7 @@ def _controller(**kw) -> "ArmController":
     # config without motor_state_period_s gets -- has its own check below.
     kw.setdefault("state_period_s", 0.01)
     kw.setdefault('settle_dwell_s', 0.)  # Legacy lifecycle checks; dwell has its own replay.
-    c = ArmController(node, _FakeExecutor(), gripper=dict(_GRIPPER), **kw)
+    c = ArmController(node, _FakeExecutor(), **kw)
     c._set_arm(True)
     c.bridge_armed = True
     c.on_motor_state(_state())   # the post-arm state that earns `ready`
@@ -111,7 +101,7 @@ def _controller(**kw) -> "ArmController":
 
 
 def _state(n: int = 7, vel: float = 0.0, pos: float = 0.0):
-    from arm_control.messages import pack_motor_state_dict
+    from arm_control.contracts.motor import pack_motor_state_dict
 
     return pack_motor_state_dict(
         {k: np.zeros(n) for k in
@@ -134,7 +124,6 @@ def _plan_msg(plan_id: str, *, gated: bool, completion=None):
 
 FakeNode = _FakeNode
 FakeExecutor = _FakeExecutor
-GRIPPER = _GRIPPER
 controller = _controller
 state = _state
 plan_msg = _plan_msg

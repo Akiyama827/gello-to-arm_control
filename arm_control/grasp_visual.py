@@ -471,15 +471,21 @@ class VisualFK:
         # source as the Rerun recordings — the page and the viewer cannot
         # disagree about where the dock stands.
         self._static: list[tuple[Path, dict]] = []
+        self._static_bodies: list[str] = []
+        self._static_transforms: list[np.ndarray] = []
+        self._carried: dict[int, object] = {}
+        self.geometry_version = 0
         self._lock = threading.Lock()
 
     def add_static_scene(self, cfg, *, geoms=None) -> None:
         """Append supplied fixed meshes, or resolve them from config."""
         if geoms is None:
-            from arm_control.planning.preview_rerun import static_scene_geoms
+            from arm_control.viz.preview import static_scene_geoms
 
             geoms = static_scene_geoms(cfg)
-        for _body, _name, mesh_path, T in geoms:
+        for body, _name, mesh_path, T in geoms:
+            self._static_bodies.append(body)
+            self._static_transforms.append(np.asarray(T).copy())
             quat = self._pin.Quaternion(T[:3, :3].copy()).coeffs()  # x,y,z,w
             self._static.append(
                 (
@@ -493,6 +499,34 @@ class VisualFK:
         if self._static:
             print(f"[teleop] page scene: {len(self._static)} static meshes",
                   flush=True)
+
+    def set_attachment(self, attachment) -> None:
+        """Move named scene meshes from static display to TCP-relative FK.
+
+        ``attachment`` is None or (body prefix, ee_T_scene), where ee_T_scene
+        maps the original static mesh poses into the grasp's TCP frame.
+        Mesh URLs retain their indices when display ownership changes.
+        """
+        carried = {}
+        if attachment is not None:
+            prefix, ee_T_scene = attachment
+            transform = np.asarray(ee_T_scene, dtype=float)
+            if transform.shape != (4, 4) or not np.isfinite(transform).all():
+                raise ValueError('attachment needs a finite 4x4 transform')
+            for i, body in enumerate(self._static_bodies):
+                if body.startswith(prefix):
+                    T = transform @ self._static_transforms[i]
+                    carried[i] = self._pin.SE3(T[:3, :3], T[:3, 3])
+            if not carried:
+                raise ValueError(f'no visual geometry matches attachment {prefix!r}')
+        with self._lock:
+            self._carried = carried
+            self.geometry_version += 1
+
+    def geometry_json(self):
+        with self._lock:
+            return {'geoms': self.scene_json(), 'static': self.static_json(),
+                    'version': self.geometry_version}
 
     def scene_json(self, mesh_prefix: str = "mesh") -> list[dict]:
         """Geometry list for the page: one cache-busted mesh URL per visual geom.
@@ -523,9 +557,12 @@ class VisualFK:
                     "scale": [float(v) for v in g.meshScale],
                 }
             )
+        for item in self._scene_meshes():
+            if item['index'] in self._carried:
+                out.append({k: item[k] for k in ('mesh', 'color', 'scale')})
         return out
 
-    def static_json(self) -> list[dict]:
+    def _scene_meshes(self) -> list[dict]:
         """Fixed scene geometry (the dock/modular base): mesh + colour + POSE.
 
         Deliberately NOT part of scene_json(): the page builds THREE robots
@@ -542,6 +579,7 @@ class VisualFK:
                 stamp = "0"
             out.append(
                 {
+                    "index": j,
                     # Muted grey: a backdrop for judging geometry, never
                     # mistakable for the live robot's own STL colours.
                     "mesh": f"mesh/{len(self._geom_ids) + j}?v={stamp}",
@@ -551,6 +589,10 @@ class VisualFK:
                 }
             )
         return out
+
+    def static_json(self) -> list[dict]:
+        return [{k: v for k, v in item.items() if k != 'index'}
+                for item in self._scene_meshes() if item['index'] not in self._carried]
 
     def mesh_path(self, k: int) -> Path | None:
         if 0 <= k < len(self._geom_ids):
@@ -578,7 +620,9 @@ class VisualFK:
                 _pose_json(pin, self._world_T_root * self.vdata.oMg[gid])
                 for gid in self._geom_ids
             ]
+            ee = self._world_T_root * self.data.oMf[self._ee_id]
+            geoms.extend(_pose_json(pin, ee * relative) for relative in self._carried.values())
             return {
                 "geoms": geoms,
-                "ee": _pose_json(pin, self._world_T_root * self.data.oMf[self._ee_id]),
+                "ee": _pose_json(pin, ee),
             }

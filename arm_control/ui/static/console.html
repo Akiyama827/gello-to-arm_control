@@ -56,6 +56,16 @@
         </div>
       </div>
 
+      <section id="carry-panel" class="rail-section" hidden>
+        <div class="rail-head">Carried object <output id="carry-status"></output></div>
+        <strong id="carry-title"></strong>
+        <p id="carry-payload"></p>
+        <p id="carry-detail"></p>
+        <div id="carry-checks" class="command-stack"></div>
+        <div id="carry-actions" class="command-stack"></div>
+        <p id="carry-feedback" aria-live="polite"></p>
+      </section>
+
       <div class="rail-section">
         <div class="rail-head">Move</div>
         <p>Plan → Preview → ARM → Execute. Runs until complete or stopped.</p>
@@ -78,8 +88,11 @@
           <select id="preset-select" aria-label="Named pose preset"></select>
           <button id="fill-preset" type="button">Fill from preset</button>
         </div>
+        <div id="joint-preset-row" class="button-pair" hidden></div>
         <p>Copy fills Desired only. Apply sets the target without moving.</p>
         <p id="pose-status" aria-live="polite"></p>
+        <label><input id="refine" type="checkbox"> Refine trajectory with TrajOpt</label>
+        <p id="refine-status" aria-live="polite">Changing refinement requires a new preview.</p>
         <div id="buttons" class="command-stack"></div>
       </div>
 
@@ -111,6 +124,7 @@
         <div class="button-pair">
           <button id="hand-grasp" disabled>Grasp</button>
           <button id="hand-open" disabled>Open</button>
+          <button id="hand-home" disabled title="Full open/close sweep that re-measures the stroke. Empty Hand, fingers clear.">Home</button>
         </div>
         <div class="hand-fields">
           <label>Force (N)<input id="hand-force" type="number" step="1" required></label>

@@ -20,15 +20,17 @@ end-goal: ``docs/history/cartesian-teleop.md``. Rerun previews still stream
     Execute                send the previewed trajectory to the executor
     Stop (hold)            executor drops to a compliant hold at measured pose
 
-Planning = OMPL RRT-Connect over joint space with the MuJoCo self-collision
-oracle, then blended time-parameterization. Requires mujoco + ompl (this
-node only — the executor stays engine-free).
+Planning = OMPL RRT-Connect with the supplied collision world, followed by
+checked retiming or optional native TrajOpt refinement in a child process.
+Requires mujoco + ompl (this node only — the executor stays engine-free).
 """
 from __future__ import annotations
 
 # ruff: noqa: E402
 
 import os
+import multiprocessing
+import signal
 import threading
 import uuid
 import inspect
@@ -42,31 +44,27 @@ from dora import Node
 from arm_control import CONTROL_ROOT, REPO_ROOT, frames
 
 from arm_control.config import arm_joints, ee_frame, gripper_joints, load_robot_config
+from arm_control.model_bundle import model_token, pose_provenance
 from arm_control.contracts.impedance import pose_hold_values
 from arm_control.contracts.gripper import pack_grasp_request, unpack_grasp_result
 from arm_control.ui.hand_panel import HandPanel
 from arm_control.ui.jog_panel import JogPanel
 from arm_control.grasp_visual import VisualFK
-from arm_control.joint_motor_map import gripper_motor_to_finger
-from arm_control.messages import (
-    pack_control_update,
-    pack_motor_command,
-    pack_jog,
-    pack_plan,
-    unpack_json_message,
-    unpack_motor_state,
-    unpack_controller_event,
-)
-from arm_control.planning.high_level import build_collision_stack
+from arm_control.joint_motor_map import finger_from_width
+from arm_control.contracts import pack_json_message, unpack_json_message
+from arm_control.contracts.motion import pack_control_update, pack_jog, pack_plan, unpack_controller_event
+from arm_control.contracts.motor import pack_motor_command, unpack_motor_state
+from arm_control.planning.planner import build_collision_stack
 from arm_control.planning.jog import JogLimits, check_step
 from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
 from arm_control.planning.ompl_planner import OMPLPlanner
 from arm_control.motion import JointTrajectory
-from arm_control.planning.retiming import collision_checked_retiming
+from arm_control.planning.retiming import plan_and_finish, refinement_choice
 from arm_control.node_utils import (
     ShutdownFlag,
     _load_mode_config,
     expand_named_values,
+    planner_speed_limits,
     install_signal_handlers,
     next_event_gil_friendly,
     resolve_gains,
@@ -135,6 +133,28 @@ def _pose_presets(raw) -> list:
     return out
 
 
+def _joint_presets(raw, names, lower, upper) -> dict[str, list[float]]:
+    """Validate caller-supplied named joint targets (e.g. a park posture).
+
+    Each names its joints so a reordered list is refused, not silently
+    permuted; a value outside the limits is refused, not clipped, because a
+    clipped park is not the posture the caller declared."""
+    out = {}
+    for entry in list(raw or []):
+        if not isinstance(entry, dict) or set(entry) != {"name", "joints", "q"}:
+            raise ValueError("joint preset needs name, joints and q only")
+        name = entry["name"]
+        if not isinstance(name, str) or not name.strip() or name in out:
+            raise ValueError("joint preset names must be unique non-empty strings")
+        if not isinstance(entry["joints"], (list, tuple)) or list(entry["joints"]) != list(names):
+            raise ValueError(f"joint preset {name!r} joints {entry['joints']!r} != console joints {list(names)}")
+        q = _finite_values(entry["q"], len(names))
+        if np.any(q < lower) or np.any(q > upper):
+            raise ValueError(f"joint preset {name!r} is outside the joint limits")
+        out[name] = q.tolist()
+    return out
+
+
 def pose_fields(ee):
     import pinocchio as pin
 
@@ -166,10 +186,11 @@ class ControlPanel:
         gain_presets: dict | None = None,
         payload_table: dict | None = None,
         pose_presets: list | None = None,
+        joint_presets: list | None = None,
+        refinement: str = "none",
     ) -> None:
         # grip_range (0,0) = no gripper slider; real travel comes from the
-        # arm config (gripper_range_m) or its joint_mimics entry — never a
-        # robot-shaped constant here.
+        # arm config (gripper_range_m) — never a robot-shaped constant here.
         self._lock = threading.Lock()
         # Named base-frame poses the operator can FILL into Desired. They are
         # a convenience over typing six numbers, not an authority: filling
@@ -182,10 +203,17 @@ class ControlPanel:
         self._names = list(names)
         self._lower = [float(v) for v in lower]
         self._upper = [float(v) for v in upper]
+        # Named joint targets: SET the target server-side (the page sends only
+        # the name), then Plan/Execute gate the motion as for any target.
+        self._joint_presets = _joint_presets(joint_presets, self._names, self._lower, self._upper)
         self._values = [0.0] * len(names)
         self._measured: np.ndarray | None = None
         self._measured_at = float('-inf')
         self._target_revision = 0
+        self._refinement = refinement_choice(refinement)
+        self._scene_state = None
+        self._scene_pending = None
+        self._scene_error = ''
         self._pose_pending = None
         self._pose_status = ''
         # (axis, abs_value|None, rot_delta|None); translation = latest wins,
@@ -207,6 +235,7 @@ class ControlPanel:
         self._grip_lo, self._grip_hi = float(grip_range[0]), float(grip_range[1])
         self._grip = self._grip_hi               # start open
         self._grip_dirty = False
+        self._home_pending = False
         self.hand = HandPanel(
             gripper_cfg=gripper_cfg,
             payload_table=payload_table,
@@ -255,10 +284,7 @@ class ControlPanel:
         if route == "state":
             return self._state()
         if route == "scene":
-            return {
-                "geoms": self._vfk.scene_json(),
-                "static": self._vfk.static_json(),
-            }
+            return self._vfk.geometry_json()
         if route == "plan":
             return self.plan_json()
         if route.startswith("mesh/"):
@@ -283,6 +309,10 @@ class ControlPanel:
             self.set_gripper(payload.get("value"), dirty=True)
         elif route == "hand":
             self.request_hand(payload)
+        elif route == "hand_home":
+            self.request_home()
+        elif route == "scene_action":
+            self.request_scene_action(payload)
         elif route == "jog":
             self.set_jog(payload.get("axis"), payload.get("dir"), payload.get("held"))
         elif route == "jog_speed":
@@ -290,6 +320,15 @@ class ControlPanel:
         elif route == "pose":
             revision = self.request_pose(payload)
             return {'ok': True, 'revision': revision}
+        elif route == "joint_preset":
+            return {'ok': True, 'revision': self.apply_joint_preset(payload.get("name"))}
+        elif route == "refinement":
+            choice = refinement_choice(payload.get("refinement"))
+            with self._lock:
+                if choice != self._refinement:
+                    self._refinement = choice
+                    self._invalidate_target_locked()
+            return {'ok': True}
         elif route == "click":
             self._click(str(payload.get("button", "")))
         else:
@@ -323,6 +362,7 @@ class ControlPanel:
                 },
                 "hand": self.hand.snapshot(armed=self._armed, fault=self._fault),
                 "buttons": list(self._buttons),
+                "refinement": self._refinement,
                 "armed": self._armed,
                 "fault": self._fault,
                 "supports_pose_hold": self._supports_pose_hold,
@@ -334,6 +374,11 @@ class ControlPanel:
                 "pose": {'current': None, 'target': None, 'status': self._pose_status,
                          'revision': self._target_revision},
                 "pose_presets": self._pose_presets,
+                "joint_presets": list(self._joint_presets),
+                "scene_action": (None if self._scene_state is None else
+                                 dict(self._scene_state, error=self._scene_error,
+                                      pending=self._scene_pending is not None)),
+                "geometry_version": getattr(self._vfk, 'geometry_version', 0),
                 "log": list(self._log)[-8:],  # deque: copy THEN slice
                 "plan_version": self._plan["version"],
                 "ident": self._ident,
@@ -406,6 +451,18 @@ class ControlPanel:
                 self._pose_pending = self._cart_pending = None
             return True
 
+    def apply_joint_preset(self, name) -> int:
+        """Set the target to a named joint preset; the robot does not move."""
+        q = self._joint_presets.get(name) if isinstance(name, str) else None
+        if q is None:
+            raise ValueError(f"unknown joint preset {name!r}")
+        with self._lock:
+            self._values = list(q)
+            self._invalidate_target_locked()
+            self._pose_pending = self._cart_pending = None
+            self._pose_status = f"Target set to {name}; Plan + preview before Execute"
+            return self._target_revision
+
     @property
     def target_revision(self):
         with self._lock:
@@ -419,21 +476,24 @@ class ControlPanel:
 
     def can_execute(self, revision):
         with self._lock:
-            return revision == self._target_revision and self._pose_pending is None and self._cart_pending is None
+            return (revision == self._target_revision and self._pose_pending is None
+                    and self._cart_pending is None and not self._scene_guard_locked())
 
     def execute_if_current(self, revision, send):
         """Serialize the control send with HTTP target invalidation; no IK here."""
         with self._lock:
-            if revision != self._target_revision or self._pose_pending is not None or self._cart_pending is not None:
+            if (revision != self._target_revision or self._pose_pending is not None
+                    or self._cart_pending is not None or self._scene_guard_locked()):
                 return False
             send()
             return True
 
-    def planning_target(self):
+    def planning_target(self, *, with_refinement=False):
         with self._lock:
             if self._pose_pending is not None or self._cart_pending is not None:
                 return None
-            return np.asarray(self._values).copy(), self._target_revision
+            target = (np.asarray(self._values).copy(), self._target_revision)
+            return (*target, self._refinement) if with_refinement else target
 
     def request_pose(self, payload):
         T = pose_matrix(payload)
@@ -550,8 +610,98 @@ class ControlPanel:
 
     def request_hand(self, payload: dict) -> None:
         with self._lock:
+            if self._scene_state is not None and payload.get('payload_id'):
+                raise ValueError('Payload is owned by explicit scene confirmation')
             self.hand.request(payload, armed=self._armed, fault=self._fault)
             self._grip_dirty = False   # the slider lost the jaws to this action
+            if self._scene_state is not None:
+                self._invalidate_target_locked()
+                self.jog.release()
+
+    def request_home(self) -> None:
+        """Home the Hand (a full open/close sweep that re-measures its stroke), sent to this graph's Hand node as
+        ``hand_home``; gated like the slider, plus: idle, fresh, holding nothing (the node checks those again)."""
+        with self._lock:
+            hand = self.hand.snapshot(armed=self._armed, fault=self._fault)
+            reason = ("Hand motion requires confirmed ARM and no fault" if self._armed is not True or self._fault
+                      else "Hand feedback unavailable or stale" if not hand["feedback_fresh"]
+                      else "Hand busy: wait for the current action" if self.hand.owns_jaws() or self._home_pending
+                      else "Homing sweeps the fingers: open the Hand and remove the object first"
+                      if hand["is_grasped"] is not False or (self._scene_state is not None
+                                                             and self._scene_state["status"] != "stored")
+                      else "")
+            if reason:
+                raise ValueError(reason)
+            self._home_pending = True
+            self._grip_dirty = False  # the sweep owns the jaws; a queued slider goal is dropped
+            self._log.append("Hand homing requested (keep fingers clear)")
+
+    def pop_home(self) -> bool:
+        with self._lock:
+            pending, self._home_pending = self._home_pending, False
+            return pending
+
+    def set_scene_state(self, state, *, error=''):
+        with self._lock:
+            self._scene_state = state
+            if error:
+                self._scene_error = error
+
+    def invalidate_scene(self):
+        with self._lock:
+            self._invalidate_target_locked()
+            self.jog.release()
+
+    def request_scene_action(self, payload):
+        if (not isinstance(payload, dict) or set(payload) != {'revision', 'action', 'checks'}
+                or type(payload['revision']) is not int
+                or not isinstance(payload['action'], str)
+                or not isinstance(payload['checks'], list)
+                or any(not isinstance(v, str) for v in payload['checks'])):
+            raise ValueError('Scene action requires revision, action and physical checks')
+        with self._lock:
+            if self._scene_state is None:
+                raise ValueError('No scene confirmation is configured')
+            if self._scene_pending is not None:
+                raise ValueError('Wait for the pending scene confirmation')
+            if payload['revision'] != self._scene_state['revision']:
+                raise ValueError('Scene confirmation expired; review the current state')
+            if payload['action'] not in {a['id'] for a in self._scene_state['actions']}:
+                raise ValueError('That scene action is not currently available')
+            self._scene_pending = dict(payload)
+            self._scene_error = ''
+            self._invalidate_target_locked()
+            self.jog.release()
+
+    def pop_scene_action(self):
+        with self._lock:
+            request, self._scene_pending = self._scene_pending, None
+            return request
+
+    def scene_context(self, *, stationary, moving):
+        with self._lock:
+            fresh = time.monotonic() - self._measured_at <= FEEDBACK_STALE_S
+            return {
+                'q': self._measured.copy() if fresh and self._measured is not None else None,
+                'hand': self.hand.snapshot(armed=self._armed, fault=self._fault),
+                'stationary': stationary and fresh, 'moving': moving,
+                'fault': self._fault, 'mode': self._control_mode,
+            }
+
+    def _scene_guard_locked(self):
+        if self._scene_state is None:
+            return ''
+        if self._scene_pending is not None:
+            return 'Scene confirmation pending'
+        if self._scene_state.get('block_reason'):
+            return self._scene_state['block_reason']
+        hand = self.hand.snapshot(armed=self._armed, fault=self._fault)
+        if self._scene_state.get('requires_grasp') and (
+                not hand['feedback_fresh'] or hand['is_grasped'] is not True or hand['busy']):
+            return 'Carrying requires fresh, stable grasp feedback'
+        if self._scene_state.get('status') == 'stored' and hand['is_grasped'] is True:
+            return 'Confirm carrying before moving a held object'
+        return ''
 
     def pop_payload(self) -> dict | None:
         with self._lock:
@@ -610,6 +760,9 @@ class ControlPanel:
             if dirty and self.hand.owns_jaws():
                 self._log.append("REFUSED: Hand action pending; wait before moving the slider")
                 return
+            if dirty and self._scene_state is not None and self._scene_state['status'] != 'stored':
+                self._log.append('REFUSED: use Hand Open to release a carried object')
+                return
             self._grip = float(np.clip(value, self._grip_lo, self._grip_hi))
             self._grip_dirty = self._grip_dirty or dirty
 
@@ -637,6 +790,24 @@ class ControlPanel:
         self._server.close()
 
 
+def collision_reason(world, q, label: str) -> str:
+    """Name blocking contacts without guessing self versus scene collision."""
+    reason = f"{label} pose is in collision"
+    report = getattr(world, 'collision_contacts', None)
+    if report is None:
+        return reason
+    contacts = report(q)
+    if contacts:
+        reason += ': ' + '; '.join(
+            f"{' / '.join(item['bodies'])} "
+            f"(distance {item['distance_m'] * 1000:.2f} mm)"
+            for item in contacts[:4]
+        )
+        if len(contacts) > 4:
+            reason += f'; and {len(contacts) - 4} more pairs'
+    return reason
+
+
 def plan_trajectory(
     world: MuJoCoCollisionWorld,
     ompl: OMPLPlanner,
@@ -644,43 +815,108 @@ def plan_trajectory(
     q_goal: np.ndarray,
     vmax: np.ndarray,
     amax: np.ndarray,
+    *, refinement="none",
 ) -> JointTrajectory:
     """Plan start -> goal or raise ValueError with an operator-readable reason."""
     q_start = np.clip(q_start, world.lower, world.upper)  # measured can sit eps outside
     if world.in_collision(q_goal):
-        raise ValueError("target pose is in self-collision")
+        raise ValueError(collision_reason(world, q_goal, 'target'))
     if world.in_collision(q_start):
-        raise ValueError("current pose is in self-collision (check padding)")
+        raise ValueError(collision_reason(world, q_start, 'current'))
     if np.allclose(q_start, q_goal, atol=5e-3):
         # 5 mrad: below anything worth planning. The old 1e-4 gate let a
         # near-zero path through, and the retimer's soft-launch taper turned
         # it into a 2-sample "plan" with a 5-day duration (seen on the bench).
         raise ValueError("already at the target (within 5 mrad)")
-    waypoints = ompl.plan(q_start, q_goal)
-    if waypoints is None:
+    trajectory = plan_and_finish(lambda: ompl.plan(q_start, q_goal), world, vmax, amax, refinement=refinement)
+    if trajectory is None:
         raise ValueError("no collision-free path found (try a different target)")
-    return collision_checked_retiming(waypoints, vmax, amax, world.in_collision)
+    return trajectory
 
 
-def main(*, cfg=None, collision_world=None, static_geoms=None, pose_presets=None) -> None:
+def _planner_init():
+    # Only the console handles Ctrl-C; pool teardown terminates the child.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def _planning_pool():
+    return multiprocessing.get_context("spawn").Pool(1, initializer=_planner_init)
+
+
+def _close_planning_pool(pool):
+    pool.terminate()
+    pool.join()
+
+
+_PLAN_WORLD = None  # planning process: (key, world) last sent whole
+
+
+class PlanWorldMiss(RuntimeError):
+    """The planning process holds no copy of this world (a fresh or restarted worker): send it whole."""
+
+
+def _plan_world_key(world):
+    """A world object AND its model: replacing either (a scene rebuild) needs a whole copy."""
+    return id(world), id(getattr(world, "model", None))
+
+
+def _plan_world_cached(cached, world) -> bool:
+    return (hasattr(world, "planning_delta") and cached[0] is world
+            and cached[1] is getattr(world, "model", None))
+
+
+def _cache_plan_world(key, world):
+    global _PLAN_WORLD
+    _PLAN_WORLD = (key, world)
+
+
+def _plan_snapshot(world, planner_cfg, start, goal, vmax, amax, refinement, key=None, delta=None):
+    """Solve against the serialized canonical world, never a rebuilt nominal URDF.
+
+    ``world`` None: the copy this process cached under ``key``, brought up to date by ``delta`` (its planning_delta):
+    the model crosses the process boundary once per world object, not once per plan."""
+    global _PLAN_WORLD
+    if world is not None:
+        _cache_plan_world(key, world)
+    else:
+        if _PLAN_WORLD is None or _PLAN_WORLD[0] != key:
+            raise PlanWorldMiss(key)
+        world = _PLAN_WORLD[1]
+        try:
+            world.apply_planning_delta(delta)
+        except Exception:  # its geometry changed in place, or the copy is unusable: never plan against it
+            _PLAN_WORLD = None
+            raise PlanWorldMiss(key) from None
+    _, planner = build_collision_stack(
+        None, world.joint_names, planner_cfg, cache_dir=None, collision_world=world,
+    )
+    return plan_trajectory(
+        world, planner, start, goal, vmax, amax, refinement=refinement,
+    )
+
+
+def main(*, cfg=None, collision_world=None, static_geoms=None, pose_presets=None,
+         joint_presets=None, scene_actions=None) -> None:
     shutdown = ShutdownFlag()
     install_signal_handlers(shutdown)
     with ExitStack() as cleanup:
         _run(
             shutdown, cleanup, cfg=cfg, collision_world=collision_world,
-            static_geoms=static_geoms, pose_presets=pose_presets,
+            static_geoms=static_geoms, pose_presets=pose_presets, joint_presets=joint_presets,
+            scene_actions=scene_actions,
         )
 
 
 def _run(
     shutdown: ShutdownFlag, cleanup: ExitStack, *,
-    cfg=None, collision_world=None, static_geoms=None, pose_presets=None,
+    cfg=None, collision_world=None, static_geoms=None, pose_presets=None, joint_presets=None,
+    scene_actions=None,
 ) -> None:
     import pinocchio as pin
     import rerun as rr
 
     from arm_control.planning.ik import PinocchioIK
-    from arm_control.planning.preview_rerun import (
+    from arm_control.viz.preview import (
         MeasuredGhost,
         PreviewScene,
         RobotGhost,
@@ -747,10 +983,9 @@ def _run(
             plan_kd if spec.get("kd") is None
             else expand_named_values(spec["kd"], names=planned, default=0.0),
         )
-    vmax = expand_named_values(planner_cfg.get("vel_limits", 0.5), names=planned, default=0.5)
-    amax = expand_named_values(planner_cfg.get("acc_limits", 1.0), names=planned, default=1.0)
+    vmax, amax = planner_speed_limits(planner_cfg, cfg.get("execution_policy"), planned)
 
-    world, ompl = build_collision_stack(
+    world, _ = build_collision_stack(
         cfg.urdf_path,
         planned,
         planner_cfg,
@@ -774,7 +1009,9 @@ def _run(
     # planner's `environment:` boxes are invisible, so without this the operator
     # judges reach against an empty table.
     vfk.add_static_scene(cfg, geoms=static_geoms)
-    log_static_scene(cfg, geoms=static_geoms)
+    # A mutable scene supplies its own measured Rerun mirror; a second fixed
+    # copy would leave an apparently stored object behind after attaching it.
+    log_static_scene(cfg, geoms=[] if scene_actions is not None else static_geoms)
     # URDF-present finger joints (vfk already filtered them). The Rerun ghosts
     # carry them too: target fingers mirror the SLIDER, measured-ghost fingers
     # mirror the LIVE width — frozen URDF-default fingers on the live ghost
@@ -791,6 +1028,7 @@ def _run(
     # restarts=1: only the current-target seed, so a Cartesian drag follows the
     # NEAREST IK branch and never jumps the arm to a different fold mid-drag.
     ik = PinocchioIK(cfg.urdf_path, ee_link, planned, restarts=1)
+    path_ik = PinocchioIK(cfg.urdf_path, ee_link, planned, restarts=1) if scene_actions else None
     # Preview draws with the SAME FK the plan was solved against (see
     # PreviewScene: the MuJoCo collision world has no body for a fixed-joint EE
     # frame such as the FR3's fr3_hand_tcp).
@@ -798,22 +1036,10 @@ def _run(
         ik.fk, urdf_path=cfg.urdf_path, joint_names=planned, ee_link=ee_link,
         gripper_joints=gj,
     )
-    # First mimic entry = the gripper's motor slot, whatever this arm calls it.
-    mimic = next(
-        (dict(m) for m in (cfg.get("joint_mimics") or {}).values() if isinstance(m, dict)),
-        {},
-    )
-    # Finger travel for the slider. An arm with no `joint_mimics` (its gripper is
-    # not a motor on this bus — the FR3's Franka Hand) has no mimic to read, and
-    # the old fallback silently handed it the DM arm's 0.0439 m. State it in the
-    # arm config instead: `gripper_range_m: [lower, upper]`, per FINGER.
+    # Finger travel for the slider, stated in the arm config: `gripper_range_m: [lower, upper]`, per FINGER. Absent: (0,0),
+    # no slider, rather than inventing another robot's numbers.
     explicit = cfg.get("gripper_range_m")
-    if explicit is not None:
-        grip_range = (float(explicit[0]), float(explicit[1]))
-    else:
-        # A mimic without travel bounds is a config error for a slider; (0,0)
-        # renders no slider rather than inventing another robot's numbers.
-        grip_range = (float(mimic.get("lower", 0.0)), float(mimic.get("upper", 0.0)))
+    grip_range = (float(explicit[0]), float(explicit[1])) if explicit is not None else (0.0, 0.0)
     # The page must SAY which arm it drives: a browser tab from a sim
     # rehearsal silently reattaches to a real graph on the same port, and the
     # first click lands on hardware.
@@ -821,6 +1047,8 @@ def _run(
     # the config path is the fallback so a single-arm graph needs no env at all.
     arm_id = os.environ.get("ARM_ID", "").strip()
     ident = arm_id or os.environ.get("ARM_CONTROL_CONFIG", "") or "unknown config"
+    # Never let a nominal and a calibrated arm read the same on the page.
+    ident = f"{ident} [{pose_provenance(cfg)} model]"
     # The panel's address is a per-INSTANCE fact, so it lives with the robot,
     # not with the mode. It used to sit in the mode config, where it only
     # avoided a collision because the two arms happened to run different modes
@@ -843,8 +1071,10 @@ def _run(
         jog_joint_speed_rad_s=jog_joint_speed,
         gripper_cfg=dict((cfg.get("franka") or {}).get("gripper") or {}),
         gain_presets={name: gains for name, gains in gain_presets.items() if name not in pose_hold_presets},
-        payload_table=dict(cfg.get("module_grasps") or {}),
+        payload_table={} if scene_actions is not None else dict(cfg.get("module_grasps") or {}),
         pose_presets=pose_presets,
+        joint_presets=joint_presets,
+        refinement=planner_cfg.get("refinement", "none"),
     )
     cleanup.callback(panel.close)
     # The legend, stated once, the same on the page and in Rerun. It used to
@@ -893,11 +1123,27 @@ def _run(
     supports_pose_hold = False
     mgrip_f = 0.0     # live measured finger metres (gripper_state topic)
     shown_grip: float | None = None
-    # Planning runs on a WORKER thread: the 2.5 s OMPL solve used to run
-    # inline on the same loop that services ARM/DISARM/Stop clicks — the
-    # authority drop was unresponsive for the whole solve, during live motion.
+    # Native solves can retain the GIL even from a worker thread. A spawned
+    # process isolates them from ARM/DISARM/Stop and feedback handling. The
+    # thread only waits for its result and runs project-specific path checks.
+    plan_pool = _planning_pool()
+    cleanup.callback(_close_planning_pool, plan_pool)
+    # The world crosses to the planning process now, before anything is ARMed, so a plan sends only its small delta.
+    warm = getattr(world, "world", world)
+    plan_cached = [None, None]  # [world, its model] the planning process holds: the refs keep their ids unique
+    if hasattr(warm, "planning_delta"):
+        plan_cached[:] = [warm, warm.model]
+        plan_pool.apply_async(_cache_plan_world, (_plan_world_key(warm), warm))
     plan_thread: threading.Thread | None = None
     plan_box: list = []  # worker appends ("ok", traj, goal_q) | ("err", msg)
+    active_plan_id = ''
+    still_since = None
+    last_motor_sample_t = None
+    scene_revision = -1
+    scene_block = ''
+    sent_payload = None
+    shown_attachment = None
+    scene_context = None
 
     while not shutdown.stop_requested:
         event = next_event_gil_friendly(node, idle_sleep=0.05)
@@ -906,17 +1152,21 @@ def _run(
         now = time.monotonic()
         if event is not None:
             if event["type"] == "INPUT" and event["id"] == "motor_state":
-                pos = unpack_motor_state(event["value"], n)["position"]
+                motor_sample = unpack_motor_state(event["value"], n)
+                pos = motor_sample["position"]
+                velocity = np.asarray(motor_sample['velocity'][:len(planned)])
+                if last_motor_sample_t is None or now - last_motor_sample_t > .2:
+                    still_since = None
+                last_motor_sample_t = now
+                if np.isfinite(velocity).all() and np.max(np.abs(velocity)) <= .01:
+                    still_since = now if still_since is None else still_since
+                else:
+                    still_since = None
                 measured = pos[: len(planned)]
                 panel.set_measured(measured)
                 if not synced_once:
                     # First state: start the target at the real pose, no surprises.
                     panel.set_sliders(measured)
-                    if n > len(planned) and mimic:
-                        panel.set_gripper(
-                            gripper_motor_to_finger(float(pos[len(planned)]), mimic),
-                            dirty=False,
-                        )
                     synced_once = True
                 if now - last_ghost >= 0.1:
                     last_ghost = now
@@ -929,7 +1179,7 @@ def _run(
                 width = float(hand_state["width"])
                 if not np.isfinite(width):
                     continue
-                mgrip_f = width / 2.0
+                mgrip_f = finger_from_width(width)
                 panel.set_measured_grip(mgrip_f)
                 scene.set_finger_state(mgrip_f)
                 if not grip_synced:
@@ -958,6 +1208,8 @@ def _run(
                 panel.log("Controller ARMED" if armed else "Controller DISARMED")
             elif event["type"] == "INPUT" and event["id"] == "controller_event":
                 result = unpack_controller_event(event["value"])
+                if result['kind'] == 'leg_result' and result.get('plan_id') == active_plan_id:
+                    active_plan_id = ''
                 if result["kind"] == "fault":
                     fault = str(result.get("reason") or "controller fault")
                     panel.set_armed(armed, fault)
@@ -1027,6 +1279,44 @@ def _run(
             health_stale_shown = False
             panel.set_armed(armed, fault)
 
+        if scene_actions is not None:
+            scene_context = panel.scene_context(
+                stationary=still_since is not None and now - still_since >= .25,
+                moving=bool(active_plan_id) or panel.jog_held() is not None,
+            )
+            scene_context['ee'] = (None if scene_context['q'] is None
+                                   else ik.fk(scene_context['q']))
+            scene_actions.observe(scene_context)
+            request = panel.pop_scene_action()
+            if request is not None:
+                try:
+                    if plan_thread is not None:
+                        raise ValueError('Wait for planning to finish before confirming the scene')
+                    panel.log(scene_actions.apply(request, scene_context))
+                except ValueError as exc:
+                    panel.set_scene_state(scene_actions.snapshot(scene_context), error=str(exc))
+                    panel.log(f'Confirmation refused: {exc}')
+            state = scene_actions.snapshot(scene_context)
+            blocked = state['block_reason']
+            if scene_actions.revision != scene_revision or (blocked and blocked != scene_block):
+                panel.invalidate_scene()
+                pending, pending_id = None, ''
+                node.send_output('control', pack_control_update(
+                    cancel=True, reason=blocked or 'manual scene changed; replan'))
+                active_plan_id = ''
+                scene_revision = scene_actions.revision
+            scene_block = blocked
+            if scene_actions.payload != sent_payload:
+                node.send_output('control', pack_control_update(payload=scene_actions.payload))
+                sent_payload = dict(scene_actions.payload)
+            if scene_actions.attachment is not shown_attachment:
+                vfk.set_attachment(scene_actions.attachment)
+                shown_attachment = scene_actions.attachment
+            width = scene_context['hand']['measured_width_mm']
+            if state['status'] != 'stored' and width is not None:
+                panel.set_gripper(finger_from_width(width / 1000), dirty=False)
+            panel.set_scene_state(state)
+
         if panel.clicked("Sync target to robot") and measured is not None:
             panel.set_sliders(measured)
 
@@ -1084,8 +1374,12 @@ def _run(
         hand_request = panel.pop_hand()
         if hand_request is not None:
             node.send_output("grasp_request", pack_grasp_request(**hand_request))
+        if panel.pop_home():
+            # A graph topic, not the trigger file: that file is shared by every graph without an ARM_ID (review
+            # 2026-10-10: a sim page's Home would have homed a real Hand). The Hand node re-gates it (empty, idle).
+            node.send_output("hand_home", pack_json_message("hand_home", {}))
         declaration = panel.pop_payload()
-        if declaration is not None:
+        if declaration is not None and scene_actions is None:
             node.send_output("control", pack_control_update(payload=declaration))
 
         # The collision world is shared with the planning worker. Update its
@@ -1098,8 +1392,10 @@ def _run(
             pending, pending_id = None, ''
 
         if panel.clicked("Plan + preview"):
-            snapshot = panel.planning_target()
-            if measured is None:
+            snapshot = panel.planning_target(with_refinement=True)
+            if scene_block:
+                panel.log(f'Plan refused: {scene_block}')
+            elif measured is None:
                 panel.log("no motor state yet — cannot plan")
             elif plan_thread is not None:
                 panel.log("still planning — wait for the current plan")
@@ -1108,16 +1404,34 @@ def _run(
             else:
                 t_plan = time.monotonic()
                 m_snap = measured.copy()
-                t_snap, revision = snapshot
-
-                def _plan_worker(m=m_snap, t=t_snap, t0=t_plan, rev=revision):
+                t_snap, revision, refinement = snapshot
+                if scene_actions is not None:
                     try:
-                        traj = plan_trajectory(
-                            world, ompl, m, t, vmax, amax,
-                        )
-                        plan_box.append(("ok", traj, t, t0, rev))
+                        scene_actions.before_plan(scene_context, ik.fk(t_snap))
                     except ValueError as exc:
-                        plan_box.append(("err", str(exc), t, t0, rev))
+                        panel.log(f'Plan refused: {exc}')
+                        continue
+
+                def _plan_worker(m=m_snap, t=t_snap, t0=t_plan, rev=revision, refine=refinement):
+                    try:
+                        w = getattr(world, "world", world)
+                        args = (planner_cfg, m, t, vmax, amax, refine)
+                        try:
+                            if not _plan_world_cached(plan_cached, w):
+                                raise PlanWorldMiss(_plan_world_key(w))
+                            traj = plan_pool.apply_async(
+                                _plan_snapshot, (None, *args, _plan_world_key(w), w.planning_delta()),
+                            ).get(timeout=180)
+                        except PlanWorldMiss:
+                            # Whole (a rebuilt world, a restarted worker): a GIL-heavy pickle, once per world.
+                            plan_cached[:] = [w, getattr(w, "model", None)]
+                            traj = plan_pool.apply_async(
+                                _plan_snapshot, (w, *args, _plan_world_key(w))).get(timeout=180)
+                        if scene_actions is not None:
+                            scene_actions.validate_path(traj, path_ik)
+                        plan_box.append(("ok", traj, t, t0, rev))
+                    except Exception as exc:
+                        plan_box.append(("err", str(exc) or type(exc).__name__, t, t0, rev))
 
                 plan_thread = threading.Thread(target=_plan_worker, daemon=True)
                 plan_thread.start()
@@ -1169,6 +1483,7 @@ def _run(
                         velocities=pending.velocities,
                         kp=plan_kp,
                         kd=plan_kd,
+                        model_token=model_token(cfg),
                     ),
                 )
                 # An Execute click that queued up DURING the solve would fire
@@ -1199,6 +1514,8 @@ def _run(
                     lambda: node.send_output("control", pack_control_update(execute=pending_id)),
                 )
                 panel.log(f"executing {pending_id}" if dispatched else "target changed — plan again")
+                if dispatched:
+                    active_plan_id = pending_id
                 pending = None
                 pending_id = ""
                 panel.clear_plan()
@@ -1209,6 +1526,9 @@ def _run(
             jog_q = None          # released: the next press re-anchors
             jog_anchor = None
             jog_t = None
+        elif scene_actions is not None and (scene_block or not state['jog_allowed']):
+            panel.set_jog_note(scene_block or 'Complete withdrawal and Confirm clear of storage before jogging')
+            panel.set_jog(None, None, False)
         elif measured is not None and plan_thread is None:
             axis, direction, speed_m_s, joint_speed_rad_s, epoch = jog_held
             now_t = time.monotonic()
@@ -1239,7 +1559,15 @@ def _run(
                 T_next[:3, 3] = p_next
                 q_next = ik.solve(T_next, q0=jog_q)
 
-            if q_next is None:
+            jog_scene_error = ''
+            if q_next is not None and scene_actions is not None:
+                try:
+                    scene_actions.before_plan(scene_context, T_next)
+                except ValueError as exc:
+                    jog_scene_error = str(exc)
+            if jog_scene_error:
+                panel.set_jog_note(f'jog refused: {jog_scene_error}')
+            elif q_next is None:
                 panel.set_jog_note(
                     f"jog {axis}: no IK solution — try a joint jog to back out"
                 )
@@ -1305,6 +1633,7 @@ def _run(
             )
 
         if panel.clicked("Stop (hold)"):
+            active_plan_id = ''
             # `cancel`, not `hold` and not `stop`: the arm must come to rest
             # where it is and STAY RUNNABLE. `hold` freezes it forever and
             # `stop` is terminal -- either would need a graph restart to undo.
@@ -1330,6 +1659,7 @@ def _run(
             node.send_output("control", pack_control_update(arm=True))
             panel.log("ARM requested — controller enables and holds this pose")
         if panel.clicked("DISARM"):
+            active_plan_id = ''
             # Cancel FIRST: a disarm+rearm inside the runaway window must never
             # resume a stale trajectory. ArmController's own _disarm_reset also
             # clears it, but the ORDERING is the point, so it stays explicit.
@@ -1415,56 +1745,176 @@ def _check_payload_declaration() -> None:
     print("arm_console: page and HandPanel agree on the payload field")
 
 
+def _check_planner_limits() -> None:
+    """The execution policy is the single statement of the speed limits; the planner follows it and may only be slower."""
+    names = ["a", "b"]
+    policy = {"velocity_limits": [0.4, 0.4], "acceleration_limits": [0.8, 0.8]}
+    v, a = planner_speed_limits({}, policy, names)
+    assert v.tolist() == [0.4, 0.4] and a.tolist() == [0.8, 0.8], (v, a)          # defaults to the policy
+    v, a = planner_speed_limits({"vel_limits": 0.2}, policy, names)
+    assert v.tolist() == [0.2, 0.2] and a.tolist() == [0.8, 0.8], (v, a)          # slower is allowed
+    try:
+        planner_speed_limits({"vel_limits": 0.5}, policy, names)
+    except ValueError as exc:
+        assert "exceeds execution_policy" in str(exc), exc
+    else:
+        raise AssertionError("a planner faster than the execution policy was accepted")
+    v, a = planner_speed_limits({}, None, names)
+    assert v.tolist() == [0.5, 0.5] and a.tolist() == [1.0, 1.0], (v, a)          # no policy: the historical defaults
+    # The planning stack and the dual console read arm.max_vel/max_acc under the same rule.
+    from arm_control.control.factory import arm_speed_limits
+    v, a = arm_speed_limits({"arm": {}, "execution_policy": policy}, 2)
+    assert v.tolist() == [0.4, 0.4] and a.tolist() == [0.8, 0.8], (v, a)
+    v, a = arm_speed_limits({"arm": {"max_vel": [0.2, 0.3]}, "execution_policy": policy}, 2)
+    assert v.tolist() == [0.2, 0.3] and a.tolist() == [0.8, 0.8], (v, a)
+    try:
+        arm_speed_limits({"arm": {"max_vel": [0.5, 0.5]}, "execution_policy": policy}, 2)
+    except ValueError as exc:
+        assert "arm.max_vel" in str(exc) and "exceeds execution_policy" in str(exc), exc
+    else:
+        raise AssertionError("an arm.max_vel faster than the execution policy was accepted")
+    v, a = arm_speed_limits({"arm": {"max_vel": 0.7, "max_acc": 1.2}}, 2)            # no policy: the arm's own statement
+    assert v.tolist() == [0.7, 0.7] and a.tolist() == [1.2, 1.2], (v, a)
+    v, a = arm_speed_limits({"arm": {}}, 2, required=False)
+    assert np.isinf(v).all() and np.isinf(a).all(), (v, a)
+    v, _ = arm_speed_limits({"arm": {"joints": ["a", "b"], "max_vel": {"b": 0.1}}, "execution_policy": policy}, 2)
+    assert v.tolist() == [0.4, 0.1], v                                               # named: the policy for the rest
+    try:
+        arm_speed_limits({"arm": {"joints": ["a", "b"], "max_vel": {"bb": 0.1}}, "execution_policy": policy}, 2)
+    except ValueError as exc:
+        assert "no such joint" in str(exc), exc
+    else:
+        raise AssertionError("a misspelt joint name in a speed limit was ignored")
+    try:
+        arm_speed_limits({"arm": {"max_vel": [0.2, 0.41]}, "execution_policy": policy}, 2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("one joint faster than the execution policy was accepted")
+    try:                                                                              # partial policy: the arm states the rest
+        arm_speed_limits({"arm": {}, "execution_policy": {"velocity_limits": [0.4, 0.4]}}, 2)
+    except ValueError as exc:
+        assert "max_acc" in str(exc), exc
+    else:
+        raise AssertionError("an unbounded acceleration fell back to a default")
+    print("arm_console: planner speed limits follow the execution policy")
+
+
+def _check_plan_world_cache() -> None:
+    """The planning process gets the world once, then per-plan deltas that carry every mutable query input."""
+    import pickle
+    import tempfile
+    from pathlib import Path
+
+    from arm_control.planning.mujoco_collision import MuJoCoCollisionWorld
+
+    cfg = load_robot_config(Path(__file__).resolve().parents[2] / "examples/configs/sim_arm.yaml")
+    joints = list(arm_joints(cfg))
+    box = dict(name="wall", pose=[.45, 0., .4, 0., 0., 0.], size=[.1, .8, .8])
+    with tempfile.TemporaryDirectory() as tmp:
+        w = MuJoCoCollisionWorld(cfg.urdf_path, joints, cache_dir=tmp, environment=[box])
+        child = pickle.loads(pickle.dumps(w))  # the copy the planning process caches
+        rng = np.random.default_rng(0)
+        qs = rng.uniform(w.lower, w.upper, (200, len(joints)))
+        hits = [w.in_collision(q) for q in qs]
+        assert any(hits) and not all(hits), "the samples must see the wall both ways, or this checks nothing"
+        wall = np.flatnonzero(w._env_geom)
+        w.model.geom_contype[wall] = w.model.geom_conaffinity[wall] = 0  # what enable_*_obstacles toggles
+        assert [w.in_collision(q) for q in qs] != hits
+        assert [child.in_collision(q) for q in qs] == hits, "stale before the delta"
+        child.apply_planning_delta(pickle.loads(pickle.dumps(w.planning_delta())))
+        assert [child.in_collision(q) for q in qs] == [w.in_collision(q) for q in qs]
+        fingers = list(gripper_joints(cfg))
+        assert fingers, "sim_arm must hold finger joints for the held-position case"
+        w.set_held_positions({fingers[0]: .013})
+        assert not np.array_equal(child._held_qpos, w._held_qpos)
+        child.apply_planning_delta(pickle.loads(pickle.dumps(w.planning_delta())))
+        assert np.array_equal(child._held_qpos, w._held_qpos)
+        assert len(pickle.dumps(w.planning_delta())) < len(pickle.dumps(w.model)) / 10
+        # geometry moved in place (no such writer today): the delta refuses, the process asks for the world whole
+        moved = pickle.loads(pickle.dumps(w))
+        moved.model.geom_pos[wall[0]] += .1
+        try:
+            child.apply_planning_delta(pickle.loads(pickle.dumps(moved.planning_delta())))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a delta from moved geometry applied")
+        _cache_plan_world(_plan_world_key(w), child)
+        try:
+            _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
+                           _plan_world_key(w), moved.planning_delta())
+        except PlanWorldMiss:
+            assert _PLAN_WORLD is None, "a refused delta must drop the cached copy"
+        else:
+            raise AssertionError("planned against stale geometry")
+        turned = pickle.loads(pickle.dumps(w))
+        turned.model.jnt_axis[0] = turned.model.jnt_axis[0][[1, 2, 0]]  # joint kinematics count as geometry
+        assert turned.planning_delta()["_geometry"] != w.planning_delta()["_geometry"]
+        _cache_plan_world(_plan_world_key(w), pickle.loads(pickle.dumps(w)))
+        broken = w.planning_delta()
+        broken.pop("_query_state")  # any failure to apply, not only ValueError, is a miss and drops the copy
+        try:
+            _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
+                           _plan_world_key(w), broken)
+        except PlanWorldMiss:
+            assert _PLAN_WORLD is None
+        else:
+            raise AssertionError("planned with a delta that did not apply")
+        other = MuJoCoCollisionWorld(cfg.urdf_path, joints[:-1], cache_dir=tmp)
+        try:
+            other.apply_planning_delta(w.planning_delta())
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a delta applied to another model")
+        # the cache key: a replaced world or model is a miss; the process refuses a delta it holds no world for
+        cached = [w, w.model]
+        assert _plan_world_cached(cached, w) and not _plan_world_cached(cached, other)
+        cached[1] = other.model
+        assert not _plan_world_cached(cached, w)
+        _cache_plan_world(_plan_world_key(other), other)
+        try:
+            _plan_snapshot(None, {}, qs[0], qs[1], np.ones(len(joints)), np.ones(len(joints)), "none",
+                           _plan_world_key(w), w.planning_delta())
+        except PlanWorldMiss:
+            pass
+        else:
+            raise AssertionError("planned against a world the process does not hold")
+    print("arm_console: planning world crosses once; deltas carry contact masks/held/qpos; moved geometry and "
+          "misses refused OK")
+
+
 def _check_graphs() -> None:
-    """Every arm_controller in every graph must be able to stream.
-
-    The controller waits for a bridge's armed health edge before its first
-    command, because a bridge publishes motor_state while DISARMED and only a
-    state after that edge is provably post-enable. A graph whose plant has no
-    bridge publishes no motor_health at all, so the wait never ends and the arm
-    simply never moves -- with no error anywhere, which is the worst shape a
-    bug can have. Exactly one of the two must hold per graph: a motor_health
-    wire, or the ARM_CONTROL_PLANT_HEALTH=0 opt-out.
-    """
-    import re
-
+    """Every console in every graph has exactly one authority feedback source (the controller's motor_health or its
+    controller_arm), never an optimistic ARM badge, and every supervised_arm input has a handler. (The in-process arm_controller node this also checked is retired: every
+    graph's controller is its supervisor's, through supervised_arm.)"""
     import yaml
 
-    root = REPO_ROOT
-    controller = (root / "arm_control" / "control" / "arm_controller.py").read_text()
-    handled = set(re.findall(r'"(\w+)": self\.on_', controller))
-
     checked = 0
-    for graph in sorted((root / "dataflows").glob("*.yml")):
+    for graph in sorted((REPO_ROOT / "dataflows").glob("*.yml")):
         spec = yaml.safe_load(graph.read_text()) or {}
         for console in spec.get("nodes", []):
             if str(console.get("path", "")).endswith("arm_console.py"):
+                checked += 1
                 inputs = console.get("inputs") or {}
                 assert ("motor_health" in inputs) != ("controller_arm" in inputs), (
                     f"{graph.name}/{console['id']}: console needs exactly one "
                     "authority feedback source, never an optimistic ARM badge"
                 )
-        for node in spec.get("nodes", []):
-            if not str(node.get("path", "")).endswith("arm_controller.py"):
-                continue
-            checked += 1
-            inputs = set(node.get("inputs") or {})
-            unhandled = sorted(inputs - handled)
-            assert not unhandled, (
-                f"{graph.name}: arm_controller is wired {unhandled}, which it "
-                f"has no handler for -- the input would be silently dropped"
-            )
-            has_health = "motor_health" in inputs
-            opts_out = str(
-                (node.get("env") or {}).get("ARM_CONTROL_PLANT_HEALTH", "")
-            ) in ("0", "false", "no")
-            assert has_health != opts_out, (
-                f"{graph.name}: arm_controller has motor_health={has_health} and "
-                f"ARM_CONTROL_PLANT_HEALTH opt-out={opts_out}. Exactly one is "
-                f"needed, or it waits forever for an armed edge and never streams"
-            )
-    assert checked, "no arm_controller found in any graph -- did paths change?"
-    print(f"arm_console: {checked} arm_controller wirings can stream")
+                # Home is a graph topic to the node that serves the console's grasp_request (the same Hand)
+                hands = [n for n in spec["nodes"]
+                         if (n.get("inputs") or {}).get("grasp_request") == f"{console['id']}/grasp_request"]
+                assert "hand_home" in (console.get("outputs") or []) and len(hands) == 1 and (
+                    hands[0]["inputs"].get("hand_home") == f"{console['id']}/hand_home"), (
+                    f"{graph.name}/{console['id']}: hand_home must reach the Hand node its grasp_request does")
+        assert not any(str(n.get("path", "")).endswith("arm_controller.py") for n in spec.get("nodes", [])), (
+            f"{graph.name}: the retired in-process arm_controller node is wired")
+        from arm_control.supervisor.dora_arm import unhandled_inputs
+        unhandled = unhandled_inputs(graph)
+        assert not unhandled, f"{graph.name}: supervised_arm is wired {unhandled}, which it has no handler for (dropped silently)"
+    assert checked, "no console found in any graph -- did paths change?"
+    print(f"arm_console: {checked} console wirings have one authority feedback source and their Home reaches their Hand")
 
 
 def cli() -> None:
@@ -1475,6 +1925,8 @@ def cli() -> None:
         _check_routes()
         _check_payload_declaration()
         _check_graphs()
+        _check_planner_limits()
+        _check_plan_world_cache()
     else:
         main()
 

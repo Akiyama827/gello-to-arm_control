@@ -10,9 +10,15 @@ import math
 
 import numpy as np
 
+from arm_control.contracts.impedance import cartesian_values
 from arm_control.control.gains import validate_torque_limits
 from arm_control.motion import JointTrajectory
 
+
+# Position-envelope rounding allowance (rad), one value for the waypoints, the certified curve and every servo command: the curve
+# check always allowed it, the sample and servo checks compared strictly, so a goal ON a joint limit -- which the evaluator can sample
+# one ulp past -- was admitted and then faulted mid-move ("non-finite or invalid servo command"). 1e-8 rad is far below any encoder.
+ENVELOPE_TOL = 1e-8
 
 @dataclass(frozen=True)
 class ExecutionPolicy:
@@ -27,10 +33,14 @@ class ExecutionPolicy:
     position_upper: np.ndarray | None = None
     velocity_limits: np.ndarray | None = None
     acceleration_limits: np.ndarray | None = None
+    # The least joint kp (N.m/rad, every joint) a cartesian_impedance leg may carry: the RT's fault/stale hold keeps only the
+    # joint law, so a leg whose stiffness lives in K_c alone would hold limp (operator 2026-10-09). None: no Cartesian legs.
+    cartesian_kp_min: float | None = None
 
     def __post_init__(self):
         for field in fields(self):
-            if field.name in ("torque_limits", "velocity_limits", "acceleration_limits", "position_lower", "position_upper"):
+            if field.name in ("torque_limits", "velocity_limits", "acceleration_limits", "position_lower", "position_upper",
+                              "cartesian_kp_min"):
                 continue
             value = float(getattr(self, field.name))
             if not math.isfinite(value) or value <= 0:
@@ -61,12 +71,33 @@ class ExecutionPolicy:
                 object.__setattr__(self, name, value)
             if np.any(self.position_lower >= self.position_upper):
                 raise ValueError("execution_policy position bounds must be ordered")
+        if self.cartesian_kp_min is not None:
+            value = float(self.cartesian_kp_min)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("execution_policy.cartesian_kp_min must be finite and positive")
+            object.__setattr__(self, "cartesian_kp_min", value)
 
     @property
     def period(self):
         return 1.0 / self.command_rate_hz
 
-    def plan_error(self, plan, measured, n_arm):
+    def envelope(self, measured=None):
+        """The admissible position band: the description's envelope, widened per joint to ``measured`` (a pose, or rows
+        of poses) where that already lies outside it (operator 2026-10-09: never further out). A joint gravity rested past
+        its limit -- an arm resting on its stops while disarmed -- can be held where it is and brought back in, never driven
+        further out: the setpoint/1 escape rule, for every command and plan. The controller passes the pose it ARMed at."""
+        if self.position_lower is None:
+            return None
+        if measured is None:
+            return self.position_lower, self.position_upper
+        q = np.atleast_2d(np.asarray(measured, dtype=float))  # one pose, or several the arm was at (rows)
+        if q.shape[1:] != self.position_lower.shape or not np.isfinite(q).all():
+            return self.position_lower, self.position_upper
+        return np.minimum(self.position_lower, q.min(axis=0)), np.maximum(self.position_upper, q.max(axis=0))
+
+    def plan_error(self, plan, measured, n_arm, *, been=None):
+        """Why ``plan`` may not run, or None. ``measured`` is the pose its start must be near; the position envelope widens
+        to ``been`` (default: ``measured``), the pose(s) a caller may hold the arm at -- the controller's pose at ARM."""
         q, v, t = plan["positions"], plan["velocities"], plan["times"]
         if q.ndim != 2 or q.shape[1] != n_arm:
             return f"trajectory must have {n_arm} joint columns"
@@ -77,8 +108,10 @@ class ExecutionPolicy:
                 return "trajectory contains non-finite values"
         if np.any(np.diff(t) <= 0):
             return "trajectory times must be strictly increasing"
-        if self.position_lower is not None:
-            if np.any(q < self.position_lower) or np.any(q > self.position_upper):
+        band = self.envelope(measured if been is None else been)
+        if band is not None:
+            if (np.any(q < band[0] - ENVELOPE_TOL)
+                    or np.any(q > band[1] + ENVELOPE_TOL)):
                 return "trajectory outside configured position/velocity safety envelope"
         dt = np.diff(t)[:, None]
         if self.velocity_limits is not None:
@@ -108,9 +141,9 @@ class ExecutionPolicy:
         # a cornered one was already refused -- so it closes the hole without
         # newly refusing anything the retimer produces today.
         curve = JointTrajectory(times=t, positions=q, velocities=v).bounds()
-        if self.position_lower is not None:
-            if (np.any(curve["q_min"] < self.position_lower - 1e-8)
-                    or np.any(curve["q_max"] > self.position_upper + 1e-8)):
+        if band is not None:
+            if (np.any(curve["q_min"] < band[0] - ENVELOPE_TOL)
+                    or np.any(curve["q_max"] > band[1] + ENVELOPE_TOL)):
                 return ("interpolated trajectory leaves the position envelope "
                         "between waypoints")
         if self.velocity_limits is not None:
@@ -124,19 +157,24 @@ class ExecutionPolicy:
         for key in ("kp", "kd"):
             if plan[key].shape != (n_arm,) or np.any(plan[key] < 0):
                 return f"trajectory {key} must be a nonnegative joint vector"
-        cartesian, poses = plan.get("cartesian"), plan.get("cartesian_poses")
-        if cartesian is not None or poses is not None:
-            if cartesian is None or poses is None:
-                return "Cartesian trajectory needs both poses and impedance settings"
-            if poses.shape != (len(t), 7) or not np.isfinite(poses).all():
-                return "Cartesian trajectory poses must be finite sample-by-7 values"
-            for key, shape in (("task_R", (3, 3)), ("kc", (6,)), ("dc", (6,))):
-                value = np.asarray(cartesian.get(key), dtype=float)
-                if value.shape != shape or not np.isfinite(value).all():
-                    return f"Cartesian trajectory {key} must be finite with shape {shape}"
-                if key != "task_R" and np.any(value < 0):
-                    return f"Cartesian trajectory {key} must be nonnegative"
-        error = float(np.max(np.abs(q[0] - measured)))
+        poses = plan.get("cartesian_poses")  # visualisation only: the plant's target is FK(q_des)
+        if poses is not None and (poses.shape != (len(t), 7) or not np.isfinite(poses).all()):
+            return "Cartesian trajectory poses must be finite sample-by-7 values"
+        if plan.get("cartesian") is not None:
+            try:
+                cartesian_values(plan["cartesian"])
+            except (TypeError, ValueError) as exc:
+                return f"Cartesian impedance spec refused: {exc}"
+            if self.cartesian_kp_min is None:
+                return "this robot's execution policy admits no Cartesian legs (no cartesian_kp_min)"
+            if np.any(plan["kp"] < self.cartesian_kp_min):
+                return (f"a Cartesian leg needs joint kp >= {self.cartesian_kp_min:g} on every joint: the fault hold keeps "
+                        "only the joint law")
+        return self.start_error(q[0], measured)
+
+    def start_error(self, start, measured):
+        """Recheck the live start pose when an already validated plan is released."""
+        error = float(np.max(np.abs(start - measured)))
         if not error <= self.start_pos_tol_rad:
             return f"start point {error:.3f} rad from measured pose (tol {self.start_pos_tol_rad:g}) — re-plan"
         return None
@@ -147,13 +185,15 @@ class ExecutionPolicy:
     def tracking_error_exceeded(self, command, measured):
         return not float(np.max(np.abs(command.q_des - measured))) <= self.abort_pos_err_rad
 
-    def command_valid(self, command, n_arm):
+    def command_valid(self, command, n_arm, measured=None):
         for key in ("q_des", "qd_des", "tau_ff", "kp", "kd"):
             value = np.asarray(getattr(command, key))
             if value.shape != (n_arm,) or not np.isfinite(value).all():
                 return False
-        if self.position_lower is not None:
-            if np.any(command.q_des < self.position_lower) or np.any(command.q_des > self.position_upper):
+        band = self.envelope(measured)
+        if band is not None:
+            if (np.any(command.q_des < band[0] - ENVELOPE_TOL)
+                    or np.any(command.q_des > band[1] + ENVELOPE_TOL)):
                 return False
         if self.velocity_limits is not None and np.any(np.abs(command.qd_des) > self.velocity_limits + 1e-8):
             return False
@@ -167,8 +207,8 @@ def build_execution_policy(policy_config, *, torque_limits, joint_limits=None):
     One constructor for every caller, because the interesting part is not the
     dataclass but WHICH numbers are allowed to come from YAML. The position
     envelope is a factory limit: the URDF owns it and a deployment reads it.
-    A deployment may still declare both bounds to NARROW the machine
-    deliberately -- an operating choice -- and that declaration wins here.
+    A deployment may declare both bounds to NARROW the machine deliberately,
+    but may never expand the description's position envelope.
 
     ``joint_limits`` is the description's ``(lower, upper)``; non-finite
     bounds (a continuous joint) are left unset rather than fabricated.
@@ -177,8 +217,14 @@ def build_execution_policy(policy_config, *, torque_limits, joint_limits=None):
     if policy_config is None:
         return None
     config = dict(policy_config)
-    if config.get("position_lower") is None and joint_limits is not None:
+    if (config.get("position_lower") is None and config.get("position_upper") is None
+            and joint_limits is not None):
         lower, upper = (np.asarray(v, dtype=float) for v in joint_limits)
         if np.isfinite(lower).all() and np.isfinite(upper).all():
             config["position_lower"], config["position_upper"] = lower, upper
-    return ExecutionPolicy(**config, torque_limits=torque_limits)
+    policy = ExecutionPolicy(**config, torque_limits=torque_limits)
+    if joint_limits is not None and policy.position_lower is not None:
+        lower, upper = joint_limits
+        if np.any(policy.position_lower < lower) or np.any(policy.position_upper > upper):
+            raise ValueError("execution_policy position bounds may only narrow the robot description")
+    return policy

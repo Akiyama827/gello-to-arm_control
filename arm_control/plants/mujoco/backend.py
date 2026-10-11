@@ -64,6 +64,10 @@ def _warn_python_pd_once() -> None:
     )
 
 
+#: the RT server's servo period: the unit of its slew budget (rt/src/server.hpp, 1 kHz)
+RT_TICK_S = 0.001
+
+
 class MuJoCoUnavailableError(RuntimeError):
     """Raised when the scene cannot be built (missing assets, bad config)."""
 
@@ -74,7 +78,7 @@ class MuJoCoUnavailableError(RuntimeError):
 # ponytail: J_rotor is still the 4340 base motors' measured 1.8e-5 -- DM
 # datasheets do not publish it and no module motor has been on the bus yet.
 # A 4310's rotor is smaller, so this is an upper bound; read the real value
-# with libs/arm_control/tools/bench/dm/read_params.py when one is reachable.
+# with tools/hw/dm_read_params.py when one is reachable.
 MODULE_ARMATURE = 10.0**2 * 1.8e-5  # 0.0018
 
 # Reflected rotor inertia (kg.m^2) for the ARM's joints. Franka's own published
@@ -467,6 +471,14 @@ def compose_workcell_scene(
                 ),
             )
             spec.add_equality(**equality)
+    for weld in scene.welds:
+        spec.add_equality(
+            name=weld.name, type=mujoco.mjtEq.mjEQ_WELD,
+            objtype=mujoco.mjtObj.mjOBJ_BODY, name1=weld.body1, name2=weld.body2,
+            active=True, data=[0., 0., 0., *weld.relpose, 1.0], solref=list(weld.solref),
+        )
+    for index, (body1, body2) in enumerate(scene.contact_exclusions):
+        spec.add_exclude(name=f"scene_grasp_{index}", bodyname1=body1, bodyname2=body2)
     for actuator in list(spec.actuators):
         spec.delete(actuator)
     return spec
@@ -708,10 +720,16 @@ class MuJoCoBackend:
     # they get fine CoACD decomposition, module-only contact bits, and pad-force
     # readout. Empty = a scene with no grip fingers.
     finger_body_match: tuple = ()
-    # Servo slew budget, N·m per plant tick. Same default as the RT server's
+    # Servo slew budget, N·m per 1 ms RT TICK. Same default as the RT server's
     # ServerConfig::slew (rt/src/server.hpp) — the sim has no better source,
     # and a twin that ramps faster than the robot flatters every transient.
+    # The servo law applies it per CALL, once per plant step, so _apply_pd
+    # scales it by step/1 ms: at a 0.5 ms step the twin slews at the robot's
+    # 1000 N·m/s, not twice that.
     slew_per_tick: float = 1.0
+    # Reflected rotor inertia added to each arm joint of a SINGLE-MODEL plant (kg.m^2), from the robot's own config
+    # (`sim_armature`); 0 = the description's own. Scene and workcell plants keep their own rule.
+    arm_armature: float = 0.0
     model_revision: int = 0
 
     model: Any = field(default=None, init=False, repr=False)
@@ -963,8 +981,8 @@ class MuJoCoBackend:
             gripper_present.append(name)
         if len(gripper_present) == 2:
             # Both jaws run off ONE actuator on the real hardware -- the FR3's
-            # URDF says so (`<mimic joint="fr3_finger_joint1"/>` on finger 2),
-            # and the DM pair has its joint_mimics block. MuJoCo's URDF
+            # URDF says so (`<mimic joint="fr3_finger_joint1"/>` on finger 2).
+            # MuJoCo's URDF
             # importer silently DROPS mimic tags, so without this the sim has
             # two free jaws: each closes until it personally finds contact, and
             # an off-centre part is simply held where it sits (measured: pads
@@ -1123,6 +1141,17 @@ class MuJoCoBackend:
                 self.data.qpos[joint.qposadr[0]] = float(value)
         else:
             _transfer_state(*previous, self.model, self.data)
+        if self.arm_armature and self.scene is None and self.workcell_scene is None:
+            # A single-model arm carries its robot's reflected rotor inertia (`sim_armature`; the FR3 states Franka's published
+            # MJCF value, the one the workcell plant applies as ARM_ARMATURE). Without it the FR3 wrist (link inertia
+            # ~0.002 kg.m^2) limit-cycles under the explicit PD; measured after a move at a 0.5 ms step: 0.05 rad/s residual on
+            # joint 7 without, 0.0000 with. Fingers excluded (their "armature" is a mass, as in scene mode).
+            fingers = set(self.gripper_joints)
+            for name in self.joint_names:
+                if name in fingers:
+                    continue
+                dof = self.model.joint(name).dofadr[0]
+                self.model.dof_armature[dof] = max(float(self.arm_armature), float(self.model.dof_armature[dof]))
         if self.workcell_scene is not None and self.scene_state is not None:
             if previous[0] is None:
                 # SPAWN ONLY. actor_q is the scene's declared start pose, and
@@ -1266,13 +1295,24 @@ class MuJoCoBackend:
         )
         self._jacp = np.zeros((3, self.model.nv))
         self._jacr = np.zeros((3, self.model.nv))
+        # The Cartesian law's frames, as the RT box has them. The robot BASE is the body the EE's kinematic chain hangs off: the
+        # parent of the chain's first jointed body (the FR3's fr3_link0 = libfranka's O frame). Found from the EE, not from
+        # joint_names[0], which in a composed world may be another actor's. The target FK(q_des) runs on a scratch state.
+        self._base_bid, self.ee_chain_joints = -1, []
+        body = self._ee_bid
+        while body > 0:
+            if self.model.body_jntnum[body] > 0:
+                self._base_bid = int(self.model.body_parentid[body])
+                start = self.model.body_jntadr[body]
+                self.ee_chain_joints[:0] = [self.model.joint(j).name for j in range(start, start + self.model.body_jntnum[body])]
+            body = int(self.model.body_parentid[body])
+        self._fk_data = mujoco.MjData(self.model)
         self._gripper_act = [
             self.model.actuator(f"{n}_servo").id for n in gripper_present
         ]
         # The joints that ACTUALLY exist in this model, not the ones configured:
-        # ``gripper_joints`` is a superset covering every arm (the DM assembler's
-        # Gripper_1/2 and the FR3's fr3_finger_joint1/2), and only one pair is
-        # present in any given model.
+        # ``gripper_joints`` may name more than one arm's fingers, and only the
+        # pair present in this model is used.
         self._gripper_names = list(gripper_present)
         # Finger travel from the MODEL, not a constant: the clamp in
         # _set_gripper_targets must match whatever gripper this scene has.
@@ -1291,8 +1331,7 @@ class MuJoCoBackend:
         for act, name in zip(self._gripper_act, gripper_present):
             self.data.ctrl[act] = self.data.qpos[self.model.joint(name).qposadr[0]]
         # The spawn rest IS this gripper's OPEN: the release trigger compares
-        # commanded ctrl against it (a literal `<= 0.004` assumed the DM's
-        # open-at-zero and never fired for the FR3's open-at-0.04). Latched
+        # commanded ctrl against it (the FR3 opens at 0.04, not at zero). Latched
         # ONCE, at spawn — re-deriving it after a dock would record whatever
         # the fingers happen to be doing (mid-grip!) as "open".
         self._gripper_open_ctrl = [float(self.data.ctrl[a]) for a in self._gripper_act]
@@ -1441,7 +1480,7 @@ class MuJoCoBackend:
                 found.append(i)
         return found
 
-    def apply_gripper_command(self, positions, force_n: float = 0.0) -> None:
+    def apply_gripper_command(self, positions, force_n: float = 0.0, *, fingers=None) -> None:
         """Servo the finger joints toward ``positions`` (clamped to travel).
 
         ``force_n`` > 0 lowers the finger servos' force cap to it for this and
@@ -1458,27 +1497,36 @@ class MuJoCoBackend:
         one-sided shove the module slid out of. Under force both fingers load
         equally (-10/-10 N, both in contact).
 
-        The plant takes every command verbatim: gripper OWNERSHIP (grasp gate
-        vs orchestrator open/hold) is bridge policy, not plant policy."""
-        self._gripper_force_mode = force_n > 0.0
-        self._set_gripper_force(force_n if force_n > 0.0 else self.gripper_force_n)
-        self._set_gripper_targets(positions)
+        The plant takes every command verbatim: gripper OWNERSHIP (grasp
+        vs orchestrator open/hold) is policy above the plant, not plant policy.
 
-    def _set_gripper_force(self, force_n: float) -> None:
-        """Cap every finger servo at ``force_n`` (N)."""
+        ``fingers``: indices into the world's finger joints (one Hand of a world with several, ``ScenePlant.finger_indices``);
+        None is every finger."""
+        # ponytail: one force-mode flag for the world (read by the in-hand monitor); per Hand if two Hands ever grasp at once
+        self._gripper_force_mode = force_n > 0.0
+        idx = self._finger_indices(fingers)
+        self._set_gripper_force(force_n if force_n > 0.0 else self.gripper_force_n, idx)
+        self._set_gripper_targets(positions, idx)
+
+    def _finger_indices(self, fingers) -> list[int]:
+        return list(range(len(getattr(self, "_gripper_act", None) or []))) if fingers is None else list(fingers)
+
+    def _set_gripper_force(self, force_n: float, idx) -> None:
+        """Cap the selected finger servos at ``force_n`` (N)."""
         if not getattr(self, "_gripper_act", None):
             return
-        for act in self._gripper_act:
-            self.model.actuator_forcerange[act] = (-float(force_n), float(force_n))
+        for i in idx:
+            self.model.actuator_forcerange[self._gripper_act[i]] = (-float(force_n), float(force_n))
 
-    def _set_gripper_targets(self, positions) -> None:
+    def _set_gripper_targets(self, positions, idx) -> None:
         if not getattr(self, "_gripper_act", None):
             return
         p = np.asarray(positions, dtype=float).reshape(-1)
-        for act, value, (lo, hi) in zip(self._gripper_act, p, self._gripper_range):
-            self.data.ctrl[act] = float(np.clip(value, lo, hi))
+        for i, value in zip(idx, p):
+            lo, hi = self._gripper_range[i]
+            self.data.ctrl[self._gripper_act[i]] = float(np.clip(value, lo, hi))
 
-    def gripper_positions(self) -> np.ndarray:
+    def gripper_positions(self, fingers=None) -> np.ndarray:
         """TRUE finger joint positions (empty when the scene has no gripper).
 
         The bridge echoes these into the 7th motor slot — a jammed finger
@@ -1488,23 +1536,26 @@ class MuJoCoBackend:
             return np.empty(0)
         self.load()
         return np.array(
-            [float(self.data.joint(str(n)).qpos[0]) for n in self._gripper_names]
+            [float(self.data.joint(str(self._gripper_names[i])).qpos[0]) for i in self._finger_indices(fingers)]
         )
 
-    def gripper_efforts(self) -> np.ndarray:
-        """Per-finger servo forces in N (plant SENSING, the sim's analog of the
-        DM gripper motor's torque estimate). The bridge's GraspGate thresholds
-        these — grasp success is policy and does not live in the plant."""
+    def gripper_efforts(self, fingers=None) -> np.ndarray:
+        """Per-finger servo forces in N (plant SENSING). Grasp success is
+        policy above the plant and does not live here."""
         if not getattr(self, "_gripper_act", None):
             return np.empty(0)
         self.load()
         return np.array(
-            [float(self.data.actuator_force[a]) for a in self._gripper_act]
+            [float(self.data.actuator_force[self._gripper_act[i]]) for i in self._finger_indices(fingers)]
         )
 
     # -- motor I/O --------------------------------------------------------
     def apply_motor_command(self, command: dict[str, np.ndarray]) -> None:
         self.load()
+        # A plant that cannot run the Cartesian law REFUSES the whole word (as the RT link and SimLink do), before installing
+        # any of it, rather than running the joint word alone as if it were the leg that was planned.
+        if command.get("cartesian") is not None and not self.supports_cartesian:
+            raise ValueError("this plant cannot run the Cartesian law (no EE on a commanded jointed chain, or no compiled law)")
         soft = command.get("pose_hold")
         if soft is not None:
             pose_hold_values(soft)
@@ -1521,10 +1572,16 @@ class MuJoCoBackend:
             .copy()
             for key in ("position", "velocity", "torque", "kp", "kd")
         }
-        # Optional Cartesian-impedance block (messages.unpack_motor_command).
-        # None = every graph that does not send one behaves exactly as before.
+        # Optional Cartesian-impedance block (messages.unpack_motor_command). None = every graph that does not send one
+        # behaves exactly as before; a refused one was refused above, before anything was installed.
         self._last_command["cartesian"] = command.get("cartesian")
         self._last_command["pose_hold"] = soft
+
+    @property
+    def supports_cartesian(self) -> bool:
+        """The cartesian_impedance law can run: an EE on a jointed chain, and the compiled law to call."""
+        return (getattr(self, "_base_bid", -1) >= 0 and _servo is not None and hasattr(_servo, "cartesian_torque")
+                and all(j in self.joint_names for j in self.ee_chain_joints))
 
     @property
     def supports_pose_hold(self) -> bool:
@@ -1532,17 +1589,27 @@ class MuJoCoBackend:
                 and getattr(self, "_ee_bid", -1) >= 0
                 and _servo is not None and hasattr(_servo, "PoseHold"))
 
-    def _cartesian_tau_ff(self, tau_ff: np.ndarray, cart: dict) -> np.ndarray:
-        """Fold the task-frame Cartesian impedance into tau_ff.
+    def _ee_pose_at(self, q_des: np.ndarray) -> np.ndarray:
+        """World EE pose ``[x, y, z, qw, qx, qy, qz]`` at the planned joints ``q_des``, everything else as measured: the RT's
+        ``ee_pose_at``, on this model."""
+        fk = self._fk_data
+        fk.qpos[:] = self.data.qpos
+        fk.mocap_pos[:], fk.mocap_quat[:] = self.data.mocap_pos, self.data.mocap_quat
+        fk.qpos[self._qadr] = q_des
+        mujoco.mj_kinematics(self.model, fk)
+        return np.r_[fk.xpos[self._ee_bid], fk.xquat[self._ee_bid]]
 
-        The twin computes J and the EE pose ITSELF, from MuJoCo, exactly as
-        the RT loop computes them from libfranka — the PC only ever sends the
-        target and the stiffness. Keeping that split honest here is the point:
-        a sim that took a PC-computed Jacobian would not be testing the thing
-        the robot actually runs.
+    def _cartesian_tau_ff(self, tau_ff: np.ndarray, cart: dict, q_des: np.ndarray) -> np.ndarray:
+        """Fold the task-frame Cartesian impedance into tau_ff: the RT box's v8 law, on the twin.
+
+        The PC sends only the task frame (robot BASE frame) and the stiffness. The twin computes J, the EE pose and the target
+        FK(q_des) ITSELF, from MuJoCo, exactly as the RT loop computes them from libfranka; MuJoCo's frame is the world, so the
+        task frame is rotated by the base body's measured orientation. A sim that took a PC-computed target or Jacobian would
+        not be testing the thing the robot runs.
         """
-        if self._ee_bid < 0 or _servo is None:
-            return tau_ff  # no EE configured, or no compiled law to call
+        if cart.get("frame") != "base":
+            raise ValueError("the Cartesian spec is in the robot BASE frame")
+        target = self._ee_pose_at(q_des)
         mujoco.mj_jacBody(self.model, self.data, self._jacp, self._jacr, self._ee_bid)
         # 6 x n row-major, ACTUATED columns only — the layout servo_law.hpp
         # documents. Rows the arm cannot drive would just be noise in J^T f.
@@ -1551,11 +1618,11 @@ class MuJoCoBackend:
         return _servo.cartesian_torque(
             tau_ff=tau_ff,
             J=jac,
-            R_task=cart["task_R"],
+            R_task=self.data.xmat[self._base_bid].reshape(3, 3) @ np.asarray(cart["task_R"], dtype=float),
             x=body.xpos,
             quat=body.xquat,  # MuJoCo quats are [w,x,y,z], like the law's
-            x_des=cart["pose"][:3],
-            quat_des=cart["pose"][3:7],
+            x_des=target[:3],
+            quat_des=target[3:7],
             # Twist from the SAME J, so the damping term can never disagree
             # with the stiffness term about what the EE is doing.
             twist=jac @ self.data.qvel[self._vadr],
@@ -1596,7 +1663,7 @@ class MuJoCoBackend:
             kp, kd = np.zeros(self.num_motors), np.zeros(self.num_motors)
         cart = cmd.get("cartesian")
         if cart is not None:
-            tau_ff = self._cartesian_tau_ff(tau_ff, cart)
+            tau_ff = self._cartesian_tau_ff(tau_ff, cart, cmd["position"])
         # Torque is computed at the FULL planned width and written only to the
         # joints that currently have an actuator: a module still in its nest is
         # commanded (the bridge does not know or care) and that command lands
@@ -1626,7 +1693,7 @@ class MuJoCoBackend:
             kd=kd,
             tau_ref=tau_ref,
             tau_limit=self._tau_limit,
-            slew_per_tick=float(self.slew_per_tick),
+            slew_per_tick=float(self.slew_per_tick) * float(self.model.opt.timestep) / RT_TICK_S,
         )[self._driven]
 
     def ee_wrench(self) -> np.ndarray:
@@ -1676,7 +1743,7 @@ class MuJoCoBackend:
         if self.scene is not None and getattr(self, "_gripper_act", None):
             # SENSOR-LOCAL topology physics — the plant senses and reacts to
             # its own world; the grasp PROTOCOL (close sequencing, success,
-            # drop events) lives in the bridge's GraspGate:
+            # drop events) lives above the plant:
             # - a nest fixture YIELDS once the gripper truly squeezes that
             #   module (a fixture's magnets give way to the hand's pull);
             # - the keyed mate COMMITS when the hand lets go with the
@@ -1794,6 +1861,39 @@ class MuJoCoBackend:
                 except Exception:
                     self.viewer = None  # window closed — keep simulating
         return self.motor_state()
+
+    def observe(self) -> dict:
+        """This tick's world by name, for observe/1: plant time, model revision, the raw ``qpos`` (valid with that revision), and
+        the position and velocity of every motor and finger joint. Any scene (composed or workcell) adds the in-hand pose,
+        the constraint reactions and the topology; a workcell scene also adds its revision, attachments and constraints (and the whole scene_state echo); a world with fingers adds the gripper; an EE
+        body adds the external wrench. A field the world cannot have is None."""
+        self.load()
+        q, dq = {}, {}
+        for name in dict.fromkeys([*self.joint_names, *self.gripper_joints]):
+            joint = self.model.joint(name)
+            q[name], dq[name] = float(self.data.qpos[joint.qposadr[0]]), float(self.data.qvel[joint.dofadr[0]])
+        # Every free body (a loose module, a part) by its body name: qpos is [x, y, z, qw, qx, qy, qz] in the world frame for a
+        # free joint, exact after the step. A world with none (one model) has no object poses.
+        objects = {(self.model.body(int(self.model.jnt_bodyid[j])).name or f"body{int(self.model.jnt_bodyid[j])}"):
+                   self.data.qpos[self.model.jnt_qposadr[j]: self.model.jnt_qposadr[j] + 7].tolist()
+                   for j in range(self.model.njnt) if self.model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE}
+        world = dict(sim_time_s=float(self.data.time), model_revision=int(self.model_revision), joint_q=q, joint_dq=dq,
+                     qpos=self.data.qpos.tolist(), scene_revision=None, attachments=None, constraints=None, scene_state=None,
+                     inhand_pose=None,
+                     constraint_force=None, topology=None, gripper=None, ee_wrench=None, object_poses=objects or None)
+        if self.scene_state is not None:  # a workcell world: the runtime overlay
+            from arm_control.contracts.scene import scene_state_payload
+            payload = scene_state_payload(self.scene_state)
+            world.update(scene_revision=payload["revision"], attachments=payload["attachments"],
+                         constraints=payload["constraints"], scene_state=payload)
+        if self.scene is not None or self.scene_state is not None:  # any scene, composed or workcell: what the node publishes
+            topology = {k: v for k, v in self.topology_state().items() if k != "schema"}  # as published (_without_schema)
+            world.update(inhand_pose=self.inhand_pose(), constraint_force=self.active_constraint_reactions(), topology=topology)
+        if getattr(self, "_gripper_act", None):
+            world["gripper"] = dict(positions=self.gripper_positions().tolist(), efforts=self.gripper_efforts().tolist())
+        if self.ee_body:
+            world["ee_wrench"] = dict(frame="world", wrench=self.ee_wrench().tolist())
+        return world
 
     def motor_state(self) -> dict[str, np.ndarray]:
         self.load()
@@ -1917,44 +2017,6 @@ class MuJoCoBackend:
                 continue
             out[name] = self.equality_reaction(name).tolist()
         return out
-
-    def release_constraint_if_force_exceeds(
-        self,
-        name: str,
-        axis_world,
-        threshold_n: float,
-    ) -> bool:
-        """Disable a named equality once its axial reaction exceeds a threshold."""
-        axis = np.asarray(axis_world, dtype=float).ravel()
-        norm = float(np.linalg.norm(axis))
-        threshold = float(threshold_n)
-        if axis.shape != (3,) or not np.isfinite(axis).all() or norm <= 0.0:
-            raise ValueError("axis_world must be a finite non-zero 3-vector")
-        if not np.isfinite(threshold) or threshold <= 0.0:
-            raise ValueError("threshold_n must be positive and finite")
-        if not self.constraint_active(name):
-            return False
-        axial = abs(float(self.equality_reaction(name)[:3] @ (axis / norm)))
-        if axial <= threshold:
-            return False
-        self.set_constraint(name, False)
-        return True
-
-    def aggregate_inertial(self, body_names: list[str]) -> dict[str, list[float] | float]:
-        self.load()
-        bodies = [self.data.body(name) for name in body_names]
-        masses = np.asarray([self.model.body_mass[body.id] for body in bodies])
-        mass = float(masses.sum())
-        if mass <= 0.0:
-            raise ValueError("aggregate bodies must have positive total mass")
-        com = sum((m * body.xipos for m, body in zip(masses, bodies)), np.zeros(3)) / mass
-        inertia = np.zeros((3, 3))
-        for m, body in zip(masses, bodies):
-            local = np.diag(self.model.body_inertia[body.id])
-            rot = body.ximat.reshape(3, 3)
-            delta = body.xipos - com
-            inertia += rot @ local @ rot.T + m * (delta @ delta * np.eye(3) - np.outer(delta, delta))
-        return {"mass": mass, "com": com.tolist(), "inertia": inertia.tolist()}
 
     # -- weld topology ----------------------------------------------------
     def _eq_id(self, name: str) -> int:
@@ -2099,7 +2161,7 @@ class MuJoCoBackend:
 def _demo() -> None:
     """Self-check for the compiled servo law this plant closes.
 
-    Run: ``python -m arm_control.simulation.mujoco_backend --demo``.
+    Run: ``python -m arm_control.plants.mujoco.backend --demo``.
     The smallest thing that fails if the Cartesian math breaks — no scene, no
     physics, just the law.
     """

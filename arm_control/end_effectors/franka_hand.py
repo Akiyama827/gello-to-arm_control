@@ -1,14 +1,12 @@
 """Grasp request/result state machine for self-sensing hands (Franka Hand).
 
-The DM path senses grasps bridge-side (``GraspGate`` thresholds the gripper
-motor torque). A Franka Hand states its own verdict: ``grasp()`` returns the
+A Franka Hand states its own grasp verdict: ``grasp()`` returns the
 width-band-under-force check, and ``is_grasped`` tracks it afterwards. This
 FSM turns that verdict stream into the orchestrator's grasp contract:
 
 - ``close``  -> caller sends the hand a grasp action; the eventual verdict
   (``gdone``) becomes the GRASPED/MISSED ``grasp_result``.
-- ``release`` -> caller opens the jaws; acked immediately (unsensed, same as
-  the DM release path).
+- ``release`` -> caller opens the jaws; acked immediately (unsensed).
 - after a held grasp, ``is_grasped`` falling is the drop event: a second,
   failed result under the close request_id — the LOST semantics the
   orchestrator already freezes on.
@@ -21,18 +19,49 @@ from __future__ import annotations
 
 import math
 from numbers import Real
+from typing import NamedTuple
+
+
+class HandLimits(NamedTuple):
+    """A gripper's command envelope, as its hand_bridge states it (``LIMITS <width_max_m> <speed_max_mps> <force_min_n>
+    <force_max_n>``). A bridge that states none is the Franka Hand. ``force_max_n == 0``: no calibrated force grasp (GRASP is
+    refused; MOVE/STOP/STATE work)."""
+    width_max_m: float
+    speed_max_mps: float
+    force_min_n: float
+    force_max_n: float
+
+    @property
+    def force_grasp(self) -> bool:
+        return self.force_max_n > 0
+
 
 # Franka Hand product manual 1.2 EN, section 5.1: 30-70 N continuous,
 # 80 mm travel, 50 mm/s per finger (0.10 m/s total opening width).
 # https://download.franka.de/documents/220010_Product%20Manual_Franka%20Hand_1.2_EN.pdf
-MIN_FORCE_N = 30.0
-MAX_FORCE_N = 70.0
-MAX_WIDTH_M = 0.08
-MAX_SPEED_MPS = 0.10
+FRANKA_HAND = HandLimits(0.08, 0.10, 30.0, 70.0)
 
 
-def resolve_grasp_parameters(config: dict, payload: dict) -> dict:
-    """Validate an isolated request without changing configured defaults.
+def parse_limits(parts: list[str]) -> HandLimits:
+    """The ``LIMITS`` line's four numbers; ValueError unless finite, a positive stroke and speed, and 0 <= fmin <= fmax (both 0:
+    no force grasp)."""
+    if len(parts) != 5 or parts[0] != "LIMITS":
+        raise ValueError("LIMITS needs width_max speed_max force_min force_max")
+    limits = HandLimits(*(float(v) for v in parts[1:]))
+    if not (all(math.isfinite(v) for v in limits) and limits.width_max_m > 0 and limits.speed_max_mps > 0
+            and 0 <= limits.force_min_n <= limits.force_max_n):
+        raise ValueError(f"invalid hand limits {limits}")
+    return limits
+
+
+def require_force_grasp(limits: HandLimits, mode: str = "close") -> None:
+    """A close is a force GRASP: refused on a gripper that states none (MOVE, HOME and release still work)."""
+    if mode == "close" and not limits.force_grasp:
+        raise ValueError("this gripper has no calibrated force grasp (GRASP refused until its force map is measured)")
+
+
+def resolve_grasp_parameters(config: dict, payload: dict, limits: HandLimits = FRANKA_HAND) -> dict:
+    """Validate an isolated request without changing configured defaults, inside the gripper's stated envelope.
 
     Epsilon <= full stroke is an application bound, not a hardware rating.
     Force is the commanded setpoint; the Hand does not measure jaw force.
@@ -53,9 +82,12 @@ def resolve_grasp_parameters(config: dict, payload: dict) -> dict:
         if key in payload:
             result[key] = payload[key]
     for key, value in result.items():
-        low, high = ((MIN_FORCE_N, MAX_FORCE_N) if key == "force_n"
-                     else (0.0, MAX_SPEED_MPS) if key == "speed_mps"
-                     else (0.0, MAX_WIDTH_M))
+        if key == "force_n" and not limits.force_grasp:
+            result[key] = 0.0  # no force grasp: no force is commanded (a close is refused by require_force_grasp)
+            continue
+        low, high = ((limits.force_min_n, limits.force_max_n) if key == "force_n"
+                     else (0.0, limits.speed_max_mps) if key == "speed_mps"
+                     else (0.0, limits.width_max_m))
         if (isinstance(value, bool) or not isinstance(value, Real)
                 or not math.isfinite(value) or not low <= value <= high
                 or (key == "speed_mps" and value == 0)):
@@ -86,6 +118,7 @@ class HandGraspFsm:
         g = gripper_cfg
         self.measured_completion = measured_completion
         self._config = dict(g)
+        self.limits = FRANKA_HAND  # the bridge's stated envelope (the adapter updates it from LIMITS)
         self.parameters = resolve_grasp_parameters(g, {})
         self.grasp_width_m = float(g.get("grasp_width_m", 0.045))
         self.speed_mps = float(g.get("speed_mps", 0.05))
@@ -106,12 +139,13 @@ class HandGraspFsm:
         rid = str(payload.get("request_id", ""))
         tid = str(payload.get("target_id", ""))
         try:
-            parameters = resolve_grasp_parameters(self._config, payload)
+            require_force_grasp(self.limits, str(payload.get("mode", "close")))
+            parameters = resolve_grasp_parameters(self._config, payload, self.limits)
         except ValueError as exc:
             return None, _result(rid, tid, False, str(exc))
         self.parameters = parameters
         if str(payload.get("mode", "close")) == "release" and not self.measured_completion:
-            # Unsensed, like the DM release: ack now, jaws travel after.
+            # Unsensed: ack now, jaws travel after.
             self._pending = None
             self._held = None
             return "open", _result(rid, tid, True, "released")
@@ -195,5 +229,5 @@ class HandGraspFsm:
         return None
 
 
-__all__ = ["HandGraspFsm", "GRASP_TIMEOUT_S", "resolve_grasp_parameters",
-           "MIN_FORCE_N", "MAX_FORCE_N", "MAX_WIDTH_M", "MAX_SPEED_MPS"]
+__all__ = ["HandGraspFsm", "GRASP_TIMEOUT_S", "require_force_grasp", "resolve_grasp_parameters",
+           "HandLimits", "FRANKA_HAND", "parse_limits"]

@@ -19,6 +19,11 @@ let gripperSlider = null;
 let measuredRobot = null;
 let targetRobot = null;
 let planRobot = null;
+let staticGroup = null;
+let geometryVersion = -1;
+let carryRevision = -1;
+let carryPosting = false;
+let carryState = null;
 let planFrames = [];
 let planIndex = 0;
 let planVersion = -1;
@@ -34,6 +39,21 @@ let poseError = "";
 let speedDirty = false;
 let speedPosting = false;
 let modeError = "";
+let refinementPosting = false;
+$('refine').onchange = async () => {
+  refinementPosting = true;
+  $('refine').disabled = true;
+  updateMoveButtons();
+  try {
+    await post('/refinement', {refinement: $('refine').checked ? 'trajopt' : 'none'});
+    $('refine-status').textContent = 'Refinement changed. Plan and review a new preview.';
+  } catch (error) {
+    $('refine-status').textContent = error.message;
+  } finally {
+    refinementPosting = false;
+    updateMoveButtons();
+  }
+};
 const poseAxes = ["x", "y", "z", "roll", "pitch", "yaw"];
 const poseInputs = poseAxes.map((axis) => $(`pose-${axis}`));
 const speedInputs = [$("jog-cart-speed"), $("jog-joint-input")];
@@ -44,8 +64,9 @@ const fillPose = (pose) => poseValues(pose).forEach((value, i) => {
 const updateMoveButtons = () => {
   for (const button of $("buttons").children) {
     if (/^(Plan|Execute)/i.test(button.textContent)) {
-      button.disabled = poseDirty || posePosting || Boolean(posePending);
-      button.title = button.disabled ? "Apply the desired pose successfully before planning or executing" : "";
+      button.disabled = refinementPosting || poseDirty || posePosting || Boolean(posePending);
+      button.title = refinementPosting ? "Wait for the refinement selection" :
+        button.disabled ? "Apply the desired pose successfully before planning or executing" : "";
     }
   }
 };
@@ -93,6 +114,34 @@ const buildPresets = (presets) => {
     $("pose-status").textContent = `"${preset.name}" filled into Desired \u00b7 not applied`;
     updateMoveButtons();
   };
+};
+// Joint presets SET the target on the server (the page sends only the name);
+// Plan/Execute still gate the motion. A Desired draft is superseded.
+const buildJointPresets = (names) => {
+  const row = $("joint-preset-row");
+  row.replaceChildren();
+  row.hidden = !(names || []).length;
+  for (const name of names || []) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `Target: ${name}`;
+    button.onclick = async () => {
+      if (posePosting) return;
+      const edits = poseEdits;
+      try {
+        await post("/joint_preset", { name });
+        // A Desired draft typed while this was in flight stays a draft.
+        if (poseEdits === edits) poseDirty = false;
+        posePending = null;
+        poseError = "";
+      } catch (error) {
+        poseError = error.message;
+        $("pose-status").textContent = poseError;
+      }
+      updateMoveButtons();
+    };
+    row.append(button);
+  }
 };
 
 $("apply-pose").onclick = async () => {
@@ -207,6 +256,8 @@ const updateMode = (mode) => {
 
 const updateHand = (hand) => {
   for (const id of ["hand-grasp", "hand-open"]) $(id).disabled = handPosting || !hand?.enabled;
+  // Home needs no force grasp; the server re-checks ARM, freshness, idle and empty.
+  $("hand-home").disabled = handPosting || !hand?.feedback_fresh || Boolean(hand?.busy) || hand?.is_grasped !== false;
   if (gripperSlider) gripperSlider[0].disabled = handPosting || Boolean(hand?.busy);
   $("hand-status").textContent = handError || [hand?.status, hand?.reason].filter(Boolean).join(" · ");
   $("hand-feedback").textContent = hand?.measured_width_mm == null
@@ -240,6 +291,19 @@ const sendHand = async (mode) => {
 };
 $("hand-grasp").onclick = () => sendHand("close");
 $("hand-open").onclick = () => sendHand("release");
+$("hand-home").onclick = async () => {
+  if (handPosting) return;
+  handPosting = true;
+  handError = "";
+  try {
+    await post("/hand_home", {});
+  } catch (error) {
+    handError = error.message;
+    $("hand-status").textContent = handError;
+  } finally {
+    handPosting = false;
+  }
+};
 
 // -- gizmo: drag the target, one axis at a time ------------------------------
 gizmo.addEventListener("objectChange", () => {
@@ -327,13 +391,76 @@ const buildJogPad = (jog) => {
 };
 
 // -- first paint -------------------------------------------------------------
-const build = async (state) => {
-  building = true;
+const buildGeometry = async () => {
   const geometry = await getJSON("/scene");
+  for (const group of [measuredRobot?.group, targetRobot?.group, planRobot?.group, staticGroup]) {
+    if (!group) continue;
+    group.removeFromParent();
+    group.traverse((part) => part.material?.dispose());
+  }
   measuredRobot = await buildRobot(geometry.geoms, null, 1);
   targetRobot = await buildRobot(geometry.geoms, new THREE.Color(0xd99a24), 0.45);
   planRobot = await buildRobot(geometry.geoms, new THREE.Color(0x55aa7a), 0.55);
-  await buildStatic(geometry.static || []);
+  staticGroup = await buildStatic(geometry.static || []);
+  geometryVersion = geometry.version;
+  planFrames = [];
+  planVersion = -1;
+};
+
+const updateCarry = (state) => {
+  carryState = state;
+  $("carry-panel").hidden = !state;
+  if (!state) return;
+  $("carry-title").textContent = state.title;
+  $("carry-status").textContent = state.status_label;
+  $("carry-detail").textContent = state.detail;
+  $("carry-payload").textContent = `Applied payload: ${state.active_mass_kg.toFixed(4)} kg. Module estimate: ${state.mass_kg.toFixed(4)} kg (${state.mass_source}).`;
+  $("carry-feedback").textContent = state.error || state.block_reason || "";
+  const updateButtons = () => {
+    const checked = [...$("carry-checks").querySelectorAll("input")].every((c) => c.checked);
+    for (const button of $("carry-actions").children) button.disabled = carryPosting || carryState?.pending || !checked;
+  };
+  if (carryRevision !== state.revision) {
+    carryRevision = state.revision;
+    $("carry-checks").replaceChildren();
+    $("carry-actions").replaceChildren();
+    for (const check of state.checks) {
+      const label = document.createElement("label");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.value = check.id;
+      input.onchange = updateButtons;
+      label.append(input, document.createTextNode(` ${check.label}`));
+      $("carry-checks").append(label);
+    }
+    for (const action of state.actions) {
+      const button = document.createElement("button");
+      button.textContent = action.label;
+      button.onclick = async () => {
+        carryPosting = true;
+        updateButtons();
+        try {
+          await post("/scene_action", {
+            revision: state.revision, action: action.id,
+            checks: [...$("carry-checks").querySelectorAll("input:checked")].map((c) => c.value),
+          });
+        } catch (error) {
+          $("carry-feedback").textContent = error.message;
+        } finally {
+          carryPosting = false;
+          for (const input of $("carry-checks").querySelectorAll("input")) input.checked = false;
+          updateButtons();
+        }
+      };
+      $("carry-actions").append(button);
+    }
+  }
+  updateButtons();
+};
+
+const build = async (state) => {
+  building = true;
+  await buildGeometry();
 
   jointSliders = state.sliders.map((descriptor) => addSlider(
     $("debug"),
@@ -377,6 +504,7 @@ const build = async (state) => {
   }
   if (state.jog) buildJogPad(state.jog);
   buildPresets(state.pose_presets);
+  buildJointPresets(state.joint_presets);
 
   const strip = $("buttons");
   const gains = $("gains");
@@ -430,12 +558,17 @@ const updateGate = (state) => {
   }
 };
 
+let polling = false;
 const poll = async () => {
+  if (polling) return;
+  polling = true;
   try {
     const state = await getJSON("/state");
     setConnected(true, state.ident);
     if (state.ident) document.title = `${state.ident} — arm console`;
     if (!built && !building) await build(state);
+    if (built && state.geometry_version !== geometryVersion) await buildGeometry();
+    updateCarry(state.scene_action);
     if (state.jog) {
       updateSpeeds(state.jog);
       const note = state.jog.note || (state.jog.held ? "jogging" : "");
@@ -448,6 +581,8 @@ const poll = async () => {
     }
     updateHand(state.hand);
     updatePose(state.pose);
+    if (!refinementPosting) $('refine').checked = state.refinement === 'trajopt';
+    $('refine').disabled = refinementPosting;
     updateMode(state.mode);
     setPoses(measuredRobot, state.measured_geoms);
     setPoses(targetRobot, state.target_geoms);
@@ -480,6 +615,8 @@ const poll = async () => {
     updateMode(null);
     releaseJog();
     console.error(error);
+  } finally {
+    polling = false;
   }
 };
 setInterval(poll, 150);

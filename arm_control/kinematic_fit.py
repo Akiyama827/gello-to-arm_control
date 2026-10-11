@@ -31,8 +31,8 @@ degeneracy report is computed from the UNPINNED Jacobian, so it is named
 rather than hidden, and any other near-degenerate direction the dataset
 happens to have is named next to it.
 
-Link geometry is deliberately NOT fitted. tools/bench/compare_flange_fk.py
-answers that question separately and far more cheaply, and giving this fit
+Link geometry is deliberately NOT fitted. A flange-FK comparison against the
+vendor model answers that question separately and far more cheaply, and giving this fit
 per-link freedom would let it absorb the very thing it is measuring.
 """
 from __future__ import annotations
@@ -86,6 +86,27 @@ def exp6(xi) -> np.ndarray:
 
     xi = np.asarray(xi, float)
     return np.asarray(pin.exp6(pin.Motion(xi[:3], xi[3:])).homogeneous)
+
+
+def compose_mount(xi, world_T_arm_nom) -> np.ndarray:
+    """The corrected mount: ``[exp3(w) R_nom | t_nom + v]`` with ``xi = [v, w]``.
+
+    ``v`` moves the arm-base ORIGIN in world coordinates and ``w`` rotates the
+    base about that origin (a world-frame rotation vector). So ``dz`` is exactly
+    the change in base height and pinning it keeps the height fixed whatever
+    roll/pitch/yaw do -- which composing ``exp6(xi)`` on the left of the nominal
+    did not: its rotation acts about the WORLD origin and its translation is
+    coupled through SO(3)'s left Jacobian, so a pinned tangent ``dz`` still
+    moved the base height by ~|t_nom| x angle.
+    """
+    import pinocchio as pin
+
+    xi = np.asarray(xi, float)
+    nom = np.asarray(world_T_arm_nom, float)
+    out = np.eye(4)
+    out[:3, :3] = np.asarray(pin.exp3(xi[3:])) @ nom[:3, :3]
+    out[:3, 3] = nom[:3, 3] + xi[:3]
+    return out
 
 
 def log3(R) -> np.ndarray:
@@ -215,12 +236,13 @@ MODELS = (
 def predict(theta, samples, fk, world_T_arm_nom, model: Model) -> np.ndarray:
     """(N,4,4) predicted ``world_T_tcp``.
 
-    ``exp(xi)`` is composed on the LEFT of the nominal mount, so xi is a
-    correction expressed in the world/bench frame and reads directly as
-    "the arm base is this far from where bench.yaml says it is".
+    The mount correction is :func:`compose_mount`: xi's translation reads
+    directly as "the arm base origin is this far from where bench.yaml says
+    it is", in the world/bench frame, and its rotation turns the base about
+    that origin.
     """
     xi, dq, tool, yaw = model.unpack(theta)
-    world_T_arm = exp6(xi) @ np.asarray(world_T_arm_nom, float)
+    world_T_arm = compose_mount(xi, world_T_arm_nom)
     # Clocking about the approach axis first, then the offset along it.
     c, sn = np.cos(yaw), np.sin(yaw)
     tool_T = np.array([[c, -sn, 0.0, 0.0], [sn, c, 0.0, 0.0],
@@ -307,7 +329,7 @@ class FitResult:
 
     def mount(self, world_T_arm_nom) -> np.ndarray:
         """The COMPOSED mount: correction applied to the nominal."""
-        return exp6(self.xi) @ np.asarray(world_T_arm_nom, float)
+        return compose_mount(self.xi, world_T_arm_nom)
 
 
 def jacobian(theta, samples, fk, world_T_arm_nom, model, rot_weight, *, eps=1e-7):
@@ -472,7 +494,8 @@ def format_parameters(res: FitResult, world_T_arm_nom) -> str:
                        f"{dq[i]:+.6f} rad{note}")
         out.append("")
     if res.model.mount:
-        out.append("Mount correction   world_T_arm = exp(xi) @ world_T_arm_nominal")
+        out.append("Mount correction   world_T_arm = [exp3(w) R_nom | t_nom + v]  "
+                   "(rotation about the base origin)")
         out.append("-" * 66)
         for label, value in zip(MOUNT_NAMES[:3], xi[:3]):
             pin = "   (PINNED)" if label in res.model.pinned else ""
@@ -595,7 +618,7 @@ def _synthesise(urdf, ee_frame, fk, world_T_arm_nom, truth_dq, truth_xi,
     ik = PinocchioIK(urdf, ee_frame=ee_frame, joint_names=JOINTS, restarts=1,
                      max_iters=4000, tol_pos=1e-10, tol_rot=1e-10)
     rng = np.random.default_rng(seed)
-    world_T_arm_true = exp6(truth_xi) @ np.asarray(world_T_arm_nom, float)
+    world_T_arm_true = compose_mount(truth_xi, world_T_arm_nom)
     arm_T_world_true = np.linalg.inv(world_T_arm_true)
     tool_inv = np.eye(4)
     tool_inv[2, 3] = -truth_tool
@@ -651,6 +674,19 @@ def _self_check() -> None:
     xi = np.array([0.003, -0.002, 0.001, 0.004, -0.003, 0.002])
     assert np.allclose(exp6(np.zeros(6)), np.eye(4))
     assert np.allclose(log3(exp6(xi)[:3, :3]), xi[3:], atol=1e-9)
+    # A pinned dz must fix the COMPOSED base height under any rotation. The
+    # former left-exp6 composition moves it by ~|t_nom| x angle: 0.17 mm for
+    # this 1-2 cm-rad tilt at FR3 #1's mount, and ~5x that at FR3 #2's corner.
+    tilt = np.array([0.0, 0.0, 0.0, 0.01, -0.02, 0.03])
+    assert compose_mount(tilt, nom)[2, 3] == nom[2, 3]
+    assert np.allclose(compose_mount(tilt, nom)[:3, :3],
+                       exp6(np.r_[0, 0, 0, tilt[3:]])[:3, :3] @ nom[:3, :3])
+    assert abs((exp6(tilt) @ nom)[2, 3] - nom[2, 3]) > 1e-4
+    # A pure yaw about the base origin is exactly a joint-1 offset.
+    yaw = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.01])
+    q0 = np.array([0.1, -0.4, 0.2, -2.0, 0.1, 1.6, 0.5])
+    assert np.allclose(compose_mount(yaw, nom) @ fk(q0),
+                       nom @ fk(q0 + np.r_[0.01, 0, 0, 0, 0, 0, 0]), atol=1e-12)
     m = Model("t", mount=True, dq=True, tool=True, probe=True,
               pinned=("dq1", "dz", "dq7"))
     a, b, c, d = m.unpack(np.arange(m.size, dtype=float))
@@ -731,6 +767,10 @@ def _self_check() -> None:
     tooled_cal = [s for s in tooled if s.split == "calibration"]
     with_tool = fit(tooled_cal, fk, nom, MODELS[3])
     assert abs(with_tool.tool - (-0.009)) < 3e-4, with_tool.tool
+    # dz pinned in this stage: the fitted mount keeps the nominal base height
+    # EXACTLY although roll/pitch were fitted nonzero.
+    assert with_tool.mount(nom)[2, 3] == nom[2, 3], with_tool.mount(nom)[2, 3]
+    assert np.abs(with_tool.xi[3:5]).max() > 1e-4, with_tool.xi
 
     # --- and with dz FREE the pair must be reported as indistinguishable,
     # not silently split. This is the reason dz is pinned in MODELS[3].

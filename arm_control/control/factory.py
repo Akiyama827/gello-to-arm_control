@@ -4,7 +4,7 @@ Split out of ``planning.stack`` so a controller host can import a servo
 without importing a planner. That was already the intent: ``arm_controller``
 reaches for ``build_executor`` precisely to avoid loading IK, OMPL, a
 collision world or a scene. But it reached for it THROUGH ``planning.stack``,
-which imports ``preview_rerun``, which imports ``rerun`` at module level --
+which imports ``viz.preview``, which imports ``rerun`` at module level --
 and ``rerun-sdk`` is an optional ``[viz]`` extra. A headless install without
 that extra therefore died at import, in the one node that most needs to run
 without a display. (The comment on that import in ``stack.py`` claimed the
@@ -23,9 +23,18 @@ import numpy as np
 
 from arm_control.config import CONTROL_ROOT, _arm_block, arm_joints, ee_frame
 from arm_control.dynamics import PinocchioDynamics
+from arm_control.control.arm_controller import ArmController
+from arm_control.control.execution_policy import build_execution_policy
 from arm_control.control.trajectory_executor import JointTrajectoryExecutor
+from arm_control.control.gains import validate_integral_vector
+from arm_control.control.integral import IntegralState
+from arm_control.model_bundle import execution_gravity, model_token, pose_provenance
+from arm_control.node_utils import planner_speed_limits, resolve_gains
 
-__all__ = ["arm_urdf", "gain_vector", "gripper_command_cfg", "build_executor"]
+__all__ = [
+    "arm_urdf", "gain_vector", "build_executor",
+    "build_arm_controller",
+]
 
 
 def arm_urdf(cfg) -> str:
@@ -73,32 +82,37 @@ def gain_vector(cfg, key: str, n: int) -> np.ndarray:
     return arr
 
 
-def gripper_command_cfg(cfg) -> dict:
-    """Gripper packing parameters for the arm+gripper motor command.
-
-    Returns ``None`` for ``mimic`` on arms whose gripper is not a motor slot on
-    the same bus (the FR3's Franka Hand is its own device, driven by grasp
-    requests rather than a packed command word).
-    """
-    mimics = cfg.get("joint_mimics") or {}
-    mimic = next((m for m in mimics.values() if isinstance(m, dict)), None)
-    grasp = cfg.get("grasp") or {}
-    return {
-        "mimic": mimic,
-        # Held open through the arm-motion legs; the bridge's grasp gate owns the
-        # gripper slot from close_gripper onward, so this never fights the grasp.
-        "open_finger_m": float(
-            cfg.get("gripper_open_finger_m", (mimic or {}).get("lower", 0.0))
-        ),
-        "gains": (float(grasp.get("close_kp", 40.0)), float(grasp.get("close_kd", 2.0))),
-        "n_motors": int(cfg.get("num_motors", 7)),
-    }
+def arm_speed_limits(cfg, n: int, *, required: bool = True):
+    """``(max_vel, max_acc)`` a planner times plans with from ``arm.max_vel``/``arm.max_acc``, under the console's rule
+    (``planner_speed_limits``): with an execution policy the arm's statement defaults to it and may only be slower (refused at load
+    otherwise -- the controller would refuse every plan at admission); without one the arm states its own (``required``), or the
+    planner is unbounded here (``required=False``, a caller that bounds speed itself)."""
+    arm = _arm_block(cfg)
+    policy = cfg.get("execution_policy") or {}
+    joints = list(arm.get("joints") or [])
+    names = joints if len(joints) == n else [str(i) for i in range(n)]
+    limits = []
+    for index, (key, plan_key, policy_key) in enumerate((("max_vel", "vel_limits", "velocity_limits"),
+                                                         ("max_acc", "acc_limits", "acceleration_limits"))):
+        if policy.get(policy_key) is None:   # the policy leaves this one unbounded: the arm states its own, as before
+            limits.append(gain_vector(cfg, key, n) if required or arm.get(key) is not None else np.full(n, np.inf))
+            continue
+        stated = {} if arm.get(key) is None else {plan_key: arm[key]}
+        try:
+            limits.append(planner_speed_limits(stated, {policy_key: policy[policy_key]}, names)[index])
+        except ValueError as exc:
+            raise ValueError(f"arm.{key}: {exc}".replace(f"planner.{plan_key} ", "")) from None
+    return limits[0], limits[1]
 
 
 def build_executor(
-    cfg, *, arm_id: str = "arm", gains: dict | None = None
+    cfg, *, arm_id: str = "arm", gains: dict | None = None, simulation_gravity=None
 ) -> JointTrajectoryExecutor:
     """The EXECUTION half of an arm's stack, with no planning half at all.
+
+    Bound hardware consumes staged model gravity. Only simulation may supply
+    ``simulation_gravity`` from its own physics/actor placement; analytical
+    callers can construct PinocchioDynamics directly.
 
     Split out of build_planning_stack so ``arm_controller`` can have a servo
     without an IK, an OMPL instance, a collision world or a scene -- the whole
@@ -115,6 +129,7 @@ def build_executor(
     resolves across both and passes the answer in; absent, the arm table is
     still the source, so every existing caller is unchanged.
     """
+    # Simulation supplies its own physics vector; hardware consumes staged facts.
     joints = arm_joints(cfg)
     n = len(joints)
     # done() tolerances are per-arm feedback facts (DM quantization, payload
@@ -123,15 +138,36 @@ def build_executor(
     tolerances = {
         k: float(arm_blk[k]) for k in ("done_pos_tol", "done_vel_tol") if k in arm_blk
     }
+    pose_keys = [k for k in ("done_pose_tol_m", "done_pose_tol_rad") if k in arm_blk]
+    if pose_keys and len(pose_keys) != 2:
+        raise ValueError("arm.done_pose_tol_m and arm.done_pose_tol_rad come together")
+    if pose_keys:
+        tolerances["done_pose_tol"] = (float(arm_blk["done_pose_tol_m"]), float(arm_blk["done_pose_tol_rad"]))
     def _gain(key: str, arm_key: str) -> np.ndarray:
         if gains is None:
             return gain_vector(cfg, arm_key, n)
         return np.asarray(gains[key], dtype=float).ravel()[:n]
 
+    if arm_blk.get("body_list") is not None:
+        # A body-list arm (arm.body_list: BodyListDynamics' description, e.g. the base and the module above it, composed from the
+        # world it moves in): no URDF, and no payload -- the load is in the bodies, revised with load_model/1.
+        from arm_control.dynamics import BodyListDynamics
+
+        dynamics = BodyListDynamics(arm_blk["body_list"])
+        if dynamics.joints != joints:
+            raise ValueError("arm.body_list joints differ from the arm's joints (order included)")
+        payload_frame = ""
+    else:
+        dynamics = PinocchioDynamics(
+            arm_urdf(cfg), joints,
+            gravity=(execution_gravity(cfg, arm_urdf(cfg)) if simulation_gravity is None
+                     else simulation_gravity),
+        )
+        payload_frame = ee_frame(cfg)
     executor = JointTrajectoryExecutor(
         arm_id=arm_id,
         joint_names=joints,
-        dynamics=PinocchioDynamics(arm_urdf(cfg), joints),
+        dynamics=dynamics,
         kp_default=_gain("kp", "kp"),
         kd_default=_gain("kd", "kd"),
         max_torque=_gain("torque_limits", "max_tau"),
@@ -140,13 +176,62 @@ def build_executor(
         # twice. The legacy standalone executor already honoured this flag; this
         # path silently ignored it.
         gravity_comp=bool(arm_blk.get("plant_gravity_comp", False)),
+        payload_frame=payload_frame,
         **tolerances,
     )
-    # Payload feedforward frame (mass toggles on grasp/release results): RNEA
-    # knows only the bare arm; a held module otherwise sags on the soft contact-
-    # phase gains (centimeters at the EE — measured in the twin).
-    executor.set_payload(0.0, ee_frame(cfg))
     return executor
+
+
+def build_arm_controller(
+    cfg, node, *, arm_id: str, mode_cfg: dict | None = None,
+    require_policy: bool = False, **options,
+) -> ArmController:
+    """The one recipe for an arm's ``ArmController`` from its config.
+
+    Gains (mode config first, arm table second; ``mode_cfg`` defaults to the
+    config's ``control_mode``), executor, execution policy, model binding,
+    pose provenance and settling are decided here and nowhere else. Callers
+    pass what their process owns -- the node, clocks, health reporting -- as
+    ``options``; ``require_policy`` refuses a config without the 100 Hz
+    deadline policy.
+    """
+    n = len(arm_joints(cfg))
+    names = list(cfg.get("joint_names") or cfg.get("motor_names") or [])
+    if mode_cfg is None:
+        mode_cfg = cfg.get("control_mode") or {}
+    gains = resolve_gains(cfg, mode_cfg, names, n)
+    executor = build_executor(cfg, arm_id=arm_id, gains=gains)
+    # Validate the complete motor vector before projecting arm slots. The
+    # state owner consumes these gains; the pure executor does not.
+    integral = IntegralState(n, **{
+        key: validate_integral_vector(None if gains is None else gains.get(key),
+                                      len(names) if names else n, where=key)[:n]
+        for key in ("ki", "i_limit")
+    }, kp_ref=executor.kp)  # the profile kp the ki values are stated at
+    policy_cfg = cfg.get("execution_policy")
+    if policy_cfg is not None and gains is None:
+        raise ValueError("execution_policy requires resolved per-joint torque limits")
+    # The position envelope comes from the robot description, not from YAML --
+    # see build_execution_policy.
+    policy = build_execution_policy(
+        policy_cfg,
+        torque_limits=None if gains is None else gains["torque_limits"][:n],
+        joint_limits=executor.joint_limits,
+    )
+    if require_policy and policy is None:
+        raise ValueError(f"{arm_id}: needs an execution_policy (100 Hz deadline mode)")
+    arm = cfg.get("arm") or {}
+    # How long a jog/setpoint stays live: read from the mode config the console reads, so both deadmen agree (too tight and a
+    # scheduling hiccup stutters the arm, too loose and it coasts after the button is released).
+    options.setdefault("jog_timeout_s", float((mode_cfg.get("jog") or {}).get("timeout_s", 0.2)))
+    return ArmController(
+        node, executor, arm_id=arm_id,
+        integral_state=integral, execution_policy=policy, model_token=model_token(cfg),
+        pose_provenance=pose_provenance(cfg),
+        settle_timeout_s=float(arm.get("settle_timeout_s", 5.0)),
+        settle_dwell_s=float(arm.get("settle_dwell_s", 0.2)),
+        **options,
+    )
 
 
 
@@ -165,8 +250,8 @@ def _self_check() -> None:
         "arm_control.scene",
         "arm_control.data",
         "arm_control.planning.stack",
-        "arm_control.planning.high_level",
-        "arm_control.planning.preview_rerun",
+        "arm_control.planning.planner",
+        "arm_control.viz.preview",
         "arm_control.planning.ik",
         "arm_control.planning.mujoco_collision",
     )

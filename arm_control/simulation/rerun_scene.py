@@ -18,7 +18,8 @@ import numpy as np
 import rerun as rr
 
 
-def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_dir):
+def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_dir,
+                      body_names=False):
     """Export a composed snapshot for file-based viewers, in the given frame.
 
     These are compiled mesh vertices (already scaled/recentered), so geom_xmat
@@ -68,7 +69,7 @@ def static_mesh_geoms(model, data, *, root_T_world, exclude_prefixes=(), cache_d
         T = np.eye(4)
         T[:3, :3] = data.geom_xmat[i].reshape(3, 3)
         T[:3, 3] = data.geom_xpos[i]
-        out.append((name, f"mesh{i}", path, np.asarray(root_T_world) @ T))
+        out.append((body if body_names else name, f"mesh{i}", path, np.asarray(root_T_world) @ T))
     return out
 
 
@@ -218,15 +219,19 @@ def start_mirror_thread(
         source = lambda: (model, fixed)  # noqa: E731
 
     def _run() -> None:
-        from arm_control.planning.preview_rerun import (
+        from arm_control.viz.preview import (
             DEFAULT_APP_ID,
             DEFAULT_RECORDING_ID,
         )
 
         # Same app + recording as the plan preview: the twin's true scene and
         # the orchestrator's overlays merge into ONE viewer recording.
-        rr.init(DEFAULT_APP_ID, recording_id=DEFAULT_RECORDING_ID, spawn=False)
-        rr.connect_grpc()
+        try:
+            rr.init(DEFAULT_APP_ID, recording_id=DEFAULT_RECORDING_ID, spawn=False)
+            rr.connect_grpc()
+        except Exception as exc:  # noqa: BLE001 -- no viewer: the mirror is optional, say so once and stop
+            print(f"[rerun_scene] rerun unavailable ({exc}) — scene mirror disabled", flush=True)
+            return
         mirror = None
         bound = None
         period = 1.0 / max(1.0, float(hz))

@@ -1,10 +1,11 @@
 // FR3 torque backend over libfranka's external-control (ActiveControl) API.
 //
-// STATUS: compiles against libfranka >= 0.13-style ActiveControl headers and
-// encodes every constraint from the 2026-07-26 franka_ros2/libfranka review,
-// but it is UNVALIDATED ON HARDWARE — the first live run is a bring-up rung
-// (gravity-hold, operator on the stop), not a formality. Review notes it
-// implements:
+// STATUS: encodes every constraint from the 2026-07-26 franka_ros2/libfranka
+// review. Hardware-run on two FR3s at build c23a0c7 (the 2026-09-24 timing
+// report: https://github.com/Westlake-Work/modular_robotic_arm/blob/f042a681841393a5a0ad7b82469f8ef0997290c8/Control/docs/status/2026-09-24-dual-arm-rt-timing.md).
+// Changes after c23a0c7 (exception containment, the fault journal and latch
+// lifecycle, the RT mailbox) are offline-checked only until deployed and
+// re-qualified. Review notes it implements:
 //
 //  - Robot is constructed ON THE LOOP THREAD: libfranka raises the calling
 //    thread's scheduling in the constructor, so construct-then-move loses RT
@@ -21,6 +22,10 @@
 //    arm attempt (which sets the flag) — the second arm recovers it.
 //  - Errors surface on readOnce(), not writeOnce() — read() is where faults
 //    are caught and reported.
+//  - Every device call also catches std::exception: libfranka's transport
+//    can surface Poco network exceptions, which are not franka::Exception
+//    (an FCI drop on 2026-09-24 terminated an armed server this way). They
+//    take the same fault path, with the operation named in the fault text.
 //  - tau_ref for the slew limiter is state.tau_J_d (the robot's echo of the
 //    last ACCEPTED torque), which survives dropped packets; the limiter IS
 //    the startup ramp, first tick included.
@@ -37,8 +42,11 @@
 //    library from the control box (seconds of blocking network work). read()
 //    then fills PlantState's Jacobian and external-wrench estimate from it —
 //    the Cartesian sensing the impedance law and contact detection need.
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
+#include <exception>
 #include <string>
 
 #include "arm_rt/backend.hpp"
@@ -47,10 +55,12 @@
 
 #include <Eigen/Geometry>
 
+#ifndef ARM_RT_FRANKA_SELFCHECK  // franka_backend_selfcheck scripts franka::
 #include <franka/active_control.h>
 #include <franka/exception.h>
 #include <franka/model.h>
 #include <franka/robot.h>
+#endif
 
 namespace arm_rt {
 namespace {
@@ -66,7 +76,10 @@ public:
   // the constructor, and never inside a control loop.
   FrankaBackend(const std::string& ip, double ee_mass, const double ee_com[3])
       : robot_(ip, franka::RealtimeConfig::kEnforce), model_(robot_.loadModel()) {
-    fault_.reserve(256);  // latch path must not allocate on the RT thread
+    // Typical fault texts fit without reallocating. Not a no-allocation
+    // guarantee: an exception path allocates anyway, which is why rt_loop
+    // paces read failures and stops writing until the next ARM.
+    fault_.reserve(256);
     // Payload declaration. setLoad writes m_load, which is ADDITIVE to the
     // Desk-configured end effector (the Hand's m_ee) — pass the camera+mount
     // or module mass alone, never hand+camera. It is a non-realtime command:
@@ -110,6 +123,29 @@ public:
   // the tick ever changes rather than being a second place to edit.
   double tau_slew_max() const override { return 1000.0 * tick_s(); }
   bool supports_pose_hold() const override { return true; }
+  // Pose/Jacobian come from the model library libfranka downloads from THIS
+  // robot's control box: the vendor model, independent of any PC-side URDF.
+  const char* task_model() const override { return "libfranka-vendor"; }
+  bool supports_cartesian() const override { return true; }
+
+  // FK at a COMMANDED q with the same vendor model and the flange/EE frames of the last measured state, so the v8
+  // law's target and its measured pose come from one model (O_T_EE is this model at the measured q).
+  bool ee_pose_at(const double* q, double* pose) override {
+    if (!have_frames_) return false;
+    try {
+      std::array<double, FR3_N> qa{};
+      std::copy_n(q, FR3_N, qa.begin());
+      const std::array<double, 16> T = model_.pose(franka::Frame::kEndEffector, qa, F_T_EE_, EE_T_K_);
+      const Eigen::Map<const Eigen::Matrix4d> transform(T.data());
+      const Eigen::Quaterniond orientation(transform.block<3,3>(0,0));
+      for (int i = 0; i < 3; ++i) pose[i] = transform(i, 3);
+      pose[3] = orientation.w(); pose[4] = orientation.x(); pose[5] = orientation.y(); pose[6] = orientation.z();
+      for (int i = 0; i < 7; ++i) if (!std::isfinite(pose[i])) return false;
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  }
 
   bool read(PlantState& out) override {
     try {
@@ -117,6 +153,11 @@ public:
           active_ ? control_->readOnce().first  // paces the armed loop
                   : robot_.readOnce();          // idle stream, no session
       out.n = FR3_N;
+      out.robot_time_ms = state.time.toMSec();
+      F_T_EE_ = state.F_T_EE;
+      EE_T_K_ = state.EE_T_K;
+      have_frames_ = true;
+      out.cmd_success_rate = state.control_command_success_rate;
       for (int j = 0; j < FR3_N; ++j) {
         out.q[j] = state.q[j];
         out.dq[j] = state.dq[j];
@@ -154,7 +195,10 @@ public:
       out.pose_valid = true;
       return true;
     } catch (const franka::Exception& exc) {
-      fail(exc);
+      fail(exc.what());
+      return false;
+    } catch (const std::exception& exc) {
+      fail("read", exc);
       return false;
     }
   }
@@ -181,37 +225,62 @@ public:
       control_->writeOnce(torques);
       return true;
     } catch (const franka::Exception& exc) {
-      fail(exc);
+      fail(exc.what());
+      return false;
+    } catch (const std::exception& exc) {
+      fail("write", exc);
       return false;
     }
   }
 
-  void stop() override {
+  bool stop() override {
     // Controlled stop: last accepted torque + motion_finished. Never zero.
-    if (!active_) return;
+    if (!active_) return true;
+    bool ok = false;
     try {
       franka::Torques torques{{0, 0, 0, 0, 0, 0, 0}};
       for (int j = 0; j < FR3_N; ++j) torques.tau_J[j] = last_tau_ref_[j];
       torques.motion_finished = true;
       control_->writeOnce(torques);
+      ok = true;
     } catch (const franka::Exception& exc) {
       fault_ = exc.what();
+      need_recovery_ = true;
+    } catch (const std::exception& exc) {
+      unexpected("stop", exc);
       need_recovery_ = true;
     }
     control_.reset();
     active_ = false;
+    return ok;
   }
 
   const std::string& fault_text() const override { return fault_; }
 
 private:
-  void fail(const franka::Exception& exc) {
+  void fail(const char* what) {
     // Unconditional: an error with NO session open (reflex entered while
     // idle, startTorqueControl refused) must ALSO set need_recovery_, or the
     // documented DISARM->ARM reflex recovery is unreachable — every re-arm
     // repeats the refused start forever. A spurious automaticErrorRecovery()
     // after a mere network blip is a harmless no-op.
-    fault_ = exc.what();
+    fault_ = what;
+    drop_session();
+  }
+
+  // A non-libfranka exception leaves the plant state unknown: same path as a
+  // device fault (no writes until the next ARM reopens the session), with the
+  // failing operation kept in the text so the first cause stays attributable.
+  void fail(const char* op, const std::exception& exc) {
+    unexpected(op, exc);
+    drop_session();
+  }
+
+  void unexpected(const char* op, const std::exception& exc) {
+    fault_.assign(op).append(": non-libfranka exception: ").append(exc.what());
+  }
+
+  void drop_session() {
     control_.reset();  // back to idle reads so state keeps flowing
     active_ = false;
     need_recovery_ = true;
@@ -223,6 +292,8 @@ private:
   bool active_ = false;
   bool need_recovery_ = false;
   double last_tau_ref_[MAX_JOINTS] = {};
+  std::array<double, 16> F_T_EE_{}, EE_T_K_{};  // the last measured state's frames, for ee_pose_at
+  bool have_frames_ = false;
   std::string fault_;
 };
 
@@ -236,6 +307,10 @@ std::unique_ptr<Backend> make_franka_backend(const std::string& ip, double ee_ma
     // FCI off, robot unreachable, no RT permission — report, exit nonzero,
     // and let systemd's Restart=on-failure keep knocking until it's there.
     std::fprintf(stderr, "[rt] franka backend: %s\n", exc.what());
+    return nullptr;
+  } catch (const std::exception& exc) {
+    std::fprintf(stderr, "[rt] franka backend: session open: non-libfranka "
+                         "exception: %s\n", exc.what());
     return nullptr;
   }
 }

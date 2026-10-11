@@ -26,7 +26,7 @@ The one rule that makes the split safe is ``plan_id``:
 3. Every result carries its plan_id back, so a late reply from a superseded
    plan is dropped rather than credited to the current one.
 
-Its checks are ``tools/bench/check_arm_controller.py`` (run it directly) and
+Its checks are ``tools/check/check_arm_controller.py`` (run it directly) and
 the doubles they share are ``arm_control.control.doubles``. They used to be the
 last third of this file.
 """
@@ -35,27 +35,20 @@ from __future__ import annotations
 
 import math
 import time
+import uuid
 
 import numpy as np
 from arm_control.contracts.impedance import pose_hold_values, unpack_pose_hold_values
 
-from arm_control.control.jog_hold import JogHold
+from arm_control.control.jog_hold import JogHold, JogRamp
 from arm_control.control.leg_settling import SETTLED, TIMED_OUT, LegSettling
+from arm_control.control.integral import IntegralState
+from arm_control.control.reference import TrajectoryReference
 from arm_control.control.trajectory_executor import gain_error
 from arm_control.motion import JointServoCommand, JointState, JointTrajectory
-from arm_control.joint_motor_map import (
-    pack_arm_gripper_command,
-    unpack_motor_state_to_joint,
-)
-from arm_control.messages import (
-    pack_controller_event,
-    unpack_jog,
-    unpack_motor_command,
-    pack_json_message,
-    unpack_control_update,
-    unpack_json_message,
-    unpack_plan,
-)
+from arm_control.contracts import pack_json_message, unpack_json_message
+from arm_control.contracts.motion import pack_controller_event, unpack_jog, unpack_control_update, unpack_plan
+from arm_control.contracts.motor import pack_cartesian_block, pack_motor_command, unpack_motor_state
 
 
 class ArmController:
@@ -67,16 +60,24 @@ class ArmController:
         executor,
         *,
         arm_id: str = "arm",
-        gripper: dict,
         state_period_s: float | None = None,
         plant_reports_health: bool = True,
         jog_timeout_s: float = 0.2,
         clock=None,
+        reference_clock=None,
         execution_policy=None,
         settle_timeout_s: float = 5.0,
         settle_dwell_s: float = 0.2,
+        model_token: str | None = None,
+        pose_provenance: str = "unbound",
+        reference_source=None,
+        integral_state: IntegralState | None = None,
     ) -> None:
         self.node = node
+        # Model binding (arm_control.model_bundle). None = unbound graph (sims,
+        # legacy entries): plans are not checked against a model.
+        self.model_token = model_token
+        self.pose_provenance = str(pose_provenance)
         self.executor = executor
         self._settling = LegSettling(timeout_s=settle_timeout_s, dwell_s=settle_dwell_s)
         self._completion_sample_at = None
@@ -85,8 +86,11 @@ class ArmController:
         self._track_kp = executor.kp.copy()
         self._track_kd = executor.kd.copy()
         self.arm_id = str(arm_id)
-        self.gripper = dict(gripper)
         self.n_arm = executor.n_joints
+        self.integral = integral_state if integral_state is not None else IntegralState(self.n_arm)
+        if self.integral.bias.shape != (self.n_arm,):
+            raise ValueError("integral state must match controller joints")
+        self._cycle_id = 0
         # TWO clock policies, and the choice is `motor_state_period_s`:
         #
         #   set    -> PLANT clock. Trajectory time advances one nominal period
@@ -117,7 +121,14 @@ class ArmController:
                 f"motor_state_period_s must be finite and positive, "
                 f"got {state_period_s!r}"
             )
+        self.session_id = uuid.uuid4().hex
         self._clock = clock or time.monotonic
+        # Local paired controllers may sample one common reference time while
+        # safety checks above/below continue to use the advancing wall clock.
+        if reference_clock is not None and self._state_period is not None:
+            raise ValueError("reference_clock cannot be combined with motor_state_period_s")
+        self._reference_clock = reference_clock or self._clock
+        self._reference_source = reference_source
         self.execution_policy = execution_policy
         if execution_policy is not None:
             if execution_policy.torque_limits.shape != (self.n_arm,):
@@ -126,16 +137,9 @@ class ArmController:
                 raise ValueError("deadline execution_policy requires wall time, not motor_state_period_s")
         self._health_at: float | None = None
         self._health_ok = not bool(plant_reports_health)
+        self._rt_holding = False
         self._observation_paused = False
         self._plant_t = 0.0
-        self._finger_m = 0.0
-        # Operator-commanded finger target, or None to hold the configured open
-        # width. The assembly path leaves this None on purpose: the bridge's
-        # grasp gate owns the gripper slot from close_gripper onward, and a
-        # second writer would fight it. A manual console has no grasp gate, so
-        # its slider has to reach the jaws somehow -- this is that path, and it
-        # is the capability the trajectory executor used to provide.
-        self._finger_cmd: float | None = None
         # A jog is a hold whose anchor MOVES, and which dies of old age. The
         # timeout is the safety property: the console re-sends while a button
         # is held, so a closed tab, a wedged console, a dropped network or a
@@ -143,15 +147,31 @@ class ArmController:
         # stop arriving and the arm stops. Nothing has to notice and send a
         # stop; not sending IS the stop.
         self._jog = JogHold(timeout_s=jog_timeout_s, n_joints=self.n_arm)
+        # A streamed target (console jog, setpoint/1) moves no faster than planned motion may: saturated per tick at the
+        # policy's velocity/acceleration limits (operator 2026-10-09). No policy limits: unsaturated.
+        policy = execution_policy
+        self._jog_ramp = (JogRamp(policy.velocity_limits, policy.acceleration_limits,
+                                  lower=policy.position_lower, upper=policy.position_upper)
+                          if policy is not None and policy.velocity_limits is not None
+                          and policy.acceleration_limits is not None else None)
 
         self.last_state = JointState(np.zeros(self.n_arm), np.zeros(self.n_arm))
         self._last_state_at: float | None = None
         self._mode_report_at: float | None = None
         self.last_command: JointServoCommand | None = None
         self._hold_anchor: JointServoCommand | None = None
+        # Never further out (operator 2026-10-09): a joint RESTING past its limit when the arm is ARMed -- gravity, disarmed,
+        # on a stop -- may be held where it rests and brought back in. `_arm_pose` is where the arm rested: it follows the
+        # measured pose until the episode's first command (the plant is limp until then, and that hold is built from a
+        # sample taken then). Joints outside the envelope there follow their outermost measured pose since ARM (`_been`:
+        # on the stop, a hold re-anchoring at the measured pose must not fault); joints inside it never widen, so an
+        # excursion while armed (overshoot, sag) grants nothing.
+        self._arm_pose: np.ndarray | None = None
+        self._arm_pose_fixed = False
+        self._been: np.ndarray | None = None
         self._cartesian_now: dict | None = None   # spec for the loaded plan
-        self._cartesian_poses: np.ndarray | None = None
-        self._last_cartesian_pose: np.ndarray | None = None
+        self._first_sample_pending: str | None = None  # a released leg whose first sample is not logged yet
+        self.last_law: str | None = None           # the law of the last word sent
         self._pose_hold: dict | None = None
         self.supports_pose_hold = False
 
@@ -170,18 +190,60 @@ class ArmController:
         self.ready_sent = False
         self.frozen = False         # milestone hold / failed settle; cancel clears
         self.stopped = False
+        self.stop_reason = ""
 
-        # The one loaded plan and whether it has been released to run.
+        # The one loaded plan, its staged trajectory, and once released the
+        # reference being executed (trajectory, start time, sampling).
         self._plan: dict | None = None
         self._pending_traj: JointTrajectory | None = None
+        self._reference: TrajectoryReference | None = None
         self._running = False
+        # Transport acceptance, not command construction, starts the local
+        # streamed deadman. Only the supervisor can report a successful send.
+        self._stream_gap_limit_s: float | None = None
+        self._stream_sent_at: float | None = None
+        self._stream_sent_target: np.ndarray | None = None
 
-    # -- clock ---------------------------------------------------------------
-    @property
-    def plant_time(self) -> float:
-        return self._plant_t
+    def set_stream_hold_deadline(self, hold_ms: float, *, margin_ms: float = 20.0) -> None:
+        """Bind the negotiated RT hold threshold for legacy streamed motion."""
+        if not (np.isfinite(hold_ms) and hold_ms > margin_ms > 0):
+            raise ValueError("RT hold_ms must exceed the streamed guard margin")
+        self._stream_gap_limit_s = (hold_ms - margin_ms) / 1000.0
+
+    def streamed_command_sent(self, plan_id: str, q_des, sent_at: float) -> None:
+        """Record a transport-accepted command for the still-running leg."""
+        if self._running and self.current_plan_id == plan_id and self._reference_source is None:
+            self._stream_sent_target = np.asarray(q_des, dtype=float).copy()
+            self._stream_sent_at = sent_at
 
     # -- inputs --------------------------------------------------------------
+    @property
+    def current_plan_id(self) -> str:
+        return "" if self._plan is None else self._plan["plan_id"]
+
+    @property
+    def mode_law(self) -> str:
+        return "soft" if self._pose_hold is not None else "joint"
+
+    @property
+    def runtime_state(self) -> dict:
+        """Controller identity and observed lifecycle, carried by heartbeats."""
+        return dict(session_id=self.session_id, model_token=self.model_token,
+                    n_arm=self.n_arm,
+                    armed=bool(self.armed), ready=bool(self.ready_sent),
+                    executing=bool(self._running), stopped=bool(self.stopped),
+                    frozen=bool(self.frozen), plan_id=self.current_plan_id)
+
+    @property
+    def reference(self) -> TrajectoryReference | None:
+        """The released reference being executed, or None."""
+        return self._reference
+
+    def _stage_ack(self, plan_id: str, *, ok: bool, reason: str = "") -> None:
+        self.node.send_output("controller_event", pack_controller_event(
+            kind="plan_staged", plan_id=plan_id, ok=ok, reason=reason,
+            runtime_state=self.runtime_state))
+
     def _refuse_plan(self, plan, reason: str, *, report: bool) -> None:
         """Say WHY, always, on the one path an operator can actually read.
 
@@ -200,13 +262,22 @@ class ArmController:
         """
         print(f"[arm_controller] REFUSED plan {plan['plan_id']} "
               f"({plan['phase']}): {reason}", flush=True)
+        self._stage_ack(plan["plan_id"], ok=False, reason=reason)
         if report:
             self.node.send_output("controller_event", pack_controller_event(
                 kind="leg_result", plan_id=plan["plan_id"], ok=False, reason=reason))
 
     def on_plan(self, value) -> None:
         """Load one leg. Refused if another is mid-flight (never swapped)."""
-        plan = unpack_plan(value)
+        try:
+            plan = unpack_plan(value)
+        except (KeyError, TypeError, ValueError) as exc:
+            # A plan that names itself but does not decode (a Cartesian spec outside the envelope, mismatched rows) is
+            # refused like any other, never allowed to take the controller down. One that cannot name itself still raises.
+            body = unpack_json_message(value, expected_schema="plan")
+            self._refuse_plan(dict(plan_id=str(body["plan_id"]), phase=str(body.get("phase"))),
+                              f"malformed plan: {exc}", report=True)
+            return
         if self._pose_hold is not None:
             self._refuse_plan(
                 plan, "Soft pose hold active; select Track before planning",
@@ -227,9 +298,17 @@ class ArmController:
             self._refuse_plan(
                 plan, f"{self._plan['plan_id']} is still executing", report=False)
             return
+        if self.model_token is not None and plan.get("model_token") != self.model_token:
+            # Planned against another bundle, revision or scene (or unbound):
+            # its joint targets and collision clearance were computed for a
+            # model this controller is not running.
+            self._refuse_plan(
+                plan, f"plan model {plan.get('model_token')!r} != controller model "
+                      f"{self.model_token!r}; re-plan", report=True)
+            return
         if self.execution_policy is not None:
             reason = self._observation_error() or self.execution_policy.plan_error(
-                plan, self.last_state.position, self.n_arm)
+                plan, self.last_state.position, self.n_arm, been=self._where_been())
             if reason:
                 self._refuse_plan(plan, reason, report=True)
                 return
@@ -238,6 +317,10 @@ class ArmController:
         # the execution_policy block on purpose — the graphs that configure no
         # policy are exactly the ones with no other admission check.
         reason = gain_error(plan["kp"], plan["kd"])
+        if not reason and plan.get("cartesian") is not None and plan.get("completion") is None \
+                and getattr(self.executor, "pose_tolerances", None) is None:
+            reason = ("a Cartesian leg without a completion rule completes on the hand pose: this arm configures no "
+                      "arm.done_pose_tol_m/done_pose_tol_rad")
         if reason:
             self._refuse_plan(plan, reason, report=True)
             return
@@ -249,9 +332,9 @@ class ArmController:
         self.executor.set_gains(kp=plan["kp"], kd=plan["kd"])
         self._plan = plan
         self._cartesian_now = plan.get("cartesian")
-        self._cartesian_poses = plan.get("cartesian_poses")
         self._pending_traj = traj
         self._running = False
+        self._stage_ack(plan["plan_id"], ok=True)
         if not plan["gated"]:
             self._release(plan["plan_id"])
 
@@ -272,12 +355,24 @@ class ArmController:
         if "pose_hold" in fields:
             self._set_pose_hold(fields["pose_hold"])
         if fields.get("cancel"):
-            self._cancel(str(fields.get("reason") or "cancelled"))
+            requested = fields.get("cancel_plan_id")
+            if requested is None or not self.current_plan_id or requested == self.current_plan_id:
+                cleared = self.current_plan_id or str(requested or "")
+                self._cancel(str(fields.get("reason") or "cancelled"))
+                if requested is not None:
+                    self.node.send_output("controller_event", pack_controller_event(
+                        kind="plan_cleared", plan_id=cleared,
+                        runtime_state=self.runtime_state))
+            else:
+                # A delayed pair cancel must never clear a different plan.
+                self.node.send_output("controller_event", pack_controller_event(
+                    kind="plan_cleared", plan_id=str(requested), ok=False,
+                    reason="another plan is loaded", runtime_state=self.runtime_state))
         if fields.get("hold"):
             # Milestone reached: hold this pose forever rather than disarming.
             self.frozen = True
             self._running = False
-            self.executor.clear_trajectory()
+            self._reference = None
             print(
                 f"[arm_controller] holding: {fields.get('reason', 'milestone')}",
                 flush=True,
@@ -285,23 +380,46 @@ class ArmController:
         if "stop" in fields:
             self._stop(str(fields.get("reason") or fields["stop"]))
 
-    def on_jog(self, value) -> None:
-        """Take a live setpoint, if this is a moment a jog may move at all.
+    def on_jog(self, value) -> str | None:
+        """Take a live setpoint, if this is a moment a jog may move at all; else return why not (None = taken).
 
         Refused while a plan runs: a reviewed plan owns the arm until it ends
         or is cancelled, and a jog arriving underneath it would fight the
-        trajectory for the same joints.
+        trajectory for the same joints. The supervisor returns the reason
+        (setpoint/1).
         """
-        if self.stopped or self.frozen or not self.armed or not self.ready_sent or self._pose_hold is not None:
-            return
-        if self._running:
-            return
-        self._jog.set(unpack_jog(value)["q"], self._clock())
+        refusal = self.jog_refusal()
+        if refusal is None:
+            if self._jog_ramp is not None and not self._jog.active:
+                # a NEW jog (none live: never, expired, cleared, a leg released or cancelled) starts at the measured pose, at
+                # rest -- never from a ramp a cleared jog left behind, even within the tick it was cleared in
+                self._jog_ramp.reset()
+            self._jog.set(unpack_jog(value)["q"], self._clock())
+        return refusal
 
-    def _jog_command(self) -> JointServoCommand | None:
-        """The servo command for a FRESH jog, or None once it has gone stale."""
+    def jog_refusal(self) -> str | None:
+        """Why a jog would be dropped now (None = it would be taken). Pure."""
+        return ("stopped" if self.stopped else "frozen after a failed settle (cancel/hold, or DISARM, clears it)" if self.frozen
+                else "not armed" if not self.armed else "no fresh measured pose since ARM" if not self.ready_sent
+                else "Soft (pose hold) is selected" if self._pose_hold is not None
+                else "a plan is running" if self._running else None)
+
+    @property
+    def jog_timeout_s(self) -> float:
+        """How long a jog/setpoint stays live without renewal."""
+        return self._jog.timeout_s
+
+    def clear_jog(self) -> None:
+        """Drop a live jog and hold the MEASURED pose (as its expiry does): its sender is gone."""
+        if self._jog.active:
+            self._jog.clear()
+            self._hold_anchor = self._static_hold()
+
+    def _jog_target(self) -> tuple[np.ndarray | None, bool]:
+        """Select the live jog target and report expiry; do not update bias."""
         q_des = self._jog.target(self._clock())
-        if self._jog.take_expired():
+        expired = self._jog.take_expired()
+        if expired:
             # Anchor at the MEASURED pose, explicitly. Clearing the anchor is
             # not enough: _anchored_hold rebuilds it from the last COMMANDED
             # target whenever that command was quiescent, and a jog command is
@@ -316,17 +434,7 @@ class ArmController:
                 f"— holding",
                 flush=True,
             )
-        if q_des is None:
-            return None
-        hold = getattr(self.executor, "hold_command", None)
-        if hold is None:
-            return None
-        return hold(self.last_state, q_des=q_des)
-
-    def on_gripper(self, value) -> None:
-        """A commanded finger width, in metres, from an operator console."""
-        command = unpack_motor_command(value, 2)
-        self._finger_cmd = float(np.asarray(command["position"], dtype=float)[0])
+        return q_des, expired
 
     def on_motor_health(self, value) -> None:
         payload = unpack_json_message(value)
@@ -335,11 +443,30 @@ class ArmController:
             self._health_ok = (payload.get("state_fresh") is True
                                and not payload.get("any_fault", False)
                                and not payload.get("latched_fault"))
+            holding = payload.get("holding") is True
+            if (self._reference_source is None and holding and not self._rt_holding
+                    and self._health_ok):
+                # RT has replaced the moving command with a measured hold.
+                # Retire a running leg before wall-clock sampling resumes;
+                # inherit that exact RT hold target for the PC keepalive. A
+                # later measurement may differ after residual motion, but
+                # relatching it would introduce another q_des step.
+                hold_q = np.asarray(payload.get("holding_q"), dtype=float)
+                if self._running:
+                    self._cancel("RT command-staleness hold — re-plan from measured pose")
+                if hold_q.shape == (self.n_arm,) and np.isfinite(hold_q).all():
+                    self._hold_anchor = self.executor.hold_command(
+                        self.last_state, q_des=hold_q, integral_bias=self.integral.bias)
+            self._rt_holding = holding
             if not self._health_ok:
                 self._pause_observation("plant health is faulted or stale")
         self.supports_pose_hold = bool(payload.get("supports_pose_hold", False))
         armed = bool(payload.get("armed", False))
-        if armed and not self.bridge_armed:
+        # Latch the plant's armed edge only while THIS controller wants
+        # authority: health can still read armed for a sample or two after a
+        # DISARM request, and latching that stale edge made the next ARM
+        # fault on its own not-yet-armed sample ("plant reported disarmed").
+        if armed and not self.bridge_armed and self.armed:
             self.bridge_armed = True
         elif not armed and self.bridge_armed and self.armed and not self.stopped:
             self._fault("plant reported disarmed")
@@ -351,9 +478,8 @@ class ArmController:
             return
         if self._state_period is not None:
             self._plant_t += self._state_period  # one message == one plant period
-        arm, finger_m = unpack_motor_state_to_joint(
-            value, self.gripper["n_motors"], self.gripper["mimic"], n_arm=self.n_arm
-        )
+        state = unpack_motor_state(value, self.n_arm)
+        arm = JointState(position=state["position"].copy(), velocity=state["velocity"].copy())
         if self.execution_policy is not None:
             if not (np.isfinite(arm.position).all() and np.isfinite(arm.velocity).all()):
                 self._last_state_at = None
@@ -361,10 +487,17 @@ class ArmController:
                 return
             if (previous_state_at is not None
                     and self._clock() - previous_state_at > self.execution_policy.state_timeout_sec):
-                self._pause_observation("motor state gap — re-plan")
+                self._pause_observation(
+                    "motor state gap — re-plan",
+                    preserve_rt_hold=self._reference_source is None,
+                )
         self.last_state = arm
-        if finger_m is not None:
-            self._finger_m = float(finger_m)
+        if self.armed and np.isfinite(arm.position).all():
+            q = np.asarray(arm.position, dtype=float)
+            if not self._arm_pose_fixed:
+                self._arm_pose = q.copy()  # where it rests, until the first command
+            self._been = (np.vstack([q, q]) if self._been is None
+                          else np.vstack([np.minimum(self._been[0], q), np.maximum(self._been[1], q)]))
         if self.execution_policy is None:
             self._stream()
         if (np.isfinite(arm.position).all() and np.isfinite(arm.velocity).all()
@@ -374,7 +507,8 @@ class ArmController:
 
     def _report_mode(self, *, ok=True, reason=None, heartbeat=False) -> None:
         law = "soft" if self._pose_hold is not None else "joint"
-        fields = dict(kind="mode", ok=ok, reason=law if reason is None else reason)
+        fields = dict(kind="mode", ok=ok, reason=law if reason is None else reason,
+                      runtime_state=self.runtime_state)
         try:
             event = pack_controller_event(**fields, mode_state=dict(
                 law=law, kp=self.executor.kp, kd=self.executor.kd))
@@ -399,17 +533,19 @@ class ArmController:
             return "motor health stale or faulted — re-plan"
         return None
 
-    def _pause_observation(self, reason):
+    def _pause_observation(self, reason, *, preserve_rt_hold=False):
+        anchor = (self._hold_anchor if preserve_rt_hold and self._rt_holding
+                  and self._health_ok else None)
         if (not self._observation_paused or self._plan is not None
                 or self._running or self._jog.active or self._pose_hold is not None):
             self._cancel(reason)
         self._observation_paused = True
         self.ready_sent = False
         self.last_command = None
-        self._hold_anchor = None
+        self._hold_anchor = anchor
 
     def tick(self):
-        """One deadline-driven command; unused by event-driven deployments."""
+        """One deadline-driven command: the supervisor's servo loop calls it once per period."""
         if self.execution_policy is None or self.stopped:
             return
         reason = self._observation_error()
@@ -432,37 +568,90 @@ class ArmController:
             self.ready_sent = True
             self.node.send_output(
                 "controller_event",
-                pack_controller_event(kind="ready", q=arm.position, qd=arm.velocity),
+                pack_controller_event(kind="ready", q=arm.position, qd=arm.velocity,
+                                      runtime_state=self.runtime_state),
             )
             # Fall through: the planner needs a hold streaming from right now,
             # because it is about to spend seconds planning the first leg.
+        if not (np.isfinite(arm.position).all() and np.isfinite(arm.velocity).all()):
+            return
+        if (self._running and self._reference_source is None
+                and self._stream_gap_limit_s is not None
+                and self._stream_sent_at is not None
+                and self._clock() - self._stream_sent_at > self._stream_gap_limit_s):
+            # A delayed state/health frame must not let the resumed PC tick
+            # sample a trajectory that advanced while RT held the old target.
+            target = self._stream_sent_target.copy()
+            self._cancel("PC streamed command gap exceeded RT hold margin — re-plan from measured pose")
+            self._hold_anchor = self.executor.hold_command(
+                arm, q_des=target, integral_bias=self.integral.bias)
+            self._stream_sent_at = None
+            self._stream_sent_target = None
+            self._send(self._hold_anchor, False)
+            return
+        self._cycle_id += 1
+        cycle = (self._cycle_id, self._clock())
         if (self.execution_policy is not None and self._running
-                and self.executor.has_trajectory and self._check_completion(arm)):
-            # Legacy ordering: completed means measured idle hold NOW, not
-            # one more trajectory sample before dropping into hold.
-            # _check_completion reports the result and anchors a timeout hold.
-            if not self.frozen:
-                self.last_command = self._hold_anchor = None
-            self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
-        if self._running and self.executor.has_trajectory:
-            command = self.executor.step(self.exec_time, arm)
+                and self._reference is not None):
+            # Ordinary joint-goal completion must retain the planned endpoint.
+            # Re-latching measured q here baked the allowed settle residual into
+            # a new target and added another static tracking error at each stop.
+            # Task-specific/contact completion keeps its measured hold contract.
+            goal = (self._reference.end.position.copy()
+                    if self._plan.get("completion") is None else None)
+            if self._check_completion(arm):
+                if not self.frozen:
+                    self.last_command = self._hold_anchor = (
+                        self.executor.hold_command(arm, q_des=goal, integral_bias=self.integral.bias)
+                        if goal is not None else None
+                    )
+                self._cartesian_now = None
+        if self._running and self._reference is not None:
+            point = self._reference.sample(self.exec_time)
+            if self._first_sample_pending is not None and self._reference.elapsed(self.exec_time) >= 0:
+                # This controller's first tick at or after the anchor (before it, a scheduled leg holds its first point):
+                # when it starts commanding the motion, its tick phase included. On hardware both supervisors of
+                # a pair read the PC's monotonic clock, so the two arms' lines differ by the PC-side start skew; the
+                # physical skew at the robots is not measured here.
+                print(f"[arm_controller] first sample {self._first_sample_pending} at {self.exec_time:.6f} "
+                      f"(phase {self._reference.elapsed(self.exec_time):+.4f} s)", flush=True)
+                self._first_sample_pending = None
+            # A Cartesian leg's stiffness is K_c's (operator 2026-10-10): its joint integral is FROZEN -- updated with zero
+            # error, so it neither accumulates against a push or a contact nor jumps; the bias it entered with (the hold's
+            # gravity residual) stays, so the leg starts without a torque step.
+            q_int = arm.position if self._cartesian_now is not None else point.position
+            bias = self.integral.update(*cycle, q_int, arm.position, self.executor.kp)
+            command = self.executor.step(point, arm, integral_bias=bias)
             self._hold_anchor = None  # motion streams: next hold re-anchors
-            if self._send(command, self._cartesian_for_time(self.exec_time)) is False:
+            if self._send(command, True) is False:
                 return
             if self.execution_policy is None:
                 self._check_completion(arm)
             return
-        jog = self._jog_command()
+        jog, expired = self._jog_target()
+        if self._jog_ramp is not None:
+            if jog is None:
+                self._jog_ramp.reset()  # no jog (none yet, expired, cleared, a leg released): the next starts at rest
+            elif np.isfinite(jog).all():
+                jog = self._jog_ramp.step(jog, self.last_state.position, self.execution_policy.period)
         if jog is not None:
+            # Invalid streamed targets used to reach _send's fault path.
+            # Refuse before the atomic integral boundary without changing
+            # that lifecycle response or allowing a partial state advance.
+            if self.execution_policy is not None and not np.isfinite(jog).all():
+                self._fault("non-finite or invalid servo command")
+                return
+            bias = self.integral.update(*cycle, jog, arm.position, self.executor.kp)
+            command = self.executor.hold_command(arm, q_des=jog, integral_bias=bias)
             self._hold_anchor = None   # a jog moves: the next hold re-anchors
-            self._send(jog, self._last_cartesian_pose)
+            self._send(command, False)
             return
         # No trajectory released: hold the anchor. This is the keepalive the
         # plant's deadman needs while the planner searches, while an operator
         # reviews a gated plan, and while a gripper/tilt/graft request is out.
-        command = self._anchored_hold()
+        command = self._anchored_hold(cycle, refresh=expired)
         if command is not None:
-            self._send(command, self._last_cartesian_pose)
+            self._send(command, False)
 
     # -- leg lifecycle -------------------------------------------------------
     @property
@@ -473,10 +662,47 @@ class ArmController:
         stamps ``t_start`` from this property), so the executor never sees the
         absolute value -- only differences.
         """
-        return self._plant_t if self._state_period is not None else self._clock()
+        return self._plant_t if self._state_period is not None else self._reference_clock()
 
-    def _release(self, plan_id: str) -> None:
+    def select_reference_window(self, plan_id, trajectory, *, terminal):
+        """Selected native stream revision; the reference owns endpoint/termination."""
+        from dataclasses import replace
+        if self.current_plan_id != plan_id or self._reference is None or self._reference.sample_source is None:
+            raise ValueError('selected native reference required')
+        self._reference = replace(self._reference, trajectory=trajectory, terminal=terminal)
+
+    def bind_reference_source(self, source) -> None:
+        """Disarmed construction binding for a negotiated plant reference."""
+        if self.armed or self._plan is not None:
+            raise ValueError("bind reference source before ARM or plan admission")
+        self._reference_source = source
+
+    def staged_trajectory(self, plan_id: str) -> JointTrajectory:
+        """Snapshot the trajectory admitted by this controller, for plant upload."""
+        if self.current_plan_id != plan_id or self._pending_traj is None or self._running:
+            raise ValueError("the named trajectory is not staged and unselected")
+        traj = self._pending_traj
+        return JointTrajectory(traj.times, traj.positions, traj.velocities)
+
+    def release_error(self, plan_id: str) -> str:
+        """The existing selection checks, shared with asynchronous RT admission."""
+        if self._plan is None or self._plan["plan_id"] != plan_id:
+            return "the named plan is no longer staged"
+        if not self.armed or not self.ready_sent:
+            return "not armed"
+        if self.execution_policy is not None:
+            # on_plan certified the staged trajectory. Selection
+            # only needs the current observation and start-pose check; repeating
+            # continuous Hermite bounds here delayed the first native envelope.
+            return self._observation_error() or self.execution_policy.start_error(
+                self._plan["positions"][0], self.last_state.position)
+        return ""
+
+    def _release(self, plan_id: str, start: float | None = None) -> None:
         """Start a named plan. Anchors t_start NOW, never at plan time.
+
+        ``start`` (on ``exec_time``'s clock) schedules the anchor instead: a pair's two supervisors anchor both members at
+        one stamp so their reference phases agree (the reference holds its first point until then).
 
         Review time must not be charged against the trajectory: anchoring at
         the planner's send made an arbitrarily long gate pause play out as
@@ -505,40 +731,55 @@ class ArmController:
         if self._running:
             return
         if self.execution_policy is not None:
-            reason = self._observation_error() or self.execution_policy.plan_error(
-                self._plan, self.last_state.position, self.n_arm)
+            reason = self.release_error(plan_id)
             if reason:
                 self._finish_leg(ok=False, reason=reason)
                 self._pending_traj = None
                 return
-        start = self.exec_time
-        self.executor.load_trajectory(self._pending_traj, t_start=start)
-        self._settling.begin(start + self._pending_traj.duration_sec)
+        self._jog.clear()  # a released plan owns the arm: a jog set before it must not resume after the leg
+        start = self.exec_time if start is None else start
+        source = self._reference_source
+        self._reference = TrajectoryReference(
+            self._pending_traj, None if source else start, sample_source=source)
+        self._settling.begin(None if source else start + self._reference.duration_sec)
         self._completion_sample_at = None
+        self._stream_sent_at = None
+        self._stream_sent_target = None
         self._running = True
+        self._first_sample_pending = plan_id
+        # `start` is the trajectory's anchor on the reference clock: a scheduled pair release gives both arms the SAME
+        # stamp by construction, so it shows the anchoring, not a skew. The skew is in the `first sample` line below.
         print(
             f"[arm_controller] executing {self._plan['phase']} "
-            f"({plan_id}, {self._pending_traj.duration_sec:.2f}s)",
+            f"({plan_id}, {self._pending_traj.duration_sec:.2f}s) start={start:.6f}",
             flush=True,
         )
 
-    def on_plant_capabilities(self, value) -> None:
-        self.supports_pose_hold = bool(unpack_json_message(value).get("supports_pose_hold", False))
+    def validate_pose_hold(self, spec: dict) -> dict:
+        """Pure admission shared with the supervisor; never retires execution."""
+        if self.execution_policy is not None and self._observation_error():
+            raise ValueError("Soft needs fresh, healthy measured state")
+        spec = unpack_pose_hold_values(pose_hold_values(spec))
+        if self.pose_provenance == "calibrated":
+            # The RT pose hold closes on the plant's own (vendor) task
+            # model; no calibrated RT task space exists. Mixing a
+            # calibrated PC model with vendor feedback is refused.
+            raise ValueError("Soft uses the RT vendor task model; unavailable "
+                             "while a calibrated model bundle is active")
+        if (not self.supports_pose_hold or not self.armed or not self.ready_sent
+                or self.stopped or self.frozen):
+            raise ValueError("Soft needs an armed, ready, capable plant")
+        if (self._last_state_at is None or self._clock() - self._last_state_at > 1.0
+                or not np.isfinite(self.last_state.position).all()
+                or not np.isfinite(self.last_state.velocity).all()):
+            raise ValueError("Soft needs fresh, finite measured state")
+        if self._running or self._jog.active or np.max(np.abs(self.last_state.velocity)) > 0.05:
+            raise ValueError("Stop and settle before selecting Soft")
+        return spec
 
     def _set_pose_hold(self, spec: dict) -> None:
         try:
-            if self.execution_policy is not None and self._observation_error():
-                raise ValueError("Soft needs fresh, healthy measured state")
-            spec = unpack_pose_hold_values(pose_hold_values(spec))
-            if (not self.supports_pose_hold or not self.armed or not self.ready_sent
-                    or self.stopped or self.frozen):
-                raise ValueError("Soft needs an armed, ready, capable plant")
-            if (self._last_state_at is None or self._clock() - self._last_state_at > 1.0
-                    or not np.isfinite(self.last_state.position).all()
-                    or not np.isfinite(self.last_state.velocity).all()):
-                raise ValueError("Soft needs fresh, finite measured state")
-            if self._running or self._jog.active or np.max(np.abs(self.last_state.velocity)) > 0.05:
-                raise ValueError("Stop and settle before selecting Soft")
+            spec = self.validate_pose_hold(spec)
         except (TypeError, ValueError) as exc:
             self._report_mode(ok=False, reason=str(exc))
             return
@@ -546,8 +787,8 @@ class ArmController:
         self.executor.set_gains(kp=self._track_kp.copy(), kd=self._track_kd.copy())
         self.last_command = None
         self._cartesian_now = None
-        self._last_cartesian_pose = None
         self._pose_hold = spec
+        self._reset_integral()  # the pose-hold law ignores tau_ff
         self._report_mode()
 
     def _set_gains(self, gains: dict) -> None:
@@ -617,12 +858,25 @@ class ArmController:
         does not dip, but a leg aborted mid-motion has a moving command, so
         ``_anchored_hold`` falls through to a static hold at the MEASURED
         pose -- which is where the arm actually is when the button is pressed.
+        A staged, unreleased joint plan has not moved the arm: cancelling only
+        that plan preserves the existing hold anchor, subject to normal relatch
+        and observation guards.
         """
+        keep_anchor = (
+            self._plan is not None and self._pending_traj is not None and not self._running
+            and not self._jog.active and self._pose_hold is None
+            and self._cartesian_now is None
+            and not self.frozen and not self.stopped
+            and self.last_command is not None and not np.any(self.last_command.qd_des)
+            and np.isfinite(self.last_state.velocity).all()
+            and np.max(np.abs(self.last_state.velocity)) < .01
+        )
         if self.execution_policy is not None:
-            self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
+            self._cartesian_now = None
         if self._pose_hold is not None:
             self._pose_hold = None
             self.last_command = None
+            self._reset_integral()  # accumulated under a law that ignored it
             self._report_mode()
         if self._running:
             self._finish_leg(ok=False, reason=reason)
@@ -630,16 +884,17 @@ class ArmController:
         self._plan = None
         self._pending_traj = None
         self._running = False
-        self.executor.clear_trajectory()
+        self._reference = None
         self._jog.clear()
-        self._hold_anchor = None
+        if not keep_anchor:
+            self._hold_anchor = None
         print(f"[arm_controller] cancelled: {reason}"
               f"{' (cleared frozen hold)' if was_frozen else ''}", flush=True)
 
     def _leg_done(self, state: JointState) -> bool:
         """Has this leg finished? The RULE arrives with the plan.
 
-        No rule means the executor's own done(): the plan played out and the
+        No rule means the default: the reference played out and the
         arm is at the target. A ``completion`` spec means the SETTLE rule
         instead -- the plan played out, the arm has genuinely STOPPED, and it
         did not stop absurdly far from the plan. That rule exists for legs
@@ -648,13 +903,16 @@ class ArmController:
         one that gets to know which legs those are, or what tolerances their
         physics deserves. Both numbers ride in with the leg.
         """
+        # LegSettling consults this only once the reference has played out
+        # (its leg end is the reference's start + duration).
+        ref = self._reference
+        if ref is None:
+            return True
         spec = (self._plan or {}).get("completion")
+        if spec is None and self._cartesian_now is not None:
+            return self.executor.hand_at_goal(ref.end.position, state)  # its K_c holds the hand, not the joints
         if spec is None:
-            return self.executor.done(self.exec_time, state)
-        if not self.executor.done(
-            self.exec_time, state, pos_tol=float("inf"), vel_tol=float("inf")
-        ):
-            return False  # the plan has not played out yet
+            return self.executor.at_goal(ref.end.position, state)
         if float(np.max(np.abs(np.asarray(state.velocity)))) > spec["vel_tol"]:
             return False  # still moving: not settled yet
         goal = spec.get("goal_q")
@@ -671,42 +929,59 @@ class ArmController:
         measurement the operator needs to see, which needs the plan and the
         executor's tolerances that this class owns and that one does not.
         """
+        if self._reference is not None and not self._reference.terminal:
+            return False
         now = self.exec_time
         fresh = self._completion_sample_at != self._last_state_at
         if fresh:
             self._completion_sample_at = self._last_state_at
         verdict = self._settling.poll(
-            now=now, fresh=fresh, done=lambda: self._leg_done(state)
+            now=now, fresh=fresh, done=lambda: self._leg_done(state),
+            reference_ended=(self._reference is not None
+                             and self._reference.sample_source is not None
+                             and self._reference.elapsed(now) >= self._reference.end_phase),
         )
         if verdict is None:
             return False
         if verdict.state == SETTLED:
+            if self._plan.get('completion') is None and self._cartesian_now is not None:
+                pos, rot = self.executor.hand_error(self._reference.end.position, state.position)
+                print(f'[arm_controller] cartesian leg {self._plan["phase"]} settled: hand {pos * 1e3:.2f} mm / '
+                      f'{np.degrees(rot):.2f} deg from FK(planned end)', flush=True)
             self._finish_leg(ok=True, reason='')
             return True
         spec = self._plan.get('completion')
         pos_tol, vel_tol = self.executor.completion_tolerances
-        goal = self._plan['positions'][-1]
+        goal = self._reference.end.position
         if spec is not None:
             vel_tol = spec['vel_tol']
             goal, pos_tol = spec.get('goal_q'), spec.get('residual_max')
-        error = None if goal is None else np.abs(state.position - goal)
+        hand = spec is None and self._cartesian_now is not None  # judged on the hand: no joint criterion to report
+        error = None if goal is None or hand else np.abs(state.position - goal)
         joint = None if error is None else int(np.argmax(error)) + 1
         residual = None if error is None else float(np.max(error))
         speed = float(np.max(np.abs(state.velocity)))
         progress = dict(state=verdict.state, elapsed_s=verdict.elapsed_s,
                         remaining_s=verdict.remaining_s,
-                        joint=joint, error_rad=residual, position_tolerance_rad=pos_tol,
+                        joint=joint, error_rad=residual, position_tolerance_rad=None if hand else pos_tol,
                         speed_rad_s=speed, velocity_tolerance_rad_s=vel_tol)
+        if hand:
+            pos, rot = self.executor.hand_error(goal, state.position)
+            lim = self.executor.pose_tolerances
+            progress.update(hand_error_m=pos, hand_error_rad=rot, hand_tolerance_m=lim[0], hand_tolerance_rad=lim[1])
         if verdict.state == TIMED_OUT:
             detail = ('' if residual is None else
                       f'joint {joint} error {residual:.5f} rad (limit {pos_tol:.5f}); ')
+            if hand:
+                detail = (f'hand error {pos * 1e3:.2f} mm / {np.degrees(rot):.2f} deg (limit {lim[0] * 1e3:g} mm / '
+                          f'{np.degrees(lim[1]):g} deg); ')
             reason = (f'Completion timeout after {self._settling.timeout_s:g}s settling: '
                       f'{detail}speed {speed:.5f} rad/s (limit {vel_tol:.5f}). '
                       'Holding measured pose; completion criteria not met.')
             # A failed settle must not turn into another motion or release an
             # attached object. Freeze at the measured pose with zero velocity.
             self.last_command = self._hold_anchor = self._static_hold()
-            self._cartesian_now = self._cartesian_poses = self._last_cartesian_pose = None
+            self._cartesian_now = None
             self._pending_traj = None
             self.frozen = True
             self._finish_leg(ok=False, reason=reason, completion=progress)
@@ -724,7 +999,9 @@ class ArmController:
 
     def _finish_leg(self, *, ok: bool, reason: str, completion=None) -> None:
         plan_id = "" if self._plan is None else self._plan["plan_id"]
-        self.executor.clear_trajectory()
+        self._stream_sent_at = None
+        self._stream_sent_target = None
+        self._reference = None
         self._running = False
         self._plan = None
         self.node.send_output(
@@ -736,19 +1013,33 @@ class ArmController:
         )
 
     # -- outputs -------------------------------------------------------------
-    def _static_hold(self) -> JointServoCommand | None:
-        """Zero-velocity gravity hold at the MEASURED pose (safe freeze).
+    def _where_been(self) -> np.ndarray | None:
+        """The poses the position envelope widens to (rows), operator 2026-10-09 "never further out": per joint, where it
+        rested at ARM if that was inside the envelope (so nothing widens), else -- on the side it rests past -- the outermost
+        pose it has been at since ARM (it rests on its stop: holds re-anchoring at the measured pose, and samples a command was built from as it
+        creeps back in, lie there). None while disarmed or before the first sample: the envelope as configured."""
+        policy = self.execution_policy
+        if not self.armed or self._arm_pose is None or policy is None or policy.position_lower is None:
+            return None
+        rest = self._arm_pose
+        been = self._been if self._been is not None else np.vstack([rest, rest])
+        # per SIDE: a joint resting past its lower limit never gains anything past its upper one
+        return np.vstack([np.where(rest < policy.position_lower, been[0], rest),
+                          np.where(rest > policy.position_upper, been[1], rest)])
 
-        Replaying ``last_command`` verbatim would carry a mid-trajectory qd_des
-        and motion tau_ff into the freeze; fall back to it only when the
-        executor cannot build a hold.
+    def envelope_band(self):
+        """``(lower, upper)`` every command and setpoint must stay inside, or None without a position envelope."""
+        return None if self.execution_policy is None else self.execution_policy.envelope(self._where_been())
+
+    def _static_hold(self) -> JointServoCommand:
+        """Measured-position gravity hold, reading this cycle's existing bias.
+
+        Replaying a moving command would retain its velocity/feedforward;
+        constructing this fallback must not advance integral state again.
         """
-        hold = getattr(self.executor, "hold_command", None)
-        if hold is None:
-            return self.last_command
-        return hold(self.last_state)
+        return self.executor.hold_command(self.last_state, integral_bias=self.integral.bias)
 
-    def _anchored_hold(self) -> JointServoCommand | None:
+    def _anchored_hold(self, cycle, *, refresh=False) -> JointServoCommand | None:
         """The gate/keepalive hold, ANCHORED once per hold episode.
 
         Rebuilding the hold from the live measured pose every tick ratchets:
@@ -768,44 +1059,31 @@ class ArmController:
             if self._hold_anchor is None or np.any(np.abs(q - self._hold_anchor.q_des) > tolerance):
                 self._hold_anchor = self._static_hold()
             # Keep only the target fixed: feedforward uses the measured pose.
-            return self.executor.hold_command(self.last_state, q_des=self._hold_anchor.q_des)
-        if self._hold_anchor is None:
+            target = self._hold_anchor.q_des
+            bias = self.integral.update(*cycle, target, q, self.executor.kp)
+            return self.executor.hold_command(self.last_state, q_des=target, integral_bias=bias)
+        if self._hold_anchor is None or refresh:
             last = self.last_command
-            hold = getattr(self.executor, "hold_command", None)
-            if (
-                last is not None
-                and hold is not None
-                and float(np.max(np.abs(last.qd_des))) < 0.05
-            ):
-                self._hold_anchor = hold(
-                    JointState(
-                        position=np.asarray(last.q_des, dtype=float).copy(),
-                        velocity=np.zeros(self.n_arm),
-                    )
-                )
-            else:
-                self._hold_anchor = self._static_hold()
+            # Legacy cached holds historically evaluated both gravity and
+            # integral at this synthetic commanded state. Preserve that cadence
+            # and observation choice; a reused cache does not advance state.
+            state = self.last_state
+            if not refresh and last is not None and np.max(np.abs(last.qd_des)) < 0.05:
+                state = JointState(np.asarray(last.q_des, dtype=float).copy(), np.zeros(self.n_arm))
+            bias = self.integral.update(*cycle, state.position, state.position, self.executor.kp)
+            self._hold_anchor = self.executor.hold_command(state, integral_bias=bias)
         return self._hold_anchor
 
-    def _cartesian_for_time(self, t_now: float):
-        """The precomputed world EE pose for the sample being commanded.
-
-        The controller owns no kinematics, so the Cartesian impedance target
-        (which is FK(q_des)) rides along with the plan rather than being
-        re-derived here from a model this node is not allowed to load.
-        """
-        poses = self._cartesian_poses
-        if poses is None or self._plan is None:
-            return None
-        times = self._plan["times"]
-        tau = np.clip(self.executor.elapsed(t_now), times[0], times[-1])
-        idx = int(np.searchsorted(times, tau, side="right")) - 1
-        return poses[max(0, min(idx, len(poses) - 1))]
-
-    def _send(self, command: JointServoCommand, cartesian_pose) -> bool:
+    def _send(self, command: JointServoCommand, cartesian: bool) -> bool:
+        """``cartesian``: this word belongs to the running leg and carries its Cartesian spec (if it has one). The law lives
+        with its leg (execution and settling) and nowhere else: every hold, jog and keepalive is the joint law only, as the RT
+        box's own hold is, so a gain change, a disarm or a finished leg can never leave a spring on under other joint gains.
+        The spec has no pose: the plant aims the spring at FK(q_des) with its own model."""
         aborted = False
         if self.execution_policy is not None:
-            if not self.execution_policy.command_valid(command, self.n_arm):
+            if self.armed and self._arm_pose is not None:
+                self._arm_pose_fixed = True  # the episode's first command: from here the band is fixed
+            if not self.execution_policy.command_valid(command, self.n_arm, self._where_been()):
                 self._fault("non-finite or invalid servo command")
                 return False
             if (self._pose_hold is None
@@ -814,35 +1092,26 @@ class ArmController:
                 self.last_command = None
                 self._hold_anchor = self._static_hold()
                 command = self._hold_anchor
-                if command is None or not self.execution_policy.command_valid(command, self.n_arm):
+                if command is None or not self.execution_policy.command_valid(command, self.n_arm, self._where_been()):
                     self._fault("invalid measured hold command")
                     return False
-                cartesian_pose = None
+                cartesian = False
                 aborted = True
         self.last_command = command
-        cartesian = None
-        if self._cartesian_now is not None and cartesian_pose is not None:
-            self._last_cartesian_pose = np.asarray(cartesian_pose, dtype=float)
-            cartesian = {
-                "pose": self._last_cartesian_pose,
-                "task_R": self._cartesian_now["task_R"],
-                "kc": self._cartesian_now["kc"],
-                "dc": self._cartesian_now["dc"],
-            }
+        spec = None
+        if self._cartesian_now is not None and cartesian:
+            spec = self._cartesian_now
+        # Which law this word asks the plant for (trace/1's law_pc: "did this leg run compliant or stiff?").
+        self.last_law = "cartesian_impedance" if spec is not None else "pose_hold" if self._pose_hold else "joint"
         self.node.send_output(
             "motor_command",
-            pack_arm_gripper_command(
-                command.q_des,
-                command.qd_des,
-                command.tau_ff,
-                command.kp,
-                command.kd,
-                self.gripper["open_finger_m"]
-                if self._finger_cmd is None
-                else self._finger_cmd,
-                self.gripper["gains"],
-                self.gripper["mimic"],
-                cartesian=cartesian,
+            pack_motor_command(
+                np.asarray(command.q_des, dtype=float),
+                np.asarray(command.qd_des, dtype=float),
+                np.asarray(command.tau_ff, dtype=float),
+                np.asarray(command.kp, dtype=float),
+                np.asarray(command.kd, dtype=float),
+                None if spec is None else pack_cartesian_block(spec),
                 pose_hold=self._pose_hold,
             ),
         )
@@ -852,6 +1121,14 @@ class ArmController:
         armed = bool(armed)
         if self.armed and not armed:
             self._disarm_reset()
+        if armed and not self.armed:
+            # the pose it rests at as it ARMs (the hold anchors there); none yet: the first sample after
+            fresh = (self._last_state_at is not None and self.execution_policy is not None
+                     and self._clock() - self._last_state_at <= self.execution_policy.state_timeout_sec)
+            self._arm_pose = (np.asarray(self.last_state.position, dtype=float).copy()
+                              if fresh and np.isfinite(self.last_state.position).all() else None)
+            self._arm_pose_fixed = False
+            self._been = None if self._arm_pose is None else np.vstack([self._arm_pose, self._arm_pose])
         self.armed = armed
         self.node.send_output("arm", pack_json_message("arm", {"armed": self.armed}))
 
@@ -870,15 +1147,20 @@ class ArmController:
         if self._running:
             self._finish_leg(ok=False, reason="disarmed mid-leg")
         self._plan = None
+        self._cartesian_now = None
         self._pending_traj = None
         self._running = False
-        self.executor.clear_trajectory()
+        self._reference = None
         self.ready_sent = False
         self.bridge_armed = not self._needs_health
         self._hold_anchor = None
         self._jog.clear()
         self.last_command = None
         self._pose_hold = None
+        self._reset_integral()  # the plant went limp; its bias is gone
+
+    def _reset_integral(self) -> None:
+        self.integral.reset()
 
     def _fault(self, reason: str) -> None:
         if self._running:
@@ -888,7 +1170,7 @@ class ArmController:
     def _stop(self, reason: str) -> None:
         if self.stopped:
             return
-        self.stopped = True
+        self.stopped, self.stop_reason = True, str(reason)
         if self.armed:
             self._set_arm(False)
         self.node.send_output(
@@ -896,56 +1178,3 @@ class ArmController:
             pack_controller_event(kind="fault", ok=False, reason=reason),
         )
         print(f"[arm_controller] stopped: {reason}", flush=True)
-
-    # -- run loop ------------------------------------------------------------
-    def run(self, *, shutdown=None) -> None:
-        handlers = {
-            "motor_state": self.on_motor_state,
-            "motor_health": self.on_motor_health,
-            "plant_capabilities": self.on_plant_capabilities,
-            "plan": self.on_plan,
-            "control": self.on_control,
-            "gripper": self.on_gripper,
-            "jog": self.on_jog,
-            # A second motion source speaks the same contract under its own
-            # topic name (dora maps one producer per input, so an alias is how
-            # two of them reach one handler -- the trajectory executor did the
-            # same for its replay input).
-            "plan_replay": self.on_plan,
-            "control_replay": self.on_control,
-        }
-        seen_unknown: set[str] = set()
-        period = None if self.execution_policy is None else self.execution_policy.period
-        next_deadline = None if period is None else self._clock() + period
-        while shutdown is None or not shutdown.stop_requested:
-            timeout = .05 if period is None else max(0.0, min(.05, next_deadline - self._clock()))
-            event = self.node.next(timeout=timeout)
-            if shutdown is not None and shutdown.stop_requested:
-                break
-            if event is not None and event["type"] == "STOP":
-                break
-            if event is not None and event["type"] == "INPUT":
-                handler = handlers.get(event["id"])
-                # A graph can wire an input this controller has no handler for
-                # -- renaming `trajectory` to `plan` did exactly that -- and a
-                # silent drop makes it look like the producer is broken. Say it
-                # once per topic; every tick would be a log flood.
-                if handler is None and event["id"] not in seen_unknown:
-                    seen_unknown.add(event["id"])
-                    print(
-                        f"[arm_controller] IGNORING input {event['id']!r}: no "
-                        f"handler (known: {sorted(handlers)})",
-                        flush=True,
-                    )
-                if handler is not None:
-                    handler(event["value"])
-            if self.stopped:
-                break
-            if period is not None:
-                now = self._clock()
-                if now >= next_deadline - .1 * period:
-                    # Legacy deadline/slack schedule: one command after a
-                    # stall, never a burst of catch-up commands.
-                    next_deadline = (next_deadline + period
-                                     if now - next_deadline < period else now + period)
-                    self.tick()

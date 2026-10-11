@@ -32,14 +32,12 @@ from dora import Node
 
 from arm_control.assets import mesh_package_dirs
 from arm_control.config import load_robot_config_dict
-from arm_control.joint_motor_map import gripper_motor_to_finger
+from arm_control.joint_motor_map import finger_from_width
 # Same scene draw as the teleop preview — one implementation, so the two Rerun
 # recordings can never disagree about where the dock stands.
-from arm_control.planning.preview_rerun import log_static_scene
-from arm_control.messages import (
-    unpack_motor_state,
-    unpack_json_message,
-)
+from arm_control.viz.preview import log_static_scene
+from arm_control.contracts import unpack_json_message
+from arm_control.contracts.motor import unpack_motor_state
 
 try:
     import pinocchio as pin
@@ -182,36 +180,11 @@ def _log_visual_assets(visual_model) -> None:
         )
 
 
-def _apply_joint_mimics(
-    q: np.ndarray,
-    joint_names: list[str],
-    motor_names: list[str],
-    q_profile: np.ndarray,
-    joint_mimics: dict,
-) -> None:
-    joint_index = {name: i for i, name in enumerate(joint_names)}
-    motor_index = {name: i for i, name in enumerate(motor_names)}
-    for joint_name, spec in joint_mimics.items():
-        source = str(spec.get("source", ""))
-        if joint_name not in joint_index or source not in motor_index:
-            continue
-        raw = float(q_profile[motor_index[source]])
-        if "motor_open" in spec and "motor_closed" in spec:
-            value = gripper_motor_to_finger(raw, spec)
-        else:
-            value = raw * float(spec.get("scale", 1.0))
-            value += float(spec.get("offset", 0.0))
-        if "lower" in spec or "upper" in spec:
-            value = float(np.clip(value, spec.get("lower", -np.inf), spec.get("upper", np.inf)))
-        q[joint_index[joint_name]] = value
-
-
 def _log_render_pose(
     render_model,
     joint_names: list[str],
     motor_names: list[str],
     q_profile: np.ndarray,
-    joint_mimics: dict | None = None,
     finger_values: dict[str, float] | None = None,
 ) -> None:
     model, data, q_idx, visual_model, visual_data = render_model[:5]
@@ -227,14 +200,8 @@ def _log_render_pose(
     if not name_matched:
         for ji in range(min(len(joint_names), len(q_profile))):
             q[q_idx[ji]] = q_profile[ji]
-    if joint_mimics:
-        q_sub = np.array([q[index] for index in q_idx])
-        _apply_joint_mimics(q_sub, joint_names, motor_names, q_profile, joint_mimics)
-        for ji, value in enumerate(q_sub):
-            q[q_idx[ji]] = value
     if finger_values:
-        # Fingers that are NOT bus motors (Franka Hand): live width arrives on
-        # the gripper_state topic instead of a motor slot / mimic.
+        # The Hand's fingers: live width arrives on the gripper_state topic.
         jindex = {name: i for i, name in enumerate(joint_names)}
         for jname, value in finger_values.items():
             ji = jindex.get(jname)
@@ -524,7 +491,6 @@ def main(*, cfg=None, static_geoms=None) -> None:
     fk_min_delta = _fk_min_delta_rad(cfg)
     time_ranges  = _plot_time_ranges(cfg)
     log_rates = bool(cfg.get("viz_log_rates", False))
-    joint_mimics = dict(cfg.get("joint_mimics") or {})
 
     joint_names   = _resolve_joint_names(cfg, urdf_path)
 
@@ -585,8 +551,7 @@ def main(*, cfg=None, static_geoms=None) -> None:
             if render_model is not None and now - last_fk_log >= fk_period_s:
                 if _fk_position_changed(_last_fk_q, q_profile, min_delta_rad=fk_min_delta):
                     _log_render_pose(
-                        render_model, joint_names, motor_names, q_profile,
-                        joint_mimics, finger_values,
+                        render_model, joint_names, motor_names, q_profile, finger_values,
                     )
                     _last_fk_q = q_profile.copy()
                     fk_logs += 1
@@ -613,8 +578,8 @@ def main(*, cfg=None, static_geoms=None) -> None:
                     _gripper_unknown = False
                     print("[viz] Hand width received; fingers are live again",
                           flush=True)
-                half = float(width) / 2.0
-                finger_values = {j: half for j in finger_joints}
+                finger = finger_from_width(float(width))
+                finger_values = {j: finger for j in finger_joints}
                 _last_fk_q = None  # force a re-render even with a motionless arm
 
         elif eid == "can_bus_status":

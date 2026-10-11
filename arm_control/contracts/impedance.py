@@ -37,3 +37,67 @@ def unpack_pose_hold_values(values) -> dict:
     checked = pose_hold_values(spec)
     return dict(id=int(checked[0]), kc=checked[1:7], dc=checked[7:13],
                 nullspace_kp=checked[13], nullspace_kd=checked[14])
+
+
+CARTESIAN_SIZE = 21
+
+
+def cartesian_values(spec: dict) -> list[float]:
+    """The v8 Cartesian-impedance tail (operator 2026-10-09): ``task_R`` (3x3, the task axes as COLUMNS in the robot BASE
+    frame), ``kc`` and ``dc`` (task-frame diagonals [x, y, z, rx, ry, rz]). No target pose: the RT box computes it as
+    FK(q_des) with the model it measures with. ``frame`` must say ``base`` -- a world-frame spec is refused here, never
+    sent. Bounds are pose hold's (one envelope for every Cartesian law on the RT box), mirrored by ``valid_cartesian_spec``."""
+    keys = {"frame", "task_R", "kc", "dc"}
+    if set(spec) != keys:
+        raise ValueError(f"cartesian requires exactly {sorted(keys)}")
+    if spec["frame"] != "base":
+        raise ValueError("the cartesian tail is in the robot BASE frame (convert world-frame specs before sending)")
+    try:
+        rows = [list(map(float, row)) for row in spec["task_R"]]
+        kc, dc = [float(x) for x in spec["kc"]], [float(x) for x in spec["dc"]]
+    except TypeError as exc:  # a flat or scalar matrix, a scalar gain vector
+        raise ValueError(f"cartesian requires a 3x3 task_R and six-axis kc/dc ({exc})") from exc
+    if len(rows) != 3 or any(len(row) != 3 for row in rows) or len(kc) != 6 or len(dc) != 6:
+        raise ValueError("cartesian requires a 3x3 task_R and six-axis kc/dc")
+    flat = [v for row in rows for v in row]
+    if not all(math.isfinite(v) for v in (*flat, *kc, *dc)):
+        raise ValueError("cartesian values must be finite")
+    for i in range(3):
+        for j in range(3):
+            if abs(sum(rows[i][k] * rows[j][k] for k in range(3)) - (i == j)) > 1e-6:
+                raise ValueError("task_R must be orthonormal")
+    r = rows
+    det = (r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1]) - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+           + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]))
+    if abs(det - 1.0) > 1e-6:
+        raise ValueError("task_R must be a rotation (det +1)")
+    caps = [1000] * 3 + [100] * 3 + [200] * 3 + [50] * 3
+    if any(not 0 <= x <= cap for x, cap in zip((*kc, *dc), caps)):
+        raise ValueError("cartesian gains must be nonnegative and within the pose-hold envelope")
+    return [*flat, *kc, *dc]
+
+
+if __name__ == "__main__":
+    # The refusals protocol_selfcheck applies to the same tail (valid_cartesian_spec), index by index.
+    good = dict(frame="base", task_R=[[0, -1, 0], [1, 0, 0], [0, 0, 1]], kc=[1000, 200, 200, 20, 5, 5],
+                dc=[130, 40, 40, .5, .25, .25])
+    base = cartesian_values(good)
+    assert len(base) == CARTESIAN_SIZE and base[:9] == [0, -1, 0, 1, 0, 0, 0, 0, 1]
+    bad = {0: 2.0, 8: -1.0, 9: 1000.1, 12: 100.1, 15: 200.1, 18: 50.1, 10: -1.0, 20: -.1, 4: math.nan, 16: math.inf}
+    for index, value in bad.items():
+        values = list(base)
+        values[index] = value
+        spec = dict(frame="base", task_R=[values[0:3], values[3:6], values[6:9]], kc=values[9:15], dc=values[15:21])
+        try:
+            cartesian_values(spec)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted a bad value at {index}")
+    for wrong in (dict(good, frame="world"), {k: v for k, v in good.items() if k != "dc"}, dict(good, extra=1),
+                  dict(good, task_R=[1, 0, 0, 0, 1, 0, 0, 0, 1]), dict(good, kc=5.0)):
+        try:
+            cartesian_values(wrong)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {sorted(wrong)}")
+    print("PASS cartesian_values: rotation, envelope, finiteness and frame refusals match valid_cartesian_spec")

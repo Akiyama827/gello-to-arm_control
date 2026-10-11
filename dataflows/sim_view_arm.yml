@@ -1,12 +1,18 @@
+# The FR3 in MuJoCo, shown in Rerun, nothing commanded (`tools/run.py sim view`). The arm's supervisor hosts the plant
+# (the launcher starts it first); supervised_arm reads its state through the SDK and never ARMs on its own.
 nodes:
-  - id: plant_interface
-    path: ../nodes/mujoco_interface.py
+  - id: supervised_arm
+    path: ../nodes/supervised_arm.py
+    env:
+      ARM_CONTROL_MODE_CONFIG: examples/profiles/motion_franka.yaml
     outputs:
       - motor_state
-      - sim_qpos       # live twin qpos (unconsumed here)
+      - arm
+      - controller_event
+      - motor_health
       - model_revision
 
   - id: visualizer
     path: ../nodes/visualizer.py
     inputs:
-      motor_state: plant_interface/motor_state
+      motor_state: supervised_arm/motor_state

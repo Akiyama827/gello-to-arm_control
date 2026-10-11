@@ -20,10 +20,10 @@ from arm_control import frames
 from arm_control.config import CONTROL_ROOT, arm_joints, ee_frame, gripper_joints
 from arm_control.control.factory import (
     arm_urdf,
+    arm_speed_limits,
     gain_vector,
-    gripper_command_cfg,
 )
-from arm_control.planning.high_level import ArmPlanner, build_collision_stack
+from arm_control.planning.planner import ArmPlanner, build_collision_stack, ompl_settings
 # Scene-derived obstacles, from the rerun-free module: a controller host must
 # not need a visualiser to servo, and this import used to drag `rerun` in at
 # module level for a function that logs nothing.
@@ -36,7 +36,6 @@ __all__ = [
     "build_planner",
     "build_preview",
     "gain_vector",
-    "gripper_command_cfg",
     "arm_joints",
     "gripper_joints",
     "ee_frame",
@@ -48,7 +47,7 @@ def build_preview(cfg, world, ik, urdf: str, joints: list[str], grip: list[str])
     preview_cfg = dict(cfg.get("planner") or {}).get("preview")
     if not preview_cfg or world is None:
         return None, None
-    from arm_control.planning.preview_rerun import (
+    from arm_control.viz.preview import (
         MeasuredGhost,
         PreviewScene,
         init_preview_stream,
@@ -71,7 +70,7 @@ def build_preview(cfg, world, ik, urdf: str, joints: list[str], grip: list[str])
     # Both go behind DeferredPreview: every Rerun call is queued and drained on
     # a daemon thread, so a viewer nobody opened costs dropped frames and never
     # a blocked caller. See its docstring for why that is not optional.
-    from arm_control.planning.preview_rerun import DeferredPreview
+    from arm_control.viz.preview import DeferredPreview
 
     preview, ghost = DeferredPreview(preview), DeferredPreview(ghost)
     print(
@@ -126,10 +125,7 @@ def build_planner(
             from arm_control.planning.ompl_planner import OMPLPlanner
 
             ompl = OMPLPlanner(
-                list(zip(world.lower, world.upper)), world.in_collision,
-                solve_time_sec=float(planner_cfg.get("solve_time_sec", 2.0)),
-                simplify_time_sec=float(planner_cfg.get("simplify_time_sec", 0.5)),
-                resolution_frac=float(planner_cfg.get("resolution_frac", 0.005)),
+                list(zip(world.lower, world.upper)), world.in_collision, **ompl_settings(planner_cfg),
             )
     elif planner_cfg.get("use_ompl", bool(planner_cfg)):
         world, ompl = build_collision_stack(
@@ -170,12 +166,13 @@ def build_planner(
 
     preview, ghost = build_preview(cfg, world, ik, urdf, joints, grip_joints)
 
+    speed = arm_speed_limits(cfg, n)
     planner = ArmPlanner(
         arm_id=arm_id,
         ik=ik,
         ompl=ompl,
-        max_vel=gain_vector(cfg, "max_vel", n),
-        max_acc=gain_vector(cfg, "max_acc", n),
+        max_vel=speed[0],
+        max_acc=speed[1],
         world=world,
         trajectory_refiner=refiner,
         ik_candidate_attempts=planner_cfg.get('ik_candidate_attempts', 0),

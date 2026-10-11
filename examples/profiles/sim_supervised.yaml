@@ -1,0 +1,22 @@
+# The simulated plant behind an arm supervisor (examples/run_console.py, a project's supervised sim scenario): what the supervisor needs that a real RT
+# server brings with it. SimLink invents none of these, so they are STATED here. `sim_servo` below is the arm_rt_server's own launch
+# defaults (rt/src/server.hpp), so the simulated servo's deadman and hold behave like the one the hardware runs; the `rt` timeouts are the
+# PC-side client defaults (plants/remote_rt/client.py RtConfig):
+rt:
+  instance_id: sim_console       # the supervisor's socket and identity; any valid id
+  state_timeout_s: 0.5
+  ack_timeout_s: 2.0
+  host: 127.0.0.1                # franka_gripper's Hand endpoint: the sim Hand below, never the RT box
+  hand_port: 47812               # == sim_hand.port
+sim_servo:
+  state_hz: 250                  # RT default: state publish rate (the sim also steps at this rate)
+  hold_ms: 100                   # RT default: a command older than this -> hold the measured pose
+  fault_ms: 1000                 # RT default: prolonged silence -> latch CMD_LOST (DISARM then ARM clears)
+  hold_kp: 50                    # RT default: hold gains before any command of the epoch
+  hold_kd: 5
+
+# The execution policy a supervisor requires is the ARM's own, included by the entry config (the FR3's robots/fr3/execution.yaml;
+# a project arm's from its project): not restated here.
+# The Hand on its own protocol (the real hand_bridge wire), backed by the plant's fingers: franka_gripper drives it as on the bench.
+# A gripper other than the Franka Hand states its envelope (sim_hand.limits).
+sim_hand: {port: 47812}
