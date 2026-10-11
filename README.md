@@ -24,6 +24,11 @@ PYTHONPATH=. python -B tools/check/check_leader_follower.py   # 离线自检，�
 PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 缩小孪生小臂 + 曲线
 ```
 
+> 默认 `git clone` 拉的是 `main` 分支（当前已是**最新**）。若你 clone 到的 `main`
+> 看起来落后（旧架构、`tools/bench/` 或 `arm_control/messages` 仍在），说明本地缓存了
+> 旧的远程引用，请先 `git fetch --all --prune`，再切到最新开发分支：
+> `git checkout feat/leader-follower-teleop`。
+
 - 需要 **Python ≥ 3.10**（3.12 验证）和图形界面；无显示环境用 `--headless` / `--save`。
 - **真实 FR3 资产已随仓库分发**（`franka/`，约 12MB），克隆后**无需联网**即可跑真实 FR3 的
   3D 查看器；需要更新时再跑 `python tools/assets/fetch_fr3_description.py`。
