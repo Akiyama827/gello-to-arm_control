@@ -43,6 +43,8 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 缩
   supervisor(rt) 驱动真机，复用完整安全链路。默认 `--follower kin` 仍是纯仿真，行为不变。
   上真机需起 supervisor + dora 图，且 `auto_arm: false`（ARM 由操作台人工执行），
   见图 `dataflows/leader_follower_interactive_franka.yml` 头部注释与启动命令。
+   交互窗口内支持人工在环热键：**`A`=ARM**、**`S`=STOP/DISARM**（仅 dora 真机模式），
+   ARM 后已安全停机的 teleop 会自动检测并恢复跟随，无需重启脚本。
 - 胶囊示意臂（无需任何 FR3 资产）：`PYTHONPATH=. python -B examples/leader_follower_viewer.py`。
 - **真 S288 → 仿真 FR3**（插上硬件就能看真小臂带动 Rerun 里的真 FR3）：
   `PYTHONPATH=. python -B examples/leader_follower_rerun.py --config examples/configs/leader_follower_s288_sim.yaml --leader-source config`

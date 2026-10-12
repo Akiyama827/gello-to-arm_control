@@ -166,6 +166,15 @@ class DoraFollowerFeedback:
             return None
         return self._q.copy()
 
+    def cached_armed(self) -> Optional[bool]:
+        """只读返回最近一帧的使能态（不 drain，供渲染线程安全读取）。
+
+        与 :meth:`sample` 不同，这里不触碰 dora Node，不会与 ``TeleopLoop``
+        线程的 ``drain()`` 争用事件泵。用于检测"真机是否已人工 ARM"，以便
+        ``TeleopLoop`` 停机后能据此自动恢复跟随。还没收到过回读时返回 None。
+        """
+        return self._armed
+
     def latest_arm_state(self) -> tuple[np.ndarray, float]:
         """启动对齐用：返回 (arm_q[n], gripper_finger_m)。无回读则零点。"""
         self.drain()

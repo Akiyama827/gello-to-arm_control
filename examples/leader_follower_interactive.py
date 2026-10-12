@@ -577,6 +577,9 @@ def run_interactive(
     use_config_leader: bool = False,
     slider: Optional["_SliderPanel"] = None,
     real_feedback: Optional[object] = None,
+    teleop: Optional[dict] = None,
+    spawn_teleop: Optional[Callable[[], None]] = None,
+    send_arm: Optional[Callable[[bool], None]] = None,
 ) -> int:
     try:
         import mujoco.viewer  # noqa: F401  # 子模块不会随 import mujoco 自动加载
@@ -595,11 +598,6 @@ def run_interactive(
     render_fps = 120.0
     substeps = max(1, int(round((1.0 / render_fps) / dt)))
 
-    thread = threading.Thread(
-        target=loop.run, kwargs={"duration_s": args.duration}, daemon=True
-    )
-    thread.start()
-
     def _text(lines) -> list:
         """lines: 可迭代的 (grid_pos, msg, sub)。"""
         return [
@@ -614,8 +612,22 @@ def run_interactive(
         line = f"{tag} " + " ".join(parts)
         return f"{line}  {tail}" if tail else line
 
+    # 人工在环 ARM/STOP 键盘：仅 dora 真机模式启用（send_arm 非 None）。
+    # 键值用 glfw 常量；此回调由 MuJoCo passive viewer 在按键时调用。
+    def _key_callback(key_code: int) -> None:
+        if send_arm is None:
+            return
+        try:
+            import glfw
+        except Exception:
+            return
+        if key_code == glfw.KEY_A:  # ARM
+            send_arm(True)
+        elif key_code == glfw.KEY_S:  # STOP / DISARM
+            send_arm(False)
+
     try:
-        with mujoco.viewer.launch_passive(model, data) as handle:
+        with mujoco.viewer.launch_passive(model, data, key_callback=_key_callback) as handle:
             handle.cam.lookat[:] = [-args.separation * 0.5, 0.0, 0.35]
             handle.cam.distance = args.separation * 0.9 + 1.4
             handle.cam.azimuth = 90.0
@@ -649,6 +661,27 @@ def run_interactive(
                 return kin.current()
 
             while handle.is_running():
+                # 兼容调用方未传 teleop/spawn（老签名/其它入口）
+                _teleop = teleop or {}
+                _spawn = spawn_teleop or (lambda: None)
+                # dora 模式 + 真机 ARM 后自动恢复：loop 因未使能安全停机后，
+                # 一旦真机被人工 ARM（armed=True 回读到位），自动重建续跑。
+                # teleop 线程停死后由渲染线程接管 drain，保持 armed/位形最新。
+                if real_feedback is not None:
+                    cur_thread = _teleop.get("thread")
+                    if cur_thread is not None and not cur_thread.is_alive():
+                        try:
+                            real_feedback.drain()  # 只在 teleop 停时 drain，避免争抢
+                            armed = real_feedback.cached_armed()
+                        except Exception:
+                            armed = None
+                        if armed:
+                            print(
+                                "[interactive] 检测到真机已 ARM，自动恢复跟随...",
+                                flush=True,
+                            )
+                            _spawn()
+                            loop = _teleop.get("loop", loop)
                 with handle.lock():
                     if use_config_leader and tap is not None:
                         # 1) 小臂 = 真机最近一次读数（由 loop 线程 100Hz 采样）
@@ -699,7 +732,10 @@ def run_interactive(
                             data.qvel[adr] = 0.0
                         mujoco.mj_forward(model, data)
 
+                monitor = _teleop.get("monitor", monitor)
                 distance = monitor.last_collision_distance
+                # ARM 后自动重启 teleop 时更新本地引用，显示/统计跟最新一次 loop
+                loop = _teleop.get("loop", loop)
                 logger.frame(loop.stats.ticks, ls, fq, fg, distance)
 
                 try:
@@ -713,6 +749,8 @@ def run_interactive(
                     else:
                         d_txt = f"{distance * 1000:.0f}mm" if np.isfinite(distance) else "n/a"
                         right_txt = "" if args.hide_follower else "  右=真实 FR3"
+                        # 人工在环提示：仅 dora 真机模式显示 ARM/STOP 热键
+                        arm_hint = "  A=ARM  S=STOP" if send_arm is not None else ""
                         if use_config_leader:
                             left_txt = "" if args.hide_leader else "  左=真机小臂(实时)"
                             line1 = (
@@ -722,7 +760,7 @@ def run_interactive(
                             line2 = (
                                 f"tick={loop.stats.ticks}  两臂最近={d_txt}  "
                                 f"鼠标=左键旋转/右键平移  "
-                                f"夹爪指令={fg * 1000:.0f}mm"
+                                f"夹爪指令={fg * 1000:.0f}mm{arm_hint}"
                             )
                         else:
                             left_txt = "" if args.hide_leader else "  左=小臂(可拖)"
@@ -733,7 +771,7 @@ def run_interactive(
                             line2 = (
                                 f"tick={loop.stats.ticks}  两臂最近={d_txt}  "
                                 f"拖拽=Ctrl+右键(平移)/Ctrl+左键(旋转)，已选中末端  "
-                                f"夹爪指令={fg * 1000:.0f}mm"
+                                f"夹爪指令={fg * 1000:.0f}mm{arm_hint}"
                             )
                     lead_tail = (
                         f"grip={ls[len(leader_arm_adr)]:+.2f}"
@@ -751,8 +789,11 @@ def run_interactive(
                 handle.sync()
                 time.sleep(1.0 / render_fps)
     finally:
-        loop.request_stop()
-        thread.join(timeout=2.0)
+        _teleop = teleop or {}
+        cur_loop = _teleop.get("loop", loop)
+        cur_thread = _teleop.get("thread", thread)
+        cur_loop.request_stop()
+        cur_thread.join(timeout=2.0)
     return 0
 
 
@@ -877,8 +918,6 @@ def main(argv=None) -> int:
     if not use_config_leader:
         # 小臂是 FR3 孪生：关节映射改为直连，大臂才会和小臂同形跟动
         force_identity_arm_mapping(cfg)
-    retargeter = build_retargeter(cfg.mapping)
-    monitor = build_monitor(cfg.safety, cfg.mapping.joints, collision_guard=guard)
 
     # --- follower / 反馈：仿真（kin）或真机（dora）---
     real_feedback = None  # dora 模式：真机实测位形回读（场景显示 + 安全反馈）
@@ -907,20 +946,66 @@ def main(argv=None) -> int:
               flush=True)
         follower = kin_follower
         loop_feedback = real_feedback.sample
+
+        # 人工在环 ARM/STOP：往 supervised_arm 发 control(arm=...) 使能/失能真机。
+        # 这只是"按键 -> 一条 control 消息"；真机是否真的 ARM/DISARM 由
+        # supervisor 裁决（未 ARM 时 STOP 仍安全；ARM 前请确认周围无人+急停在手）。
+        def _send_arm(armed: bool) -> None:
+            from arm_control.contracts.motion import pack_control_update
+
+            dora_node.send_output("control", pack_control_update(arm=bool(armed)))
+            print(
+                f"[interactive] 人工{'ARM' if armed else 'STOP/DISARM'}："
+                f"已发 control(arm={bool(armed)})",
+                flush=True,
+            )
+
     else:
         follower = kin
         loop_feedback = FollowerFeedback(kin, armed=True)
+        _send_arm = None
 
-    loop = TeleopLoop(
-        leader=leader,
-        retargeter=retargeter,
-        follower=follower,
-        monitor=monitor,
-        feedback=loop_feedback,
-        hz=cfg.loop.hz,
-        auto_align=cfg.mapping.auto_align,
-        log_period_s=cfg.loop.log_period_s,
-    )
+    # dora 模式支持"人工 ARM 后自动恢复跟随"：未使能时 loop 会因
+    # `大臂已失能` 安全停机（安全门：未 ARM 不允许下发 jog）；一旦操作台
+    # ARM 使能，渲染线程检测到 armed 就重建 teleop loop 自动续跑，无需重启
+    # 脚本。重建只换成新鲜的 retargeter/monitor（避免停机态残留），而
+    # leader / follower / 反馈复用同一份（share 同一个 dora 节点，不相撞）。
+    teleop = {}  # 存放当前 (loop, thread)；渲染线程按需更新/读取
+
+    def _spawn_teleop():
+        """（重新）装配 TeleopLoop 并启动其线程，更新 ``teleop`` 容器。"""
+        old_thread = teleop.get("thread")
+        if old_thread is not None and old_thread.is_alive():
+            return  # 仍在跑，不重复启动
+        if old_thread is not None:
+            old_thread.join(timeout=2.0)
+        fresh_retargeter = build_retargeter(cfg.mapping)
+        fresh_monitor = build_monitor(
+            cfg.safety, cfg.mapping.joints, collision_guard=guard
+        )
+        fresh_loop = TeleopLoop(
+            leader=leader,
+            retargeter=fresh_retargeter,
+            follower=follower,
+            monitor=fresh_monitor,
+            feedback=loop_feedback,
+            hz=cfg.loop.hz,
+            auto_align=cfg.mapping.auto_align,
+            log_period_s=cfg.loop.log_period_s,
+        )
+        fresh_thread = threading.Thread(
+            target=fresh_loop.run,
+            kwargs={"duration_s": args.duration},
+            daemon=True,
+        )
+        teleop["loop"], teleop["thread"] = fresh_loop, fresh_thread
+        teleop["monitor"] = fresh_monitor
+        fresh_thread.start()
+
+    _spawn_teleop()
+    loop = teleop["loop"]
+    thread = teleop["thread"]
+    monitor = teleop["monitor"]
 
     logger = _RerunLogger(bool(args.rerun or args.rerun_save))
     if args.rerun or args.rerun_save:
@@ -975,6 +1060,9 @@ def main(argv=None) -> int:
             use_config_leader=use_config_leader,
             slider=slider,
             real_feedback=real_feedback,
+            teleop=teleop,
+            spawn_teleop=_spawn_teleop,
+            send_arm=_send_arm,
         )
     finally:
         if slider is not None:
