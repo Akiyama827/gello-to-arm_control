@@ -1,0 +1,75 @@
+# leader_follower_interactive.py 的「真机 mode」配置（--follower dora 用）。
+#
+# 目的：MuJoCo 虚拟小臂（拖拽/滑块）-> TeleopLoop 安全链路 -> Dora jog ->
+#        supervised_arm -> supervisor(rt) -> 真机 FR3。
+#
+# 与 examples/configs/leader_follower.yaml（纯仿真）的区别只有 follower 块：
+#   follower.kind = dora  经 Dora 图发 jog/gripper/control 到 supervised_arm
+#   auto_arm      = false 节点 open() 只发 control(cancel)，TAKES 手动 ARM
+#                         （真机安全：不让 leader 节点自动使能）
+#
+# leader：kind 无实际作用（interactive 用 drag_leader 作 leader，不走 build_leader），
+#         保留 fake 仅作合法占位。
+#
+# 用法（作为 dora 图节点运行，见 dataflows/leader_follower_interactive_franka.yml）：
+#   LEADER_FOLLOWER_CONFIG=examples/configs/leader_follower_dora_simleader.yaml \
+#     LEADER_FOLLOWER_DORA=1 \
+#     dora run dataflows/leader_follower_interactive_franka.yml
+#
+# 上真机安全顺序：
+#   1) 起 supervisor（未 armed）— 见 examples/configs/fr3_2_rt.yaml
+#   2) 起本 dora 图（交互脚本节点 + supervised_arm）
+#   3) 在 MuJoCo 里拖拽/拖滑块设定目标（此时 jog 仅缓存，未使能不驱动）
+#   4) 确认周围无人、紧急停止在手，才在操作台/用 SDK 人工 ARM
+#   5) ARM 后虚拟小臂位置才真正驱动真机 FR3
+leader:
+  kind: fake            # 占位：interactive 的 leader 是 MuJoCo 虚拟小臂
+  n_arm_joints: 7
+  with_gripper: true
+
+follower:
+  kind: dora            # 经 Dora 图发 jog/control/gripper 到 supervised_arm
+  n_arm_joints: 7       # FR3：7 关节 + Franka Hand
+  auto_arm: false       # 安全：不自动使能；ARM 由操作台人工执行
+  initial: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+  initial_finger_m: 0.04
+
+mapping:
+  auto_align: true      # 用实测 FR3 位形对齐，避免接管跳变
+  alpha: 0.9
+  ramp_s: 0.0
+  joints:
+    - {src: 0, sign:  1.0, offset: 0.0, scale: 1.0, lower: -2.7437, upper:  2.7437, max_rate: 1.5}
+    - {src: 1, sign: -1.0, offset: 0.0, scale: 1.0, lower: -1.7831, upper:  1.7831, max_rate: 1.5}
+    - {src: 2, sign: -1.0, offset: 0.0, scale: 1.0, lower: -2.9007, upper:  2.9007, max_rate: 2.0}
+    - {src: 3, sign: -1.0, offset: 0.0, scale: 1.0, lower: -3.0421, upper: -0.1518, max_rate: 2.0}
+    - {src: 4, sign:  1.0, offset: 0.0, scale: 1.0, lower: -2.8064, upper:  2.8064, max_rate: 2.5}
+    - {src: 5, sign:  1.0, offset: 0.0, scale: 1.0, lower: -0.5445, upper:  4.5161, max_rate: 2.5}
+    - {src: 6, sign:  1.0, offset: 0.0, scale: 1.0, lower: -3.0159, upper:  3.0159, max_rate: 2.5}
+  gripper:
+    src: 7
+    open_finger_m: 0.04
+    closed_finger_m: 0.0
+    max_rate_m_s: 0.1
+
+safety:
+  joint_lower: [-2.7437, -1.7831, -2.9007, -3.0421, -2.8064, -0.5445, -3.0159]
+  joint_upper: [ 2.7437,  1.7831,  2.9007, -0.1518,  2.8064,  4.5161,  3.0159]
+  limits:
+    joint_margin_rad: 0.05
+    max_step_rad: 0.30
+    max_target_vel_rad_s: 2.0
+    feedback_required: true
+    feedback_timeout_s: 0.30
+    track_err_rad: 0.15
+    track_err_hold_s: 0.30
+    track_vel_rad_s: 3.0
+    leader_timeout_s: 0.30
+    collision_stop_m: 0.010
+    collision_warn_m: 0.050
+    collision_every_n: 1
+    collision_slow_scale: 0.25
+
+loop:
+  hz: 100
+  log_period_s: 1.0

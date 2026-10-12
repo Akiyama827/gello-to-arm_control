@@ -1,0 +1,64 @@
+# MuJoCo 虚拟小臂（拖拽/滑块）-> 真机 FR3（fr3_2）的 dora 图。
+#
+# 链路：
+#   leader_follower_interactive.py（MuJoCo 虚拟小臂 + 滑块）
+#     --jog/control--> supervised_arm --SDK--> supervisor(rt) --> RT box --> 真机 FR3
+#
+# 与 leader_teleop_franka.yml 的唯一区别：这里的 leader 不是真实 S288 硬件，而是
+# MuJoCo 里的虚拟小臂（交互脚本自身，含 MuJoCo 窗口 + 可选 tkinter 滑块）。
+# 其余（supervised_arm 契约、motor_state/controller_event 反馈）与 leader_teleop 完全一致。
+#
+# 前置（必须按顺序）：
+#   1. supervisor 已为 fr3_2 起好（DISARMED）：
+#        python -m arm_control.supervisor.service \
+#          --config <绝对路径>/examples/configs/fr3_2_rt.yaml --plant rt
+#   2. 周围无人、紧急停止在手——ARM 只在操作台人工执行，本图内任何节点都不自动使能。
+#
+# 启动（与 leader_teleop_franka.yml 同款惯例：关键 env 由启动命令导出，$PWD 绝对化）：
+#   LEADER_FOLLOWER_DORA=1 \
+#   LEADER_FOLLOWER_CONFIG=$PWD/examples/configs/leader_follower_dora_simleader.yaml \
+#   ARM_CONTROL_CONFIG=$PWD/examples/configs/fr3_2_rt.yaml \
+#   PYTHONPATH=$CONDA_SITE/.venv? 见下方"运行环境" \
+#   dora run dataflows/leader_follower_interactive_franka.yml
+#
+# 运行环境（本机实测，重要）：
+#   * dora CLI 在 .venv/bin（`pip install dora-rs` 装进 .venv）；节点进程由 dora 用
+#     它自己的 .venv python 拉起，与 shell 的 conda 环境无关。
+#   * 但交互脚本要 import pinocchio/mujoco（真 C++ 库只在 conda arm_control 有；
+#     .venv 的 pinocchio 是 PyPI 冒名空包）。所以 PYTHONPATH 需指向 conda 的
+#     site-packages，再叠加仓库根（arm_control）：
+#       PYTHONPATH="/home/akiyama0827/miniconda3/envs/arm_control/lib/python3.12/site-packages:$PWD"
+#   * 两环境 dora-rs 均 1.0.1，Node API 与 run 兼容，混用安全。
+#
+# 安全说明：
+#   * 交互脚本节点用 LEADER_FOLLOWER_DORA=1 触发 dora 后端，部署配置
+#     follower.auto_arm=false：节点 open() 只发 control(cancel) 不 ARM。
+#   * jog 只在 TeleopLoop 线程下发，但因未 ARM，supervisor 不驱动真机。
+#   * 真正驱动 = 人工在操作台（arm_console / SDK）ARM。ARM 前真机不动。
+#   * 本图暂不接 franka_gripper（需要 rt.host/rt.hand_port；Hand 端口未确认，不臆断），
+#     夹爪后续再接入。
+nodes:
+  # 交互脚本：MuJoCo 虚拟小臂作为 leader，输出 jog/control（gripper 留空）。
+  - id: leader_interactive
+    path: ../examples/leader_follower_interactive.py
+    inputs:
+      motor_state:      supervised_arm/motor_state
+      motor_health:     supervised_arm/motor_health
+      controller_event: supervised_arm/controller_event
+    outputs:
+      - jog
+      - control
+      - gripper
+
+  # arm_controller 契约：通过 SDK 连 supervisor，唯一控制权威。
+  - id: supervised_arm
+    path: ../nodes/supervised_arm.py
+    inputs:
+      control: leader_interactive/control
+      jog:     leader_interactive/jog
+    outputs:
+      - motor_state
+      - arm
+      - controller_event
+      - motor_health
+      - model_revision

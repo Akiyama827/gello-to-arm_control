@@ -1,0 +1,59 @@
+# 第二台 FR3（fr3_2）真机 supervisor 配置（--plant rt）。
+#
+# 这是 supervisor（arm_control.supervisor.service）使用的 robot config：
+# 描述"这台机械臂是哪台、关节是哪些、怎么连 RT server、用什么控制增益"。
+# 注意：这是 SUPERVISOR 的配置，不是 leader_follower 遥操配置。
+#
+# 现场事实（实测）：
+#   * RT box          = 172.16.1.2
+#   * arm_rt_server   = --instance-id fr3_2 --udp 47820 --tcp 47821（franka 后端）
+#   * Franka Hand     = hand_bridge，独立 TCP 服务（本配置不负责 Hand，见下）
+#   * 第二台 FR3 FCI  = 172.16.2.3（RT server 侧连它）
+#
+# 启动（本题起点；未 armed，不会动）：
+#   python -m arm_control.supervisor.service \
+#     --config examples/configs/fr3_2_rt.yaml --plant rt
+#
+# 说明：
+#   * supervisor 起来后 DISARMED 且无 owner，机械臂不会动；要驱动需
+#     ARM + supervisor 权限（经 sdk/ArmClient）。
+#   * Franka Hand 由 dora 图里的 franka_gripper 节点驱动，不走本 supervisor
+#     （supervisor 只管 7 个臂关节）。rt.hand_port 仅用于标识，不影响臂。
+include:
+  - ../../robots/fr3/description.yaml   # arm.joints / gripper / URDF / max_tau
+  - ../../robots/fr3/gains.yaml         # arm.kp / arm.kd（臂默认阻抗）
+  - ../../robots/fr3/execution.yaml     # execution_policy（100 Hz 截止策略）
+  - ../../robots/fr3/control_mode.yaml  # controller 上限 + gain_presets
+
+# control_mode：把 controller 上限、增益预设、以及本机的模式键装在一起。
+# build_arm_controller 读 cfg['control_mode']（resolve_gains / resolve_presets）。
+control_mode:
+  controller:
+    kp_max: 3000.0
+    kd_max: 200.0
+    torque_limit_max: 90.0
+  gain_presets:
+    float:
+      kp: 0.0
+      kd: 5.0
+    soft:
+      pose_hold:
+        kc: [300, 300, 300, 30, 30, 30]
+        dc: [35, 35, 35, 8, 8, 8]
+        nullspace_kp: 0.5
+        nullspace_kd: 2.0
+    track: {}
+
+# 真机 RT 连接块（supervisor 用 RtBackend.from_config 读它）。
+rt:
+  instance_id: fr3_2      # 实例名：决定 socket fr3_2.sock 与 RT identity
+  host: 172.16.1.2        # RT box 地址
+  udp_port: 47820         # 实测 arm_rt_server fr3_2 的 UDP（状态）
+  tcp_port: 47821         # RT server 的控制 TCP
+  state_timeout_s: 0.5
+  ack_timeout_s: 2.0
+  # max_fault_ms 缺省 = 0（不校验 RT server 的 fault-ms）。如需强制"命令断流
+  # 不能超过 N ms"，设一个正值并确保小于 RT server 的 --fault-ms。
+
+# 这台臂的几何/位形事实：电池、基座位置等现场项由部署侧 workcell 提供；
+# 真机不需要 sim_* 块（那是 SimLink 用的）。这里不声明任何 sim_ 字段。

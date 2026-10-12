@@ -155,6 +155,17 @@ class DoraFollowerFeedback:
     def stopped(self) -> bool:
         return self._stopped
 
+    def cached_arm_state(self) -> Optional[np.ndarray]:
+        """只读返回最近一帧实测臂关节角（不 drain，供渲染线程安全读缓存）。
+
+        与 :meth:`latest_arm_state` 不同，这里不触碰 dora Node，因此可在
+        ``TeleopLoop`` 线程之外（如 MuJoCo 渲染线程）安全调用，不会与主循环
+        的 ``drain()`` 争用同一个 runtime 事件泵。无回读时返回 None。
+        """
+        if self._q is None:
+            return None
+        return self._q.copy()
+
     def latest_arm_state(self) -> tuple[np.ndarray, float]:
         """启动对齐用：返回 (arm_q[n], gripper_finger_m)。无回读则零点。"""
         self.drain()

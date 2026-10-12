@@ -38,6 +38,11 @@ PYTHONPATH=. python -B examples/leader_follower_rerun.py      # 真实 FR3 + 缩
   （上游只发布打印用 STL，没有装配体/CAD），待拿到官方 CAD 再精确对齐。查看/调参：
   `PYTHONPATH=. python -B examples/gello_leader_preview.py`。
 - 交互拖拽版：`PYTHONPATH=. python -B examples/leader_follower_interactive.py`。
+- **虚拟小臂 → 真机 FR3（dora）**：同一交互脚本加 `--follower dora`（或环境变量
+  `LEADER_FOLLOWER_DORA=1`）把 MuJoCo 虚拟小臂的拖拽/滑块经 `supervised_arm` 发到
+  supervisor(rt) 驱动真机，复用完整安全链路。默认 `--follower kin` 仍是纯仿真，行为不变。
+  上真机需起 supervisor + dora 图，且 `auto_arm: false`（ARM 由操作台人工执行），
+  见图 `dataflows/leader_follower_interactive_franka.yml` 头部注释与启动命令。
 - 胶囊示意臂（无需任何 FR3 资产）：`PYTHONPATH=. python -B examples/leader_follower_viewer.py`。
 - **真 S288 → 仿真 FR3**（插上硬件就能看真小臂带动 Rerun 里的真 FR3）：
   `PYTHONPATH=. python -B examples/leader_follower_rerun.py --config examples/configs/leader_follower_s288_sim.yaml --leader-source config`
