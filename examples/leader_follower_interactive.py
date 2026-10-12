@@ -667,7 +667,10 @@ def run_interactive(
                 # dora 模式 + 真机 ARM 后自动恢复：loop 因未使能安全停机后，
                 # 一旦真机被人工 ARM（armed=True 回读到位），自动重建续跑。
                 # teleop 线程停死后由渲染线程接管 drain，保持 armed/位形最新。
-                if real_feedback is not None:
+                # dora 已 STOP（图收尾/异常退出）时不自动恢复，否则 would
+                # 陷入"STOP->重建->STOP->重建"风暴，且 cached_armed 残留 True
+                # 会误判"仍已 ARM"持续重建，最终在重建中异常崩溃。
+                if real_feedback is not None and not real_feedback.stopped:
                     cur_thread = _teleop.get("thread")
                     if cur_thread is not None and not cur_thread.is_alive():
                         try:
@@ -790,10 +793,15 @@ def run_interactive(
                 time.sleep(1.0 / render_fps)
     finally:
         _teleop = teleop or {}
-        cur_loop = _teleop.get("loop", loop)
-        cur_thread = _teleop.get("thread", thread)
-        cur_loop.request_stop()
-        cur_thread.join(timeout=2.0)
+        # 注意：cur_loop/cur_thread 一律从容器取值（exists 判定），不依赖 may
+        # 尚未赋值的裸局部变量（loop/thread 在装配段才赋值，早期异常会走到
+        # finally 导致 NameError 二次覆盖原始异常）。判 None 再 join 同样防抖。
+        cur_loop = _teleop.get("loop")
+        if cur_loop is not None:
+            cur_loop.request_stop()
+        cur_thread = _teleop.get("thread")
+        if cur_thread is not None:
+            cur_thread.join(timeout=2.0)
     return 0
 
 
@@ -940,6 +948,10 @@ def main(argv=None) -> int:
         kin_follower.state_provider = None  # auto_align 基准由 prime 后回读注入
         real_feedback = DoraFollowerFeedback(dora_node, cfg.follower.n_arm_joints)
         kin_follower.state_provider = real_feedback.latest_arm_state
+        # 下发限幅实测源：用只读的 cached_arm_state（不 drain、不争用），
+        # 让 DoraJogFollower.send 把目标钳到 superando 接受的 setpoint 步长内，
+        # 实现"绝对对齐逐步追平小臂位置"（supervisor abort_pos_err_rad 限制）。
+        kin_follower.measured_limiter = real_feedback.cached_arm_state
         # 首帧真机位形回来后再 auto_align，避免拿零点对齐（fr3_joint4 零位越限）
         real_feedback.prime()
         print("[interactive] 大臂后端：Dora -> supervised_arm -> 真机 FR3（未 ARM，人工使能）",

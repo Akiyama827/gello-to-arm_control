@@ -35,7 +35,9 @@ follower:
   initial_finger_m: 0.04
 
 mapping:
-  auto_align: true      # 用实测 FR3 位形对齐，避免接管跳变
+  # false = 绝对对齐：不做 leader->follower 的起点偏移，大臂以 max_rate 限速
+  # 主动 track 到小臂的实际绝对位形（两臂同 home/同刻度）。ARM 后自动追平"对牢"。
+  auto_align: false      # true 会记 offset 相对接管（大臂保持不动）
   alpha: 0.9
   ramp_s: 0.0
   joints:
@@ -63,6 +65,9 @@ safety:
     feedback_timeout_s: 0.30
     track_err_rad: 0.25
     track_err_hold_s: 0.60
+    track_err_enter_rad: 0.35  # 追近判区阈值：偏差>此值视为"追赶中"不判 track_err
+                               #   （绝对对齐大臂正从当前位置向远处目标限速爬行，位置差是
+                               #   正常追赶进度）；追到偏差 < 此值才启用 0.25 紧误差监控。
     track_vel_rad_s: 2.5
     leader_timeout_s: 0.30
     collision_stop_m: 0.010

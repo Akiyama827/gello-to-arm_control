@@ -228,6 +228,17 @@ class DoraJogFollower:
     state_provider: Optional[Callable[[], tuple[np.ndarray, float]]] = field(
         default=None, repr=False
     )
+    # 下发限幅用的当前实测来源：返回 arm_q[n]（**只读、不 drain**，如
+    # ``DoraFollowerFeedback.cached_arm_state``）。supervisor 的 setpoint/1 会拒绝
+    # "距当前实测 > abort_pos_err_rad" 的目标（防突跳），绝对对齐追赶的第一步
+    # 往往超此阈值；限幅后每帧目标距当前实测 <= setpoint_step_lim_rad，大臂以
+    # 真机 JogRamp 限速逐步追平。None = 不限幅（kin 等无此限制的后端）。
+    measured_limiter: Optional[Callable[[], Optional[np.ndarray]]] = field(
+        default=None, repr=False
+    )
+    # supervisor ES 的 abort_pos_err_rad（execution.yaml）：setpoint 目标距当前
+    # 实测超过此值会被拒绝。限幅值必须 <= 它。
+    setpoint_step_lim_rad: float = 0.35
 
     _sent: int = field(default=0, init=False)
     _opened: bool = field(default=False, init=False)
@@ -265,6 +276,16 @@ class DoraJogFollower:
         q = np.asarray(arm_q, dtype=float)
         if q.shape != (self.num_arm_joints,):
             raise ValueError(f"大臂目标长度应为 {self.num_arm_joints}，得到 {q.shape}")
+        # 限幅逼近（dora 真机）：supervisor setpoint 拒绝"距当前实测 > abort_pos_err_rad"
+        # 的目标，绝对对齐的第一步往往超阈。用当前实测把目标钳到 ±setpoint_step_lim_rad
+        # 内，大臂以真机 JogRamp 限速逐步追平；追近后目标不再被钳，照常下发。
+        if self.measured_limiter is not None and self.setpoint_step_lim_rad > 0.0:
+            measured = self.measured_limiter()
+            if measured is not None:
+                m = np.asarray(measured, dtype=float).ravel()
+                if m.shape == q.shape and np.all(np.isfinite(m)):
+                    step = self.setpoint_step_lim_rad
+                    q = m + np.clip(q - m, -step, step)
         node.send_output("jog", pack_jog(q=q, reason=self.reason))
         # 夹爪走 gripper topic，格式为 2 指 motor_command：`franka_gripper` 取
         # position[0] 作为**单指位移（米）**并令 width = 2*finger；DM 臂则由

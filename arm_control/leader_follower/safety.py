@@ -58,6 +58,10 @@ class SafetyLimits:
     feedback_timeout_s: float = 0.30      # 反馈陈旧上限
     track_err_rad: float = 0.15           # 命令-实测位置误差阈值
     track_err_hold_s: float = 0.30        # 误差持续多久才停（滤瞬态）
+    track_err_enter_rad: float = 0.60     # 追赶进入阈值：偏差超此值视为"追赶中"
+                                          #   （绝对对齐大臂从当前位置向远处目标爬行，偏差大是
+                                          #   正常进度），暂不判 track_err；追到偏差 < 此值后，
+                                          #   才启用 track_err_rad 的紧误差监控。
     track_vel_rad_s: float = 3.0          # 实测关节速度异常上限
     leader_timeout_s: float = 0.30        # leader 断流上限
 
@@ -386,9 +390,15 @@ class SafetyMonitor:
                     )
 
         # 跟踪误差：命令(上一 tick 目标) vs 实测，需持续超阈才停。
+        # 追赶阶段（偏差 > enter 阈值）视为"大臂正在从当前位置向远处目标
+        # 限速爬行"，位置差是正常追赶进度，不判 track_err 停机；一旦追到
+        # 偏差 < enter，说明已贴近目标，恢复紧误差监控（防卡住不动/越走越远）。
         if self._prev_target is not None:
             err = float(np.max(np.abs(self._prev_target - q)))
-            if err > self.limits.track_err_rad:
+            if err > self.limits.track_err_enter_rad:
+                # 追赶中：大偏差是正常追赶进度，重置计时避免误停。
+                self._track_since = None
+            elif err > self.limits.track_err_rad:
                 if self._track_since is None:
                     self._track_since = now
                 elif now - self._track_since > self.limits.track_err_hold_s:
