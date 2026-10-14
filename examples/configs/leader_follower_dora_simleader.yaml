@@ -63,11 +63,15 @@ safety:
     max_target_vel_rad_s: 2.0
     feedback_required: true
     feedback_timeout_s: 0.30
-    track_err_rad: 0.25
+    track_err_rad: 0.30
     track_err_hold_s: 0.60
-    track_err_enter_rad: 0.35  # 追近判区阈值：偏差>此值视为"追赶中"不判 track_err
+    track_err_enter_rad: 0.60  # 追近判区阈值：偏差>此值视为"追赶中"不判 track_err
                                #   （绝对对齐大臂正从当前位置向远处目标限速爬行，位置差是
-                               #   正常追赶进度）；追到偏差 < 此值才启用 0.25 紧误差监控。
+                               #   正常追赶进度）；追到偏差 < 此值才启用 0.30 紧误差监控。
+                               #   2026-10-15: 此前 enter=0.35 与 rad=0.25 死区过窄(0.1 rad)，
+                               #   真机 joint2 偏差停在 0.26 附近(被 JogRamp 限速追赶)持续时间
+                               #   达 0.6s 即误触"跟踪误差过大"停机。拉宽 enter 到 0.60（回默认）、
+                               #   rad 提到 0.30（仍 < supervisor abort_pos_err 0.35，安全）。
     track_vel_rad_s: 2.5
     leader_timeout_s: 0.30
     collision_stop_m: 0.010

@@ -237,8 +237,41 @@ class DoraJogFollower:
         default=None, repr=False
     )
     # supervisor ES 的 abort_pos_err_rad（execution.yaml）：setpoint 目标距当前
-    # 实测超过此值会被拒绝。限幅值必须 <= 它。
-    setpoint_step_lim_rad: float = 0.35
+    # 实测超过它会被拒绝。限幅值必须**严格小于** abort_pos_err_rad，留出实测
+    # 抖动的余量：若 =0.35 则命令停在实测+0.35，恰好压线，任何实测微小抖动都
+    # 可能让真实差跳到 0.35+ 被拒 -> 回中。取 0.30，距阈值 0.35 留 0.05 余量。
+    setpoint_step_lim_rad: float = 0.30
+
+    # ===== 安全兜底（以下均"不依赖真机回读"，链路不稳也生效）=====
+    # 1) 本帧目标相对"上帧已发送目标"的偏移绝对上限（本地统计、链路无关，
+    #    防"回读不可用时把远离一切的原始绝对目标"直发）。两帧间突跳超过它
+    #    就不发本帧（保持上次），等后续帧跟上来。取 0.30，严格小于 supervisor
+    #    abort_pos_err_rad(0.35)，确保极端突跳也不触线。
+    max_step_from_prev_rad: float = 0.30
+    # 2) 命令目标的车速自检：若设置（如 supervisor 的 velocity_limits），
+    #    send 自己把目标每帧步伐硬限到 velocity_limits * dt（dt 为距上次发送
+    #    的时间），确保命令目标永远不超真机允许的角速度。这样即使"小臂快、
+    #    大臂慢慢跟"，命令目标也始终落在真机能平顺追上的范围内，**永不触发
+    #    supervisor 的 abort_pos_err_rad 拒绝，也就不存在 jog 过期->re-anchor
+    #    回中->拉锯**。这是"传输前自己算会不会超速"的实现。
+    velocity_limits_rad_s: Optional[Sequence[float]] = field(default=None, repr=False)
+    # 3) 回读实测的"年龄（秒）"来源（配合 measured_limiter）：返回最近一帧
+    #    实测距今多久。超过新鲜度门槛(measured_fresh_s)就当作不可用（宁可不发，
+    #    也不拿陈旧实测当钳制基准——陈旧基准会让命令目标仍距 supervisor 新鲜
+    #    实测 >0.35 被拒）。None = 不做新鲜度检查。
+    measured_limiter_age: Optional[Callable[[], Optional[float]]] = field(
+        default=None, repr=False
+    )
+    measured_fresh_s: float = 0.3
+
+    # 回读实测不可用（None/非有限/非新鲜）且没有任何上帧基准时，是否整体跳过
+    # 下发（True=宁可不发也不放行远处原始目标；这是安全默认值）。
+    hold_when_no_measure_and_no_prev: bool = True
+
+    _last_sent: Optional[np.ndarray] = field(default=None, init=False, repr=False)
+    _last_sent_t: float = field(default=0.0, init=False, repr=False)
+    _skipped: int = field(default=0, init=False, repr=False)
+    _now: Callable[[], float] = field(default=time.monotonic, init=False, repr=False)
 
     _sent: int = field(default=0, init=False)
     _opened: bool = field(default=False, init=False)
@@ -268,6 +301,16 @@ class DoraJogFollower:
             return np.asarray(arm, dtype=float).ravel(), float(finger)
         return np.zeros(self.num_arm_joints), 0.0
 
+    def _measured_is_fresh(self) -> bool:
+        """回读实测是否新鲜（配合 measured_limiter_age）；无年龄来源时视为新鲜。"""
+        if self.measured_limiter_age is None:
+            return True
+        try:
+            age = self.measured_limiter_age()
+        except Exception:
+            return False
+        return age is None or float(age) <= self.measured_fresh_s
+
     def send(self, arm_q: Sequence[float], gripper_finger_m: float) -> None:
         from arm_control.contracts.motion import pack_jog
         from arm_control.contracts.motor import pack_motor_command
@@ -276,16 +319,57 @@ class DoraJogFollower:
         q = np.asarray(arm_q, dtype=float)
         if q.shape != (self.num_arm_joints,):
             raise ValueError(f"大臂目标长度应为 {self.num_arm_joints}，得到 {q.shape}")
-        # 限幅逼近（dora 真机）：supervisor setpoint 拒绝"距当前实测 > abort_pos_err_rad"
-        # 的目标，绝对对齐的第一步往往超阈。用当前实测把目标钳到 ±setpoint_step_lim_rad
-        # 内，大臂以真机 JogRamp 限速逐步追平；追近后目标不再被钳，照常下发。
+        now = self._now()
+
+        # ---- 车速自检（传输前自己算会不会超速；最优先）----
+        # 若配了 velocity_limits_rad_s（如 supervisor 的 0.4 rad/s），把本帧目标
+        # 相对上帧的移动硬限到 velocity_limits * dt。这保证命令目标永远落在真机
+        # 能平顺追上的速度内 -> 距 supervisor 新鲜实测不会累积超 abort_pos_err_rad
+        # -> 永不触发"被拒 -> jog 过期 -> re-anchor 回中"的拉锯。
+        # dt 封顶 0.1s：即使调用方偶发阻塞很久，单帧移动也不超过 0.4*0.1=0.04 rad，
+        # 异常阻塞也不会让命令目标突跳（相邻帧钳制再兜 0.35）。
+        if self.velocity_limits_rad_s is not None and self._last_sent is not None:
+            dt = min(max(now - self._last_sent_t, 1e-4), 0.1)
+            v = np.asarray(self.velocity_limits_rad_s, dtype=float).ravel() * dt
+            if v.shape == q.shape and np.all(v > 0.0):
+                q = self._last_sent + np.clip(q - self._last_sent, -v, v)
+
+        # ---- 相邻帧偏移绝对上限（更大粒度的兜底，防 dt 异常导致的突跳）----
+        if self._last_sent is not None:
+            prev = self._last_sent
+            q = prev + np.clip(q - prev, -self.max_step_from_prev_rad, self.max_step_from_prev_rad)
+
+        # ---- 限幅到"新鲜实测 ± setpoint_step_lim_rad"----
+        # 实测新鲜且有效：钳到 fresh_measured ± setpoint_step_lim_rad(0.30，
+        # 严格小于 abort 阈值 0.35)，确保距 supervisor 新鲜实测 <= 0.30 < 0.35，
+        # 绝对不被拒，且留抖动余量。
+        # 实测不可用/非有限/不新鲜：**绝不静默放行**。
+        #   - 有上帧基准 -> 若车速自检生效则命令已限速（安全小步），但仍冻结在
+        #     上帧（不推进），避免命令目标脱离真机实测；无车速自检则同样冻结。
+        #   - 无上帧基准  -> 跳过本帧（宁可不发，也不发远处目标）。
+        measured_good = False
         if self.measured_limiter is not None and self.setpoint_step_lim_rad > 0.0:
-            measured = self.measured_limiter()
+            measured = None
+            age_ok = self._measured_is_fresh()
+            if age_ok:
+                measured = self.measured_limiter()
             if measured is not None:
                 m = np.asarray(measured, dtype=float).ravel()
                 if m.shape == q.shape and np.all(np.isfinite(m)):
                     step = self.setpoint_step_lim_rad
                     q = m + np.clip(q - m, -step, step)
+                    measured_good = True
+            if not measured_good:
+                if self._last_sent is None and self.hold_when_no_measure_and_no_prev:
+                    # 无新鲜实测且无上帧基准：不发本帧（安全；等回读恢复）
+                    self._skipped += 1
+                    return
+                # 有上帧基准但实测不可靠：冻结在上一帧（不推进、不后退），
+                # 等待新鲜回读恢复。绝不放行放大后的目标。
+                q = self._last_sent.copy() if self._last_sent is not None else q
+
+        self._last_sent = q.copy()
+        self._last_sent_t = now
         node.send_output("jog", pack_jog(q=q, reason=self.reason))
         # 夹爪走 gripper topic，格式为 2 指 motor_command：`franka_gripper` 取
         # position[0] 作为**单指位移（米）**并令 width = 2*finger；DM 臂则由

@@ -166,6 +166,17 @@ class DoraFollowerFeedback:
             return None
         return self._q.copy()
 
+    def cached_arm_state_age(self) -> Optional[float]:
+        """只读返回最近一帧实测距今多少秒（无回读则 None）。
+
+        供 :meth:`arm_control.leader_follower.follower.DoraJogFollower` 的
+        ``measured_limiter_age`` 使用：回读陈旧（超过新鲜度门槛）时，限幅器应
+        把陈旧实测当作不可用，避免拿旧值做钳制基准导致命令目标脱离真机。
+        """
+        if self._q is None:
+            return None
+        return time.monotonic() - self._t
+
     def cached_armed(self) -> Optional[bool]:
         """只读返回最近一帧的使能态（不 drain，供渲染线程安全读取）。
 

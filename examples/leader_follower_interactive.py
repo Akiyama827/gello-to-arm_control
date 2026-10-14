@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
+import yaml  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -91,6 +92,36 @@ FINGER_MAX_M = 0.04
 # follower.initial 时兜底，否则 auto_align 会从全零起步、第一 tick 就因越限停机。
 FR3_HOME = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
 APP_ID = "arm_control_leader_follower_interactive"
+
+
+def _read_execution_policy() -> dict:
+    """读 supervisor 同一份 execution.yaml（robots/fr3/execution.yaml）的执行策略。
+
+    返回含 ``velocity_limits``/``acceleration_limits``/``abort_pos_err_rad`` 等关键
+    上限的 dict，供 dora 侧把命令目标的车速/步长对齐到真机实际允许范围——与
+    supervisor 的判定使用同一事实来源，避免两侧对"会不会超"判断不一致。
+    读不到就回退到 FR3 默认值（0.4 rad/s），并打印警告。
+    """
+    path = ROOT / "robots" / "fr3" / "execution.yaml"
+    fallback = {
+        "velocity_limits": [0.4] * 7,
+        "acceleration_limits": [0.8] * 7,
+        "abort_pos_err_rad": 0.35,
+    }
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[interactive] 警告：读取 {path} 失败（{exc}），回退默认执行策略", flush=True)
+        return fallback
+    pol = (data or {}).get("execution_policy") or {}
+    out = {k: v for k, v in fallback.items() if k in pol}
+    for k in ("velocity_limits", "acceleration_limits"):
+        v = pol.get(k)
+        if v and len(v) == 7:
+            out[k] = [float(x) for x in v]
+    if "abort_pos_err_rad" in pol:
+        out["abort_pos_err_rad"] = float(pol["abort_pos_err_rad"])
+    return out
 
 
 def _adr(model: mujoco.MjModel, joint_name: str) -> int:
@@ -952,6 +983,14 @@ def main(argv=None) -> int:
         # 让 DoraJogFollower.send 把目标钳到 superando 接受的 setpoint 步长内，
         # 实现"绝对对齐逐步追平小臂位置"（supervisor abort_pos_err_rad 限制）。
         kin_follower.measured_limiter = real_feedback.cached_arm_state
+        # 回读新鲜度：实测过期（>0.3s）就当不可用，避免拿陈旧基准钳制导致命令目标
+        # 脱离真机（陈旧回读会让命令目标仍距 supervisor 新鲜实测>0.35 被拒->回中）。
+        kin_follower.measured_limiter_age = real_feedback.cached_arm_state_age
+        # 命令目标车速自检：与 supervisor execution.yaml 的 velocity_limits 对齐，
+        # 让命令目标步伐硬限 <= 真机能平顺追上的速度，从而永不触发 abort_pos_err_rad
+        # 拒绝 -> 不存在 jog 过期 re-anchor 回中 -> 不抽搐。
+        exec_cfg = _read_execution_policy()
+        kin_follower.velocity_limits_rad_s = exec_cfg["velocity_limits"]
         # 首帧真机位形回来后再 auto_align，避免拿零点对齐（fr3_joint4 零位越限）
         real_feedback.prime()
         print("[interactive] 大臂后端：Dora -> supervised_arm -> 真机 FR3（未 ARM，人工使能）",

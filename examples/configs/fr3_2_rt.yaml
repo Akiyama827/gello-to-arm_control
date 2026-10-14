@@ -32,6 +32,11 @@ control_mode:
     kp_max: 3000.0
     kd_max: 200.0
     torque_limit_max: 90.0
+    # 真机增益 = 工作台实测值（modular_robotic_arm/Control configs/modes/franka_rt.yaml）。
+    # 若不配，会落到库的 arm-table 回退值（kp 800/600/400 on joints 5-7，属仿真默认），
+    # 对轻手腕在 RT 循环抖动下过 stiff -> 遥操时 joint5 振铃。故显式给定逐关节 kp/kd。
+    kp: {fr3_joint1: 600.0, fr3_joint2: 600.0, fr3_joint3: 600.0, fr3_joint4: 600.0, fr3_joint5: 250.0, fr3_joint6: 150.0, fr3_joint7: 60.0}
+    kd: {fr3_joint1: 50.0, fr3_joint2: 50.0, fr3_joint3: 50.0, fr3_joint4: 20.0, fr3_joint5: 20.0, fr3_joint6: 20.0, fr3_joint7: 10.0}
   gain_presets:
     float:
       kp: 0.0
@@ -45,9 +50,14 @@ control_mode:
     track: {}
 
 # 真机 RT 连接块（supervisor 用 RtBackend.from_config 读它）。
+# ⚠️ 以下 ip/端口/instance_id 都是**你这台现场（fr3_2 = 172.16.1.2 RT box）**的实测值。
+#   其它机器/现场使用前**必须按对方实际部署改**：
+#     instance_id —— 对方那台的实例名（决定 socket 名与 RT identity）
+#     host         —— 对方的 RT box 地址（可能不是 172.16.1.2）
+#     udp_port/tcp_port —— 对方 arm_rt_server 的端口（由启动参数 --udp/--tcp 定，未必是 47820/47821）
 rt:
   instance_id: fr3_2      # 实例名：决定 socket fr3_2.sock 与 RT identity
-  host: 172.16.1.2        # RT box 地址
+  host: 172.16.1.2        # RT box 地址（本机现场；换现场必改）
   udp_port: 47820         # 实测 arm_rt_server fr3_2 的 UDP（状态）
   tcp_port: 47821         # RT server 的控制 TCP
   state_timeout_s: 0.5
